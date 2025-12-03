@@ -1,0 +1,34 @@
+# IDE and OS files
+.idea/
+.vscode/
+.kotlin/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+
+# Gradle files
+.gradle/
+build/
+
+# Node.js files
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-error.log*
+
+# Local environment variables
+.env
+.env.local
+.env.*
+
+# Log files
+*.log
+
+# AI agents
+.gemini/
+GEMINI.md
+
+# 项目数据文件夹
+/config/
