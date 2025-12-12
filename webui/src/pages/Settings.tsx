@@ -201,6 +201,11 @@ const Settings: React.FC = () => {
                             保存设置
                         </Button>
                     </Box>
+                    <Box mt={4} textAlign="center">
+                        <Typography variant="body2" color="textSecondary">
+                            当前版本: {__APP_VERSION__}
+                        </Typography>
+                    </Box>
                 </Grid>
             </Grid>
             {snackbar && (
