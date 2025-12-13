@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.ProxyType
+import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import io.ktor.client.*
 import io.ktor.client.call.*
@@ -11,17 +12,35 @@ import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.net.InetSocketAddress
 import java.net.Proxy
 
 class TelegramService(
-    private var appSettings: AppSettings,
+    settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository
 ) {
 
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var appSettings: AppSettings = settingsRepository.settingsFlow.value
     private var client: HttpClient = createClient()
+
+    init {
+        settingsRepository.settingsFlow.onEach { newSettings ->
+            val needRecreate = appSettings.proxy != newSettings.proxy
+            appSettings = newSettings
+            if (needRecreate) {
+                client.close()
+                client = createClient()
+            }
+        }.launchIn(scope)
+    }
 
     private fun createClient(): HttpClient {
         return HttpClient(OkHttp) {
@@ -42,12 +61,6 @@ class TelegramService(
                 })
             }
         }
-    }
-
-    fun updateSettings(newSettings: AppSettings) {
-        this.appSettings = newSettings
-        this.client.close()
-        this.client = createClient()
     }
 
     suspend fun sendMessage(chatId: String, text: String): HttpResponse {
@@ -87,7 +100,6 @@ class TelegramService(
                 val title = chat.title 
                     ?: chat.username 
                     ?: "${chat.first_name ?: ""} ${chat.last_name ?: ""}".trim()
-                    ?: "Unknown Chat"
                 
                 chats[chat.id] = ChatInfo(
                     id = chat.id.toString(),
@@ -103,7 +115,7 @@ class TelegramService(
     }
     
     fun getSavedChats(): List<ChatInfo> {
-        return updatesRepository.loadChats()
+        return updatesRepository.chatsFlow.value
     }
 }
 

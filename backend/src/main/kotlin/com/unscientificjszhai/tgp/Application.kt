@@ -32,8 +32,7 @@ data class UpdateChatIdRequest(val chatId: String)
 fun Application.module() {
     val settingsRepository = SettingsRepository()
     val updatesRepository = UpdatesRepository()
-    var appSettings = settingsRepository.loadSettings()
-    val telegramService = TelegramService(appSettings, updatesRepository)
+    val telegramService = TelegramService(settingsRepository, updatesRepository)
 
     install(ContentNegotiation) {
         json()
@@ -42,20 +41,18 @@ fun Application.module() {
     routing {
         route("/api") {
             get("/settings") {
-                call.respond(appSettings)
+                call.respond(settingsRepository.settingsFlow.value)
             }
             post("/settings") {
                 val newSettings = call.receive<AppSettings>()
                 settingsRepository.saveSettings(newSettings)
-                appSettings = newSettings
                 call.respond(HttpStatusCode.OK)
             }
             post("/settings/chat") {
                 val request = call.receive<UpdateChatIdRequest>()
-                val newSettings = appSettings.copy(chatId = request.chatId)
+                val currentSettings = settingsRepository.settingsFlow.value
+                val newSettings = currentSettings.copy(chatId = request.chatId)
                 settingsRepository.saveSettings(newSettings)
-                appSettings = newSettings
-                telegramService.updateSettings(newSettings)
                 call.respond(HttpStatusCode.OK)
             }
             post("/send-message") {
