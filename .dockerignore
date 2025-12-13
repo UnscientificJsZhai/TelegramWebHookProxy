@@ -7,3 +7,4 @@ webui/node_modules
 .git
 .gitignore
 Dockerfile
+data

@@ -16,10 +16,11 @@ RUN ./gradlew :backend:shadowJar --no-daemon
 
 FROM eclipse-temurin:17-jre-alpine
 
-WORKDIR /app
+WORKDIR /
 
 COPY --from=builder /app/backend/build/libs/TelegramWebHookProxy-*-all.jar app.jar
 
 EXPOSE 10178
+VOLUME [ "config" ]
 
 ENTRYPOINT ["java", "-jar", "app.jar"]
