@@ -25,7 +25,7 @@ dependencies {
     implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:${ktorVersion}")
     implementation("io.ktor:ktor-server-host-common-jvm:${ktorVersion}")
     implementation("io.ktor:ktor-server-config-yaml:${ktorVersion}")
-    implementation("ch.qos.logback:logback-classic:1.4.11")
+    implementation("ch.qos.logback:logback-classic:1.5.19")
 
     implementation("io.ktor:ktor-client-core:${ktorVersion}")
     implementation("io.ktor:ktor-client-okhttp:${ktorVersion}")

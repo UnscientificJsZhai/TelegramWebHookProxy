@@ -16,6 +16,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
+import java.io.File
 
 fun main() {
     embeddedServer(Netty, port = 10178, host = "0.0.0.0", module = Application::module)
@@ -85,7 +86,9 @@ fun Application.module() {
         }
 
         singlePageApplication {
-            staticResources("/", "static")
+            staticResources("/", "static") {
+                default("index.html")
+            }
         }
     }
 }
