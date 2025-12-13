@@ -39,4 +39,10 @@ class UpdatesRepository {
         configFile.writeText(content)
         _chatsFlow.value = chats
     }
+
+    fun deleteChat(chatId: String) {
+        val currentChats = _chatsFlow.value.toMutableList()
+        currentChats.removeIf { it.id == chatId }
+        saveChats(currentChats)
+    }
 }

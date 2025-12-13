@@ -19,8 +19,10 @@ import {
     DialogTitle,
     DialogContent,
     DialogContentText,
-    DialogActions
+    DialogActions,
+    IconButton
 } from '@mui/material';
+import DeleteIcon from '@mui/icons-material/Delete';
 import api from '../api';
 
 interface ChatInfo {
@@ -48,6 +50,9 @@ const Home: React.FC = () => {
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [pendingChatId, setPendingChatId] = useState<string | null>(null);
     const [isTokenSet, setIsTokenSet] = useState(false);
+    
+    const [confirmDeleteDialogOpen, setConfirmDeleteDialogOpen] = useState(false);
+    const [chatToDeleteId, setChatToDeleteId] = useState<string | null>(null);
 
     useEffect(() => {
         // Fetch current settings to get initial chatId
@@ -130,6 +135,38 @@ const Home: React.FC = () => {
         setPendingChatId(null);
     };
 
+    const handleDeleteChat = (e: React.MouseEvent, id: string) => {
+        e.stopPropagation();
+        setChatToDeleteId(id);
+        setConfirmDeleteDialogOpen(true);
+    };
+
+    const handleConfirmDelete = () => {
+        if (chatToDeleteId) {
+            api.delete(`/chats/${chatToDeleteId}`)
+                .then(() => {
+                    setChats(chats.filter(c => c.id !== chatToDeleteId));
+                    if (selectedChatId === chatToDeleteId) {
+                         setSelectedChatId(null);
+                    }
+                    setSnackbar({open: true, message: '聊天已从列表中删除', severity: 'success'});
+                })
+                .catch(error => {
+                    console.error('Failed to delete chat:', error);
+                    setSnackbar({open: true, message: '删除聊天失败: ' + (error.response?.data || error.message), severity: 'error'});
+                })
+                .finally(() => {
+                    setConfirmDeleteDialogOpen(false);
+                    setChatToDeleteId(null);
+                });
+        }
+    };
+
+    const handleCancelDelete = () => {
+        setConfirmDeleteDialogOpen(false);
+        setChatToDeleteId(null);
+    };
+
     const handleSend = async () => {
         if (!selectedChatId) {
             setSnackbar({open: true, message: '请选择至少一个聊天', severity: 'warning'});
@@ -187,6 +224,11 @@ const Home: React.FC = () => {
                                             key={chat.id}
                                             role="listitem"
                                             disablePadding
+                                            secondaryAction={
+                                                <IconButton edge="end" aria-label="delete" onClick={(e) => handleDeleteChat(e, chat.id)}>
+                                                    <DeleteIcon />
+                                                </IconButton>
+                                            }
                                         >
                                             <ListItemButton role={undefined} onClick={() => handleToggleChat(chat.id)} dense>
                                                 <ListItemIcon>
@@ -262,6 +304,28 @@ const Home: React.FC = () => {
                     <Button onClick={handleCancelChange}>取消</Button>
                     <Button onClick={handleConfirmChange} autoFocus>
                         确认
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog
+                open={confirmDeleteDialogOpen}
+                onClose={handleCancelDelete}
+                aria-labelledby="alert-dialog-delete-title"
+                aria-describedby="alert-dialog-delete-description"
+            >
+                <DialogTitle id="alert-dialog-delete-title">
+                    {"确认删除？"}
+                </DialogTitle>
+                <DialogContent>
+                    <DialogContentText id="alert-dialog-delete-description">
+                        您确定要删除聊天 "{chats.find(c => c.id === chatToDeleteId)?.title || chatToDeleteId}" 吗？此操作将从列表中移除该聊天。如果已经选中此聊天，选中状态不会修改。
+                    </DialogContentText>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={handleCancelDelete}>取消</Button>
+                    <Button onClick={handleConfirmDelete} autoFocus color="error">
+                        删除
                     </Button>
                 </DialogActions>
             </Dialog>

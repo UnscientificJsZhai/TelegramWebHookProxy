@@ -80,6 +80,19 @@ fun Application.module() {
                     call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred refreshing chats")
                 }
             }
+            delete("/chats/{id}") {
+                val id = call.parameters["id"]
+                if (id == null) {
+                    call.respond(HttpStatusCode.BadRequest, "Missing chat ID")
+                    return@delete
+                }
+                try {
+                    telegramService.deleteChat(id)
+                    call.respond(HttpStatusCode.OK)
+                } catch (e: Exception) {
+                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred deleting chat")
+                }
+            }
         }
 
         singlePageApplication {

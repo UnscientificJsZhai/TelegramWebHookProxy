@@ -89,7 +89,7 @@ class TelegramService(
             throw IllegalStateException("Failed to get updates from Telegram")
         }
 
-        val chats = mutableMapOf<Long, ChatInfo>()
+        val chats = updatesRepository.chatsFlow.value.associateBy { it.id }.toMutableMap()
 
         response.result.forEach { update ->
             val chat = update.message?.chat 
@@ -101,7 +101,7 @@ class TelegramService(
                     ?: chat.username 
                     ?: "${chat.first_name ?: ""} ${chat.last_name ?: ""}".trim()
                 
-                chats[chat.id] = ChatInfo(
+                chats[chat.id.toString()] = ChatInfo(
                     id = chat.id.toString(),
                     title = title,
                     type = chat.type
@@ -116,6 +116,10 @@ class TelegramService(
     
     fun getSavedChats(): List<ChatInfo> {
         return updatesRepository.chatsFlow.value
+    }
+
+    fun deleteChat(chatId: String) {
+        updatesRepository.deleteChat(chatId)
     }
 }
 
