@@ -1,0 +1,9 @@
+.gradle
+.idea
+build
+backend/build
+webui/build
+webui/node_modules
+.git
+.gitignore
+Dockerfile
