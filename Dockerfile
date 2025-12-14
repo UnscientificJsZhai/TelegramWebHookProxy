@@ -12,7 +12,7 @@ COPY webui webui
 
 RUN chmod +x gradlew
 
-RUN ./gradlew :backend:shadowJar --no-daemon
+RUN ./gradlew build --no-daemon
 
 FROM eclipse-temurin:17-jre-alpine
 

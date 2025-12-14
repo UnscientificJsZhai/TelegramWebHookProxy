@@ -4,7 +4,8 @@ build
 backend/build
 webui/build
 webui/node_modules
+webui/dist
 .git
 .gitignore
 Dockerfile
-data
+config
