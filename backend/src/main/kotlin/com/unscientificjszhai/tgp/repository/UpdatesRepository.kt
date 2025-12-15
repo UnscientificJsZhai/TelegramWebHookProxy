@@ -1,10 +1,9 @@
 package com.unscientificjszhai.tgp.repository
 
-import com.unscientificjszhai.tgp.service.ChatInfo
+import com.unscientificjszhai.tgp.models.ChatInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 

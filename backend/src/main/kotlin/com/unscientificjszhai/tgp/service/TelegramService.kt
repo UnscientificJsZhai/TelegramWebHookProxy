@@ -1,7 +1,6 @@
 package com.unscientificjszhai.tgp.service
 
-import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.models.ProxyType
+import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import io.ktor.client.*
@@ -17,7 +16,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -72,7 +70,7 @@ class TelegramService(
 
         return client.post(url) {
             contentType(ContentType.Application.Json)
-            setBody(SendMessageRequest(chatId, text))
+            setBody(SendTelegramMessageRequest(chatId, text))
         }
     }
 
@@ -84,7 +82,7 @@ class TelegramService(
         val url = "https://api.telegram.org/bot$token/getUpdates"
 
         val response: GetUpdatesResponse = client.get(url).body()
-        
+
         if (!response.ok) {
             throw IllegalStateException("Failed to get updates from Telegram")
         }
@@ -92,15 +90,15 @@ class TelegramService(
         val chats = updatesRepository.chatsFlow.value.associateBy { it.id }.toMutableMap()
 
         response.result.forEach { update ->
-            val chat = update.message?.chat 
-                ?: update.channel_post?.chat 
+            val chat = update.message?.chat
+                ?: update.channel_post?.chat
                 ?: update.my_chat_member?.chat
-            
+
             if (chat != null) {
-                val title = chat.title 
-                    ?: chat.username 
+                val title = chat.title
+                    ?: chat.username
                     ?: "${chat.first_name ?: ""} ${chat.last_name ?: ""}".trim()
-                
+
                 chats[chat.id.toString()] = ChatInfo(
                     id = chat.id.toString(),
                     title = title,
@@ -108,12 +106,12 @@ class TelegramService(
                 )
             }
         }
-        
+
         val chatList = chats.values.toList()
         updatesRepository.saveChats(chatList)
         return chatList
     }
-    
+
     fun getSavedChats(): List<ChatInfo> {
         return updatesRepository.chatsFlow.value
     }
@@ -122,50 +120,3 @@ class TelegramService(
         updatesRepository.deleteChat(chatId)
     }
 }
-
-@Serializable
-data class ChatInfo(
-    val id: String,
-    val title: String,
-    val type: String
-)
-
-@Serializable
-private data class SendMessageRequest(
-    val chat_id: String,
-    val text: String
-)
-
-@Serializable
-private data class GetUpdatesResponse(
-    val ok: Boolean,
-    val result: List<Update>
-)
-
-@Serializable
-private data class Update(
-    val update_id: Long,
-    val message: Message? = null,
-    val channel_post: Message? = null,
-    val my_chat_member: ChatMemberUpdated? = null
-)
-
-@Serializable
-private data class ChatMemberUpdated(
-    val chat: Chat
-)
-
-@Serializable
-private data class Message(
-    val chat: Chat
-)
-
-@Serializable
-private data class Chat(
-    val id: Long,
-    val type: String,
-    val title: String? = null,
-    val username: String? = null,
-    val first_name: String? = null,
-    val last_name: String? = null
-)

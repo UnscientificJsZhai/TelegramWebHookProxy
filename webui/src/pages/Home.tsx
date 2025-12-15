@@ -55,7 +55,6 @@ const Home: React.FC = () => {
     const [chatToDeleteId, setChatToDeleteId] = useState<string | null>(null);
 
     useEffect(() => {
-        // Fetch current settings to get initial chatId
         api.get<AppSettings>('/settings')
             .then(response => {
                 if (response.data.chatId) {
@@ -69,7 +68,6 @@ const Home: React.FC = () => {
             })
             .catch(error => console.error('Failed to fetch settings:', error));
 
-        // Fetch saved chats
         fetchSavedChats();
     }, []);
 
@@ -103,10 +101,8 @@ const Home: React.FC = () => {
 
     const handleToggleChat = (id: string) => {
         if (selectedChatId === id) {
-            // 如果聊天已选中，则取消选中 (仅本地操作)
             setSelectedChatId(null);
         } else {
-            // 如果选择新聊天，弹出确认对话框
             setPendingChatId(id);
             setConfirmDialogOpen(true);
         }
