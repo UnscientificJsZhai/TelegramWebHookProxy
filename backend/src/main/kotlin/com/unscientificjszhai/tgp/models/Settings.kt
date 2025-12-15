@@ -13,7 +13,7 @@ import kotlinx.serialization.Serializable
 data class AppSettings(
     val telegramToken: String = "",
     val chatId: String = "",
-    val proxy: ProxySettings = ProxySettings()
+    val proxy: ProxySettings? = null
 )
 
 /**
@@ -21,7 +21,6 @@ data class AppSettings(
  */
 @Serializable
 data class ProxySettings(
-    val enabled: Boolean = false,
     val host: String = "",
     val port: Int = 8080,
     val type: ProxyType = ProxyType.HTTP,

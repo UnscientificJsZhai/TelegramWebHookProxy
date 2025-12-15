@@ -43,10 +43,10 @@ class TelegramService(
     private fun createClient(): HttpClient {
         return HttpClient(OkHttp) {
             engine {
-                if (appSettings.proxy.enabled) {
-                    val proxyHost = appSettings.proxy.host
-                    val proxyPort = appSettings.proxy.port
-                    val proxyType = when (appSettings.proxy.type) {
+                appSettings.proxy?.let { proxySettings ->
+                    val proxyHost = proxySettings.host
+                    val proxyPort = proxySettings.port
+                    val proxyType = when (proxySettings.type) {
                         ProxyType.HTTP -> Proxy.Type.HTTP
                         ProxyType.SOCKS -> Proxy.Type.SOCKS
                     }

@@ -5,9 +5,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.Json
+import org.slf4j.LoggerFactory
 import java.io.File
 
 class UpdatesRepository {
+    private val logger = LoggerFactory.getLogger(javaClass)
+
     private val configFile = File("config/updates.json")
     private val json = Json { prettyPrint = true }
 
@@ -26,6 +29,7 @@ class UpdatesRepository {
             try {
                 json.decodeFromString(content)
             } catch (e: Exception) {
+                logger.error("Error while loading chats", e)
                 emptyList()
             }
         } else {

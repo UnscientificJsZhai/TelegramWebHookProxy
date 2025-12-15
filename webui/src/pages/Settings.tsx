@@ -20,7 +20,6 @@ import {
 import api from '../api';
 
 interface ProxySettings {
-    enabled: boolean;
     host: string;
     port: number;
     type: string;
@@ -31,7 +30,7 @@ interface ProxySettings {
 interface AppSettings {
     telegramToken: string;
     chatId: string;
-    proxy: ProxySettings;
+    proxy: ProxySettings | null;
 }
 
 const Settings: React.FC = () => {
@@ -51,17 +50,20 @@ const Settings: React.FC = () => {
 
     const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         if (!settings) return;
-        const { name, value, type, checked } = event.target;
+        const { name, value } = event.target;
         const [section, field] = name.split('.');
 
         if (section === 'proxy') {
-            setSettings(prev => ({
-                ...prev!,
-                proxy: {
-                    ...prev!.proxy,
-                    [field]: type === 'checkbox' ? checked : value
-                }
-            }));
+            setSettings(prev => {
+                if (!prev || !prev.proxy) return prev;
+                return {
+                    ...prev,
+                    proxy: {
+                        ...prev.proxy,
+                        [field]: value
+                    }
+                };
+            });
         } else {
             setSettings(prev => ({
                 ...prev!,
@@ -70,16 +72,38 @@ const Settings: React.FC = () => {
         }
     };
     
+    const handleEnableProxyChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        if (!settings) return;
+        if (event.target.checked) {
+            setSettings(prev => ({
+                ...prev!,
+                proxy: {
+                    host: '127.0.0.1',
+                    port: 7890,
+                    type: 'HTTP'
+                }
+            }));
+        } else {
+            setSettings(prev => ({
+                ...prev!,
+                proxy: null
+            }));
+        }
+    };
+    
     const handleProxyTypeChange = (event: SelectChangeEvent) => {
         if (!settings) return;
         const { value } = event.target;
-        setSettings(prev => ({
-            ...prev!,
-            proxy: {
-                ...prev!.proxy,
-                type: value
-            }
-        }));
+        setSettings(prev => {
+            if (!prev || !prev.proxy) return prev;
+            return {
+                ...prev,
+                proxy: {
+                    ...prev.proxy,
+                    type: value
+                }
+            };
+        });
     };
 
     const handleSave = () => {
@@ -128,15 +152,14 @@ const Settings: React.FC = () => {
                     <FormControlLabel
                         control={
                             <Checkbox
-                                checked={settings.proxy.enabled}
-                                onChange={handleChange}
-                                name="proxy.enabled"
+                                checked={!!settings.proxy}
+                                onChange={handleEnableProxyChange}
                             />
                         }
                         label="启用代理"
                     />
                 </Grid>
-                {settings.proxy.enabled && (
+                {settings.proxy && (
                     <>
                         <Grid size={{xs: 12, sm: 6}}>
                             <TextField
@@ -177,7 +200,7 @@ const Settings: React.FC = () => {
                                 fullWidth
                                 label="用户名（可选）"
                                 name="proxy.username"
-                                value={settings.proxy.username}
+                                value={settings.proxy.username || ''}
                                 onChange={handleChange}
                                 variant="outlined"
                             />
@@ -188,7 +211,7 @@ const Settings: React.FC = () => {
                                 label="密码（可选）"
                                 name="proxy.password"
                                 type="password"
-                                value={settings.proxy.password}
+                                value={settings.proxy.password || ''}
                                 onChange={handleChange}
                                 variant="outlined"
                             />
