@@ -45,11 +45,8 @@ tasks.withType<ShadowJar> {
     archiveClassifier.set("all")
 }
 
-tasks.named("jar") {
-    dependsOn(project(":webui").tasks.named("npmBuild"))
-}
-
 tasks.named<Copy>("processResources") {
+    dependsOn(project(":webui").tasks.named("npmBuild"))
     from(project(":webui").layout.projectDirectory.dir("dist")) {
         into("static")
     }
