@@ -16,7 +16,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.Serializable
-import java.io.File
+import kotlinx.serialization.json.Json
 
 fun main() {
     embeddedServer(Netty, port = 10178, host = "0.0.0.0", module = Application::module)
@@ -24,7 +24,7 @@ fun main() {
 }
 
 @Serializable
-data class SendMessageRequest(val chatId: String, val text: String)
+data class SendMessageRequest(val chatId: String?, val text: String)
 
 @Serializable
 data class UpdateChatIdRequest(val chatId: String)
@@ -35,7 +35,13 @@ fun Application.module() {
     val telegramService = TelegramService(settingsRepository, updatesRepository)
 
     install(ContentNegotiation) {
-        json()
+        json(
+            Json {
+                prettyPrint = true
+                isLenient = true
+                explicitNulls = false
+            }
+        )
     }
 
     routing {
@@ -58,7 +64,12 @@ fun Application.module() {
             post("/send-message") {
                 val request = call.receive<SendMessageRequest>()
                 try {
-                    val response = telegramService.sendMessage(request.chatId, request.text)
+                    val chatId = (request.chatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
+                    if (chatId.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, "Chat ID is required")
+                        return@post
+                    }
+                    val response = telegramService.sendMessage(chatId, request.text)
                     call.respond(response.status, response.bodyAsText())
                 } catch (e: Exception) {
                     call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred")
