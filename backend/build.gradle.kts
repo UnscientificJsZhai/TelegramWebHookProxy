@@ -11,7 +11,7 @@ plugins {
     application
 }
 
-version = "1.0.0"
+version = "1.0.1"
 
 val ktorVersion = "3.3.1"
 
