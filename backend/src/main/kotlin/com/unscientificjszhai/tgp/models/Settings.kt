@@ -21,9 +21,9 @@ data class AppSettings(
  */
 @Serializable
 data class ProxySettings(
-    val host: String = "",
-    val port: Int = 8080,
-    val type: ProxyType = ProxyType.HTTP,
+    val host: String,
+    val port: Int,
+    val type: ProxyType,
     val username: String? = null,
     val password: String? = null
 )

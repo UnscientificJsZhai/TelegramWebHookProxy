@@ -5,6 +5,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.io.File
 
@@ -30,8 +34,10 @@ class SettingsRepository {
             try {
                 json.decodeFromString(content)
             } catch (e: Exception) {
-                logger.error("Error while loading config file", e)
-                AppSettings()
+                fixMissingProxyType(content) ?: run {
+                    logger.error("Error while loading config file", e)
+                    AppSettings()
+                }
             }
         } else {
             AppSettings()
@@ -42,5 +48,32 @@ class SettingsRepository {
         val content = json.encodeToString(settings)
         configFile.writeText(content)
         _settingsFlow.value = settings
+    }
+
+    private fun fixMissingProxyType(content: String): AppSettings? {
+        val rawElement = json.parseToJsonElement(content)
+        val settings = rawElement as? JsonObject ?: return null
+        val proxy = settings["proxy"] as? JsonObject ?: return null
+        if (proxy.containsKey("host") && proxy.containsKey("port") && !proxy.containsKey("type")) {
+            val newProxy = buildJsonObject {
+                proxy.forEach { (key, value) -> put(key, value) }
+                put("type", "HTTP")
+            }
+            val newSettings = buildJsonObject {
+                settings.forEach { (key, value) ->
+                    if (key == "proxy") {
+                        put(key, newProxy)
+                    } else {
+                        put(key, value)
+                    }
+                }
+            }
+
+            return json.decodeFromJsonElement<AppSettings>(newSettings).also {
+                configFile.writeText(json.encodeToString(it))
+            }
+        } else {
+            return null
+        }
     }
 }
