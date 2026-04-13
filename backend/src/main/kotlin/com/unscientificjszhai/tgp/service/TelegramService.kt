@@ -61,7 +61,11 @@ class TelegramService(
         }
     }
 
-    suspend fun sendMessage(chatId: String, text: String): HttpResponse {
+    suspend fun sendMessage(
+        chatId: String,
+        text: String,
+        replyParameters: ReplyParameters? = null
+    ): HttpResponse {
         val token = appSettings.telegramToken
         if (token.isBlank()) {
             throw IllegalStateException("Telegram token is not set.")
@@ -70,46 +74,34 @@ class TelegramService(
 
         return client.post(url) {
             contentType(ContentType.Application.Json)
-            setBody(SendTelegramMessageRequest(chatId, text))
+            setBody(SendTelegramMessageRequest(chatId, text, replyParameters))
         }
     }
 
-    suspend fun refreshChats(): List<ChatInfo> {
+    suspend fun sendChatAction(chatId: String, action: String): HttpResponse {
+        val token = appSettings.telegramToken
+        if (token.isBlank()) {
+            throw IllegalStateException("Telegram token is not set.")
+        }
+        val url = "https://api.telegram.org/bot$token/sendChatAction"
+
+        return client.post(url) {
+            contentType(ContentType.Application.Json)
+            setBody(ChatActionRequest(chatId, action))
+        }
+    }
+
+    suspend fun getUpdates(offset: Long? = null, timeout: Int? = null): GetUpdatesResponse {
         val token = appSettings.telegramToken
         if (token.isBlank()) {
             throw IllegalStateException("Telegram token is not set.")
         }
         val url = "https://api.telegram.org/bot$token/getUpdates"
 
-        val response: GetUpdatesResponse = client.get(url).body()
-
-        if (!response.ok) {
-            throw IllegalStateException("Failed to get updates from Telegram")
-        }
-
-        val chats = updatesRepository.chatsFlow.value.associateBy { it.id }.toMutableMap()
-
-        response.result.forEach { update ->
-            val chat = update.message?.chat
-                ?: update.channel_post?.chat
-                ?: update.my_chat_member?.chat
-
-            if (chat != null) {
-                val title = chat.title
-                    ?: chat.username
-                    ?: "${chat.first_name ?: ""} ${chat.last_name ?: ""}".trim()
-
-                chats[chat.id.toString()] = ChatInfo(
-                    id = chat.id.toString(),
-                    title = title,
-                    type = chat.type
-                )
-            }
-        }
-
-        val chatList = chats.values.toList()
-        updatesRepository.saveChats(chatList)
-        return chatList
+        return client.get(url) {
+            offset?.let { parameter("offset", it) }
+            timeout?.let { parameter("timeout", it) }
+        }.body()
     }
 
     fun getSavedChats(): List<ChatInfo> {

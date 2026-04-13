@@ -8,7 +8,6 @@ import {
     Snackbar,
     TextField,
     Typography,
-    CircularProgress,
     List,
     ListItem,
     ListItemButton,
@@ -34,14 +33,13 @@ interface ChatInfo {
 interface AppSettings {
     chatId: string;
     telegramToken: string;
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 const Home: React.FC = () => {
     const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
     const [text, setText] = useState('');
     const [chats, setChats] = useState<ChatInfo[]>([]);
-    const [loadingChats, setLoadingChats] = useState(false);
     const [snackbar, setSnackbar] = useState<{
         open: boolean,
         message: string,
@@ -54,13 +52,21 @@ const Home: React.FC = () => {
     const [confirmDeleteDialogOpen, setConfirmDeleteDialogOpen] = useState(false);
     const [chatToDeleteId, setChatToDeleteId] = useState<string | null>(null);
 
+    const fetchSavedChats = () => {
+        api.get<ChatInfo[]>('/chats')
+            .then(response => {
+                setChats(response.data);
+            })
+            .catch(error => console.error('Failed to fetch chats:', error));
+    };
+
     useEffect(() => {
         api.get<AppSettings>('/settings')
             .then(response => {
                 if (response.data.chatId) {
                     setSelectedChatId(response.data.chatId);
                 }
-                if (response.data.telegramToken && response.data.telegramToken.trim() !== '') {
+                if (response.data.telegramToken && typeof response.data.telegramToken === 'string' && response.data.telegramToken.trim() !== '') {
                     setIsTokenSet(true);
                 } else {
                     setIsTokenSet(false);
@@ -70,34 +76,6 @@ const Home: React.FC = () => {
 
         fetchSavedChats();
     }, []);
-
-    const fetchSavedChats = () => {
-        api.get<ChatInfo[]>('/chats')
-            .then(response => {
-                setChats(response.data);
-            })
-            .catch(error => console.error('Failed to fetch chats:', error));
-    };
-
-    const handleRefreshChats = () => {
-        setLoadingChats(true);
-        api.post<ChatInfo[]>('/chats/refresh')
-            .then(response => {
-                setChats(response.data);
-                if (response.data.length === 0) {
-                    setSnackbar({ open: true, message: '未找到最近的聊天记录，请先向机器人发送消息', severity: 'info' });
-                } else {
-                    setSnackbar({ open: true, message: '成功刷新聊天列表', severity: 'success' });
-                }
-            })
-            .catch(error => {
-                console.error('Failed to refresh chats:', error);
-                setSnackbar({ open: true, message: '刷新聊天列表失败: ' + (error.response?.data || error.message), severity: 'error' });
-            })
-            .finally(() => {
-                setLoadingChats(false);
-            });
-    };
 
     const handleToggleChat = (id: string) => {
         if (selectedChatId === id) {
@@ -175,9 +153,11 @@ const Home: React.FC = () => {
             await api.post('/send-message', {chatId: selectedChatId, text});
             setSnackbar({open: true, message: '消息发送成功！', severity: 'success'});
             setText('');
-        } catch (error: any) {
+        } catch (error: unknown) {
             console.error('Failed to send message:', error);
-            setSnackbar({open: true, message: '消息发送失败: ' + (error.response?.data || error.message), severity: 'error'});
+            const errMsg = error instanceof Error ? error.message : String(error);
+            const errRespData = (error as {response?: {data?: string}})?.response?.data;
+            setSnackbar({open: true, message: '消息发送失败: ' + (errRespData || errMsg), severity: 'error'});
         }
     };
 
@@ -201,16 +181,6 @@ const Home: React.FC = () => {
                 
                 <Grid size={{xs: 12}}>
                      <Box display="flex" flexDirection="column" gap={2}>
-                        <Button 
-                            variant="outlined" 
-                            onClick={handleRefreshChats} 
-                            disabled={loadingChats || !isTokenSet}
-                            sx={{ alignSelf: 'flex-start' }}
-                            title={!isTokenSet ? "请先在设置中配置 Telegram Token" : ""}
-                        >
-                            {loadingChats ? <CircularProgress size={24} /> : "刷新聊天列表"}
-                        </Button>
-                        
                         <Paper variant="outlined" sx={{ height: 300, overflow: 'auto' }}>
                             <List dense component="div" role="list">
                                 {chats.map((chat) => {

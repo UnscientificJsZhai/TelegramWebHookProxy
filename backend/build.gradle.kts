@@ -1,5 +1,6 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import com.github.jk1.license.render.TextReportRenderer
+import java.util.Properties
 
 evaluationDependsOn(":webui")
 
@@ -11,7 +12,7 @@ plugins {
     application
 }
 
-version = "1.0.1"
+version = "1.1.0"
 
 val ktorVersion = "3.3.1"
 
@@ -35,6 +36,18 @@ dependencies {
 
     // Ktor client logging
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
+
+    // Gemini SDK
+    implementation("com.google.genai:google-genai:1.47.0")
+
+    // MCP SDK
+    implementation("io.modelcontextprotocol:kotlin-sdk:0.10.0")
+
+    // Testing
+    testImplementation("org.jetbrains.kotlin:kotlin-test")
+    testImplementation("io.ktor:ktor-server-test-host:${ktorVersion}")
+    testImplementation("io.mockk:mockk:1.13.13")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
 }
 
 application {
@@ -43,6 +56,25 @@ application {
 
 configure<com.github.jk1.license.LicenseReportExtension> {
     renderers = arrayOf(TextReportRenderer("backend-licenses.txt"))
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
+
+    // Pass environment variables or Gradle properties as system properties
+    systemProperty("telegram.token", System.getenv("TELEGRAM_TOKEN") ?: project.findProperty("TELEGRAM_TOKEN") ?: "")
+    systemProperty("telegram.chat_id", System.getenv("TELEGRAM_CHAT_ID") ?: project.findProperty("TELEGRAM_CHAT_ID") ?: "")
+    systemProperty("gemini.api_key", System.getenv("GEMINI_API_KEY") ?: project.findProperty("GEMINI_API_KEY") ?: "")
+
+    // Load local.properties if it exists
+    val localProps = Properties()
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { localProps.load(it) }
+        localProps.forEach { (key: Any, value: Any) ->
+            systemProperty(key.toString(), value.toString())
+        }
+    }
 }
 
 tasks.withType<ShadowJar> {

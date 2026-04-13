@@ -15,8 +15,12 @@ import {
     CircularProgress,
     Snackbar,
     Alert,
+    IconButton,
+    Divider,
     type SelectChangeEvent
 } from '@mui/material';
+import DeleteIcon from '@mui/icons-material/Delete';
+import AddIcon from '@mui/icons-material/Add';
 import api from '../api';
 
 interface ProxySettings {
@@ -27,11 +31,35 @@ interface ProxySettings {
     password?: string;
 }
 
+interface MCPServerConfig {
+    name: string;
+    url: string;
+    headers: Record<string, string>;
+    _headerString?: string;
+}
+
+interface AISettings {
+    geminiApiKey: string;
+    agentEnabled: boolean;
+    agentChatId: string;
+    globalContext: string;
+    mcpServers: MCPServerConfig[];
+}
+
 interface AppSettings {
     telegramToken: string;
     chatId: string;
     proxy: ProxySettings | null;
+    ai: AISettings | null;
 }
+
+const defaultAiSettings: AISettings = {
+    geminiApiKey: '',
+    agentEnabled: false,
+    agentChatId: '',
+    globalContext: '',
+    mcpServers: []
+};
 
 const Settings: React.FC = () => {
     const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -64,6 +92,18 @@ const Settings: React.FC = () => {
                     }
                 };
             });
+        } else if (section === 'ai') {
+            setSettings(prev => {
+                if (!prev) return prev;
+                const ai = prev.ai || defaultAiSettings;
+                return {
+                    ...prev,
+                    ai: {
+                        ...ai,
+                        [field]: value
+                    }
+                };
+            });
         } else {
             setSettings(prev => ({
                 ...prev!,
@@ -71,7 +111,27 @@ const Settings: React.FC = () => {
             }));
         }
     };
-    
+
+    const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        if (!settings) return;
+        const { name, checked } = event.target;
+        const [section, field] = name.split('.');
+
+        if (section === 'ai') {
+            setSettings(prev => {
+                if (!prev) return prev;
+                const ai = prev.ai || defaultAiSettings;
+                return {
+                    ...prev,
+                    ai: {
+                        ...ai,
+                        [field]: checked
+                    }
+                };
+            });
+        }
+    };
+
     const handleEnableProxyChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         if (!settings) return;
         if (event.target.checked) {
@@ -106,9 +166,120 @@ const Settings: React.FC = () => {
         });
     };
 
+    const handleCopyChatId = () => {
+        if (!settings) return;
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    agentChatId: prev.chatId
+                }
+            };
+        });
+    };
+
+    // MCP Server List Handlers
+    const handleAddMCPServer = () => {
+        if (!settings) return;
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            const currentServers = ai.mcpServers || [];
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    mcpServers: [...currentServers, { name: '', url: '', headers: {} }]
+                }
+            };
+        });
+    };
+
+    const handleRemoveMCPServer = (index: number) => {
+        if (!settings) return;
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            const updatedServers = [...(ai.mcpServers || [])];
+            updatedServers.splice(index, 1);
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    mcpServers: updatedServers
+                }
+            };
+        });
+    };
+
+    const handleMCPServerChange = (index: number, field: keyof MCPServerConfig, value: string) => {
+        if (!settings) return;
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            const updatedServers = [...(ai.mcpServers || [])];
+            updatedServers[index] = { ...updatedServers[index], [field]: value };
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    mcpServers: updatedServers
+                }
+            };
+        });
+    };
+
+    const handleMCPHeaderChange = (index: number, headerString: string) => {
+        if (!settings) return;
+        
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            const updatedServers = [...(ai.mcpServers || [])];
+            
+            let parsedHeaders = updatedServers[index].headers;
+            try {
+                if (headerString.trim() !== '') {
+                    parsedHeaders = JSON.parse(headerString);
+                } else {
+                    parsedHeaders = {};
+                }
+            } catch {
+                // Ignore parsing errors, keep old headers object but update the string
+            }
+
+            updatedServers[index] = { 
+                ...updatedServers[index], 
+                headers: parsedHeaders,
+                _headerString: headerString 
+            };
+
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    mcpServers: updatedServers
+                }
+            };
+        });
+    };
+
     const handleSave = () => {
         if (!settings) return;
-        api.post('/settings', settings)
+
+        // 剥离仅用于 UI 的 _headerString 字段
+        const settingsToSave = {
+            ...settings,
+            ai: settings.ai ? {
+                ...settings.ai,
+                mcpServers: settings.ai.mcpServers.map(({ _headerString, ...server }) => server)
+            } : null
+        };
+
+        api.post('/settings', settingsToSave)
             .then(() => {
                 setSnackbar({ open: true, message: '设置保存成功！', severity: 'success' });
             })
@@ -126,12 +297,19 @@ const Settings: React.FC = () => {
         return <CircularProgress />;
     }
 
+    const ai = settings.ai || defaultAiSettings;
+
     return (
         <Paper elevation={3} sx={{ p: 4 }}>
             <Typography variant="h4" gutterBottom>
                 设置
             </Typography>
             <Grid container spacing={3}>
+                <Grid size={{xs: 12}}>
+                    <Typography variant="h5" gutterBottom>
+                        基础设置
+                    </Typography>
+                </Grid>
                 <Grid size={{xs: 12}}>
                     <TextField
                         fullWidth
@@ -142,8 +320,154 @@ const Settings: React.FC = () => {
                         variant="outlined"
                     />
                 </Grid>
+                <Grid size={{xs: 12}}>
+                    <TextField
+                        fullWidth
+                        label="Chat ID (代理消息发送目标)"
+                        name="chatId"
+                        value={settings.chatId}
+                        onChange={handleChange}
+                        variant="outlined"
+                        helperText="用于接收代理转发消息的Chat ID"
+                    />
+                </Grid>
                 
                 <Grid size={{xs: 12}}>
+                    <Divider sx={{ my: 2 }} />
+                    <Typography variant="h5" gutterBottom>
+                        AI 代理设置
+                    </Typography>
+                </Grid>
+
+                <Grid size={{xs: 12}}>
+                    <FormControlLabel
+                        control={
+                            <Checkbox
+                                checked={ai.agentEnabled}
+                                name="ai.agentEnabled"
+                                onChange={handleCheckboxChange}
+                            />
+                        }
+                        label="启用 AI Agent"
+                    />
+                </Grid>
+
+                {ai.agentEnabled && (
+                    <>
+                        <Grid size={{xs: 12}}>
+                            <TextField
+                                fullWidth
+                                label="Gemini API Key"
+                                name="ai.geminiApiKey"
+                                type="password"
+                                value={ai.geminiApiKey}
+                                onChange={handleChange}
+                                variant="outlined"
+                            />
+                        </Grid>
+                        
+                        <Grid size={{xs: 12}}>
+                            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                                <TextField
+                                    fullWidth
+                                    label="监听 Chat ID"
+                                    name="ai.agentChatId"
+                                    value={ai.agentChatId}
+                                    onChange={handleChange}
+                                    variant="outlined"
+                                    helperText="AI 将只在此 Chat ID 的会话中回复消息，且可以响应 /reset"
+                                />
+                                <Button 
+                                    variant="outlined" 
+                                    onClick={handleCopyChatId}
+                                    sx={{ whiteSpace: 'nowrap', height: 'fit-content', mt: -3 }}
+                                >
+                                    填入发送消息ID
+                                </Button>
+                            </Box>
+                        </Grid>
+
+                        <Grid size={{xs: 12}}>
+                            <TextField
+                                fullWidth
+                                label="全局上下文 (系统提示词)"
+                                name="ai.globalContext"
+                                value={ai.globalContext}
+                                onChange={handleChange}
+                                variant="outlined"
+                                multiline
+                                rows={4}
+                            />
+                        </Grid>
+
+                        <Grid size={{xs: 12}}>
+                            <Typography variant="h6" gutterBottom>
+                                MCP 服务器配置
+                            </Typography>
+                            {ai.mcpServers?.map((server, index) => (
+                                <Paper key={index} variant="outlined" sx={{ p: 2, mb: 2 }}>
+                                    <Grid container spacing={2} alignItems="center">
+                                        <Grid size={{xs: 12, md: 3}}>
+                                            <TextField
+                                                fullWidth
+                                                label="名称"
+                                                value={server.name}
+                                                onChange={(e) => handleMCPServerChange(index, 'name', e.target.value)}
+                                                variant="outlined"
+                                                size="small"
+                                            />
+                                        </Grid>
+                                        <Grid size={{xs: 12, md: 4}}>
+                                            <TextField
+                                                fullWidth
+                                                label="URL (SSE 端点)"
+                                                value={server.url}
+                                                onChange={(e) => handleMCPServerChange(index, 'url', e.target.value)}
+                                                variant="outlined"
+                                                size="small"
+                                            />
+                                        </Grid>
+                                        <Grid size={{xs: 12, md: 4}}>
+                                            <TextField
+                                                fullWidth
+                                                label="Headers (使用JSON格式配置请求头)"
+                                                value={server._headerString !== undefined ? server._headerString : JSON.stringify(server.headers || {})}
+                                                onChange={(e) => handleMCPHeaderChange(index, e.target.value)}
+                                                variant="outlined"
+                                                size="small"
+                                                error={(() => {
+                                                    try {
+                                                        const toParse = server._headerString !== undefined ? server._headerString : JSON.stringify(server.headers || {});
+                                                        if (toParse.trim() !== '') JSON.parse(toParse);
+                                                        return false;
+                                                    } catch {
+                                                        return true;
+                                                    }
+                                                })() as unknown as boolean}
+                                            />
+                                        </Grid>
+                                        <Grid size={{xs: 12, md: 1}} sx={{ textAlign: 'center' }}>
+                                            <IconButton color="error" onClick={() => handleRemoveMCPServer(index)}>
+                                                <DeleteIcon />
+                                            </IconButton>
+                                        </Grid>
+                                    </Grid>
+                                </Paper>
+                            ))}
+                            <Button 
+                                variant="outlined" 
+                                startIcon={<AddIcon />} 
+                                onClick={handleAddMCPServer}
+                            >
+                                添加 MCP 服务器
+                            </Button>
+                        </Grid>
+                    </>
+                )}
+
+
+                <Grid size={{xs: 12}}>
+                    <Divider sx={{ my: 2 }} />
                     <Typography variant="h5" gutterBottom>
                         代理设置
                     </Typography>

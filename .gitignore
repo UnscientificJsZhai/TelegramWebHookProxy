@@ -11,10 +11,11 @@ Thumbs.db
 # Gradle files
 .gradle/
 build/
+local.properties
 
 # Node.js files
-frontend/node_modules/
-frontend/dist/
+webui/node_modules/
+webui/dist/
 npm-debug.log*
 yarn-error.log*
 

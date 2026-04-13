@@ -5,6 +5,8 @@ import com.unscientificjszhai.tgp.models.SendMessageRequest
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
+import com.unscientificjszhai.tgp.service.AgentPoller
+import com.unscientificjszhai.tgp.service.GeminiAgentService
 import com.unscientificjszhai.tgp.service.TelegramService
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -17,6 +19,15 @@ fun Application.apiModule() {
     val settingsRepository = SettingsRepository()
     val updatesRepository = UpdatesRepository()
     val telegramService = TelegramService(settingsRepository, updatesRepository)
+    val mcpClientService = com.unscientificjszhai.tgp.service.MCPClientService()
+    val geminiAgentService = GeminiAgentService(settingsRepository, mcpClientService)
+    
+    val agentPoller = AgentPoller(
+        telegramService, 
+        geminiAgentService, 
+        settingsRepository, 
+        updatesRepository
+    ).apply { start() }
 
     routing {
         route("/api") {
@@ -55,14 +66,6 @@ fun Application.apiModule() {
                     call.respond(chats)
                 } catch (e: Exception) {
                     call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred fetching chats")
-                }
-            }
-            post("/chats/refresh") {
-                try {
-                    val chats = telegramService.refreshChats()
-                    call.respond(chats)
-                } catch (e: Exception) {
-                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred refreshing chats")
                 }
             }
             delete("/chats/{id}") {

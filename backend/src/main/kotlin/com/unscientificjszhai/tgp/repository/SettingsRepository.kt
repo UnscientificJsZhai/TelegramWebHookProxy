@@ -17,7 +17,10 @@ class SettingsRepository {
     private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
 
     private val configFile = File("config/settings.json")
-    private val json = Json { prettyPrint = true }
+    private val json = Json { 
+        prettyPrint = true
+        ignoreUnknownKeys = true
+    }
 
     private val _settingsFlow = MutableStateFlow(loadSettings())
     val settingsFlow: StateFlow<AppSettings> = _settingsFlow.asStateFlow()
