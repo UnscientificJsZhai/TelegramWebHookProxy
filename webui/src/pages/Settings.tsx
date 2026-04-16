@@ -203,6 +203,7 @@ const Settings: React.FC = () => {
                                 value={settings.proxy.username || ''}
                                 onChange={handleChange}
                                 variant="outlined"
+                                disabled={settings.proxy.type === 'SOCKS'}
                             />
                         </Grid>
                         <Grid size={{xs: 12, sm: 6}}>
@@ -214,6 +215,7 @@ const Settings: React.FC = () => {
                                 value={settings.proxy.password || ''}
                                 onChange={handleChange}
                                 variant="outlined"
+                                disabled={settings.proxy.type === 'SOCKS'}
                             />
                         </Grid>
                     </>
