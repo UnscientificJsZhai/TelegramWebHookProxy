@@ -16,8 +16,8 @@ tasks.register<NpmTask>("npmBuild") {
     args.set(listOf("run", "build"))
 }
 
-tasks.register<NpmTask>("clean") {
-    args.set(listOf("run", "clean"))
+tasks.register<Delete>("clean") {
+    delete("dist", "build")
 }
 
 val generateLicenses by tasks.registering(NpxTask::class) {

@@ -15,6 +15,10 @@ version = "1.0.1"
 
 val ktorVersion = "3.4.2"
 
+kotlin {
+    jvmToolchain(21)
+}
+
 repositories {
     mavenCentral()
 }

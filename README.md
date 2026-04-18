@@ -29,7 +29,7 @@ docker build -t telegram-webhook-proxy .
 docker run -d \
   --name telegram-webhook-proxy \
   -p 10178:10178 \
-  -v <dir>:/config \
+  -v <dir>:/app/config \
   telegram-webhook-proxy
 ```
 
