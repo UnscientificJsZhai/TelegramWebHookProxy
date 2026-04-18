@@ -8,13 +8,14 @@ import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.function.HttpApiFunctionProvider
+import com.unscientificjszhai.tgp.service.function.McpFunctionProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
-import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 import kotlin.jvm.optionals.getOrNull
 import com.google.genai.types.ProxyType as GeminiProxyType
@@ -28,6 +29,10 @@ class GeminiAgentService(
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    private val localFunctionProviders = listOf(
+        HttpApiFunctionProvider(),
+        McpFunctionProvider(mcpClientService)
+    )
     private var client: Client? = null
     internal var chat: Chat? = null
 
@@ -195,26 +200,14 @@ class GeminiAgentService(
             configBuilder.systemInstruction(systemInstruction)
         }
 
-        // Add MCP Tools
-        val mcpTools = mcpClientService.getAllTools()
-        if (mcpTools.isNotEmpty()) {
-            val functionDeclarations = mcpTools.map { (serverName, mcpTool) ->
-                val schemaJson = buildJsonObject {
-                    put("type", "OBJECT")
-                    put("properties", (mcpTool.inputSchema?.properties ?: JsonObject(emptyMap())).toGeminiSchemaJson())
-                    val required = mcpTool.inputSchema?.required ?: emptyList()
-                    if (required.isNotEmpty()) {
-                        put("required", buildJsonArray {
-                            required.forEach { add(it) }
-                        })
-                    }
-                }.toString()
+        val functionDeclarations = mutableListOf<FunctionDeclaration>()
 
-                val schema = Schema.fromJson(schemaJson) ?: Schema.builder().type(Type(Type.Known.OBJECT)).build()
+        // Add Local Functions
+        localFunctionProviders.forEach { provider ->
+            functionDeclarations.addAll(provider.providedFunctions)
+        }
 
-                FunctionDeclaration.builder().name("${serverName}_${mcpTool.name}")
-                    .description(mcpTool.description ?: "").parameters(schema).build()
-            }
+        if (functionDeclarations.isNotEmpty()) {
             configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
         }
 
@@ -225,24 +218,6 @@ class GeminiAgentService(
             logger.error("Failed to create Gemini chat session", e)
             chat = null
         }
-    }
-
-    private fun JsonElement.toGeminiSchemaJson(): JsonElement = when (this) {
-        is JsonObject -> buildJsonObject {
-            forEach { (key, value) ->
-                if (key == "type" && value is JsonPrimitive && value.isString) {
-                    put(key, value.content.uppercase())
-                } else {
-                    put(key, value.toGeminiSchemaJson())
-                }
-            }
-        }
-
-        is JsonArray -> buildJsonArray {
-            forEach { add(it.toGeminiSchemaJson()) }
-        }
-
-        else -> this
     }
 
     /**
@@ -280,26 +255,15 @@ class GeminiAgentService(
                 val fullNameOpt = functionCall.name()
                 if (!fullNameOpt.isPresent) continue
                 val fullName = fullNameOpt.get()
-                val serverName = fullName.substringBefore('_')
-                val toolName = fullName.substringAfter('_')
 
                 val argsMapOpt = functionCall.args()
                 val argsMap = if (argsMapOpt.isPresent) argsMapOpt.get() else emptyMap()
 
-                try {
-                    val result = mcpClientService.callTool(serverName, toolName, argsMap)
-                    functionResponses.add(
-                        Part.fromFunctionResponse(
-                            fullName, mapOf("result" to result)
-                        )
-                    )
-                } catch (e: Exception) {
-                    logger.error("Error executing MCP tool $fullName", e)
-                    functionResponses.add(
-                        Part.fromFunctionResponse(
-                            fullName, mapOf("error" to (e.message ?: "Unknown error"))
-                        )
-                    )
+                val localProvider = localFunctionProviders.find { it.canHandle(fullName) }
+                if (localProvider != null) {
+                    val result = localProvider.execute(fullName, argsMap)
+                    functionResponses.add(Part.fromFunctionResponse(fullName, result))
+                    continue
                 }
             }
 

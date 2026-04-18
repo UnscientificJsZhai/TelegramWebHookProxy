@@ -38,7 +38,7 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Gemini SDK
-    implementation("com.google.genai:google-genai:1.47.0")
+    implementation("com.google.genai:google-genai:1.50.0")
 
     // MCP SDK
     implementation("io.modelcontextprotocol:kotlin-sdk:0.10.0")
