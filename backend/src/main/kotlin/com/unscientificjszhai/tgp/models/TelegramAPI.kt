@@ -10,8 +10,8 @@ data class ChatInfo(
 
 @Serializable
 data class ReplyParameters(
-    val message_id: Long,
-    val chat_id: String? = null,
+    val messageId: Long,
+    val chatId: String? = null,
     val allow_sending_without_reply: Boolean? = null,
     val quote: String? = null,
     val quote_parse_mode: String? = null,
@@ -73,10 +73,35 @@ data class ChatMemberUpdated(
 )
 
 @Serializable
+data class Voice(
+    val file_id: String,
+    val file_unique_id: String,
+    val duration: Int,
+    val mime_type: String? = null,
+    val file_size: Long? = null
+)
+
+@Serializable
+data class FileResponse(
+    val ok: Boolean,
+    val result: TelegramFile? = null
+)
+
+@Serializable
+data class TelegramFile(
+    val file_id: String,
+    val file_unique_id: String,
+    val file_size: Long? = null,
+    val file_path: String? = null
+)
+
+@Serializable
 data class Message(
     val message_id: Long,
     val chat: Chat,
-    val text: String? = null
+    val text: String? = null,
+    val voice: Voice? = null,
+    val caption: String? = null
 )
 
 @Serializable

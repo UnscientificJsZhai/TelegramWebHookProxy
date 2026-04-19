@@ -133,6 +133,40 @@ class TelegramService(
         }.body()
     }
 
+    /**
+     * 获取文件元数据。
+     *
+     * @param fileId 文件的唯一标识符。
+     * @return 文件的元数据。
+     */
+    suspend fun getFile(fileId: String): FileResponse {
+        val token = appSettings.telegramToken
+        if (token.isBlank()) {
+            throw IllegalStateException("Telegram token is not set.")
+        }
+        val url = "https://api.telegram.org/bot$token/getFile"
+
+        return client.get(url) {
+            parameter("file_id", fileId)
+        }.body()
+    }
+
+    /**
+     * 下载文件字节流。
+     *
+     * @param filePath 文件的路径。
+     * @return 文件的字节数组。
+     */
+    suspend fun downloadFile(filePath: String): ByteArray {
+        val token = appSettings.telegramToken
+        if (token.isBlank()) {
+            throw IllegalStateException("Telegram token is not set.")
+        }
+        val url = "https://api.telegram.org/file/bot$token/$filePath"
+
+        return client.get(url).readRawBytes()
+    }
+
     fun getSavedChats(): List<ChatInfo> {
         return updatesRepository.chatsFlow.value
     }

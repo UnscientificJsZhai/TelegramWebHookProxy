@@ -221,21 +221,37 @@ class GeminiAgentService(
     }
 
     /**
-     * 发送消息并获取回复。
+     * 发送文本消息并获取回复。
      *
      * @param text 消息内容。
      * @return Gemini 的回复文本。
      */
     suspend fun sendMessage(text: String): String {
+        return sendMessage(text, emptyList())
+    }
+
+    /**
+     * 发送包含语音数据的消息并获取回复。
+     *
+     * @param text 配文或指令内容（可选）。
+     * @param audioParts 包含音频数据的 Part 列表。
+     * @return Gemini 的回复文本。
+     */
+    suspend fun sendMessage(text: String?, audioParts: List<Part>): String {
         val currentChat = chat ?: throw IllegalStateException("Gemini chat session is not initialized.")
         try {
+            val parts = mutableListOf<Part>()
+            text?.let { parts.add(Part.fromText(it)) }
+            parts.addAll(audioParts)
+
+            val userContent = Content.builder().role("user").parts(parts).build()
+
             val history = savedHistory
             val response = if (history != null && currentChat.getHistory(false).isEmpty()) {
                 savedHistory = null
-                val userContent = Content.builder().role("user").parts(listOf(Part.fromText(text))).build()
                 currentChat.sendMessage(history + userContent)
             } else {
-                currentChat.sendMessage(text)
+                currentChat.sendMessage(listOf(userContent))
             }
 
             // Check for tool calls

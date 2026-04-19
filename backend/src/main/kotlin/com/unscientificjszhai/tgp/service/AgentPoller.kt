@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.ChatInfo
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.Update
+import com.unscientificjszhai.tgp.models.Voice
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import kotlinx.coroutines.*
@@ -109,17 +110,80 @@ class AgentPoller(
 
     internal suspend fun handleUpdate(update: Update) {
         val message = update.message ?: return
-        val text = message.text ?: return
+        val text = message.text
+        val voice = message.voice
+        if (text == null && voice == null) return
+
         val chatId = message.chat.id.toString()
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return
 
         if (!aiSettings.agentEnabled || aiSettings.geminiApiKey.isBlank()) return
 
         if (chatId == aiSettings.agentChatId) {
-            if (text.startsWith("/")) {
+            if (text != null && text.startsWith("/")) {
                 handleCommand(chatId, text, message.message_id)
-            } else {
+            } else if (voice != null) {
+                handleVoiceMessage(chatId, voice, message.caption, message.message_id)
+            } else if (text != null) {
                 handleAiMessage(chatId, text, message.message_id)
+            }
+        }
+    }
+
+    internal suspend fun handleVoiceMessage(chatId: String, voice: Voice, caption: String?, messageId: Long) {
+        try {
+            telegramService.sendChatAction(chatId, "typing")
+        } catch (e: Exception) {
+            logger.warn("Failed to send initial typing action", e)
+        }
+
+        coroutineScope {
+            val typingJob = launch {
+                while (isActive) {
+                    delay(4000.milliseconds)
+                    try {
+                        telegramService.sendChatAction(chatId, "typing")
+                    } catch (e: Exception) {
+                        logger.warn("Failed to send typing action", e)
+                    }
+                }
+            }
+
+            try {
+                // 1. 获取文件路径
+                val fileResponse = telegramService.getFile(voice.file_id)
+                val filePath = fileResponse.result?.file_path
+                    ?: throw IllegalStateException("Failed to get file path for voice message")
+
+                // 2. 下载文件数据
+                val audioData = telegramService.downloadFile(filePath)
+
+                // 3. 构建 Gemini 请求 Part
+                val mimeType = voice.mime_type ?: "audio/ogg"
+                val audioPart = com.google.genai.types.Part.builder()
+                    .inlineData(
+                        com.google.genai.types.Blob.builder()
+                            .mimeType(mimeType)
+                            .data(audioData)
+                            .build()
+                    )
+                    .build()
+
+                // 4. 发送给 Gemini
+                val reply = geminiAgentService.sendMessage(caption, listOf(audioPart))
+
+                typingJob.cancel()
+                if (reply.isNotBlank()) {
+                    telegramService.sendMessage(
+                        chatId, reply, ReplyParameters(messageId = messageId)
+                    )
+                }
+            } catch (e: Exception) {
+                typingJob.cancel()
+                logger.error("Failed to handle voice message", e)
+                telegramService.sendMessage(
+                    chatId, "处理语音消息时出错：${e.message}", ReplyParameters(messageId)
+                )
             }
         }
     }
@@ -192,7 +256,7 @@ class AgentPoller(
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
                     telegramService.sendMessage(
-                        chatId, reply, ReplyParameters(message_id = messageId)
+                        chatId, reply, ReplyParameters(messageId = messageId)
                     )
                 }
             } catch (e: Exception) {

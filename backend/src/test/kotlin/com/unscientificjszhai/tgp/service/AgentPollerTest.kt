@@ -44,7 +44,7 @@ class AgentPollerTest {
         coVerify { geminiAgentService.sendMessage(userMessage) }
         coVerify {
             telegramService.sendMessage(
-                chatId, aiReply, match { it.message_id == messageId })
+                chatId, aiReply, match { it.messageId == messageId })
         }
     }
 
@@ -62,7 +62,7 @@ class AgentPollerTest {
         coVerify { geminiAgentService.resetSession() }
         coVerify {
             telegramService.sendMessage(
-                chatId, "会话已重置", match { it.message_id == messageId })
+                chatId, "会话已重置", match { it.messageId == messageId })
         }
     }
 }
