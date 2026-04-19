@@ -14,7 +14,11 @@ plugins {
 
 version = "1.1.0"
 
-val ktorVersion = "3.3.1"
+val ktorVersion = "3.4.2"
+
+kotlin {
+    jvmToolchain(21)
+}
 
 repositories {
     mavenCentral()
@@ -28,7 +32,7 @@ dependencies {
     implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:${ktorVersion}")
     implementation("io.ktor:ktor-server-host-common-jvm:${ktorVersion}")
     implementation("io.ktor:ktor-server-config-yaml:${ktorVersion}")
-    implementation("ch.qos.logback:logback-classic:1.5.19")
+    implementation("ch.qos.logback:logback-classic:1.5.32")
 
     implementation("io.ktor:ktor-client-core:${ktorVersion}")
     implementation("io.ktor:ktor-client-okhttp:${ktorVersion}")

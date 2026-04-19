@@ -18,6 +18,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.json.Json
+import okhttp3.Credentials
 import java.net.InetSocketAddress
 import java.net.Proxy
 
@@ -57,6 +58,28 @@ class TelegramService(
                         ProxyType.SOCKS -> Proxy.Type.SOCKS
                     }
                     proxy = Proxy(proxyType, InetSocketAddress(proxyHost, proxyPort))
+                }
+                config {
+                    appSettings.proxy?.let { proxySettings ->
+                        if (
+                            proxySettings.type == ProxyType.HTTP
+                            && proxySettings.username?.isNotBlank() ?: false
+                            && proxySettings.password?.isNotBlank() ?: false
+                        ) {
+                            val credentials = Credentials.basic(proxySettings.username, proxySettings.password)
+                            proxyAuthenticator { _, response ->
+                                if (response.request.header("Proxy-Authorization") == null) {
+                                    return@proxyAuthenticator response
+                                        .request
+                                        .newBuilder()
+                                        .header("Proxy-Authorization", credentials)
+                                        .build()
+                                } else {
+                                    return@proxyAuthenticator null
+                                }
+                            }
+                        }
+                    }
                 }
             }
             install(ContentNegotiation) {
