@@ -1,4 +1,4 @@
-package com.unscientificjszhai.tgp.service
+package com.unscientificjszhai.tgp.service.ai
 
 import com.google.genai.Chat
 import com.google.genai.Client
@@ -8,8 +8,8 @@ import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.service.function.HttpApiFunctionProvider
-import com.unscientificjszhai.tgp.service.function.McpFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.HttpApiFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -34,7 +34,7 @@ class GeminiAgentService(
         McpFunctionProvider(mcpClientService)
     )
     private var client: Client? = null
-    internal var chat: Chat? = null
+    var chat: Chat? = null
 
     private var currentApiKey: String? = null
     private var currentProxy: ProxySettings? = null

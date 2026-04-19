@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
+import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import io.mockk.*
 import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest

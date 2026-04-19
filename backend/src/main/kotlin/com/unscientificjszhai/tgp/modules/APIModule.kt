@@ -6,8 +6,9 @@ import com.unscientificjszhai.tgp.models.SetChatIdRequest
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.AgentPoller
-import com.unscientificjszhai.tgp.service.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -19,7 +20,7 @@ fun Application.apiModule() {
     val settingsRepository = SettingsRepository()
     val updatesRepository = UpdatesRepository()
     val telegramService = TelegramService(settingsRepository, updatesRepository)
-    val mcpClientService = com.unscientificjszhai.tgp.service.MCPClientService()
+    val mcpClientService = MCPClientService()
     val geminiAgentService = GeminiAgentService(settingsRepository, mcpClientService)
     
     val agentPoller = AgentPoller(

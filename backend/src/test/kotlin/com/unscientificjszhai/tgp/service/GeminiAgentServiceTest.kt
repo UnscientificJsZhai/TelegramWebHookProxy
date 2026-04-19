@@ -3,6 +3,8 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import kotlinx.coroutines.test.runTest
 import java.io.File
 import kotlin.test.AfterTest

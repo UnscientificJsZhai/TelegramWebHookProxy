@@ -1,8 +1,9 @@
-package com.unscientificjszhai.tgp.service
+package com.unscientificjszhai.tgp.service.ai
 
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.sse.SSE
 import io.ktor.client.request.header
 import io.modelcontextprotocol.kotlin.sdk.client.Client
@@ -23,7 +24,7 @@ class MCPClientService {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient = HttpClient(OkHttp) {
         install(SSE)
-        install(io.ktor.client.plugins.HttpTimeout) {
+        install(HttpTimeout) {
             requestTimeoutMillis = 300000
         }
     }

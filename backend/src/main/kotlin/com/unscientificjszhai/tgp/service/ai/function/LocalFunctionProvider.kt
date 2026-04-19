@@ -1,4 +1,4 @@
-package com.unscientificjszhai.tgp.service.function
+package com.unscientificjszhai.tgp.service.ai.function
 
 import com.google.genai.types.FunctionDeclaration
 

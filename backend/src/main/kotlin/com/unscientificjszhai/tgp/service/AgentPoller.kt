@@ -6,6 +6,7 @@ import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.models.Voice
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
+import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
@@ -108,7 +109,7 @@ class AgentPoller(
         delay(1000.milliseconds)
     }
 
-    internal suspend fun handleUpdate(update: Update) {
+     suspend fun handleUpdate(update: Update) {
         val message = update.message ?: return
         val text = message.text
         val voice = message.voice
@@ -130,7 +131,7 @@ class AgentPoller(
         }
     }
 
-    internal suspend fun handleVoiceMessage(chatId: String, voice: Voice, caption: String?, messageId: Long) {
+     suspend fun handleVoiceMessage(chatId: String, voice: Voice, caption: String?, messageId: Long) {
         try {
             telegramService.sendChatAction(chatId, "typing")
         } catch (e: Exception) {
@@ -188,7 +189,7 @@ class AgentPoller(
         }
     }
 
-    internal suspend fun handleCommand(chatId: String, text: String, messageId: Long) {
+     suspend fun handleCommand(chatId: String, text: String, messageId: Long) {
         val parts = text.split(Regex("\\s+"), 2)
         val command = parts[0]
 
@@ -232,7 +233,7 @@ class AgentPoller(
         }
     }
 
-    internal suspend fun handleAiMessage(chatId: String, text: String, messageId: Long) {
+     suspend fun handleAiMessage(chatId: String, text: String, messageId: Long) {
         try {
             telegramService.sendChatAction(chatId, "typing")
         } catch (e: Exception) {

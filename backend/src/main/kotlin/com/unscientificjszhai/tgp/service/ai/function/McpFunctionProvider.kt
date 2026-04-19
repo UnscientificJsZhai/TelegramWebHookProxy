@@ -1,9 +1,9 @@
-package com.unscientificjszhai.tgp.service.function
+package com.unscientificjszhai.tgp.service.ai.function
 
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.google.genai.types.Type
-import com.unscientificjszhai.tgp.service.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
