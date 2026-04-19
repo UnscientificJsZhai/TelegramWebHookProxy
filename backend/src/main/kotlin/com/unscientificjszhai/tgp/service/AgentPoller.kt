@@ -52,11 +52,11 @@ class AgentPoller(
         var lastStoredId = updatesRepository.lastUpdateId
 
         if (lastStoredId == 0L) {
-            // 第一次运行，先获取最新的 update_id 以避免处理历史消息
+            // 第一次运行，先获取最新的 updateId 以避免处理历史消息
             try {
                 val initialResponse = telegramService.getUpdates(offset = -1, timeout = 0)
                 if (initialResponse.ok && initialResponse.result.isNotEmpty()) {
-                    lastStoredId = initialResponse.result.last().update_id
+                    lastStoredId = initialResponse.result.last().updateId
                     updatesRepository.saveLastUpdateId(lastStoredId)
                     logger.info("Initialized lastUpdateId to $lastStoredId")
                 }
@@ -75,10 +75,10 @@ class AgentPoller(
             var chatsUpdated = false
 
             for (update in response.result) {
-                val chat = update.message?.chat ?: update.channel_post?.chat ?: update.my_chat_member?.chat
+                val chat = update.message?.chat ?: update.channelPost?.chat ?: update.myChatMember?.chat
 
                 if (chat != null) {
-                    val title = chat.title ?: chat.username ?: "${chat.first_name ?: ""} ${chat.last_name ?: ""}".trim()
+                    val title = chat.title ?: chat.username ?: "${chat.firstName ?: ""} ${chat.lastName ?: ""}".trim()
 
                     val chatInfo = ChatInfo(
                         id = chat.id.toString(), title = title, type = chat.type
@@ -93,9 +93,9 @@ class AgentPoller(
                 try {
                     handleUpdate(update)
                 } catch (e: Exception) {
-                    logger.error("Error handling update ${update.update_id}", e)
+                    logger.error("Error handling update ${update.updateId}", e)
                 }
-                lastId = update.update_id
+                lastId = update.updateId
             }
 
             if (chatsUpdated) {
@@ -121,11 +121,11 @@ class AgentPoller(
 
         if (chatId == aiSettings.agentChatId) {
             if (text != null && text.startsWith("/")) {
-                handleCommand(chatId, text, message.message_id)
+                handleCommand(chatId, text, message.messageId)
             } else if (voice != null) {
-                handleVoiceMessage(chatId, voice, message.caption, message.message_id)
+                handleVoiceMessage(chatId, voice, message.caption, message.messageId)
             } else if (text != null) {
-                handleAiMessage(chatId, text, message.message_id)
+                handleAiMessage(chatId, text, message.messageId)
             }
         }
     }
@@ -151,15 +151,15 @@ class AgentPoller(
 
             try {
                 // 1. 获取文件路径
-                val fileResponse = telegramService.getFile(voice.file_id)
-                val filePath = fileResponse.result?.file_path
+                val fileResponse = telegramService.getFile(voice.fileId)
+                val filePath = fileResponse.result?.filePath
                     ?: throw IllegalStateException("Failed to get file path for voice message")
 
                 // 2. 下载文件数据
                 val audioData = telegramService.downloadFile(filePath)
 
                 // 3. 构建 Gemini 请求 Part
-                val mimeType = voice.mime_type ?: "audio/ogg"
+                val mimeType = voice.mimeType ?: "audio/ogg"
                 val audioPart = com.google.genai.types.Part.builder()
                     .inlineData(
                         com.google.genai.types.Blob.builder()

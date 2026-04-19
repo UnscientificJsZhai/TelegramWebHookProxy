@@ -1,5 +1,6 @@
 package com.unscientificjszhai.tgp.models
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 
@@ -10,13 +11,13 @@ data class ChatInfo(
 
 @Serializable
 data class ReplyParameters(
-    val messageId: Long,
-    val chatId: String? = null,
-    val allow_sending_without_reply: Boolean? = null,
+    @SerialName("message_id") val messageId: Long,
+    @SerialName("chat_id") val chatId: String? = null,
+    @SerialName("allow_sending_without_reply") val allowSendingWithoutReply: Boolean? = null,
     val quote: String? = null,
-    val quote_parse_mode: String? = null,
-    val quote_entities: List<MessageEntity>? = null,
-    val quote_position: Int? = null
+    @SerialName("quote_parse_mode") val quoteParseMode: String? = null,
+    @SerialName("quote_entities") val quoteEntities: List<MessageEntity>? = null,
+    @SerialName("quote_position") val quotePosition: Int? = null
 )
 
 @Serializable
@@ -27,31 +28,31 @@ data class MessageEntity(
     val url: String? = null,
     val user: User? = null,
     val language: String? = null,
-    val custom_emoji_id: String? = null
+    @SerialName("custom_emoji_id") val customEmojiId: String? = null
 )
 
 @Serializable
 data class User(
     val id: Long,
-    val is_bot: Boolean,
-    val first_name: String,
-    val last_name: String? = null,
+    @SerialName("is_bot") val isBot: Boolean,
+    @SerialName("first_name") val firstName: String,
+    @SerialName("last_name") val lastName: String? = null,
     val username: String? = null,
-    val language_code: String? = null,
-    val is_premium: Boolean? = null,
-    val added_to_attachment_menu: Boolean? = null,
-    val can_join_groups: Boolean? = null,
-    val can_read_all_group_messages: Boolean? = null,
-    val supports_inline_queries: Boolean? = null,
-    val can_connect_to_business: Boolean? = null,
-    val has_main_web_app: Boolean? = null
+    @SerialName("language_code") val languageCode: String? = null,
+    @SerialName("is_premium") val isPremium: Boolean? = null,
+    @SerialName("added_to_attachment_menu") val addedToAttachmentMenu: Boolean? = null,
+    @SerialName("can_join_groups") val canJoinGroups: Boolean? = null,
+    @SerialName("can_read_all_group_messages") val canReadAllGroupMessages: Boolean? = null,
+    @SerialName("supports_inline_queries") val supportsInlineQueries: Boolean? = null,
+    @SerialName("can_connect_to_business") val canConnectToBusiness: Boolean? = null,
+    @SerialName("has_main_web_app") val hasMainWebApp: Boolean? = null
 )
 
 @Serializable
 data class SendTelegramMessageRequest(
-    val chat_id: String,
+    @SerialName("chat_id") val chatId: String,
     val text: String,
-    val reply_parameters: ReplyParameters? = null
+    @SerialName("reply_parameters") val replyParameters: ReplyParameters? = null
 )
 
 @Serializable
@@ -61,10 +62,10 @@ data class GetUpdatesResponse(
 
 @Serializable
 data class Update(
-    val update_id: Long,
+    @SerialName("update_id") val updateId: Long,
     val message: Message? = null,
-    val channel_post: Message? = null,
-    val my_chat_member: ChatMemberUpdated? = null
+    @SerialName("channel_post") val channelPost: Message? = null,
+    @SerialName("my_chat_member") val myChatMember: ChatMemberUpdated? = null
 )
 
 @Serializable
@@ -74,30 +75,29 @@ data class ChatMemberUpdated(
 
 @Serializable
 data class Voice(
-    val file_id: String,
-    val file_unique_id: String,
+    @SerialName("file_id") val fileId: String,
+    @SerialName("file_unique_id") val fileUniqueId: String,
     val duration: Int,
-    val mime_type: String? = null,
-    val file_size: Long? = null
+    @SerialName("mime_type") val mimeType: String? = null,
+    @SerialName("file_size") val fileSize: Long? = null
 )
 
 @Serializable
 data class FileResponse(
-    val ok: Boolean,
-    val result: TelegramFile? = null
+    val ok: Boolean, val result: TelegramFile? = null
 )
 
 @Serializable
 data class TelegramFile(
-    val file_id: String,
-    val file_unique_id: String,
-    val file_size: Long? = null,
-    val file_path: String? = null
+    @SerialName("file_id") val fileId: String,
+    @SerialName("file_unique_id") val fileUniqueId: String,
+    @SerialName("file_size") val fileSize: Long? = null,
+    @SerialName("file_path") val filePath: String? = null
 )
 
 @Serializable
 data class Message(
-    val message_id: Long,
+    @SerialName("message_id") val messageId: Long,
     val chat: Chat,
     val text: String? = null,
     val voice: Voice? = null,
@@ -106,8 +106,7 @@ data class Message(
 
 @Serializable
 data class ChatActionRequest(
-    val chat_id: String,
-    val action: String
+    @SerialName("chat_id") val chatId: String, val action: String
 )
 
 @Serializable
@@ -116,6 +115,6 @@ data class Chat(
     val type: String,
     val title: String? = null,
     val username: String? = null,
-    val first_name: String? = null,
-    val last_name: String? = null
+    @SerialName("first_name") val firstName: String? = null,
+    @SerialName("last_name") val lastName: String? = null
 )
