@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
+import io.ktor.client.plugins.sse.SSE
 import io.ktor.client.request.header
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
@@ -13,7 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
-import kotlin.time.Duration.Companion.seconds
 
 /**
  * MCP客户端服务，管理与多个外部工具的连接。
@@ -22,14 +22,15 @@ class MCPClientService {
     private val logger = LoggerFactory.getLogger(MCPClientService::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient = HttpClient(OkHttp) {
+        install(SSE)
         install(io.ktor.client.plugins.HttpTimeout) {
             requestTimeoutMillis = 300000
         }
     }
-    
+
     // Server Name -> Client
     private val clients = mutableMapOf<String, Client>()
-    
+
     // Server Name -> Tools
     private val serverTools = mutableMapOf<String, List<Tool>>()
 
@@ -53,18 +54,17 @@ class MCPClientService {
         val client = Client(
             Implementation(name = "telegram-webhook-proxy", version = "1.0.0")
         )
-        
+
         val url = config.url
         val transport = StreamableHttpClientTransport(
-            httpClient,
-            url
+            httpClient, url
         ) {
             config.headers.forEach { (key, value) ->
                 header(key, value)
             }
         }
         client.connect(transport)
-        
+
         clients[config.name] = client
         val toolsList = client.listTools()
         serverTools[config.name] = toolsList.tools
@@ -84,17 +84,17 @@ class MCPClientService {
         }
         serverTools.remove(name)
     }
-    
+
     fun disconnectAll() {
         clients.keys.toList().forEach { disconnect(it) }
     }
-    
+
     fun getAllTools(): List<Pair<String, Tool>> {
         return serverTools.flatMap { (serverName, tools) ->
             tools.map { serverName to it }
         }
     }
-    
+
     suspend fun callTool(serverName: String, toolName: String, args: Map<String, Any?>): Any {
         val client = clients[serverName] ?: throw IllegalStateException("MCP server $serverName not connected")
         val result = client.callTool(toolName, args)

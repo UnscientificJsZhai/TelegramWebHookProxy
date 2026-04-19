@@ -7,6 +7,7 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
+import java.net.SocketTimeoutException
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
@@ -34,8 +35,12 @@ class AgentPoller(
                 } catch (_: CancellationException) {
                     break
                 } catch (e: Exception) {
-                    logger.error("Error during polling", e)
-                    delay(5000.milliseconds) // 发生错误时等待 5 秒
+                    if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
+                        logger.warn("Polling timeout: ${e.message ?: "Socket timeout expired"}")
+                    } else {
+                        logger.error("Error during polling", e)
+                        delay(5000.milliseconds) // 发生错误时等待 5 秒
+                    }
                 }
             }
         }

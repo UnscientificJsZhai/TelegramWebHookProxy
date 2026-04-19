@@ -6,6 +6,7 @@ import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.okhttp.*
+import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -42,6 +43,11 @@ class TelegramService(
 
     private fun createClient(): HttpClient {
         return HttpClient(OkHttp) {
+            install(HttpTimeout) {
+                requestTimeoutMillis = 40000
+                connectTimeoutMillis = 10000
+                socketTimeoutMillis = 40000
+            }
             engine {
                 appSettings.proxy?.let { proxySettings ->
                     val proxyHost = proxySettings.host
