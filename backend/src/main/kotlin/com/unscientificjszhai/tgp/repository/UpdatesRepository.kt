@@ -8,6 +8,8 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
 
 @Serializable
 data class UpdatesData(
@@ -15,7 +17,10 @@ data class UpdatesData(
     val lastUpdateId: Long = 0,
 )
 
-class UpdatesRepository {
+@Singleton
+class UpdatesRepository
+@Inject
+constructor() {
     private val logger = LoggerFactory.getLogger(javaClass)
 
     private val configFile = File("config/updates.json")

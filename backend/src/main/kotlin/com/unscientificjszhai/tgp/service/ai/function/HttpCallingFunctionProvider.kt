@@ -17,8 +17,8 @@ import org.slf4j.LoggerFactory
 /**
  * 提供 HTTP API 调用能力的本地功能提供者。
  */
-class HttpApiFunctionProvider : LocalFunctionProvider() {
-    private val logger = LoggerFactory.getLogger(HttpApiFunctionProvider::class.java)
+class HttpCallingFunctionProvider : LocalFunctionProvider() {
+    private val logger = LoggerFactory.getLogger(HttpCallingFunctionProvider::class.java)
 
     private val httpClient =
         HttpClient(OkHttp) {

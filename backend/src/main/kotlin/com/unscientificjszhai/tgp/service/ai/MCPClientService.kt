@@ -15,11 +15,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import javax.inject.Inject
+import javax.inject.Singleton
 
-/**
- * MCP客户端服务，管理与多个外部工具的连接。
- */
-class MCPClientService {
+@Singleton
+class MCPClientService @Inject constructor() {
     private val logger = LoggerFactory.getLogger(MCPClientService::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient =

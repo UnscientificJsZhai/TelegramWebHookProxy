@@ -22,7 +22,10 @@ class McpFunctionProvider(
                 val schemaJson =
                     buildJsonObject {
                         put("type", "OBJECT")
-                        put("properties", (mcpTool.inputSchema.properties ?: JsonObject(emptyMap())).toGeminiSchemaJson())
+                        put(
+                            "properties",
+                            (mcpTool.inputSchema.properties ?: JsonObject(emptyMap())).toGeminiSchemaJson(),
+                        )
                         val required = mcpTool.inputSchema.required ?: emptyList()
                         if (required.isNotEmpty()) {
                             put(

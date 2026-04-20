@@ -7,8 +7,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
 
-class SettingsRepository {
+@Singleton
+class SettingsRepository
+@Inject
+constructor() {
     private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
 
     private val configFile = File("config/settings.json")

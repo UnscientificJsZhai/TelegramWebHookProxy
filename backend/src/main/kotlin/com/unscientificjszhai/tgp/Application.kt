@@ -1,6 +1,10 @@
 package com.unscientificjszhai.tgp
 
+import com.unscientificjszhai.tgp.di.AppComponent
+import com.unscientificjszhai.tgp.di.AppModule
+import com.unscientificjszhai.tgp.di.DaggerAppComponent
 import com.unscientificjszhai.tgp.modules.apiModule
+import com.unscientificjszhai.tgp.modules.messagePollerModule
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -18,6 +22,8 @@ fun main() {
 }
 
 fun Application.module() {
+    val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
+
     install(ContentNegotiation) {
         json(
             Json {
@@ -29,7 +35,8 @@ fun Application.module() {
         )
     }
 
-    apiModule()
+    apiModule(appComponent)
+    messagePollerModule(appComponent)
 
     routing {
         get("/license") {

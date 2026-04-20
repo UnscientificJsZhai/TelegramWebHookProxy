@@ -7,6 +7,7 @@ evaluationDependsOn(":webui")
 plugins {
     kotlin("jvm")
     kotlin("plugin.serialization") version "2.2.20"
+    kotlin("kapt")
     id("com.github.johnrengelman.shadow") version "8.1.1"
     id("com.github.jk1.dependency-license-report") version "2.9"
     application
@@ -15,6 +16,7 @@ plugins {
 version = "1.1.0"
 
 val ktorVersion = "3.4.2"
+val daggerVersion = "2.59.2"
 
 kotlin {
     jvmToolchain(21)
@@ -26,17 +28,17 @@ repositories {
 
 dependencies {
     // Ktor
-    implementation("io.ktor:ktor-server-core-jvm:${ktorVersion}")
-    implementation("io.ktor:ktor-server-netty-jvm:${ktorVersion}")
-    implementation("io.ktor:ktor-server-content-negotiation-jvm:${ktorVersion}")
-    implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:${ktorVersion}")
-    implementation("io.ktor:ktor-server-host-common-jvm:${ktorVersion}")
-    implementation("io.ktor:ktor-server-config-yaml:${ktorVersion}")
+    implementation("io.ktor:ktor-server-core-jvm:$ktorVersion")
+    implementation("io.ktor:ktor-server-netty-jvm:$ktorVersion")
+    implementation("io.ktor:ktor-server-content-negotiation-jvm:$ktorVersion")
+    implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:$ktorVersion")
+    implementation("io.ktor:ktor-server-host-common-jvm:$ktorVersion")
+    implementation("io.ktor:ktor-server-config-yaml:$ktorVersion")
     implementation("ch.qos.logback:logback-classic:1.5.32")
 
-    implementation("io.ktor:ktor-client-core:${ktorVersion}")
-    implementation("io.ktor:ktor-client-okhttp:${ktorVersion}")
-    implementation("io.ktor:ktor-client-content-negotiation:${ktorVersion}")
+    implementation("io.ktor:ktor-client-core:$ktorVersion")
+    implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
+    implementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
 
     // Ktor client logging
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
@@ -47,9 +49,12 @@ dependencies {
     // MCP SDK
     implementation("io.modelcontextprotocol:kotlin-sdk:0.10.0")
 
+    implementation("com.google.dagger:dagger:$daggerVersion")
+    kapt("com.google.dagger:dagger-compiler:$daggerVersion")
+
     // Testing
     testImplementation("org.jetbrains.kotlin:kotlin-test")
-    testImplementation("io.ktor:ktor-server-test-host:${ktorVersion}")
+    testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.mockk:mockk:1.13.13")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
 }

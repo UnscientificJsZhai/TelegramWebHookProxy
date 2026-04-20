@@ -21,9 +21,12 @@ import kotlinx.serialization.json.Json
 import okhttp3.Credentials
 import java.net.InetSocketAddress
 import java.net.Proxy
+import javax.inject.Inject
+import javax.inject.Singleton
 
-class TelegramService(
-    settingsRepository: SettingsRepository,
+@Singleton
+class TelegramService @Inject constructor(
+    private val settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository,
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())

@@ -1,14 +1,9 @@
 package com.unscientificjszhai.tgp.modules
 
+import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.SendMessageRequest
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.UpdatesRepository
-import com.unscientificjszhai.tgp.service.MessagePoller
-import com.unscientificjszhai.tgp.service.TelegramService
-import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
-import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -16,25 +11,9 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 
-fun Application.apiModule() {
-    val settingsRepository = SettingsRepository()
-    val updatesRepository = UpdatesRepository()
-    val telegramService = TelegramService(settingsRepository, updatesRepository)
-    val mcpClientService = MCPClientService()
-    val geminiAgentService = GeminiAgentService(settingsRepository, mcpClientService)
-
-    val messagePoller =
-        MessagePoller(
-            this@apiModule,
-            telegramService,
-            geminiAgentService,
-            settingsRepository,
-            updatesRepository,
-        ).apply { start() }
-
-    monitor.subscribe(ApplicationStopped) {
-        messagePoller.close()
-    }
+fun Application.apiModule(appComponent: AppComponent) {
+    val settingsRepository = appComponent.settingsRepository
+    val telegramService = appComponent.telegramService
 
     routing {
         route("/api") {
