@@ -3,9 +3,9 @@ package com.unscientificjszhai.tgp.service.ai
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
-import io.ktor.client.plugins.HttpTimeout
-import io.ktor.client.plugins.sse.SSE
-import io.ktor.client.request.header
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.sse.*
+import io.ktor.client.request.*
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
@@ -22,12 +22,13 @@ import org.slf4j.LoggerFactory
 class MCPClientService {
     private val logger = LoggerFactory.getLogger(MCPClientService::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val httpClient = HttpClient(OkHttp) {
-        install(SSE)
-        install(HttpTimeout) {
-            requestTimeoutMillis = 300000
+    private val httpClient =
+        HttpClient(OkHttp) {
+            install(SSE)
+            install(HttpTimeout) {
+                requestTimeoutMillis = 300000
+            }
         }
-    }
 
     // Server Name -> Client
     private val clients = mutableMapOf<String, Client>()
@@ -52,18 +53,21 @@ class MCPClientService {
     }
 
     private suspend fun connectToServer(config: MCPServerConfig) {
-        val client = Client(
-            Implementation(name = "telegram-webhook-proxy", version = "1.0.0")
-        )
+        val client =
+            Client(
+                Implementation(name = "telegram-webhook-proxy", version = "1.0.0"),
+            )
 
         val url = config.url
-        val transport = StreamableHttpClientTransport(
-            httpClient, url
-        ) {
-            config.headers.forEach { (key, value) ->
-                header(key, value)
+        val transport =
+            StreamableHttpClientTransport(
+                httpClient,
+                url,
+            ) {
+                config.headers.forEach { (key, value) ->
+                    header(key, value)
+                }
             }
-        }
         client.connect(transport)
 
         clients[config.name] = client
@@ -90,13 +94,16 @@ class MCPClientService {
         clients.keys.toList().forEach { disconnect(it) }
     }
 
-    fun getAllTools(): List<Pair<String, Tool>> {
-        return serverTools.flatMap { (serverName, tools) ->
+    fun getAllTools(): List<Pair<String, Tool>> =
+        serverTools.flatMap { (serverName, tools) ->
             tools.map { serverName to it }
         }
-    }
 
-    suspend fun callTool(serverName: String, toolName: String, args: Map<String, Any?>): Any {
+    suspend fun callTool(
+        serverName: String,
+        toolName: String,
+        args: Map<String, Any?>,
+    ): Any {
         val client = clients[serverName] ?: throw IllegalStateException("MCP server $serverName not connected")
         val result = client.callTool(toolName, args)
         return result

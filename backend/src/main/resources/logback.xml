@@ -6,7 +6,7 @@
     </appender>
 
     <root level="${LOG_LEVEL:-INFO}">
-        <appender-ref ref="STDOUT" />
+        <appender-ref ref="STDOUT"/>
     </root>
 
     <logger name="io.ktor" level="${KTOR_LOG_LEVEL:-INFO}"/>

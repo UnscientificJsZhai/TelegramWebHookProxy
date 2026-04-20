@@ -19,7 +19,7 @@ class AgentPoller(
     private val telegramService: TelegramService,
     private val geminiAgentService: GeminiAgentService,
     private val settingsRepository: SettingsRepository,
-    private val updatesRepository: UpdatesRepository
+    private val updatesRepository: UpdatesRepository,
 ) : AutoCloseable {
     private val logger = LoggerFactory.getLogger(AgentPoller::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -30,22 +30,23 @@ class AgentPoller(
      */
     fun start() {
         if (job != null) return
-        job = scope.launch {
-            while (isActive) {
-                try {
-                    poll()
-                } catch (_: CancellationException) {
-                    break
-                } catch (e: Exception) {
-                    if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
-                        logger.warn("Polling timeout: ${e.message ?: "Socket timeout expired"}")
-                    } else {
-                        logger.error("Error during polling", e)
-                        delay(5000.milliseconds) // 发生错误时等待 5 秒
+        job =
+            scope.launch {
+                while (isActive) {
+                    try {
+                        poll()
+                    } catch (_: CancellationException) {
+                        break
+                    } catch (e: Exception) {
+                        if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
+                            logger.warn("Polling timeout: ${e.message ?: "Socket timeout expired"}")
+                        } else {
+                            logger.error("Error during polling", e)
+                            delay(5000.milliseconds) // 发生错误时等待 5 秒
+                        }
                     }
                 }
             }
-        }
         logger.info("Agent poller started.")
     }
 
@@ -72,7 +73,10 @@ class AgentPoller(
 
         if (response.ok) {
             var lastId = lastStoredId
-            val currentChats = updatesRepository.chatsFlow.value.associateBy { it.id }.toMutableMap()
+            val currentChats =
+                updatesRepository.chatsFlow.value
+                    .associateBy { it.id }
+                    .toMutableMap()
             var chatsUpdated = false
 
             for (update in response.result) {
@@ -81,9 +85,12 @@ class AgentPoller(
                 if (chat != null) {
                     val title = chat.title ?: chat.username ?: "${chat.firstName ?: ""} ${chat.lastName ?: ""}".trim()
 
-                    val chatInfo = ChatInfo(
-                        id = chat.id.toString(), title = title, type = chat.type
-                    )
+                    val chatInfo =
+                        ChatInfo(
+                            id = chat.id.toString(),
+                            title = title,
+                            type = chat.type,
+                        )
 
                     if (currentChats[chatInfo.id] != chatInfo) {
                         currentChats[chatInfo.id] = chatInfo
@@ -109,7 +116,7 @@ class AgentPoller(
         delay(1000.milliseconds)
     }
 
-     suspend fun handleUpdate(update: Update) {
+    suspend fun handleUpdate(update: Update) {
         val message = update.message ?: return
         val text = message.text
         val voice = message.voice
@@ -131,7 +138,12 @@ class AgentPoller(
         }
     }
 
-     suspend fun handleVoiceMessage(chatId: String, voice: Voice, caption: String?, messageId: Long) {
+    suspend fun handleVoiceMessage(
+        chatId: String,
+        voice: Voice,
+        caption: String?,
+        messageId: Long,
+    ) {
         try {
             telegramService.sendChatAction(chatId, "typing")
         } catch (e: Exception) {
@@ -139,36 +151,40 @@ class AgentPoller(
         }
 
         coroutineScope {
-            val typingJob = launch {
-                while (isActive) {
-                    delay(4000.milliseconds)
-                    try {
-                        telegramService.sendChatAction(chatId, "typing")
-                    } catch (e: Exception) {
-                        logger.warn("Failed to send typing action", e)
+            val typingJob =
+                launch {
+                    while (isActive) {
+                        delay(4000.milliseconds)
+                        try {
+                            telegramService.sendChatAction(chatId, "typing")
+                        } catch (e: Exception) {
+                            logger.warn("Failed to send typing action", e)
+                        }
                     }
                 }
-            }
 
             try {
                 // 1. 获取文件路径
                 val fileResponse = telegramService.getFile(voice.fileId)
-                val filePath = fileResponse.result?.filePath
-                    ?: throw IllegalStateException("Failed to get file path for voice message")
+                val filePath =
+                    fileResponse.result?.filePath
+                        ?: throw IllegalStateException("Failed to get file path for voice message")
 
                 // 2. 下载文件数据
                 val audioData = telegramService.downloadFile(filePath)
 
                 // 3. 构建 Gemini 请求 Part
                 val mimeType = voice.mimeType ?: "audio/ogg"
-                val audioPart = com.google.genai.types.Part.builder()
-                    .inlineData(
-                        com.google.genai.types.Blob.builder()
-                            .mimeType(mimeType)
-                            .data(audioData)
-                            .build()
-                    )
-                    .build()
+                val audioPart =
+                    com.google.genai.types.Part
+                        .builder()
+                        .inlineData(
+                            com.google.genai.types.Blob
+                                .builder()
+                                .mimeType(mimeType)
+                                .data(audioData)
+                                .build(),
+                        ).build()
 
                 // 4. 发送给 Gemini
                 val reply = geminiAgentService.sendMessage(caption, listOf(audioPart))
@@ -176,20 +192,28 @@ class AgentPoller(
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
                     telegramService.sendMessage(
-                        chatId, reply, ReplyParameters(messageId = messageId)
+                        chatId,
+                        reply,
+                        ReplyParameters(messageId = messageId),
                     )
                 }
             } catch (e: Exception) {
                 typingJob.cancel()
                 logger.error("Failed to handle voice message", e)
                 telegramService.sendMessage(
-                    chatId, "处理语音消息时出错：${e.message}", ReplyParameters(messageId)
+                    chatId,
+                    "处理语音消息时出错：${e.message}",
+                    ReplyParameters(messageId),
                 )
             }
         }
     }
 
-     suspend fun handleCommand(chatId: String, text: String, messageId: Long) {
+    suspend fun handleCommand(
+        chatId: String,
+        text: String,
+        messageId: Long,
+    ) {
         val parts = text.split(Regex("\\s+"), 2)
         val command = parts[0]
 
@@ -206,26 +230,29 @@ class AgentPoller(
                     try {
                         geminiAgentService.switchModel(requestedModel)
                         telegramService.sendMessage(
-                            chatId, "已切换模型并重置会话：$requestedModel", ReplyParameters(messageId)
+                            chatId,
+                            "已切换模型并重置会话：$requestedModel",
+                            ReplyParameters(messageId),
                         )
                     } catch (_: Exception) {
                         telegramService.sendMessage(
                             chatId,
                             "不支持的模型：$requestedModel\n使用 /model 查看可用列表。",
-                            ReplyParameters(messageId)
+                            ReplyParameters(messageId),
                         )
                     }
                 } else {
                     geminiAgentService.updateModel()
                     val current = geminiAgentService.currentModel
                     val available = geminiAgentService.availableModels
-                    val list = available.joinToString("\n") { model ->
-                        if (model == current) "✅ $model" else "    $model"
-                    }
+                    val list =
+                        available.joinToString("\n") { model ->
+                            if (model == current) "✅ $model" else "    $model"
+                        }
                     telegramService.sendMessage(
                         chatId,
                         "当前可用模型列表：\n$list\n\n使用 `/model <模型名称>` 切换模型。",
-                        ReplyParameters(messageId)
+                        ReplyParameters(messageId),
                     )
                 }
             }
@@ -233,7 +260,11 @@ class AgentPoller(
         }
     }
 
-     suspend fun handleAiMessage(chatId: String, text: String, messageId: Long) {
+    suspend fun handleAiMessage(
+        chatId: String,
+        text: String,
+        messageId: Long,
+    ) {
         try {
             telegramService.sendChatAction(chatId, "typing")
         } catch (e: Exception) {
@@ -241,30 +272,35 @@ class AgentPoller(
         }
 
         coroutineScope {
-            val typingJob = launch {
-                while (isActive) {
-                    delay(4000.milliseconds)
-                    try {
-                        telegramService.sendChatAction(chatId, "typing")
-                    } catch (e: Exception) {
-                        logger.warn("Failed to send typing action", e)
+            val typingJob =
+                launch {
+                    while (isActive) {
+                        delay(4000.milliseconds)
+                        try {
+                            telegramService.sendChatAction(chatId, "typing")
+                        } catch (e: Exception) {
+                            logger.warn("Failed to send typing action", e)
+                        }
                     }
                 }
-            }
 
             try {
                 val reply = geminiAgentService.sendMessage(text)
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
                     telegramService.sendMessage(
-                        chatId, reply, ReplyParameters(messageId = messageId)
+                        chatId,
+                        reply,
+                        ReplyParameters(messageId = messageId),
                     )
                 }
             } catch (e: Exception) {
                 typingJob.cancel()
                 logger.error("Failed to handle AI message", e)
                 telegramService.sendMessage(
-                    chatId, "AI 处理消息时出错：${e.message}", ReplyParameters(messageId)
+                    chatId,
+                    "AI 处理消息时出错：${e.message}",
+                    ReplyParameters(messageId),
                 )
             }
         }

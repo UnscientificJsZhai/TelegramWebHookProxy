@@ -18,83 +18,104 @@ import org.slf4j.LoggerFactory
  * 提供 HTTP API 调用能力的本地功能提供者。
  */
 class HttpApiFunctionProvider : LocalFunctionProvider() {
-
     private val logger = LoggerFactory.getLogger(HttpApiFunctionProvider::class.java)
 
-    private val httpClient = HttpClient(OkHttp) {
-        install(HttpTimeout) {
-            requestTimeoutMillis = 60000
+    private val httpClient =
+        HttpClient(OkHttp) {
+            install(HttpTimeout) {
+                requestTimeoutMillis = 60000
+            }
         }
-    }
 
     override val providedFunctions: List<FunctionDeclaration> by lazy {
-        val callHttpApiSchemaJson = buildJsonObject {
-            put("type", "OBJECT")
-            put("properties", buildJsonObject {
-                put("url", buildJsonObject {
-                    put("type", "STRING")
-                    put("description", "The URL to call.")
-                })
-                put("method", buildJsonObject {
-                    put("type", "STRING")
-                    put("description", "HTTP method (GET, POST, etc.). Default is GET.")
-                })
-                put("headers", buildJsonObject {
-                    put("type", "OBJECT")
-                    put("description", "HTTP headers as a key-value object.")
-                })
-                put("body", buildJsonObject {
-                    put("type", "STRING")
-                    put("description", "HTTP request body.")
-                })
-            })
-            put("required", buildJsonArray { add("url") })
-        }.toString()
+        val callHttpApiSchemaJson =
+            buildJsonObject {
+                put("type", "OBJECT")
+                put(
+                    "properties",
+                    buildJsonObject {
+                        put(
+                            "url",
+                            buildJsonObject {
+                                put("type", "STRING")
+                                put("description", "The URL to call.")
+                            },
+                        )
+                        put(
+                            "method",
+                            buildJsonObject {
+                                put("type", "STRING")
+                                put("description", "HTTP method (GET, POST, etc.). Default is GET.")
+                            },
+                        )
+                        put(
+                            "headers",
+                            buildJsonObject {
+                                put("type", "OBJECT")
+                                put("description", "HTTP headers as a key-value object.")
+                            },
+                        )
+                        put(
+                            "body",
+                            buildJsonObject {
+                                put("type", "STRING")
+                                put("description", "HTTP request body.")
+                            },
+                        )
+                    },
+                )
+                put("required", buildJsonArray { add("url") })
+            }.toString()
 
         listOf(
-            FunctionDeclaration.builder()
+            FunctionDeclaration
+                .builder()
                 .name("call_http_api")
                 .description("Call a local or remote HTTP API. Useful for triggering webhooks or fetching local data.")
                 .parameters(Schema.fromJson(callHttpApiSchemaJson))
-                .build()
+                .build(),
         )
     }
 
-    override suspend fun execute(functionName: String, args: Map<String, Any?>): Map<String, Any?> {
-        return when (functionName) {
+    override suspend fun execute(
+        functionName: String,
+        args: Map<String, Any?>,
+    ): Map<String, Any?> =
+        when (functionName) {
             "call_http_api" -> callHttpApi(args)
             else -> mapOf("error" to "Unsupported function: $functionName")
         }
-    }
 
-    private suspend fun callHttpApi(args: Map<String, Any?>): Map<String, Any?> {
-        return try {
+    private suspend fun callHttpApi(args: Map<String, Any?>): Map<String, Any?> =
+        try {
             val url = args["url"] as? String ?: throw IllegalArgumentException("Missing URL")
             val method = (args["method"] as? String) ?: "GET"
-            val headers = (args["headers"] as? Map<*, *>)?.mapKeys { it.key.toString() }
-                ?.mapValues { it.value.toString() } ?: emptyMap()
+            val headers =
+                (args["headers"] as? Map<*, *>)
+                    ?.mapKeys { it.key.toString() }
+                    ?.mapValues { it.value.toString() } ?: emptyMap()
             val body = args["body"] as? String
 
-            val response = httpClient.request(url) {
-                this.method = HttpMethod.parse(method.uppercase())
-                headers.forEach { (key, value) ->
-                    header(key, value)
-                }
-                if (body != null) {
-                    setBody(body)
-                    if (headers.keys.none { it.equals(HttpHeaders.ContentType, ignoreCase = true) }) {
-                        header(HttpHeaders.ContentType, ContentType.Application.Json)
+            val response =
+                httpClient.request(url) {
+                    this.method = HttpMethod.parse(method.uppercase())
+                    headers.forEach { (key, value) ->
+                        header(key, value)
+                    }
+                    if (body != null) {
+                        setBody(body)
+                        if (headers.keys.none { it.equals(HttpHeaders.ContentType, ignoreCase = true) }) {
+                            header(HttpHeaders.ContentType, ContentType.Application.Json)
+                        }
                     }
                 }
-            }
 
             mapOf(
                 "status" to response.status.value,
-                "body" to response.bodyAsText()
+                "body" to response.bodyAsText(),
             )
         } catch (e: Exception) {
             logger.error("Error calling HTTP API", e)
             mapOf("error" to (e.message ?: "Unknown error"))
         }
-    }
 }

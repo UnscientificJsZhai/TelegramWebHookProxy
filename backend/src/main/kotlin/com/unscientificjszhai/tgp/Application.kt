@@ -1,8 +1,8 @@
 package com.unscientificjszhai.tgp
 
 import com.unscientificjszhai.tgp.modules.apiModule
-import io.ktor.serialization.kotlinx.json.*
 import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.http.content.*
@@ -25,7 +25,7 @@ fun Application.module() {
                 isLenient = true
                 explicitNulls = false
                 ignoreUnknownKeys = true
-            }
+            },
         )
     }
 

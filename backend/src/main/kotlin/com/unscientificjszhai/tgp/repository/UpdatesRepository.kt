@@ -3,11 +3,7 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.ChatInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
@@ -16,7 +12,7 @@ import java.io.File
 @Serializable
 data class UpdatesData(
     val chats: List<ChatInfo> = emptyList(),
-    val lastUpdateId: Long = 0
+    val lastUpdateId: Long = 0,
 )
 
 class UpdatesRepository {
@@ -26,11 +22,12 @@ class UpdatesRepository {
     private val json = Json { prettyPrint = true }
 
     private val _dataFlow = MutableStateFlow(loadData())
-    val chatsFlow: StateFlow<List<ChatInfo>> = _dataFlow.asStateFlow().let { flow ->
-        val stateFlow = MutableStateFlow(flow.value.chats)
-        flow.onEach { stateFlow.value = it.chats }.launchIn(CoroutineScope(Dispatchers.IO))
-        stateFlow
-    }
+    val chatsFlow: StateFlow<List<ChatInfo>> =
+        _dataFlow.asStateFlow().let { flow ->
+            val stateFlow = MutableStateFlow(flow.value.chats)
+            flow.onEach { stateFlow.value = it.chats }.launchIn(CoroutineScope(Dispatchers.IO))
+            stateFlow
+        }
 
     val lastUpdateId: Long
         get() = _dataFlow.value.lastUpdateId

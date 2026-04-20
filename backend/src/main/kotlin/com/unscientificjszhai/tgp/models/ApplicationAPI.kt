@@ -9,7 +9,10 @@ import kotlinx.serialization.Serializable
  * @property text 消息正文。
  */
 @Serializable
-data class SendMessageRequest(val chatId: String?, val text: String)
+data class SendMessageRequest(
+    val chatId: String?,
+    val text: String,
+)
 
 /**
  * 设置默认聊天ID请求体。
@@ -17,4 +20,6 @@ data class SendMessageRequest(val chatId: String?, val text: String)
  * @property chatId 要设置的聊天ID。
  */
 @Serializable
-data class SetChatIdRequest(val chatId: String)
+data class SetChatIdRequest(
+    val chatId: String,
+)

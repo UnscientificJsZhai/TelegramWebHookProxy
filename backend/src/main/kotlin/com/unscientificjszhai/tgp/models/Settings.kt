@@ -7,7 +7,7 @@ data class AppSettings(
     val telegramToken: String = "",
     val chatId: String = "",
     val proxy: ProxySettings? = null,
-    val ai: AISettings? = null
+    val ai: AISettings? = null,
 )
 
 @Serializable
@@ -16,14 +16,14 @@ data class AISettings(
     val agentEnabled: Boolean = false,
     val agentChatId: String = "",
     val globalContext: String = "",
-    val mcpServers: List<MCPServerConfig> = emptyList()
+    val mcpServers: List<MCPServerConfig> = emptyList(),
 )
 
 @Serializable
 data class MCPServerConfig(
     val name: String,
     val url: String,
-    val headers: Map<String, String> = emptyMap()
+    val headers: Map<String, String> = emptyMap(),
 )
 
 @Serializable
@@ -32,10 +32,11 @@ data class ProxySettings(
     val port: Int,
     val type: ProxyType,
     val username: String? = null,
-    val password: String? = null
+    val password: String? = null,
 )
 
 @Serializable
 enum class ProxyType {
-    HTTP, SOCKS
+    HTTP,
+    SOCKS,
 }

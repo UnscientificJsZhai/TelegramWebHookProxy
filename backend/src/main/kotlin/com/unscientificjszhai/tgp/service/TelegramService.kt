@@ -24,22 +24,22 @@ import java.net.Proxy
 
 class TelegramService(
     settingsRepository: SettingsRepository,
-    private val updatesRepository: UpdatesRepository
+    private val updatesRepository: UpdatesRepository,
 ) {
-
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var appSettings: AppSettings = settingsRepository.settingsFlow.value
     private var client: HttpClient = createClient()
 
     init {
-        settingsRepository.settingsFlow.onEach { newSettings ->
-            val needRecreate = appSettings.proxy != newSettings.proxy
-            appSettings = newSettings
-            if (needRecreate) {
-                client.close()
-                client = createClient()
-            }
-        }.launchIn(scope)
+        settingsRepository.settingsFlow
+            .onEach { newSettings ->
+                val needRecreate = appSettings.proxy != newSettings.proxy
+                appSettings = newSettings
+                if (needRecreate) {
+                    client.close()
+                    client = createClient()
+                }
+            }.launchIn(scope)
     }
 
     private fun createClient(): HttpClient {
@@ -53,18 +53,19 @@ class TelegramService(
                 appSettings.proxy?.let { proxySettings ->
                     val proxyHost = proxySettings.host
                     val proxyPort = proxySettings.port
-                    val proxyType = when (proxySettings.type) {
-                        ProxyType.HTTP -> Proxy.Type.HTTP
-                        ProxyType.SOCKS -> Proxy.Type.SOCKS
-                    }
+                    val proxyType =
+                        when (proxySettings.type) {
+                            ProxyType.HTTP -> Proxy.Type.HTTP
+                            ProxyType.SOCKS -> Proxy.Type.SOCKS
+                        }
                     proxy = Proxy(proxyType, InetSocketAddress(proxyHost, proxyPort))
                 }
                 config {
                     appSettings.proxy?.let { proxySettings ->
                         if (
-                            proxySettings.type == ProxyType.HTTP
-                            && proxySettings.username?.isNotBlank() ?: false
-                            && proxySettings.password?.isNotBlank() ?: false
+                            proxySettings.type == ProxyType.HTTP &&
+                            proxySettings.username?.isNotBlank() ?: false &&
+                            proxySettings.password?.isNotBlank() ?: false
                         ) {
                             val credentials = Credentials.basic(proxySettings.username, proxySettings.password)
                             proxyAuthenticator { _, response ->
@@ -83,9 +84,11 @@ class TelegramService(
                 }
             }
             install(ContentNegotiation) {
-                json(Json {
-                    ignoreUnknownKeys = true
-                })
+                json(
+                    Json {
+                        ignoreUnknownKeys = true
+                    },
+                )
             }
         }
     }
@@ -93,7 +96,7 @@ class TelegramService(
     suspend fun sendMessage(
         chatId: String,
         text: String,
-        replyParameters: ReplyParameters? = null
+        replyParameters: ReplyParameters? = null,
     ): HttpResponse {
         val token = appSettings.telegramToken
         if (token.isBlank()) {
@@ -107,7 +110,10 @@ class TelegramService(
         }
     }
 
-    suspend fun sendChatAction(chatId: String, action: String): HttpResponse {
+    suspend fun sendChatAction(
+        chatId: String,
+        action: String,
+    ): HttpResponse {
         val token = appSettings.telegramToken
         if (token.isBlank()) {
             throw IllegalStateException("Telegram token is not set.")
@@ -120,17 +126,21 @@ class TelegramService(
         }
     }
 
-    suspend fun getUpdates(offset: Long? = null, timeout: Int? = null): GetUpdatesResponse {
+    suspend fun getUpdates(
+        offset: Long? = null,
+        timeout: Int? = null,
+    ): GetUpdatesResponse {
         val token = appSettings.telegramToken
         if (token.isBlank()) {
             throw IllegalStateException("Telegram token is not set.")
         }
         val url = "https://api.telegram.org/bot$token/getUpdates"
 
-        return client.get(url) {
-            offset?.let { parameter("offset", it) }
-            timeout?.let { parameter("timeout", it) }
-        }.body()
+        return client
+            .get(url) {
+                offset?.let { parameter("offset", it) }
+                timeout?.let { parameter("timeout", it) }
+            }.body()
     }
 
     /**
@@ -146,9 +156,10 @@ class TelegramService(
         }
         val url = "https://api.telegram.org/bot$token/getFile"
 
-        return client.get(url) {
-            parameter("file_id", fileId)
-        }.body()
+        return client
+            .get(url) {
+                parameter("file_id", fileId)
+            }.body()
     }
 
     /**
@@ -167,9 +178,7 @@ class TelegramService(
         return client.get(url).readRawBytes()
     }
 
-    fun getSavedChats(): List<ChatInfo> {
-        return updatesRepository.chatsFlow.value
-    }
+    fun getSavedChats(): List<ChatInfo> = updatesRepository.chatsFlow.value
 
     fun deleteChat(chatId: String) {
         updatesRepository.deleteChat(chatId)

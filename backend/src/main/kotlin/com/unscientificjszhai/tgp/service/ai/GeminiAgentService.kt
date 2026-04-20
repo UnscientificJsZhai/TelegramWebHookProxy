@@ -24,15 +24,17 @@ import com.google.genai.types.ProxyType as GeminiProxyType
  * Gemini Agent 服务，负责与 Google Gemini API 交互。
  */
 class GeminiAgentService(
-    private val settingsRepository: SettingsRepository, private val mcpClientService: MCPClientService
+    private val settingsRepository: SettingsRepository,
+    private val mcpClientService: MCPClientService,
 ) {
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private val localFunctionProviders = listOf(
-        HttpApiFunctionProvider(),
-        McpFunctionProvider(mcpClientService)
-    )
+    private val localFunctionProviders =
+        listOf(
+            HttpApiFunctionProvider(),
+            McpFunctionProvider(mcpClientService),
+        )
     private var client: Client? = null
     var chat: Chat? = null
 
@@ -51,96 +53,106 @@ class GeminiAgentService(
     /**
      * 可选的模型列表。
      */
-    var availableModels = listOf(
-        "models/gemini-3.1-flash-lite-preview", "models/gemini-2.5-flash"
-    )
+    var availableModels =
+        listOf(
+            "models/gemini-3.1-flash-lite-preview",
+            "models/gemini-2.5-flash",
+        )
 
     fun isAiFeatureEnabled(aiSettings: AISettings) = aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
 
     init {
-        settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) }.onEach { settings ->
-            val aiSettings = settings.ai
-            val proxySettings = settings.proxy
+        settingsRepository.settingsFlow
+            .onStart { emit(settingsRepository.settingsFlow.value) }
+            .onEach { settings ->
+                val aiSettings = settings.ai
+                val proxySettings = settings.proxy
 
-            if (aiSettings != null && isAiFeatureEnabled(aiSettings)) {
-                val needsClientRestart =
-                    client == null || currentApiKey != aiSettings.geminiApiKey || currentProxy != proxySettings
+                if (aiSettings != null && isAiFeatureEnabled(aiSettings)) {
+                    val needsClientRestart =
+                        client == null || currentApiKey != aiSettings.geminiApiKey || currentProxy != proxySettings
 
-                if (needsClientRestart) {
-                    captureHistory()
-                    client?.close()
-                    try {
-                        val clientOptionsBuilder = ClientOptions.builder()
-                        if (proxySettings != null) {
-                            val geminiProxyType = when (proxySettings.type) {
-                                ProxyType.HTTP -> GeminiProxyType(GeminiProxyType.Known.HTTP)
-                                ProxyType.SOCKS -> GeminiProxyType(GeminiProxyType.Known.SOCKS)
-                            }
-                            clientOptionsBuilder.proxyOptions(
-                                ProxyOptions.builder().type(geminiProxyType)
-                                    .host(proxySettings.host)
-                                    .port(proxySettings.port)
-                                    .apply { proxySettings.username?.let { username(it) } }
-                                    .apply { proxySettings.password?.let { password(it) } }
-                                    .build()
-                            )
-                        }
-
-                        client =
-                            Client.builder().apiKey(aiSettings.geminiApiKey).clientOptions(clientOptionsBuilder.build())
-                                .build()
-
-                        currentApiKey = aiSettings.geminiApiKey
-                        currentProxy = proxySettings
-
-                        mcpClientService.connect(aiSettings.mcpServers)
-                        currentMcpServers = aiSettings.mcpServers
-
-                        resetSession()
-                        currentGlobalContext = aiSettings.globalContext
-                        logger.info("Gemini client initialized.")
-                    } catch (e: Exception) {
-                        logger.error("Failed to initialize Gemini client", e)
-                        client = null
-                        chat = null
-                    }
-                } else {
-                    // Check if only session needs reset
-                    val needsSessionReset =
-                        currentGlobalContext != aiSettings.globalContext || currentMcpServers != aiSettings.mcpServers || chat == null
-
-                    if (needsSessionReset) {
+                    if (needsClientRestart) {
                         captureHistory()
+                        client?.close()
                         try {
-                            if (currentMcpServers != aiSettings.mcpServers) {
-                                mcpClientService.connect(aiSettings.mcpServers)
-                                currentMcpServers = aiSettings.mcpServers
+                            val clientOptionsBuilder = ClientOptions.builder()
+                            if (proxySettings != null) {
+                                val geminiProxyType =
+                                    when (proxySettings.type) {
+                                        ProxyType.HTTP -> GeminiProxyType(GeminiProxyType.Known.HTTP)
+                                        ProxyType.SOCKS -> GeminiProxyType(GeminiProxyType.Known.SOCKS)
+                                    }
+                                clientOptionsBuilder.proxyOptions(
+                                    ProxyOptions
+                                        .builder()
+                                        .type(geminiProxyType)
+                                        .host(proxySettings.host)
+                                        .port(proxySettings.port)
+                                        .apply { proxySettings.username?.let { username(it) } }
+                                        .apply { proxySettings.password?.let { password(it) } }
+                                        .build(),
+                                )
                             }
+
+                            client =
+                                Client
+                                    .builder()
+                                    .apiKey(aiSettings.geminiApiKey)
+                                    .clientOptions(clientOptionsBuilder.build())
+                                    .build()
+
+                            currentApiKey = aiSettings.geminiApiKey
+                            currentProxy = proxySettings
+
+                            mcpClientService.connect(aiSettings.mcpServers)
+                            currentMcpServers = aiSettings.mcpServers
+
                             resetSession()
                             currentGlobalContext = aiSettings.globalContext
+                            logger.info("Gemini client initialized.")
                         } catch (e: Exception) {
-                            logger.error("Failed to reset session", e)
+                            logger.error("Failed to initialize Gemini client", e)
+                            client = null
+                            chat = null
+                        }
+                    } else {
+                        // Check if only session needs reset
+                        val needsSessionReset =
+                            currentGlobalContext != aiSettings.globalContext || currentMcpServers != aiSettings.mcpServers || chat == null
+
+                        if (needsSessionReset) {
+                            captureHistory()
+                            try {
+                                if (currentMcpServers != aiSettings.mcpServers) {
+                                    mcpClientService.connect(aiSettings.mcpServers)
+                                    currentMcpServers = aiSettings.mcpServers
+                                }
+                                resetSession()
+                                currentGlobalContext = aiSettings.globalContext
+                            } catch (e: Exception) {
+                                logger.error("Failed to reset session", e)
+                            }
                         }
                     }
+                } else {
+                    if (client != null) {
+                        captureHistory()
+                        client?.close()
+                        client = null
+                        chat = null
+                        currentApiKey = null
+                        currentProxy = null
+                        currentGlobalContext = null
+                        currentMcpServers = null
+                        mcpClientService.disconnectAll()
+                        logger.info("Gemini client closed.")
+                    }
+                    if (aiSettings?.agentEnabled == false) {
+                        savedHistory = null
+                    }
                 }
-            } else {
-                if (client != null) {
-                    captureHistory()
-                    client?.close()
-                    client = null
-                    chat = null
-                    currentApiKey = null
-                    currentProxy = null
-                    currentGlobalContext = null
-                    currentMcpServers = null
-                    mcpClientService.disconnectAll()
-                    logger.info("Gemini client closed.")
-                }
-                if (aiSettings?.agentEnabled == false) {
-                    savedHistory = null
-                }
-            }
-        }.launchIn(scope)
+            }.launchIn(scope)
     }
 
     /**
@@ -161,7 +173,7 @@ class GeminiAgentService(
 
     /**
      * 切换当前会话使用的模型。
-     * 
+     *
      * @param modelName 模型名称。
      */
     fun switchModel(modelName: String) {
@@ -226,9 +238,7 @@ class GeminiAgentService(
      * @param text 消息内容。
      * @return Gemini 的回复文本。
      */
-    suspend fun sendMessage(text: String): String {
-        return sendMessage(text, emptyList())
-    }
+    suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
 
     /**
      * 发送包含语音数据的消息并获取回复。
@@ -237,22 +247,31 @@ class GeminiAgentService(
      * @param audioParts 包含音频数据的 Part 列表。
      * @return Gemini 的回复文本。
      */
-    suspend fun sendMessage(text: String?, audioParts: List<Part>): String {
+    suspend fun sendMessage(
+        text: String?,
+        audioParts: List<Part>,
+    ): String {
         val currentChat = chat ?: throw IllegalStateException("Gemini chat session is not initialized.")
         try {
             val parts = mutableListOf<Part>()
             text?.let { parts.add(Part.fromText(it)) }
             parts.addAll(audioParts)
 
-            val userContent = Content.builder().role("user").parts(parts).build()
+            val userContent =
+                Content
+                    .builder()
+                    .role("user")
+                    .parts(parts)
+                    .build()
 
             val history = savedHistory
-            val response = if (history != null && currentChat.getHistory(false).isEmpty()) {
-                savedHistory = null
-                currentChat.sendMessage(history + userContent)
-            } else {
-                currentChat.sendMessage(listOf(userContent))
-            }
+            val response =
+                if (history != null && currentChat.getHistory(false).isEmpty()) {
+                    savedHistory = null
+                    currentChat.sendMessage(history + userContent)
+                } else {
+                    currentChat.sendMessage(listOf(userContent))
+                }
 
             // Check for tool calls
             return handleResponse(response, currentChat)
@@ -262,7 +281,10 @@ class GeminiAgentService(
         }
     }
 
-    private suspend fun handleResponse(response: GenerateContentResponse, currentChat: Chat): String {
+    private suspend fun handleResponse(
+        response: GenerateContentResponse,
+        currentChat: Chat,
+    ): String {
         val functionCalls = response.functionCalls()
         if (!functionCalls.isNullOrEmpty()) {
             val functionResponses = mutableListOf<Part>()
@@ -284,7 +306,12 @@ class GeminiAgentService(
             }
 
             // Send function results back to the model
-            val content = Content.builder().role("user").parts(functionResponses).build()
+            val content =
+                Content
+                    .builder()
+                    .role("user")
+                    .parts(functionResponses)
+                    .build()
             val finalResponse = currentChat.sendMessage(content)
             return handleResponse(finalResponse, currentChat)
         } else {
