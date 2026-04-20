@@ -5,8 +5,10 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
 import java.io.File
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -25,8 +27,9 @@ class GeminiAgentServiceTest {
         if (configFile.exists()) {
             configFile.delete()
         }
+        val testScope = CoroutineScope(EmptyCoroutineContext)
         settingsRepository = SettingsRepository()
-        service = GeminiAgentService(settingsRepository, MCPClientService())
+        service = GeminiAgentService(testScope, settingsRepository, MCPClientService(testScope))
     }
 
     @AfterTest

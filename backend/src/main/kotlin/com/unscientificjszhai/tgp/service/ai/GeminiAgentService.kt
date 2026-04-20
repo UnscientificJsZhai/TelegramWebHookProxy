@@ -10,12 +10,11 @@ import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.plus
 import org.slf4j.LoggerFactory
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -24,11 +23,12 @@ import com.google.genai.types.ProxyType as GeminiProxyType
 
 @Singleton
 class GeminiAgentService @Inject constructor(
+    parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
     private val mcpClientService: MCPClientService,
 ) {
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
 
     private val localFunctionProviders = listOf(
         HttpCallingFunctionProvider(),

@@ -12,11 +12,10 @@ import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.plus
 import kotlinx.serialization.json.Json
 import okhttp3.Credentials
 import java.net.InetSocketAddress
@@ -26,10 +25,11 @@ import javax.inject.Singleton
 
 @Singleton
 class TelegramService @Inject constructor(
-    private val settingsRepository: SettingsRepository,
+    parentScope: CoroutineScope,
+    settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository,
 ) {
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private var appSettings: AppSettings = settingsRepository.settingsFlow.value
     private var client: HttpClient = createClient()
 

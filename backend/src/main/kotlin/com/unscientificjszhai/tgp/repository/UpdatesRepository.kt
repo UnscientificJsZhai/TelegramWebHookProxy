@@ -1,8 +1,7 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.ChatInfo
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -20,19 +19,20 @@ data class UpdatesData(
 @Singleton
 class UpdatesRepository
 @Inject
-constructor() {
+constructor(
+    parentScope: CoroutineScope,
+) {
     private val logger = LoggerFactory.getLogger(javaClass)
+    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
 
     private val configFile = File("config/updates.json")
     private val json = Json { prettyPrint = true }
 
     private val _dataFlow = MutableStateFlow(loadData())
     val chatsFlow: StateFlow<List<ChatInfo>> =
-        _dataFlow.asStateFlow().let { flow ->
-            val stateFlow = MutableStateFlow(flow.value.chats)
-            flow.onEach { stateFlow.value = it.chats }.launchIn(CoroutineScope(Dispatchers.IO))
-            stateFlow
-        }
+        _dataFlow
+            .map { it.chats }
+            .stateIn(scope, SharingStarted.Eagerly, _dataFlow.value.chats)
 
     val lastUpdateId: Long
         get() = _dataFlow.value.lastUpdateId

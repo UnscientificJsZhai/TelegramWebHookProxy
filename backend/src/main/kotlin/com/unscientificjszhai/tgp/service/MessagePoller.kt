@@ -28,7 +28,7 @@ class MessagePoller @Inject constructor(
     private val updatesRepository: UpdatesRepository,
 ) : AutoCloseable {
     private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
-    private val scope = parentScope + Dispatchers.IO + SupervisorJob()
+    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private var job: Job? = null
 
     /**

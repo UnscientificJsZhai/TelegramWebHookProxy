@@ -10,18 +10,15 @@ import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class MCPClientService @Inject constructor() {
+class MCPClientService @Inject constructor(parentScope: CoroutineScope) {
     private val logger = LoggerFactory.getLogger(MCPClientService::class.java)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private val httpClient =
         HttpClient(OkHttp) {
             install(SSE)
