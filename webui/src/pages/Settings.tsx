@@ -320,18 +320,7 @@ const Settings: React.FC = () => {
                         variant="outlined"
                     />
                 </Grid>
-                <Grid size={{xs: 12}}>
-                    <TextField
-                        fullWidth
-                        label="Chat ID (代理消息发送目标)"
-                        name="chatId"
-                        value={settings.chatId}
-                        onChange={handleChange}
-                        variant="outlined"
-                        helperText="用于接收代理转发消息的Chat ID"
-                    />
-                </Grid>
-                
+
                 <Grid size={{xs: 12}}>
                     <Divider sx={{ my: 2 }} />
                     <Typography variant="h5" gutterBottom>
