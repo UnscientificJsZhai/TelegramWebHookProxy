@@ -4,17 +4,18 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import io.mockk.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 
-class AgentPollerTest {
+class MessagePollerTest {
 
     private lateinit var telegramService: TelegramService
     private lateinit var geminiAgentService: GeminiAgentService
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var updatesRepository: UpdatesRepository
-    private lateinit var agentPoller: AgentPoller
+    private lateinit var messagePoller: MessagePoller
 
     @BeforeTest
     fun setup() {
@@ -23,7 +24,8 @@ class AgentPollerTest {
         settingsRepository = mockk()
         updatesRepository = mockk()
 
-        agentPoller = AgentPoller(
+        messagePoller = MessagePoller(
+            CoroutineScope(kotlin.coroutines.EmptyCoroutineContext),
             telegramService, geminiAgentService, settingsRepository, updatesRepository
         )
     }
@@ -39,7 +41,7 @@ class AgentPollerTest {
         coEvery { geminiAgentService.sendMessage(userMessage) } returns aiReply
         coEvery { telegramService.sendMessage(chatId, aiReply, any()) } returns mockk()
 
-        agentPoller.handleAiMessage(chatId, userMessage, messageId)
+        messagePoller.handleAiMessage(chatId, userMessage, messageId)
 
         coVerify { telegramService.sendChatAction(chatId, "typing") }
         coVerify { geminiAgentService.sendMessage(userMessage) }
@@ -58,7 +60,7 @@ class AgentPollerTest {
         coEvery { geminiAgentService.resetSession() } just Runs
         coEvery { telegramService.sendMessage(chatId, any(), any()) } returns mockk()
 
-        agentPoller.handleCommand(chatId, command, messageId)
+        messagePoller.handleCommand(chatId, command, messageId)
 
         coVerify { geminiAgentService.resetSession() }
         coVerify {

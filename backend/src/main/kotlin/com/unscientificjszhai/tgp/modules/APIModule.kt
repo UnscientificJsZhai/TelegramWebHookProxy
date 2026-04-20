@@ -5,7 +5,7 @@ import com.unscientificjszhai.tgp.models.SendMessageRequest
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
-import com.unscientificjszhai.tgp.service.AgentPoller
+import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
@@ -23,13 +23,18 @@ fun Application.apiModule() {
     val mcpClientService = MCPClientService()
     val geminiAgentService = GeminiAgentService(settingsRepository, mcpClientService)
 
-    val agentPoller =
-        AgentPoller(
+    val messagePoller =
+        MessagePoller(
+            this@apiModule,
             telegramService,
             geminiAgentService,
             settingsRepository,
             updatesRepository,
         ).apply { start() }
+
+    monitor.subscribe(ApplicationStopped) {
+        messagePoller.close()
+    }
 
     routing {
         route("/api") {

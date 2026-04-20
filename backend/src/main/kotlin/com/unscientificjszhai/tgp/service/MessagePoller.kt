@@ -15,14 +15,15 @@ import kotlin.time.Duration.Companion.milliseconds
 /**
  * 后台机器人轮询服务，负责监听 Telegram 消息并执行指令或调用 AI。
  */
-class AgentPoller(
+class MessagePoller(
+    parentScope: CoroutineScope,
     private val telegramService: TelegramService,
     private val geminiAgentService: GeminiAgentService,
     private val settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository,
 ) : AutoCloseable {
-    private val logger = LoggerFactory.getLogger(AgentPoller::class.java)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
+    private val scope = parentScope + Dispatchers.IO + SupervisorJob()
     private var job: Job? = null
 
     /**
