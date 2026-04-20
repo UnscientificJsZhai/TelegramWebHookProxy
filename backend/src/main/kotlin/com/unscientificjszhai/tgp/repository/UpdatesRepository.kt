@@ -9,7 +9,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -32,7 +31,7 @@ class UpdatesRepository {
         flow.onEach { stateFlow.value = it.chats }.launchIn(CoroutineScope(Dispatchers.IO))
         stateFlow
     }
-    
+
     val lastUpdateId: Long
         get() = _dataFlow.value.lastUpdateId
 
@@ -43,16 +42,28 @@ class UpdatesRepository {
     }
 
     private fun loadData(): UpdatesData {
-        return if (configFile.exists()) {
-            val content = configFile.readText()
+        if (!configFile.exists()) {
+            return UpdatesData()
+        }
+
+        val content = configFile.readText()
+        if (content.isBlank()) {
+            return UpdatesData()
+        }
+
+        return try {
+            json.decodeFromString<UpdatesData>(content)
+        } catch (e: Exception) {
             try {
-                json.decodeFromString(content)
-            } catch (e: Exception) {
+                val chats = json.decodeFromString<List<ChatInfo>>(content)
+                val migratedData = UpdatesData(chats = chats, lastUpdateId = 0)
+                configFile.writeText(json.encodeToString(migratedData))
+                logger.info("Successfully migrated updates data from old format")
+                migratedData
+            } catch (e2: Exception) {
                 logger.error("Error while loading updates data", e)
                 UpdatesData()
             }
-        } else {
-            UpdatesData()
         }
     }
 

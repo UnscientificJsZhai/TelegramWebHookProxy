@@ -57,7 +57,10 @@ data class SendTelegramMessageRequest(
 
 @Serializable
 data class GetUpdatesResponse(
-    val ok: Boolean, val result: List<Update>
+    val ok: Boolean,
+    val result: List<Update> = emptyList(),
+    @SerialName("error_code") val errorCode: Int? = null,
+    val description: String? = null
 )
 
 @Serializable
@@ -84,7 +87,10 @@ data class Voice(
 
 @Serializable
 data class FileResponse(
-    val ok: Boolean, val result: TelegramFile? = null
+    val ok: Boolean,
+    val result: TelegramFile? = null,
+    @SerialName("error_code") val errorCode: Int? = null,
+    val description: String? = null
 )
 
 @Serializable
