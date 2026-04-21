@@ -9,3 +9,15 @@ data class Skill(
     val description: String,
     val content: String
 )
+
+@Serializable
+data class SkillBrief(
+    val id: String,
+    val description: String
+)
+
+@Serializable
+data class PageResult<T>(
+    val total: Int,
+    val items: List<T>
+)

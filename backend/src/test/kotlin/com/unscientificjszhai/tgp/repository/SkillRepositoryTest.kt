@@ -1,6 +1,11 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.Skill
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import java.io.File
 import kotlin.test.*
 
@@ -29,7 +34,7 @@ class SkillRepositoryTest {
         val skill = Skill(description = "Test Description", content = "Test Content")
         repository.saveSkill(skill)
         
-        val skills = repository.getAllSkills()
+        val skills = repository.getAllSkills().items
         assertEquals(1, skills.size)
         assertEquals("Test Description", skills[0].description)
         assertEquals("Test Content", skills[0].content)
@@ -54,7 +59,7 @@ class SkillRepositoryTest {
         val updatedSkill = skill.copy(description = "New Description")
         repository.saveSkill(updatedSkill)
         
-        val skills = repository.getAllSkills()
+        val skills = repository.getAllSkills().items
         assertEquals(1, skills.size)
         assertEquals("New Description", skills[0].description)
         assertEquals("Old Content", skills[0].content)
@@ -64,9 +69,33 @@ class SkillRepositoryTest {
     fun testDeleteSkill() {
         val skill = Skill(description = "Test Description", content = "Test Content")
         repository.saveSkill(skill)
-        assertEquals(1, repository.getAllSkills().size)
+        assertEquals(1, repository.getAllSkills().items.size)
         
         repository.deleteSkill(skill.id)
-        assertEquals(0, repository.getAllSkills().size)
+        assertEquals(0, repository.getAllSkills().items.size)
+    }
+
+    @Test
+    fun testSkillsUpdateEvent() = runTest {
+        val events = mutableListOf<Unit>()
+        val job = launch {
+            repository.skillsUpdateEvent.collect {
+                events.add(it)
+            }
+        }
+        yield()
+
+        val skill = Skill(description = "Event Test", content = "Content")
+        repository.saveSkill(skill)
+        
+        // Wait a bit for the event to be processed
+        delay(100)
+        assertEquals(1, events.size)
+
+        repository.deleteSkill(skill.id)
+        delay(100)
+        assertEquals(2, events.size)
+
+        job.cancel()
     }
 }

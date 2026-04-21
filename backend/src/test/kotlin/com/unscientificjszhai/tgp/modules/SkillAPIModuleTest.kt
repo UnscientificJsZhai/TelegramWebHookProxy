@@ -1,5 +1,6 @@
 package com.unscientificjszhai.tgp.modules
 
+import com.unscientificjszhai.tgp.models.PageResult
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.module
 import io.ktor.client.request.*
@@ -37,7 +38,9 @@ class SkillAPIModuleTest {
         // 1. 初始状态：获取空列表
         client.get("/api/skills").apply {
             assertEquals(HttpStatusCode.OK, status)
-            assertEquals("[]", bodyAsText())
+            val received = Json.decodeFromString<PageResult<Skill>>(bodyAsText())
+            assertEquals(0, received.total)
+            assertEquals(0, received.items.size)
         }
 
         val testSkill1 = Skill(description = "Skill 1", content = "Content 1")
@@ -57,11 +60,11 @@ class SkillAPIModuleTest {
         // 3. GET：验证列表包含两个技能
         val skills = client.get("/api/skills").apply {
             assertEquals(HttpStatusCode.OK, status)
-            val received = Json.decodeFromString<List<Skill>>(bodyAsText())
+            val received = Json.decodeFromString<PageResult<Skill>>(bodyAsText()).items
             assertEquals(2, received.size)
             assertTrue(received.any { it.description == "Skill 1" })
             assertTrue(received.any { it.description == "Skill 2" })
-        }.let { Json.decodeFromString<List<Skill>>(it.bodyAsText()) }
+        }.let { Json.decodeFromString<PageResult<Skill>>(it.bodyAsText()).items }
 
         // 4. DELETE：删除第一个技能
         client.delete("/api/skills/${skills[0].id}").apply {
@@ -70,7 +73,7 @@ class SkillAPIModuleTest {
 
         // 5. GET：验证只剩下一个技能
         client.get("/api/skills").apply {
-            val received = Json.decodeFromString<List<Skill>>(bodyAsText())
+            val received = Json.decodeFromString<PageResult<Skill>>(bodyAsText()).items
             assertEquals(1, received.size)
             assertEquals(skills[1].description, received[0].description)
         }

@@ -14,7 +14,9 @@ fun Application.skillAPIModule(appComponent: AppComponent) {
     routing {
         route("/api/skills") {
             get {
-                call.respond(skillRepository.getAllSkills())
+                val page = call.request.queryParameters["page"]?.toIntOrNull() ?: 1
+                val size = call.request.queryParameters["size"]?.toIntOrNull() ?: 10
+                call.respond(skillRepository.getAllSkills(page, size))
             }
             post {
                 val skill = call.receive<Skill>()

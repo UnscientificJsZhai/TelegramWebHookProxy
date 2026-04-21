@@ -47,7 +47,7 @@ class GeminiAgentService @Inject constructor(
     private var currentProxy: ProxySettings? = null
     private var currentGlobalContext: String? = null
     private var currentMcpServers: List<MCPServerConfig>? = null
-    private var currentSkills: List<Skill>? = null
+    private var currentSkills: List<SkillBrief>? = null
     private var savedHistory: List<Content>? = null
 
     /**
@@ -69,8 +69,8 @@ class GeminiAgentService @Inject constructor(
     init {
         combine(
             settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) },
-            skillRepository.skillsFlow.onStart { emit(skillRepository.skillsFlow.value) }
-        ) { settings, skills -> settings to skills }.onEach { (settings, skills) ->
+            skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
+        ) { settings, _ -> settings to skillRepository.getSkillSummaries() }.onEach { (settings, skills) ->
             val aiSettings = settings.ai
             val proxySettings = settings.proxy
 
@@ -205,7 +205,7 @@ class GeminiAgentService @Inject constructor(
         val aiSettings = settingsRepository.settingsFlow.value.ai
 
         val configBuilder = GenerateContentConfig.builder()
-        val skills = skillRepository.getAllSkills()
+        val skills = skillRepository.getSkillSummaries()
         val skillPrompt = if (skills.isNotEmpty()) {
             "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" + skills.joinToString("\n") { "- ID: ${it.id}, Description: ${it.description}" } + "\n\n"
         } else {

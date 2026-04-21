@@ -12,6 +12,7 @@ import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
+import java.util.concurrent.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.time.Duration.Companion.milliseconds
@@ -139,6 +140,24 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 发送“输入中”事件的任务。
+     *
+     * @param chatId 聊天ID。
+     */
+    private fun CoroutineScope.typingJob(chatId: String) = launch {
+        while (isActive) {
+            delay(4000.milliseconds)
+            try {
+                telegramService.sendChatAction(chatId, "typing")
+            } catch (_: CancellationException) {
+                logger.debug("Failed to send typing action. Job cancelled")
+            } catch (e: Exception) {
+                logger.warn("Failed to send typing action", e)
+            }
+        }
+    }
+
     suspend fun handleVoiceMessage(
         chatId: String,
         voice: Voice,
@@ -152,16 +171,7 @@ class MessagePoller @Inject constructor(
         }
 
         coroutineScope {
-            val typingJob = launch {
-                while (isActive) {
-                    delay(4000.milliseconds)
-                    try {
-                        telegramService.sendChatAction(chatId, "typing")
-                    } catch (e: Exception) {
-                        logger.warn("Failed to send typing action", e)
-                    }
-                }
-            }
+            val typingJob = typingJob(chatId)
 
             try {
                 // 1. 获取文件路径
@@ -175,8 +185,8 @@ class MessagePoller @Inject constructor(
                 // 3. 构建 Gemini 请求 Part
                 val mimeType = voice.mimeType ?: "audio/ogg"
                 val audioPart = Part.builder().inlineData(
-                        Blob.builder().mimeType(mimeType).data(audioData).build(),
-                    ).build()
+                    Blob.builder().mimeType(mimeType).data(audioData).build(),
+                ).build()
 
                 // 4. 发送给 Gemini
                 val reply = geminiAgentService.sendMessage(caption, listOf(audioPart))
@@ -263,16 +273,7 @@ class MessagePoller @Inject constructor(
         }
 
         coroutineScope {
-            val typingJob = launch {
-                while (isActive) {
-                    delay(4000.milliseconds)
-                    try {
-                        telegramService.sendChatAction(chatId, "typing")
-                    } catch (e: Exception) {
-                        logger.warn("Failed to send typing action", e)
-                    }
-                }
-            }
+            val typingJob = typingJob(chatId)
 
             try {
                 val reply = geminiAgentService.sendMessage(text)
