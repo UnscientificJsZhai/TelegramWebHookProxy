@@ -1,6 +1,5 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import com.github.jk1.license.render.TextReportRenderer
-import java.util.Properties
 
 evaluationDependsOn(":webui")
 

@@ -20,23 +20,32 @@ import kotlin.test.assertNull
 class GeminiAgentServiceTest {
 
     private lateinit var settingsRepository: SettingsRepository
+    private lateinit var skillRepository: com.unscientificjszhai.tgp.repository.SkillRepository
     private lateinit var service: GeminiAgentService
     private val configFile = File("config/settings.json")
+    private val skillFile = File("config/skills.json")
 
     @BeforeTest
     fun setup() {
         if (configFile.exists()) {
             configFile.delete()
         }
+        if (skillFile.exists()) {
+            skillFile.delete()
+        }
         val testScope = CoroutineScope(EmptyCoroutineContext)
         settingsRepository = SettingsRepository()
-        service = GeminiAgentService(testScope, settingsRepository, MCPClientService(testScope)) { mockk() }
+        skillRepository = com.unscientificjszhai.tgp.repository.SkillRepository()
+        service = GeminiAgentService(testScope, settingsRepository, skillRepository, MCPClientService(testScope)) { mockk() }
     }
 
     @AfterTest
     fun teardown() {
         if (configFile.exists()) {
             configFile.delete()
+        }
+        if (skillFile.exists()) {
+            skillFile.delete()
         }
     }
 

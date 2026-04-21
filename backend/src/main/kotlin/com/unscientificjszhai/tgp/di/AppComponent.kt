@@ -12,6 +12,8 @@ import javax.inject.Singleton
 interface AppComponent {
     val settingsRepository: SettingsRepository
 
+    val skillRepository: com.unscientificjszhai.tgp.repository.SkillRepository
+
     val telegramService: TelegramService
 
     val messagePoller: MessagePoller

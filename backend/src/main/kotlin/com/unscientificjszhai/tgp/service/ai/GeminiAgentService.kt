@@ -3,16 +3,16 @@ package com.unscientificjszhai.tgp.service.ai
 import com.google.genai.Chat
 import com.google.genai.Client
 import com.google.genai.types.*
-import com.unscientificjszhai.tgp.models.AISettings
-import com.unscientificjszhai.tgp.models.MCPServerConfig
-import com.unscientificjszhai.tgp.models.ProxySettings
-import com.unscientificjszhai.tgp.models.ProxyType
+import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
 import javax.inject.Provider
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
@@ -27,8 +27,9 @@ import com.google.genai.types.ProxyType as GeminiProxyType
 class GeminiAgentService @Inject constructor(
     parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
+    private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
-    private val taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
+    taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
 ) {
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
@@ -37,6 +38,7 @@ class GeminiAgentService @Inject constructor(
         HttpCallingFunctionProvider(),
         McpFunctionProvider(mcpClientService),
         ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
+        SkillFunctionProvider(skillRepository),
     )
     private var client: Client? = null
     var chat: Chat? = null
@@ -45,6 +47,7 @@ class GeminiAgentService @Inject constructor(
     private var currentProxy: ProxySettings? = null
     private var currentGlobalContext: String? = null
     private var currentMcpServers: List<MCPServerConfig>? = null
+    private var currentSkills: List<Skill>? = null
     private var savedHistory: List<Content>? = null
 
     /**
@@ -64,7 +67,10 @@ class GeminiAgentService @Inject constructor(
     fun isAiFeatureEnabled(aiSettings: AISettings) = aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
 
     init {
-        settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) }.onEach { settings ->
+        combine(
+            settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) },
+            skillRepository.skillsFlow.onStart { emit(skillRepository.skillsFlow.value) }
+        ) { settings, skills -> settings to skills }.onEach { (settings, skills) ->
             val aiSettings = settings.ai
             val proxySettings = settings.proxy
 
@@ -100,6 +106,7 @@ class GeminiAgentService @Inject constructor(
 
                         resetSession()
                         currentGlobalContext = aiSettings.globalContext
+                        currentSkills = skills
                         logger.info("Gemini client initialized.")
                     } catch (e: Exception) {
                         logger.error("Failed to initialize Gemini client", e)
@@ -109,7 +116,7 @@ class GeminiAgentService @Inject constructor(
                 } else {
                     // Check if only session needs reset
                     val needsSessionReset =
-                        currentGlobalContext != aiSettings.globalContext || currentMcpServers != aiSettings.mcpServers || chat == null
+                        currentGlobalContext != aiSettings.globalContext || currentMcpServers != aiSettings.mcpServers || currentSkills != skills || chat == null
 
                     if (needsSessionReset) {
                         captureHistory()
@@ -120,6 +127,7 @@ class GeminiAgentService @Inject constructor(
                             }
                             resetSession()
                             currentGlobalContext = aiSettings.globalContext
+                            currentSkills = skills
                         } catch (e: Exception) {
                             logger.error("Failed to reset session", e)
                         }
@@ -197,10 +205,19 @@ class GeminiAgentService @Inject constructor(
         val aiSettings = settingsRepository.settingsFlow.value.ai
 
         val configBuilder = GenerateContentConfig.builder()
-        if (aiSettings != null && aiSettings.globalContext.isNotBlank()) {
-            val systemInstruction = Content.fromParts(Part.fromText(aiSettings.globalContext))
-            configBuilder.systemInstruction(systemInstruction)
+        val skills = skillRepository.getAllSkills()
+        val skillPrompt = if (skills.isNotEmpty()) {
+            "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" + skills.joinToString("\n") { "- ID: ${it.id}, Description: ${it.description}" } + "\n\n"
+        } else {
+            ""
         }
+
+        val systemInstruction = if(aiSettings != null && aiSettings.globalContext.isNotBlank()) {
+            Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
+        } else {
+            Content.fromParts(Part.fromText(skillPrompt))
+        }
+        configBuilder.systemInstruction(systemInstruction)
 
         val functionDeclarations = mutableListOf<FunctionDeclaration>()
 

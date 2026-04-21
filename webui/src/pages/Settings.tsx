@@ -21,6 +21,7 @@ import {
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
+import { useNavigate } from 'react-router-dom';
 import api from '../api';
 
 interface ProxySettings {
@@ -62,6 +63,7 @@ const defaultAiSettings: AISettings = {
 };
 
 const Settings: React.FC = () => {
+    const navigate = useNavigate();
     const [settings, setSettings] = useState<AppSettings | null>(null);
     const [snackbar, setSnackbar] = useState<{ open: boolean, message: string, severity: 'success' | 'error' | 'info' } | null>(null);
 
@@ -329,16 +331,28 @@ const Settings: React.FC = () => {
                 </Grid>
 
                 <Grid size={{xs: 12}}>
-                    <FormControlLabel
-                        control={
-                            <Checkbox
-                                checked={ai.agentEnabled}
-                                name="ai.agentEnabled"
-                                onChange={handleCheckboxChange}
-                            />
-                        }
-                        label="启用 AI Agent"
-                    />
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <FormControlLabel
+                            control={
+                                <Checkbox
+                                    checked={ai.agentEnabled}
+                                    name="ai.agentEnabled"
+                                    onChange={handleCheckboxChange}
+                                />
+                            }
+                            label="启用 AI Agent"
+                        />
+                        {ai.agentEnabled && (
+                            <Button
+                                variant="outlined"
+                                color="secondary"
+                                onClick={() => navigate('/skill')}
+                                size="small"
+                            >
+                                管理技能 (Skill)
+                            </Button>
+                        )}
+                    </Box>
                 </Grid>
 
                 {ai.agentEnabled && (
