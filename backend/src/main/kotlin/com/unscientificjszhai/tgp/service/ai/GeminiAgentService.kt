@@ -10,6 +10,8 @@ import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
+import javax.inject.Provider
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -26,6 +28,7 @@ class GeminiAgentService @Inject constructor(
     parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
     private val mcpClientService: MCPClientService,
+    private val taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
 ) {
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
@@ -33,6 +36,7 @@ class GeminiAgentService @Inject constructor(
     private val localFunctionProviders = listOf(
         HttpCallingFunctionProvider(),
         McpFunctionProvider(mcpClientService),
+        ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
     )
     private var client: Client? = null
     var chat: Chat? = null

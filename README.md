@@ -6,6 +6,10 @@ TelegramWebHookProxy可以用于转发消息到Telegram机器人，只需要一�
 
 - [x] 使用更简单的API发送消息。
 - [x] 使用单独设置的代理服务器转发Telegram API请求。
+- [x] 集成 Google Gemini AI，支持智能对话。
+- [x] 支持 Model Context Protocol (MCP)，扩展 AI 能力。
+- [x] 自动会话发现与管理。
+- [x] 允许 AI 代理创建并管理定时任务 (Scheduled Tasks)。
 - [ ] 通过模板发送复杂消息。
 - [ ] 接收消息后执行特定操作。
 

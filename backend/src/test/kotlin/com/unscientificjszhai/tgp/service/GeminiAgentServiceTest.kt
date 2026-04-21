@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
 import java.io.File
@@ -29,7 +30,7 @@ class GeminiAgentServiceTest {
         }
         val testScope = CoroutineScope(EmptyCoroutineContext)
         settingsRepository = SettingsRepository()
-        service = GeminiAgentService(testScope, settingsRepository, MCPClientService(testScope))
+        service = GeminiAgentService(testScope, settingsRepository, MCPClientService(testScope)) { mockk() }
     }
 
     @AfterTest

@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.di.AppModule
 import com.unscientificjszhai.tgp.di.DaggerAppComponent
 import com.unscientificjszhai.tgp.modules.apiModule
 import com.unscientificjszhai.tgp.modules.messagePollerModule
+import com.unscientificjszhai.tgp.modules.taskSchedulerModule
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -37,6 +38,7 @@ fun Application.module() {
 
     apiModule(appComponent)
     messagePollerModule(appComponent)
+    taskSchedulerModule(appComponent)
 
     routing {
         get("/license") {
