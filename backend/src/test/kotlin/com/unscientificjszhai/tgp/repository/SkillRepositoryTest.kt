@@ -2,12 +2,12 @@ package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.Skill
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.yield
 import java.io.File
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 
 class SkillRepositoryTest {
 
@@ -89,11 +89,11 @@ class SkillRepositoryTest {
         repository.saveSkill(skill)
         
         // Wait a bit for the event to be processed
-        delay(100)
+        delay(100.milliseconds)
         assertEquals(1, events.size)
 
         repository.deleteSkill(skill.id)
-        delay(100)
+        delay(100.milliseconds)
         assertEquals(2, events.size)
 
         job.cancel()

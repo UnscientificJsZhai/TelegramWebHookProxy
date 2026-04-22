@@ -10,8 +10,15 @@ export interface Skill {
     content: string;
 }
 
-export const getSkills = async () => {
-    const response = await api.get<Skill[]>('/skills');
+export interface PageResult<T> {
+    total: number;
+    items: T[];
+}
+
+export const getSkills = async (page: number = 1, size: number = 10) => {
+    const response = await api.get<PageResult<Skill>>('/skills', {
+        params: { page, size }
+    });
     return response.data;
 };
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
     Box,
     Button,
@@ -16,7 +16,8 @@ import {
     Card,
     CardContent,
     CardActions,
-    Grid
+    Grid,
+    Pagination
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
@@ -32,20 +33,26 @@ const SkillPage: React.FC = () => {
     const [open, setOpen] = useState(false);
     const [currentSkill, setCurrentSkill] = useState<Partial<Skill>>({});
     const [snackbar, setSnackbar] = useState<{ open: boolean, message: string, severity: 'success' | 'error' } | null>(null);
+    
+    // Pagination state
+    const [page, setPage] = useState(1);
+    const [total, setTotal] = useState(0);
+    const pageSize = 10;
 
-    const fetchSkills = async () => {
+    const fetchSkills = useCallback(async () => {
         try {
-            const data = await getSkills();
-            setSkills(data);
+            const data = await getSkills(page, pageSize);
+            setSkills(Array.isArray(data?.items) ? data.items : []);
+            setTotal(data?.total || 0);
         } catch (error) {
             console.error('Failed to fetch skills:', error);
             showSnackbar('加载技能失败', 'error');
         }
-    };
+    }, [page]);
 
     useEffect(() => {
         fetchSkills();
-    }, []);
+    }, [fetchSkills]);
 
     const handleOpen = (skill?: Skill) => {
         if (skill) {
@@ -82,7 +89,12 @@ const SkillPage: React.FC = () => {
         try {
             await deleteSkill(id);
             showSnackbar('技能删除成功', 'success');
-            fetchSkills();
+            // If deleting the last item on the current page, and it's not the first page, go back a page
+            if (skills.length === 1 && page > 1) {
+                setPage(page - 1);
+            } else {
+                fetchSkills();
+            }
         } catch (error) {
             console.error('Failed to delete skill:', error);
             showSnackbar('删除技能失败', 'error');
@@ -93,6 +105,12 @@ const SkillPage: React.FC = () => {
         setSnackbar({ open: true, message, severity });
     };
 
+    const handlePageChange = (_event: React.ChangeEvent<unknown>, value: number) => {
+        setPage(value);
+    };
+
+    const totalPages = Math.ceil(total / pageSize);
+
     return (
         <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
             <Box display="flex" alignItems="center" mb={3}>
@@ -100,7 +118,7 @@ const SkillPage: React.FC = () => {
                     <ArrowBackIcon />
                 </IconButton>
                 <Typography variant="h4" component="h1" gutterBottom sx={{ mb: 0 }}>
-                    技能管理 (Skill Management)
+                    技能管理
                 </Typography>
                 <Box flexGrow={1} />
                 <Button variant="contained" startIcon={<AddIcon />} onClick={() => handleOpen()}>
@@ -149,13 +167,24 @@ const SkillPage: React.FC = () => {
                 )}
             </Grid>
 
+            {totalPages > 1 && (
+                <Box display="flex" justifyContent="center" mt={4}>
+                    <Pagination 
+                        count={totalPages} 
+                        page={page} 
+                        onChange={handlePageChange} 
+                        color="primary" 
+                    />
+                </Box>
+            )}
+
             <Dialog open={open} onClose={handleClose} fullWidth maxWidth="md">
                 <DialogTitle>{currentSkill.id ? '编辑技能' : '新增技能'}</DialogTitle>
                 <DialogContent>
                     <TextField
                         autoFocus
                         margin="dense"
-                        label="描述 (Description)"
+                        label="描述"
                         fullWidth
                         variant="outlined"
                         value={currentSkill.description || ''}
@@ -164,7 +193,7 @@ const SkillPage: React.FC = () => {
                     />
                     <TextField
                         margin="dense"
-                        label="内容 (Content)"
+                        label="内容"
                         fullWidth
                         variant="outlined"
                         multiline

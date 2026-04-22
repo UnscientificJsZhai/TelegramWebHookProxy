@@ -62,7 +62,7 @@ constructor(
                 configFile.writeText(json.encodeToString(migratedData))
                 logger.info("Successfully migrated updates data from old format")
                 migratedData
-            } catch (e2: Exception) {
+            } catch (_: Exception) {
                 logger.error("Error while loading updates data", e)
                 UpdatesData()
             }
