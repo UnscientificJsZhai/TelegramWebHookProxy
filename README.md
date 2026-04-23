@@ -1,17 +1,24 @@
 # TelegramWebHookProxy
 
-TelegramWebHookProxy可以用于转发消息到Telegram机器人，只需要一个POST请求。
+TelegramWebHookProxy可以用于转发消息到Telegram机器人，只需要一个POST请求。也可以作为控制家中各种服务的AI Agent，通过各种方式调用家中部署的服务。
 
-核心功能：
+## 核心功能
+
+### 消息转发
 
 - [x] 使用更简单的API发送消息。
 - [x] 使用单独设置的代理服务器转发Telegram API请求。
-- [x] 集成 Google Gemini AI，支持智能对话。
-- [x] 支持 Model Context Protocol (MCP)，扩展 AI 能力。
-- [x] 自动会话发现与管理。
-- [x] 允许 AI 代理创建并管理定时任务 (Scheduled Tasks)。
-- [ ] 通过模板发送复杂消息。
-- [ ] 接收消息后执行特定操作。
+
+### AI 功能
+
+- [x] 接入 Google Gemini API 。
+- [ ] 接入 OpenAI SDK。
+
+- [x] **语音交互**：支持接收并理解 Telegram 语音消息。
+- [x] **小型 Skill 系统**：允许 AI 读写知识库，实现长期记忆与技能扩展。
+- [x] **定时任务**：支持 AI 代理创建并管理自动化定时任务。
+- [x] **HTTP 访问**：AI 代理可主动调用外部或本地 HTTP API。
+- [x] 支持 **Model Context Protocol**，可接入 MCP 工具。
 
 ## 快速开始
 
@@ -19,7 +26,7 @@ TelegramWebHookProxy可以用于转发消息到Telegram机器人，只需要一�
 
 #### 1. 构建镜像
 
-你可以使用预先打包好的镜像，也可以自己构建。在项目根目录下运行以下命令构建 Docker 镜像：
+你可以使用预先打包好的镜像，也可以自己构建镜像。在项目根目录下运行以下命令构建 Docker 镜像：
 
 ```bash
 docker build -t telegram-webhook-proxy .
@@ -64,9 +71,11 @@ java -jar <path-to>/TelegramWebHookProxy-<version>-all.jar
 
 启动成功后，服务默认监听 **10178** 端口，并在`./config`目录下保存配置文件。
 
-*   **Web 管理界面:** [http://localhost:10178](http://localhost:10178)
+*   **Web 管理界面:** `http://localhost:10178`
     *   你需要设置Telegram Bot Token才能开始使用。
-    *   设置Token后所有Telegram API请求都将发送到这个Bot。你可以使用Web UI首页的聊天列表来快速选择你需要的聊天ID，并测试消息是否能成功发送。
+    *   设置Token后，所有Telegram API请求都将发送到这个Bot。
+    *   向机器人发送消息，然后你和机器人的对话信息就会出现在首页。通过Web UI确认选择要监听的对话ID，并测试消息是否能成功发送。
+    *   在这里启用AI功能，填写API Key后才能启用AI功能
 *   **API 基础路径:** `http://localhost:10178/api`
 
 ## 接口文档
@@ -81,10 +90,10 @@ java -jar <path-to>/TelegramWebHookProxy-<version>-all.jar
 
 #### 请求参数 (Request Body)
 
-| 字段名 | 类型 | 必填 | 描述 |
-| :--- | :--- | :--- | :--- |
-| `chatId` | String | 否 | 目标Telegram会话ID(Chat ID)。如果为空，则会给WebUI中选择的默认聊天发送消息。 |
-| `text` | String | 是 | 要发送的消息内容 |
+| 字段名      | 类型     | 必填 | 描述                                                 |
+|:---------|:-------|:---|:---------------------------------------------------|
+| `chatId` | String | 否  | 目标Telegram会话ID(Chat ID)。如果为空，则会给WebUI中选择的默认聊天发送消息。 |
+| `text`   | String | 是  | 要发送的消息内容                                           |
 
 #### 请求示例
 
