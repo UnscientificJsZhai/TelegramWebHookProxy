@@ -22,7 +22,23 @@ fun Application.apiModule(appComponent: AppComponent) {
             }
             post("/settings") {
                 val newSettings = call.receive<AppSettings>()
+                val oldSettings = settingsRepository.settingsFlow.value
                 settingsRepository.saveSettings(newSettings)
+
+                if (newSettings.telegramToken != oldSettings.telegramToken ||
+                    newSettings.ai?.agentEnabled != oldSettings.ai?.agentEnabled
+                ) {
+                    if (newSettings.telegramToken.isNotBlank()) {
+                        try {
+                            telegramService.updateBotCommands(
+                                newSettings.telegramToken,
+                                newSettings.ai?.agentEnabled == true,
+                            )
+                        } catch (e: Exception) {
+                            application.log.error("Failed to update bot commands: ${e.message}")
+                        }
+                    }
+                }
                 call.respond(HttpStatusCode.OK)
             }
             post("/settings/chat") {

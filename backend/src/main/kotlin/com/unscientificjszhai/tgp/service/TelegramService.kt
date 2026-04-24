@@ -181,6 +181,40 @@ class TelegramService @Inject constructor(
         return client.get(url).readRawBytes()
     }
 
+    /**
+     * 更新机器人的指令列表。
+     *
+     * @param token Telegram 机器人的 Token。
+     * @param enableAI 是否启用 AI 功能。
+     */
+    suspend fun updateBotCommands(
+        token: String,
+        enableAI: Boolean,
+    ): HttpResponse {
+        if (token.isBlank()) {
+            throw IllegalStateException("Telegram token is not set.")
+        }
+
+        return if (enableAI) {
+            val url = "https://api.telegram.org/bot$token/setMyCommands"
+            client.post(url) {
+                contentType(ContentType.Application.Json)
+                setBody(
+                    SetMyCommandsRequest(
+                        commands =
+                            listOf(
+                                BotCommand("model", "切换 Gemini 模型"),
+                                BotCommand("reset", "重置对话上下文"),
+                            ),
+                    ),
+                )
+            }
+        } else {
+            val url = "https://api.telegram.org/bot$token/deleteMyCommands"
+            client.post(url)
+        }
+    }
+
     fun getSavedChats(): List<ChatInfo> = updatesRepository.chatsFlow.value
 
     fun deleteChat(chatId: String) {

@@ -118,6 +118,17 @@ data class ChatActionRequest(
 )
 
 @Serializable
+data class BotCommand(
+    val command: String,
+    val description: String,
+)
+
+@Serializable
+data class SetMyCommandsRequest(
+    val commands: List<BotCommand>,
+)
+
+@Serializable
 data class Chat(
     val id: Long,
     val type: String,
