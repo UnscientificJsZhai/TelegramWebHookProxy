@@ -2,7 +2,7 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import io.mockk.*
 import kotlinx.coroutines.CoroutineScope
@@ -15,7 +15,7 @@ import kotlin.test.*
 class TaskSchedulerServiceTest {
 
     private lateinit var telegramService: TelegramService
-    private lateinit var geminiAgentService: GeminiAgentService
+    private lateinit var agentService: AgentService
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var service: TaskSchedulerService
     private val scheduleFile = File("config/schedule.json")
@@ -26,13 +26,13 @@ class TaskSchedulerServiceTest {
             scheduleFile.delete()
         }
         telegramService = mockk()
-        geminiAgentService = mockk()
+        agentService = mockk()
         settingsRepository = mockk(relaxed = true)
         
-        val geminiProvider = Provider { geminiAgentService }
+        val agentProvider = Provider { agentService }
         val testScope = CoroutineScope(EmptyCoroutineContext)
         
-        service = TaskSchedulerService(testScope, telegramService, geminiProvider)
+        service = TaskSchedulerService(testScope, telegramService, agentProvider)
     }
 
     @AfterTest
@@ -67,12 +67,12 @@ class TaskSchedulerServiceTest {
         val instruction = "Test instruction"
         service.createTask(instruction, System.currentTimeMillis() - 1000, LoopMode.ONCE, chatId)
 
-        coEvery { geminiAgentService.sendMessage(any()) } returns "LLM result"
+        coEvery { agentService.sendMessage(any()) } returns "LLM result"
         coEvery { telegramService.sendMessage(any(), any()) } returns mockk()
 
         service.scanAndExecute()
 
-        coVerify { geminiAgentService.sendMessage(any()) }
+        coVerify { agentService.sendMessage(any()) }
         coVerify { telegramService.sendMessage(chatId, match { it.contains("LLM result") }) }
         
         assertEquals(0, service.listTasks().size, "ONCE task should be removed after execution")
@@ -85,7 +85,7 @@ class TaskSchedulerServiceTest {
         val executionTime = System.currentTimeMillis() - 1000
         service.createTask(instruction, executionTime, LoopMode.HOURLY, chatId)
 
-        coEvery { geminiAgentService.sendMessage(any()) } returns "LLM result"
+        coEvery { agentService.sendMessage(any()) } returns "LLM result"
         coEvery { telegramService.sendMessage(any(), any()) } returns mockk()
 
         service.scanAndExecute()

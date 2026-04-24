@@ -1,14 +1,13 @@
 package com.unscientificjszhai.tgp.service
 
-import com.google.genai.types.Blob
-import com.google.genai.types.Part
 import com.unscientificjszhai.tgp.models.ChatInfo
+import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.models.Voice
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
-import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
@@ -24,7 +23,7 @@ import kotlin.time.Duration.Companion.milliseconds
 class MessagePoller @Inject constructor(
     parentScope: CoroutineScope,
     private val telegramService: TelegramService,
-    private val geminiAgentService: GeminiAgentService,
+    private val agentService: AgentService,
     private val settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository,
 ) : AutoCloseable {
@@ -182,14 +181,12 @@ class MessagePoller @Inject constructor(
                 // 2. 下载文件数据
                 val audioData = telegramService.downloadFile(filePath)
 
-                // 3. 构建 Gemini 请求 Part
+                // 3. 构建媒体数据
                 val mimeType = voice.mimeType ?: "audio/ogg"
-                val audioPart = Part.builder().inlineData(
-                    Blob.builder().mimeType(mimeType).data(audioData).build(),
-                ).build()
+                val mediaData = MediaData(audioData, mimeType)
 
-                // 4. 发送给 Gemini
-                val reply = geminiAgentService.sendMessage(caption, listOf(audioPart))
+                // 4. 发送给 AI
+                val reply = agentService.sendMessage(caption, listOf(mediaData))
 
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
@@ -221,7 +218,7 @@ class MessagePoller @Inject constructor(
 
         when (command) {
             "/reset" -> {
-                geminiAgentService.resetSession()
+                agentService.resetSession()
                 telegramService.sendMessage(chatId, "会话已重置", ReplyParameters(messageId))
                 logger.info("Session reset by command in chat $chatId")
             }
@@ -230,7 +227,7 @@ class MessagePoller @Inject constructor(
                 if (parts.size > 1) {
                     val requestedModel = parts[1].trim()
                     try {
-                        geminiAgentService.switchModel(requestedModel)
+                        agentService.switchModel(requestedModel)
                         telegramService.sendMessage(
                             chatId,
                             "已切换模型并重置会话：$requestedModel",
@@ -244,9 +241,9 @@ class MessagePoller @Inject constructor(
                         )
                     }
                 } else {
-                    geminiAgentService.updateModel()
-                    val current = geminiAgentService.currentModel
-                    val available = geminiAgentService.availableModels
+                    agentService.updateModel()
+                    val current = agentService.currentModel
+                    val available = agentService.availableModels
                     val list = available.joinToString("\n") { model ->
                         if (model == current) "✅ $model" else "    $model"
                     }
@@ -276,7 +273,7 @@ class MessagePoller @Inject constructor(
             val typingJob = typingJob(chatId)
 
             try {
-                val reply = geminiAgentService.sendMessage(text)
+                val reply = agentService.sendMessage(text)
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
                     telegramService.sendMessage(

@@ -1,5 +1,7 @@
 package com.unscientificjszhai.tgp.di
 
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import dagger.Module
 import dagger.Provides
 import io.ktor.server.application.*
@@ -13,4 +15,8 @@ class AppModule(
     @Provides
     @Singleton
     fun provideCoroutineScope(): CoroutineScope = application
+
+    @Provides
+    @Singleton
+    fun provideAgentService(geminiAgentService: GeminiAgentService): AgentService = geminiAgentService
 }

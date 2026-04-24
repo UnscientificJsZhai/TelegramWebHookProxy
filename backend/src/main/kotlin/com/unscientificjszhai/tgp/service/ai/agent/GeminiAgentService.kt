@@ -1,4 +1,4 @@
-package com.unscientificjszhai.tgp.service.ai
+package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.google.genai.Chat
 import com.google.genai.Client
@@ -6,6 +6,8 @@ import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
@@ -30,7 +32,7 @@ class GeminiAgentService @Inject constructor(
     private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
     taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
-) {
+) : AgentService() {
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
 
@@ -53,18 +55,18 @@ class GeminiAgentService @Inject constructor(
     /**
      * 当前会话使用的模型。
      */
-    var currentModel: String = "models/gemini-3.1-flash-lite-preview"
+    override var currentModel: String = "models/gemini-3.1-flash-lite-preview"
         private set
 
     /**
      * 可选的模型列表。
      */
-    var availableModels = listOf(
+    override var availableModels = listOf(
         "models/gemini-3.1-flash-lite-preview",
         "models/gemini-2.5-flash",
     )
 
-    fun isAiFeatureEnabled(aiSettings: AISettings) = aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
+    override fun isAiFeatureEnabled(aiSettings: AISettings) = aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
 
     init {
         combine(
@@ -174,7 +176,7 @@ class GeminiAgentService @Inject constructor(
      *
      * @param modelName 模型名称。
      */
-    fun switchModel(modelName: String) {
+    override fun switchModel(modelName: String) {
         if (modelName !in availableModels && modelName != "gemini-2.5-flash") {
             throw IllegalArgumentException("Unsupported model: $modelName")
         }
@@ -185,7 +187,7 @@ class GeminiAgentService @Inject constructor(
         }
     }
 
-    fun updateModel() {
+    override fun updateModel() {
         client?.models?.let { models ->
             this@GeminiAgentService.availableModels =
                 models.list(ListModelsConfig.builder().build()).mapNotNull { it.name().getOrNull() }
@@ -195,7 +197,7 @@ class GeminiAgentService @Inject constructor(
     /**
      * 重置当前会话，清空历史记录并重新应用系统提示词。
      */
-    fun resetSession() {
+    override fun resetSession() {
         val currentClient = client
         if (currentClient == null) {
             logger.warn("Cannot reset session: Gemini client is not initialized.")
@@ -245,16 +247,31 @@ class GeminiAgentService @Inject constructor(
      * @param text 消息内容。
      * @return Gemini 的回复文本。
      */
-    suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
+    override suspend fun sendMessage(text: String): String = sendMessage(text, emptyList<MediaData>())
 
     /**
      * 发送包含语音数据的消息并获取回复。
      *
      * @param text 配文或指令内容（可选）。
-     * @param audioParts 包含音频数据的 Part 列表。
+     * @param mediaData 包含媒体数据的列表。
      * @return Gemini 的回复文本。
      */
-    suspend fun sendMessage(
+    override suspend fun sendMessage(
+        text: String?,
+        mediaData: List<MediaData>,
+    ): String {
+        val audioParts = mediaData.map {
+            Part.builder().inlineData(
+                Blob.builder().mimeType(it.mimeType).data(it.data).build()
+            ).build()
+        }
+        return sendMessageWithParts(text, audioParts)
+    }
+
+    /**
+     * 发送包含 Gemini Part 的消息。
+     */
+    private suspend fun sendMessageWithParts(
         text: String?,
         audioParts: List<Part>,
     ): String {

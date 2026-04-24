@@ -3,7 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.service.ai.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope

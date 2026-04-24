@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service.ai
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,7 +26,7 @@ import kotlin.time.Duration.Companion.minutes
 class TaskSchedulerService @Inject constructor(
     parentScope: CoroutineScope,
     private val telegramService: TelegramService,
-    private val geminiAgentService: Provider<GeminiAgentService>
+    private val agentService: Provider<AgentService>
 ) : AutoCloseable {
 
     private val logger = LoggerFactory.getLogger(TaskSchedulerService::class.java)
@@ -104,7 +105,7 @@ class TaskSchedulerService @Inject constructor(
     private suspend fun executeTask(task: ScheduledTask) {
         logger.info("Executing task: ${task.id} - ${task.instruction}")
         try {
-            val result = geminiAgentService.get()
+            val result = agentService.get()
                 .sendMessage("以下是一个定时任务指令：\n${task.instruction}\n\n请直接执行并返回结果。")
             if (result.isNotBlank()) {
                 telegramService.sendMessage(task.agentChatId, "⏰ 定时任务执行结果：\n\n$result")
