@@ -2,7 +2,6 @@ package com.unscientificjszhai.tgp.modules
 
 import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.models.SendMessageRequest
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -10,6 +9,8 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 fun Application.apiModule(appComponent: AppComponent) {
     val settingsRepository = appComponent.settingsRepository
@@ -49,14 +50,43 @@ fun Application.apiModule(appComponent: AppComponent) {
                 call.respond(HttpStatusCode.OK)
             }
             post("/send-message") {
-                val request = call.receive<SendMessageRequest>()
+                val messageField = call.request.queryParameters["messagefield"] ?: "text"
+                val chatIdField = call.request.queryParameters["chatidfield"] ?: "chatId"
+
+                val contentType = call.request.contentType()
+                val (requestChatId, requestText) = when {
+                    contentType.match(ContentType.Application.Json) -> {
+                        val json = call.receive<JsonObject>()
+                        val chatId = json[chatIdField]?.jsonPrimitive?.content
+                        val text = json[messageField]?.jsonPrimitive?.content ?: ""
+                        chatId to text
+                    }
+
+                    contentType.match(ContentType.Application.FormUrlEncoded) -> {
+                        val parameters = call.receiveParameters()
+                        val chatId = parameters[chatIdField]
+                        val text = parameters[messageField] ?: ""
+                        chatId to text
+                    }
+
+                    else -> {
+                        call.respond(HttpStatusCode.UnsupportedMediaType)
+                        return@post
+                    }
+                }
+
+                if (requestText.isBlank()) {
+                    call.respond(HttpStatusCode.BadRequest, "Message text is required")
+                    return@post
+                }
+
                 try {
-                    val chatId = (request.chatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
+                    val chatId = (requestChatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
                     if (chatId.isBlank()) {
                         call.respond(HttpStatusCode.BadRequest, "Chat ID is required")
                         return@post
                     }
-                    val response = telegramService.sendMessage(chatId, request.text)
+                    val response = telegramService.sendMessage(chatId, requestText)
                     call.respond(response.status, response.bodyAsText())
                 } catch (e: Exception) {
                     call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred")

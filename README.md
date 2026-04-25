@@ -73,31 +73,54 @@ java -jar <path-to>/TelegramWebHookProxy-<version>-all.jar
 
 ### 发送消息 (`/api/send-message`)
 
-这是核心接口，用于通过配置好的Bot发送消息到指定的Chat ID。
+这是核心接口，用于通过配置好的Bot发送消息。该接口支持通过查询参数自定义 Body 中的字段名，方便对接不同的 Webhook 来源。
 
 *   **URL:** `/api/send-message`
 *   **Method:** `POST`
-*   **Content-Type:** `application/json`
+*   **Content-Type:** `application/json`, `application/x-www-form-urlencoded`
+
+#### 查询参数 (Query Parameters)
+
+| 参数名 | 默认值      | 描述 |
+| :--- |:---------| :--- |
+| `messagefield` | `text`   | 指定 Body 中表示消息内容的字段名。 |
+| `chatidfield` | `chatId` | 指定 Body 中表示目标 Chat ID 的字段名。 |
 
 #### 请求参数 (Request Body)
 
-| 字段名 | 类型 | 必填 | 描述 |
-| :--- | :--- | :--- | :--- |
-| `chatId` | String | 否 | 目标Telegram会话ID(Chat ID)。如果为空，则会给WebUI中选择的默认聊天发送消息。 |
-| `text` | String | 是 | 要发送的消息内容 |
+Body 中的字段名由上述查询参数决定。
+
+| 默认字段名    | 类型 | 必填 | 描述 |
+|:---------| :--- | :--- | :--- |
+| `chatId` | String | 否 | 目标 Telegram 会话 ID。如果为空，则发送给 Web 管理界面中选择的默认聊天。 |
+| `text`   | String | 是 | 要发送的消息内容。 |
 
 #### 请求示例
 
+**1. 使用默认字段名 (JSON):**
+
 ```bash
-curl -X POST http://localhost:10178/api/send-message \
+curl -X POST "http://localhost:10178/api/send-message" \
   -H "Content-Type: application/json" \
   -d '{
-    "chatId": "123456789",
+    "chatid": "123456789",
     "text": "Hello from TelegramWebHookProxy!"
   }'
+```
+
+**2. 自定义字段名 (表单提交):**
+
+例如，对接某个第三方系统，其发送的消息字段名为 `content`，目标 ID 为 `to`:
+
+```bash
+curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chatidfield=to" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "to=123456789&content=Custom field message"
 ```
 
 #### 响应 (Response)
 
 *   **成功 (200 OK):** 返回 Telegram API 的原始响应 JSON。
-*   **错误 (500 Internal Server Error):** 返回错误描述信息。
+*   **错误 (400 Bad Request):** 消息内容缺失或 Chat ID 未配置。
+*   **错误 (415 Unsupported Media Type):** 不支持的 Content-Type。
+*   **错误 (500 Internal Server Error):** 其他内部错误。
