@@ -48,19 +48,25 @@ class McpFunctionProvider(
             }
         }
 
+    private val json by lazy { Json { ignoreUnknownKeys = true } }
+
     override suspend fun execute(
         functionName: String,
         args: Map<String, Any?>,
-    ): Map<String, Any?> {
+    ): JsonObject {
         val serverName = functionName.substringBefore('_')
         val toolName = functionName.substringAfter('_')
 
         return try {
             val result = mcpClientService.callTool(serverName, toolName, args)
-            mapOf("result" to result)
+            buildJsonObject {
+                put("result", json.encodeToJsonElement(result))
+            }
         } catch (e: Exception) {
             logger.error("Error executing MCP tool $functionName", e)
-            mapOf("error" to (e.message ?: "Unknown error"))
+            buildJsonObject {
+                put("error", (e.message ?: "Unknown error"))
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.di
 
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
@@ -12,13 +13,15 @@ import javax.inject.Singleton
 interface AppComponent {
     val settingsRepository: SettingsRepository
 
-    val skillRepository: com.unscientificjszhai.tgp.repository.SkillRepository
+    val skillRepository: SkillRepository
 
     val telegramService: TelegramService
 
     val messagePoller: MessagePoller
 
     val taskSchedulerService: TaskSchedulerService
+
+    fun agentComponentFactory(): AgentComponent.Factory
 
     @Component.Factory
     interface Factory {

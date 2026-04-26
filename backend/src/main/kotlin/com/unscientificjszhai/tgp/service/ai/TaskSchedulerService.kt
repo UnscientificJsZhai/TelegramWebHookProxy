@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -12,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -33,10 +35,6 @@ class TaskSchedulerService @Inject constructor(
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job.Key])
 
     private val scheduleFile = File("config/schedule.json")
-    private val json = Json {
-        prettyPrint = true
-        ignoreUnknownKeys = true
-    }
 
     private val tasks = mutableListOf<ScheduledTask>()
     private var job: Job? = null
@@ -53,7 +51,7 @@ class TaskSchedulerService @Inject constructor(
         if (scheduleFile.exists()) {
             try {
                 val content = scheduleFile.readText()
-                val loadedTasks = json.decodeFromString<List<ScheduledTask>>(content)
+                val loadedTasks = ConfigJson.decodeFromString<List<ScheduledTask>>(content)
                 synchronized(tasks) {
                     tasks.clear()
                     tasks.addAll(loadedTasks)
@@ -68,7 +66,7 @@ class TaskSchedulerService @Inject constructor(
     private fun saveTasks() {
         try {
             val content = synchronized(tasks) {
-                json.encodeToString(tasks.toList())
+                ConfigJson.encodeToString(tasks.toList())
             }
             scheduleFile.writeText(content)
         } catch (e: Exception) {

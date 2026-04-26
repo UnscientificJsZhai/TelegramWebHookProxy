@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -17,11 +18,6 @@ constructor() {
     private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
 
     private val configFile = File("config/settings.json")
-    private val json =
-        Json {
-            prettyPrint = true
-            ignoreUnknownKeys = true
-        }
 
     private val _settingsFlow = MutableStateFlow(loadSettings())
     val settingsFlow: StateFlow<AppSettings> = _settingsFlow.asStateFlow()
@@ -36,7 +32,7 @@ constructor() {
         if (configFile.exists()) {
             val content = configFile.readText()
             try {
-                json.decodeFromString(content)
+                ConfigJson.decodeFromString(content)
             } catch (e: Exception) {
                 fixMissingProxyType(content) ?: run {
                     logger.error("Error while loading config file", e)
@@ -48,13 +44,13 @@ constructor() {
         }
 
     fun saveSettings(settings: AppSettings) {
-        val content = json.encodeToString(settings)
+        val content = ConfigJson.encodeToString(settings)
         configFile.writeText(content)
         _settingsFlow.value = settings
     }
 
     private fun fixMissingProxyType(content: String): AppSettings? {
-        val rawElement = json.parseToJsonElement(content)
+        val rawElement = ConfigJson.parseToJsonElement(content)
         val settings = rawElement as? JsonObject ?: return null
         val proxy = settings["proxy"] as? JsonObject ?: return null
         if (proxy.containsKey("host") && proxy.containsKey("port") && !proxy.containsKey("type")) {
@@ -74,8 +70,8 @@ constructor() {
                     }
                 }
 
-            return json.decodeFromJsonElement<AppSettings>(newSettings).also {
-                configFile.writeText(json.encodeToString(it))
+            return ConfigJson.decodeFromJsonElement<AppSettings>(newSettings).also {
+                configFile.writeText(ConfigJson.encodeToString(it))
             }
         } else {
             return null

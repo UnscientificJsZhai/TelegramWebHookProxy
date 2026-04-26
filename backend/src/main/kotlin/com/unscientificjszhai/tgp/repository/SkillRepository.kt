@@ -3,11 +3,13 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.PageResult
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.models.SkillBrief
+import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeToSequence
 import org.slf4j.LoggerFactory
@@ -21,10 +23,6 @@ import javax.inject.Singleton
 class SkillRepository @Inject constructor() {
     private val logger = LoggerFactory.getLogger(SkillRepository::class.java)
     private val configFile = File("config/skills.json")
-    private val json = Json {
-        prettyPrint = true
-        ignoreUnknownKeys = true
-    }
 
     private val _skillsUpdateEvent = MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,
@@ -50,7 +48,7 @@ class SkillRepository @Inject constructor() {
                 val startIndex = (page - 1) * size
                 val endIndex = startIndex + size
 
-                json.decodeToSequence<Skill>(inputStream).forEachIndexed { index, skill ->
+                ConfigJson.decodeToSequence<Skill>(inputStream).forEachIndexed { index, skill ->
                     total++
                     if (index in startIndex..<endIndex) {
                         items.add(skill)
@@ -71,7 +69,7 @@ class SkillRepository @Inject constructor() {
         }
         return try {
             configFile.inputStream().use { inputStream ->
-                json.decodeToSequence<SkillBrief>(inputStream).toList()
+                ConfigJson.decodeToSequence<SkillBrief>(inputStream).toList()
             }
         } catch (e: Exception) {
             logger.error("Error loading skills.json for getSkillSummaries", e)
@@ -83,7 +81,7 @@ class SkillRepository @Inject constructor() {
     fun getSkillById(id: String): Skill? {
         return try {
             configFile.inputStream().use { inputStream ->
-                json.decodeToSequence<Skill>(inputStream).find { it.id == id }
+                ConfigJson.decodeToSequence<Skill>(inputStream).find { it.id == id }
             }
         } catch (e: Exception) {
             logger.error("Error loading skills.json while finding skill id $id", e)
@@ -95,7 +93,7 @@ class SkillRepository @Inject constructor() {
     fun saveSkill(skill: Skill) {
         if (!configFile.exists() || configFile.length() == 0L) {
             configFile.parentFile.mkdirs()
-            configFile.writeText("[\n${json.encodeToString(skill)}\n]")
+            configFile.writeText("[\n${ConfigJson.encodeToString(skill)}\n]")
             _skillsUpdateEvent.tryEmit(Unit)
             return
         }
@@ -103,7 +101,7 @@ class SkillRepository @Inject constructor() {
         try {
             configFile.inputStream().use { inputStream ->
                 tmpFile.outputStream().bufferedWriter().use { writer ->
-                    val elements = json.decodeToSequence<Skill>(inputStream)
+                    val elements = ConfigJson.decodeToSequence<Skill>(inputStream)
 
                     writer.write("[\n")
                     var isFirst = true
@@ -113,17 +111,17 @@ class SkillRepository @Inject constructor() {
                         if (!isFirst) writer.write(",\n")
 
                         if (element.id == skill.id) {
-                            writer.write(json.encodeToString(skill))
+                            writer.write(ConfigJson.encodeToString(skill))
                             alreadyUpdated = true
                         } else {
-                            writer.write(json.encodeToString(element))
+                            writer.write(ConfigJson.encodeToString(element))
                         }
                         isFirst = false
                     }
 
                     if (!alreadyUpdated) {
                         if (!isFirst) writer.write(",\n")
-                        writer.write(json.encodeToString(skill))
+                        writer.write(ConfigJson.encodeToString(skill))
                     }
 
                     writer.write("\n]")
@@ -151,13 +149,13 @@ class SkillRepository @Inject constructor() {
         try {
             configFile.inputStream().use { inputStream ->
                 tmpFile.outputStream().bufferedWriter().use { writer ->
-                    val elements = json.decodeToSequence<Skill>(inputStream)
+                    val elements = ConfigJson.decodeToSequence<Skill>(inputStream)
                     writer.write("[\n")
                     var isFirst = true
                     elements.forEach { element ->
                         if (element.id != id) {
                             if (!isFirst) writer.write(",\n")
-                            writer.write(json.encodeToString(element))
+                            writer.write(ConfigJson.encodeToString(element))
                             isFirst = false
                         }
                     }

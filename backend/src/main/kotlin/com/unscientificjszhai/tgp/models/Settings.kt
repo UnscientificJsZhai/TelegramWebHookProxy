@@ -12,12 +12,21 @@ data class AppSettings(
 
 @Serializable
 data class AISettings(
+    val provider: AIProvider = AIProvider.GEMINI,
     val geminiApiKey: String = "",
+    val openAiApiKey: String = "",
+    val openAiBaseUrl: String = "",
     val agentEnabled: Boolean = false,
     val agentChatId: String = "",
     val globalContext: String = "",
     val mcpServers: List<MCPServerConfig> = emptyList(),
 )
+
+@Serializable
+enum class AIProvider {
+    GEMINI,
+    OPENAI
+}
 
 @Serializable
 data class MCPServerConfig(

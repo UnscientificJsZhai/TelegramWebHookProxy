@@ -1,7 +1,10 @@
 package com.unscientificjszhai.tgp.models
 
-import kotlinx.serialization.json.Json
+import com.unscientificjszhai.tgp.utils.ConfigJson
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class SettingsTest {
@@ -26,10 +29,28 @@ class SettingsTest {
             )
         )
 
-        val jsonString = Json.encodeToString(appSettings)
-        assertTrue(jsonString.contains("\"ai\":"))
-        assertTrue(jsonString.contains("\"geminiApiKey\":\"test_key\""))
-        assertTrue(jsonString.contains("\"mcpServers\":"))
-        assertTrue(jsonString.contains("\"name\":\"server1\""))
+        val jsonString = ConfigJson.encodeToString(appSettings)
+        val jsonElement = ConfigJson.parseToJsonElement(jsonString).jsonObject
+        
+        assertTrue(jsonElement.containsKey("ai"))
+        val aiElement = jsonElement["ai"]?.jsonObject
+        assertNotNull(aiElement)
+        assertTrue(aiElement.containsKey("provider"))
+        assertTrue(aiElement.containsKey("geminiApiKey"))
+        assertTrue(aiElement.containsKey("openAiApiKey"))
+        assertTrue(aiElement.containsKey("openAiBaseUrl"))
+        assertTrue(aiElement.containsKey("mcpServers"))
+    }
+
+    @Test
+    fun testAISettingsDefaultValuesInSerialization() {
+        val aiSettings = AISettings()
+        val jsonString = ConfigJson.encodeToString(aiSettings)
+        val jsonElement = ConfigJson.parseToJsonElement(jsonString).jsonObject
+
+        // 验证即使是默认值，也会被序列化出来
+        assertTrue(jsonElement.containsKey("provider"), "Provider field should be present even if default")
+        assertTrue(jsonElement.containsKey("openAiApiKey"), "openAiApiKey field should be present even if default")
+        assertTrue(jsonElement.containsKey("openAiBaseUrl"), "openAiBaseUrl field should be present even if default")
     }
 }

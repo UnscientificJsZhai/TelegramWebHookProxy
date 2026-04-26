@@ -8,6 +8,7 @@ import io.ktor.client.plugins.sse.*
 import io.ktor.client.request.*
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.*
@@ -100,7 +101,7 @@ class MCPClientService @Inject constructor(parentScope: CoroutineScope) {
         serverName: String,
         toolName: String,
         args: Map<String, Any?>,
-    ): Any {
+    ): CallToolResult {
         val client = clients[serverName] ?: throw IllegalStateException("MCP server $serverName not connected")
         val result = client.callTool(toolName, args)
         return result

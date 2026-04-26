@@ -1,4 +1,5 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import com.github.jk1.license.LicenseReportExtension
 import com.github.jk1.license.render.TextReportRenderer
 
 evaluationDependsOn(":webui")
@@ -12,9 +13,9 @@ plugins {
     application
 }
 
-version = "1.1.0"
+version = "1.1.1"
 
-val ktorVersion = "3.4.2"
+val ktorVersion = "3.4.3"
 val daggerVersion = "2.59.2"
 
 kotlin {
@@ -45,6 +46,9 @@ dependencies {
     // Gemini SDK
     implementation("com.google.genai:google-genai:1.51.0")
 
+    // OpenAI SDK
+    implementation("com.openai:openai-java:4.32.0")
+
     // MCP SDK
     implementation("io.modelcontextprotocol:kotlin-sdk:0.10.0")
 
@@ -62,7 +66,7 @@ application {
     mainClass.set("com.unscientificjszhai.tgp.ApplicationKt")
 }
 
-configure<com.github.jk1.license.LicenseReportExtension> {
+configure<LicenseReportExtension> {
     renderers = arrayOf(TextReportRenderer("backend-licenses.txt"))
 }
 

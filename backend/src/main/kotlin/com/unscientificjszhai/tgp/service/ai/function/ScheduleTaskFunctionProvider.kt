@@ -6,10 +6,7 @@ import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import javax.inject.Provider
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
+import kotlinx.serialization.json.*
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -76,61 +73,70 @@ class ScheduleTaskFunctionProvider(
         )
     }
 
-    override suspend fun execute(functionName: String, args: Map<String, Any?>): Map<String, Any?> =
+    override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject =
         when (functionName) {
             "create_scheduled_task" -> createScheduledTask(args)
             "list_scheduled_tasks" -> listScheduledTasks()
             "cancel_scheduled_task" -> cancelScheduledTask(args)
-            else -> mapOf("error" to "Unsupported function: $functionName")
+            else -> buildJsonObject { put("error", "Unsupported function: $functionName") }
         }
 
-    private fun createScheduledTask(args: Map<String, Any?>): Map<String, Any?> {
-        val instruction = args["instruction"] as? String ?: return mapOf("error" to "Missing instruction")
-        val executionTimeStr = args["executionTime"] as? String ?: return mapOf("error" to "Missing executionTime")
+    private fun createScheduledTask(args: Map<String, Any?>): JsonObject {
+        val instruction = args["instruction"] as? String ?: return buildJsonObject { put("error", "Missing instruction") }
+        val executionTimeStr = args["executionTime"] as? String ?: return buildJsonObject { put("error", "Missing executionTime") }
         val loopModeStr = (args["loopMode"] as? String)?.uppercase() ?: "ONCE"
 
         val loopMode = try {
             LoopMode.valueOf(loopModeStr)
         } catch (_: Exception) {
-            return mapOf("error" to "Invalid loopMode: $loopModeStr")
+            return buildJsonObject { put("error", "Invalid loopMode: $loopModeStr") }
         }
 
         val executionTime = try {
             parseExecutionTime(executionTimeStr)
         } catch (_: Exception) {
-            return mapOf("error" to "Invalid executionTime format: $executionTimeStr. Expected 'yyyy-MM-dd HH:mm:ss' or relative time like '+1h'.")
+            return buildJsonObject { put("error", "Invalid executionTime format: $executionTimeStr. Expected 'yyyy-MM-dd HH:mm:ss' or relative time like '+1h'.") }
         }
 
         val agentChatId = settingsRepository.settingsFlow.value.ai?.agentChatId
-            ?: return mapOf("error" to "Agent Chat ID is not configured. Please set it in settings first.")
+            ?: return buildJsonObject { put("error", "Agent Chat ID is not configured. Please set it in settings first.") }
 
         val taskId = taskSchedulerService.get().createTask(instruction, executionTime, loopMode, agentChatId)
-        return mapOf(
-            "status" to "success",
-            "taskId" to taskId,
-            "message" to "Task created successfully. Next execution at: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date(executionTime))}"
-        )
-    }
-
-    private fun listScheduledTasks(): Map<String, Any?> {
-        val tasks = taskSchedulerService.get().listTasks().map {
-            mapOf(
-                "id" to it.id,
-                "instruction" to it.instruction,
-                "executionTime" to SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date(it.executionTime)),
-                "loopMode" to it.loopMode.name
-            )
+        return buildJsonObject {
+            put("status", "success")
+            put("taskId", taskId)
+            put("message", "Task created successfully. Next execution at: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date(executionTime))}")
         }
-        return mapOf("tasks" to tasks)
     }
 
-    private fun cancelScheduledTask(args: Map<String, Any?>): Map<String, Any?> {
-        val taskId = args["taskId"] as? String ?: return mapOf("error" to "Missing taskId")
+    private fun listScheduledTasks(): JsonObject {
+        val tasks = taskSchedulerService.get().listTasks().map {
+            buildJsonObject {
+                put("id", it.id)
+                put("instruction", it.instruction)
+                put("executionTime", SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date(it.executionTime)))
+                put("loopMode", it.loopMode.name)
+            }
+        }
+        return buildJsonObject {
+            put("tasks", buildJsonArray {
+                tasks.forEach { add(it) }
+            })
+        }
+    }
+
+    private fun cancelScheduledTask(args: Map<String, Any?>): JsonObject {
+        val taskId = args["taskId"] as? String ?: return buildJsonObject { put("error", "Missing taskId") }
         val success = taskSchedulerService.get().cancelTask(taskId)
         return if (success) {
-            mapOf("status" to "success", "message" to "Task $taskId cancelled.")
+            buildJsonObject {
+                put("status", "success")
+                put("message", "Task $taskId cancelled.")
+            }
         } else {
-            mapOf("error" to "Task $taskId not found.")
+            buildJsonObject {
+                put("error", "Task $taskId not found.")
+            }
         }
     }
 

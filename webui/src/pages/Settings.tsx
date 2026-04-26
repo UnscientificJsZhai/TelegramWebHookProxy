@@ -40,7 +40,10 @@ interface MCPServerConfig {
 }
 
 interface AISettings {
+    provider: 'GEMINI' | 'OPENAI';
     geminiApiKey: string;
+    openAiApiKey: string;
+    openAiBaseUrl: string;
     agentEnabled: boolean;
     agentChatId: string;
     globalContext: string;
@@ -55,7 +58,10 @@ interface AppSettings {
 }
 
 const defaultAiSettings: AISettings = {
+    provider: 'GEMINI',
     geminiApiKey: '',
+    openAiApiKey: '',
+    openAiBaseUrl: '',
     agentEnabled: false,
     agentChatId: '',
     globalContext: '',
@@ -163,6 +169,22 @@ const Settings: React.FC = () => {
                 proxy: {
                     ...prev.proxy,
                     type: value
+                }
+            };
+        });
+    };
+
+    const handleAiProviderChange = (event: SelectChangeEvent) => {
+        if (!settings) return;
+        const { value } = event.target;
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    provider: value as 'GEMINI' | 'OPENAI'
                 }
             };
         });
@@ -358,16 +380,58 @@ const Settings: React.FC = () => {
                 {ai.agentEnabled && (
                     <>
                         <Grid size={{xs: 12}}>
-                            <TextField
-                                fullWidth
-                                label="Gemini API Key"
-                                name="ai.geminiApiKey"
-                                type="password"
-                                value={ai.geminiApiKey}
-                                onChange={handleChange}
-                                variant="outlined"
-                            />
+                            <FormControl fullWidth variant="outlined">
+                                <InputLabel>AI 提供商</InputLabel>
+                                <Select
+                                    value={ai.provider || 'GEMINI'}
+                                    onChange={handleAiProviderChange}
+                                    label="AI 提供商"
+                                >
+                                    <MenuItem value={'GEMINI'}>Gemini</MenuItem>
+                                    <MenuItem value={'OPENAI'}>OpenAI (兼容 API)</MenuItem>
+                                </Select>
+                            </FormControl>
                         </Grid>
+
+                        {(!ai.provider || ai.provider === 'GEMINI') ? (
+                            <Grid size={{xs: 12}}>
+                                <TextField
+                                    fullWidth
+                                    label="Gemini API Key"
+                                    name="ai.geminiApiKey"
+                                    type="password"
+                                    value={ai.geminiApiKey}
+                                    onChange={handleChange}
+                                    variant="outlined"
+                                />
+                            </Grid>
+                        ) : (
+                            <>
+                                <Grid size={{xs: 12}}>
+                                    <TextField
+                                        fullWidth
+                                        label="OpenAI API Key"
+                                        name="ai.openAiApiKey"
+                                        type="password"
+                                        value={ai.openAiApiKey}
+                                        onChange={handleChange}
+                                        variant="outlined"
+                                    />
+                                </Grid>
+                                <Grid size={{xs: 12}}>
+                                    <TextField
+                                        fullWidth
+                                        label="OpenAI Base URL (可选)"
+                                        name="ai.openAiBaseUrl"
+                                        value={ai.openAiBaseUrl}
+                                        onChange={handleChange}
+                                        variant="outlined"
+                                        placeholder="https://api.openai.com/v1"
+                                        helperText="留空则使用默认地址。可用于配置国内代理或中转接口。"
+                                    />
+                                </Grid>
+                            </>
+                        )}
                         
                         <Grid size={{xs: 12}}>
                             <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>

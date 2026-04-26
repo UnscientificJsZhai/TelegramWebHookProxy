@@ -3,29 +3,27 @@ package com.unscientificjszhai.tgp.service.ai.agent
 import com.google.genai.Chat
 import com.google.genai.Client
 import com.google.genai.types.*
-import com.unscientificjszhai.tgp.models.*
+import com.unscientificjszhai.tgp.di.AgentScope
+import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.MediaData
+import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
-import javax.inject.Provider
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
-import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.plus
 import org.slf4j.LoggerFactory
 import javax.inject.Inject
-import javax.inject.Singleton
+import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
 import com.google.genai.types.ProxyType as GeminiProxyType
 
-@Singleton
+@AgentScope
 class GeminiAgentService @Inject constructor(
     parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
@@ -43,14 +41,11 @@ class GeminiAgentService @Inject constructor(
         SkillFunctionProvider(skillRepository),
     )
     private var client: Client? = null
-    var chat: Chat? = null
+    private var chat: Chat? = null
 
-    private var currentApiKey: String? = null
-    private var currentProxy: ProxySettings? = null
-    private var currentGlobalContext: String? = null
-    private var currentMcpServers: List<MCPServerConfig>? = null
-    private var currentSkills: List<SkillBrief>? = null
     private var savedHistory: List<Content>? = null
+
+    private var resetSessionJob: Job? = null
 
     /**
      * 当前会话使用的模型。
@@ -66,93 +61,40 @@ class GeminiAgentService @Inject constructor(
         "models/gemini-2.5-flash",
     )
 
-    override fun isAiFeatureEnabled(aiSettings: AISettings) = aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
+    override fun isAiFeatureEnabled(aiSettings: AISettings) =
+        aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
 
     init {
-        combine(
-            settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) },
-            skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
-        ) { settings, _ -> settings to skillRepository.getSkillSummaries() }.onEach { (settings, skills) ->
-            val aiSettings = settings.ai
-            val proxySettings = settings.proxy
+        val settings = settingsRepository.settingsFlow.value
+        val aiSettings = settings.ai
+        val proxySettings = settings.proxy
 
-            if (aiSettings != null && isAiFeatureEnabled(aiSettings)) {
-                val needsClientRestart =
-                    client == null || currentApiKey != aiSettings.geminiApiKey || currentProxy != proxySettings
-
-                if (needsClientRestart) {
-                    captureHistory()
-                    client?.close()
-                    try {
-                        val clientOptionsBuilder = ClientOptions.builder()
-                        if (proxySettings != null) {
-                            val geminiProxyType = when (proxySettings.type) {
-                                ProxyType.HTTP -> GeminiProxyType(GeminiProxyType.Known.HTTP)
-                                ProxyType.SOCKS -> GeminiProxyType(GeminiProxyType.Known.SOCKS)
-                            }
-                            clientOptionsBuilder.proxyOptions(
-                                ProxyOptions.builder().type(geminiProxyType).host(proxySettings.host)
-                                    .port(proxySettings.port).apply { proxySettings.username?.let { username(it) } }
-                                    .apply { proxySettings.password?.let { password(it) } }.build(),
-                            )
-                        }
-
-                        client = Client.builder().apiKey(aiSettings.geminiApiKey)
-                            .clientOptions(clientOptionsBuilder.build()).build()
-
-                        currentApiKey = aiSettings.geminiApiKey
-                        currentProxy = proxySettings
-
-                        mcpClientService.connect(aiSettings.mcpServers)
-                        currentMcpServers = aiSettings.mcpServers
-
-                        resetSession()
-                        currentGlobalContext = aiSettings.globalContext
-                        currentSkills = skills
-                        logger.info("Gemini client initialized.")
-                    } catch (e: Exception) {
-                        logger.error("Failed to initialize Gemini client", e)
-                        client = null
-                        chat = null
+        if (aiSettings != null && isAiFeatureEnabled(aiSettings)) {
+            try {
+                val clientOptionsBuilder = ClientOptions.builder()
+                if (proxySettings != null) {
+                    val geminiProxyType = when (proxySettings.type) {
+                        ProxyType.HTTP -> GeminiProxyType(GeminiProxyType.Known.HTTP)
+                        ProxyType.SOCKS -> GeminiProxyType(GeminiProxyType.Known.SOCKS)
                     }
-                } else {
-                    // Check if only session needs reset
-                    val needsSessionReset =
-                        currentGlobalContext != aiSettings.globalContext || currentMcpServers != aiSettings.mcpServers || currentSkills != skills || chat == null
+                    clientOptionsBuilder.proxyOptions(
+                        ProxyOptions.builder().type(geminiProxyType).host(proxySettings.host).port(proxySettings.port)
+                            .apply { proxySettings.username?.let { username(it) } }
+                            .apply { proxySettings.password?.let { password(it) } }.build(),
+                    )
+                }
 
-                    if (needsSessionReset) {
-                        captureHistory()
-                        try {
-                            if (currentMcpServers != aiSettings.mcpServers) {
-                                mcpClientService.connect(aiSettings.mcpServers)
-                                currentMcpServers = aiSettings.mcpServers
-                            }
-                            resetSession()
-                            currentGlobalContext = aiSettings.globalContext
-                            currentSkills = skills
-                        } catch (e: Exception) {
-                            logger.error("Failed to reset session", e)
-                        }
-                    }
-                }
-            } else {
-                if (client != null) {
-                    captureHistory()
-                    client?.close()
-                    client = null
-                    chat = null
-                    currentApiKey = null
-                    currentProxy = null
-                    currentGlobalContext = null
-                    currentMcpServers = null
-                    mcpClientService.disconnectAll()
-                    logger.info("Gemini client closed.")
-                }
-                if (aiSettings?.agentEnabled == false) {
-                    savedHistory = null
-                }
+                client =
+                    Client.builder().apiKey(aiSettings.geminiApiKey).clientOptions(clientOptionsBuilder.build()).build()
+
+                this.resetSessionJob = resetSession()
+                logger.info("Gemini client initialized.")
+            } catch (e: Exception) {
+                logger.error("Failed to initialize Gemini client", e)
+                client = null
+                chat = null
             }
-        }.launchIn(scope)
+        }
     }
 
     /**
@@ -176,15 +118,16 @@ class GeminiAgentService @Inject constructor(
      *
      * @param modelName 模型名称。
      */
-    override fun switchModel(modelName: String) {
+    override fun switchModel(modelName: String): Job? {
         if (modelName !in availableModels && modelName != "gemini-2.5-flash") {
             throw IllegalArgumentException("Unsupported model: $modelName")
         }
         if (currentModel != modelName) {
             captureHistory()
             currentModel = modelName
-            resetSession()
+            return resetSession()
         }
+        return null
     }
 
     override fun updateModel() {
@@ -197,47 +140,48 @@ class GeminiAgentService @Inject constructor(
     /**
      * 重置当前会话，清空历史记录并重新应用系统提示词。
      */
-    override fun resetSession() {
+    override fun resetSession(): Job? {
         val currentClient = client
         if (currentClient == null) {
             logger.warn("Cannot reset session: Gemini client is not initialized.")
-            return
+            return null
         }
 
-        val aiSettings = settingsRepository.settingsFlow.value.ai
-
-        val configBuilder = GenerateContentConfig.builder()
-        val skills = skillRepository.getSkillSummaries()
-        val skillPrompt = if (skills.isNotEmpty()) {
-            "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" + skills.joinToString("\n") { "- ID: ${it.id}, Description: ${it.description}" } + "\n\n"
-        } else {
-            ""
-        }
-
-        val systemInstruction = if(aiSettings != null && aiSettings.globalContext.isNotBlank()) {
-            Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
-        } else {
-            Content.fromParts(Part.fromText(skillPrompt))
-        }
-        configBuilder.systemInstruction(systemInstruction)
-
+        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
         val functionDeclarations = mutableListOf<FunctionDeclaration>()
+        return scope.launch {
+            mcpClientService.connect(aiSettings.mcpServers)
+            localFunctionProviders.forEach { provider ->
+                functionDeclarations.addAll(provider.providedFunctions)
+            }
+            val configBuilder = GenerateContentConfig.builder()
+            val skills = skillRepository.getSkillSummaries()
+            val skillPrompt = if (skills.isNotEmpty()) {
+                "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" + skills.joinToString(
+                    "\n"
+                ) { "- ID: ${it.id}, Description: ${it.description}" } + "\n\n"
+            } else {
+                ""
+            }
 
-        // Add Local Functions
-        localFunctionProviders.forEach { provider ->
-            functionDeclarations.addAll(provider.providedFunctions)
-        }
+            val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
+                Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
+            } else {
+                Content.fromParts(Part.fromText(skillPrompt))
+            }
+            configBuilder.systemInstruction(systemInstruction)
 
-        if (functionDeclarations.isNotEmpty()) {
-            configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
-        }
+            if (functionDeclarations.isNotEmpty()) {
+                configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
+            }
 
-        try {
-            chat = currentClient.chats.create(currentModel, configBuilder.build())
-            logger.info("Gemini session reset with model: $currentModel")
-        } catch (e: Exception) {
-            logger.error("Failed to create Gemini chat session", e)
-            chat = null
+            try {
+                chat = currentClient.chats.create(currentModel, configBuilder.build())
+                logger.info("Gemini session reset with model: $currentModel")
+            } catch (e: Exception) {
+                logger.error("Failed to create Gemini chat session", e)
+                chat = null
+            }
         }
     }
 
@@ -247,7 +191,7 @@ class GeminiAgentService @Inject constructor(
      * @param text 消息内容。
      * @return Gemini 的回复文本。
      */
-    override suspend fun sendMessage(text: String): String = sendMessage(text, emptyList<MediaData>())
+    override suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
 
     /**
      * 发送包含语音数据的消息并获取回复。
@@ -275,7 +219,10 @@ class GeminiAgentService @Inject constructor(
         text: String?,
         audioParts: List<Part>,
     ): String {
-        val currentChat = chat ?: throw IllegalStateException("Gemini chat session is not initialized.")
+        val currentChat = chat ?: resetSessionJob?.run {
+            join()
+            chat
+        } ?: throw IllegalStateException("Gemini chat session is not initialized.")
         try {
             val parts = mutableListOf<Part>()
             text?.let { parts.add(Part.fromText(it)) }
@@ -318,7 +265,7 @@ class GeminiAgentService @Inject constructor(
                 val localProvider = localFunctionProviders.find { it.canHandle(fullName) }
                 if (localProvider != null) {
                     val result = localProvider.execute(fullName, argsMap)
-                    functionResponses.add(Part.fromFunctionResponse(fullName, result))
+                    functionResponses.add(Part.fromFunctionResponse(fullName, result.toMap()))
                     continue
                 }
             }
@@ -330,5 +277,13 @@ class GeminiAgentService @Inject constructor(
         } else {
             return response.text() ?: ""
         }
+    }
+
+    override fun close() {
+        client?.close()
+        client = null
+        chat = null
+        mcpClientService.disconnectAll()
+        logger.info("Gemini client closed.")
     }
 }

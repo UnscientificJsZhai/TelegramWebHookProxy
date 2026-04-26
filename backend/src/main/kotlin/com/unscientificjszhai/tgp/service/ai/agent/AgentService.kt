@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.MediaData
+import kotlinx.coroutines.Job
 
 /**
  * AI 代理服务基类，抽象了 AI 对话的核心逻辑。
@@ -27,7 +28,7 @@ abstract class AgentService {
      *
      * @param modelName 模型名称。
      */
-    abstract fun switchModel(modelName: String)
+    abstract fun switchModel(modelName: String): Job?
 
     /**
      * 更新可用模型列表。
@@ -37,7 +38,7 @@ abstract class AgentService {
     /**
      * 重置当前会话，清空历史记录并重新应用系统提示词。
      */
-    abstract fun resetSession()
+    abstract fun resetSession(): Job?
 
     /**
      * 发送文本消息并获取回复。
@@ -55,4 +56,9 @@ abstract class AgentService {
      * @return AI 的回复文本。
      */
     abstract suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String
+
+    /**
+     * 关闭服务，释放资源。
+     */
+    open fun close() {}
 }

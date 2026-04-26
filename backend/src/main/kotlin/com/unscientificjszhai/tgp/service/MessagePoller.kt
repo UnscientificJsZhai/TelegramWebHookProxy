@@ -126,7 +126,7 @@ class MessagePoller @Inject constructor(
         val chatId = message.chat.id.toString()
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return
 
-        if (!aiSettings.agentEnabled || aiSettings.geminiApiKey.isBlank()) return
+        if (!aiSettings.agentEnabled) return //todo AI服务启动条件
 
         if (chatId == aiSettings.agentChatId) {
             if (text != null && text.startsWith("/")) {
@@ -218,7 +218,7 @@ class MessagePoller @Inject constructor(
 
         when (command) {
             "/reset" -> {
-                agentService.resetSession()
+                agentService.resetSession()?.join()
                 telegramService.sendMessage(chatId, "会话已重置", ReplyParameters(messageId))
                 logger.info("Session reset by command in chat $chatId")
             }
@@ -227,7 +227,7 @@ class MessagePoller @Inject constructor(
                 if (parts.size > 1) {
                     val requestedModel = parts[1].trim()
                     try {
-                        agentService.switchModel(requestedModel)
+                        agentService.switchModel(requestedModel)?.join()
                         telegramService.sendMessage(
                             chatId,
                             "已切换模型并重置会话：$requestedModel",

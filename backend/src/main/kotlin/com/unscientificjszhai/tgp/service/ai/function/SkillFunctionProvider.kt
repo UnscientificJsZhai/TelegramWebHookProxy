@@ -4,10 +4,7 @@ import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
+import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
 class SkillFunctionProvider(
@@ -64,24 +61,30 @@ class SkillFunctionProvider(
         )
     }
 
-    override suspend fun execute(functionName: String, args: Map<String, Any?>): Map<String, Any?> {
+    override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
         logger.debug("Processing function {} {}", functionName, args)
 
         return when (functionName) {
             "read_skill" -> {
-                val id = args["id"] as? String ?: return mapOf("error" to "Missing or invalid id")
+                val id = args["id"] as? String ?: return buildJsonObject { put("error", "Missing or invalid id") }
                 val skill = skillRepository.getSkillById(id)
                 if (skill != null) {
-                    mapOf("id" to skill.id, "description" to skill.description, "content" to skill.content)
+                    buildJsonObject {
+                        put("id", skill.id)
+                        put("description", skill.description)
+                        put("content", skill.content)
+                    }
                 } else {
-                    mapOf("error" to "Skill with ID $id not found.")
+                    buildJsonObject {
+                        put("error", "Skill with ID $id not found.")
+                    }
                 }
             }
 
             "write_skill" -> {
                 val id = args["id"] as? String
-                val description = args["description"] as? String ?: return mapOf("error" to "Missing description")
-                val content = args["content"] as? String ?: return mapOf("error" to "Missing content")
+                val description = args["description"] as? String ?: return buildJsonObject { put("error", "Missing description") }
+                val content = args["content"] as? String ?: return buildJsonObject { put("error", "Missing content") }
 
                 val skill = if (id != null) {
                     Skill(id = id, description = description, content = content)
@@ -90,10 +93,14 @@ class SkillFunctionProvider(
                 }
 
                 skillRepository.saveSkill(skill)
-                mapOf("status" to "success", "id" to skill.id, "message" to "Skill saved successfully.")
+                buildJsonObject {
+                    put("status", "success")
+                    put("id", skill.id)
+                    put("message", "Skill saved successfully.")
+                }
             }
 
-            else -> mapOf("error" to "Unsupported function: $functionName")
+            else -> buildJsonObject { put("error", "Unsupported function: $functionName") }
         }
     }
 }

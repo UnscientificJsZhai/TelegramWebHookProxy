@@ -8,10 +8,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
+import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
 /**
@@ -80,13 +77,13 @@ class HttpCallingFunctionProvider : LocalFunctionProvider() {
     override suspend fun execute(
         functionName: String,
         args: Map<String, Any?>,
-    ): Map<String, Any?> =
+    ): JsonObject =
         when (functionName) {
             "call_http_api" -> callHttpApi(args)
-            else -> mapOf("error" to "Unsupported function: $functionName")
+            else -> buildJsonObject { put("error", "Unsupported function: $functionName") }
         }
 
-    private suspend fun callHttpApi(args: Map<String, Any?>): Map<String, Any?> =
+    private suspend fun callHttpApi(args: Map<String, Any?>): JsonObject =
         try {
             val url = args["url"] as? String ?: throw IllegalArgumentException("Missing URL")
             val method = (args["method"] as? String) ?: "GET"
@@ -110,12 +107,14 @@ class HttpCallingFunctionProvider : LocalFunctionProvider() {
                     }
                 }
 
-            mapOf(
-                "status" to response.status.value,
-                "body" to response.bodyAsText(),
-            )
+            buildJsonObject {
+                put("status", response.status.value)
+                put("body", response.bodyAsText())
+            }
         } catch (e: Exception) {
             logger.error("Error calling HTTP API", e)
-            mapOf("error" to (e.message ?: "Unknown error"))
+            buildJsonObject {
+                put("error", (e.message ?: "Unknown error"))
+            }
         }
 }

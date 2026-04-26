@@ -1,9 +1,11 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.ChatInfo
+import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -26,7 +28,6 @@ constructor(
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
 
     private val configFile = File("config/updates.json")
-    private val json = Json { prettyPrint = true }
 
     private val _dataFlow = MutableStateFlow(loadData())
     val chatsFlow: StateFlow<List<ChatInfo>> =
@@ -54,12 +55,12 @@ constructor(
         }
 
         return try {
-            json.decodeFromString<UpdatesData>(content)
+            ConfigJson.decodeFromString<UpdatesData>(content)
         } catch (e: Exception) {
             try {
-                val chats = json.decodeFromString<List<ChatInfo>>(content)
+                val chats = ConfigJson.decodeFromString<List<ChatInfo>>(content)
                 val migratedData = UpdatesData(chats = chats, lastUpdateId = 0)
-                configFile.writeText(json.encodeToString(migratedData))
+                configFile.writeText(ConfigJson.encodeToString(migratedData))
                 logger.info("Successfully migrated updates data from old format")
                 migratedData
             } catch (_: Exception) {
@@ -70,7 +71,7 @@ constructor(
     }
 
     private fun saveData(data: UpdatesData) {
-        val content = json.encodeToString(data)
+        val content = ConfigJson.encodeToString(data)
         configFile.writeText(content)
         _dataFlow.value = data
     }
