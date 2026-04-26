@@ -9,12 +9,15 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.receiveAsFlow
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
 import java.util.concurrent.CancellationException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 
 /**
  * 后台机器人轮询服务，负责监听 Telegram 消息并执行指令或调用 AI。
@@ -30,12 +33,17 @@ class MessagePoller @Inject constructor(
     private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private var job: Job? = null
+    private var consumerJob: Job? = null
+
+    // 消息队列，容量为 10，存储更新内容及入队时间戳
+    private val updateChannel = Channel<Pair<Update, Long>>(10)
 
     /**
      * 启动轮询。
      */
     fun start() {
         if (job != null) return
+        startQueueConsumer()
         job = scope.launch {
             while (isActive) {
                 try {
@@ -117,6 +125,67 @@ class MessagePoller @Inject constructor(
         delay(1000.milliseconds)
     }
 
+    /**
+     * 启动队列消费者，按顺序处理消息。
+     */
+    private fun startQueueConsumer() {
+        if (consumerJob != null) return
+        consumerJob = scope.launch {
+            updateChannel.receiveAsFlow().collect { (update, entryTime) ->
+                val deadline = entryTime + 10.minutes.inWholeMilliseconds
+                val now = System.currentTimeMillis()
+                val remaining = (deadline - now).coerceAtLeast(0)
+
+                try {
+                    // 在剩余时间内处理消息
+                    withTimeout(remaining.milliseconds) {
+                        processUpdate(update)
+                    }
+                } catch (_: TimeoutCancellationException) {
+                    handleProcessingTimeout(update)
+                } catch (e: Exception) {
+                    logger.error("Error processing update ${update.updateId}", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * 实际处理更新的逻辑。
+     */
+    private suspend fun processUpdate(update: Update) {
+        val message = update.message ?: return
+        val text = message.text
+        val voice = message.voice
+        val chatId = message.chat.id.toString()
+
+        if (text != null && text.startsWith("/")) {
+            handleCommand(chatId, text, message.messageId)
+        } else if (voice != null) {
+            handleVoiceMessage(chatId, voice, message.caption, message.messageId)
+        } else if (text != null) {
+            handleAiMessage(chatId, text, message.messageId)
+        }
+    }
+
+    /**
+     * 处理超时的回调。
+     */
+    private suspend fun handleProcessingTimeout(update: Update) {
+        val message = update.message ?: return
+        val chatId = message.chat.id.toString()
+        logger.warn("Update ${update.updateId} processing timed out after 10 minutes.")
+        try {
+            telegramService.sendMessage(
+                chatId,
+                "抱歉，该消息处理超时（超过10分钟）。",
+                ReplyParameters(messageId = message.messageId),
+            )
+        } catch (e: Exception) {
+            logger.warn("Failed to send timeout notification", e)
+        }
+    }
+
     suspend fun handleUpdate(update: Update) {
         val message = update.message ?: return
         val text = message.text
@@ -126,15 +195,22 @@ class MessagePoller @Inject constructor(
         val chatId = message.chat.id.toString()
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return
 
-        if (!aiSettings.agentEnabled) return //todo AI服务启动条件
+        if (!aiSettings.agentEnabled) return
 
         if (chatId == aiSettings.agentChatId) {
-            if (text != null && text.startsWith("/")) {
-                handleCommand(chatId, text, message.messageId)
-            } else if (voice != null) {
-                handleVoiceMessage(chatId, voice, message.caption, message.messageId)
-            } else if (text != null) {
-                handleAiMessage(chatId, text, message.messageId)
+            // 尝试入队，如果不成功（队列满）则直接回复失败
+            val result = updateChannel.trySend(update to System.currentTimeMillis())
+            if (result.isFailure) {
+                logger.warn("Update ${update.updateId} rejected: Queue is full.")
+                try {
+                    telegramService.sendMessage(
+                        chatId,
+                        "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
+                        ReplyParameters(messageId = message.messageId),
+                    )
+                } catch (e: Exception) {
+                    logger.warn("Failed to send queue full notification", e)
+                }
             }
         }
     }
@@ -208,6 +284,19 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 清除队列中所有待处理的消息。
+     */
+    private fun clearQueue() {
+        var count = 0
+        while (updateChannel.tryReceive().isSuccess) {
+            count++
+        }
+        if (count > 0) {
+            logger.info("Cleared $count pending updates from queue due to reset/model switch.")
+        }
+    }
+
     suspend fun handleCommand(
         chatId: String,
         text: String,
@@ -218,19 +307,21 @@ class MessagePoller @Inject constructor(
 
         when (command) {
             "/reset" -> {
+                clearQueue()
                 agentService.resetSession()?.join()
-                telegramService.sendMessage(chatId, "会话已重置", ReplyParameters(messageId))
-                logger.info("Session reset by command in chat $chatId")
+                telegramService.sendMessage(chatId, "会话已重置，待处理消息已清空。", ReplyParameters(messageId))
+                logger.info("Session reset and queue cleared by command in chat $chatId")
             }
 
             "/model" -> {
                 if (parts.size > 1) {
                     val requestedModel = parts[1].trim()
                     try {
+                        clearQueue()
                         agentService.switchModel(requestedModel)?.join()
                         telegramService.sendMessage(
                             chatId,
-                            "已切换模型并重置会话：$requestedModel",
+                            "已切换模型并重置会话，待处理消息已清空：$requestedModel",
                             ReplyParameters(messageId),
                         )
                     } catch (_: Exception) {
@@ -297,6 +388,8 @@ class MessagePoller @Inject constructor(
     override fun close() {
         job?.cancel()
         job = null
+        consumerJob?.cancel()
+        consumerJob = null
         logger.info("Agent poller stopped.")
     }
 }

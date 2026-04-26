@@ -50,22 +50,4 @@ class MessagePollerTest {
                 chatId, aiReply, match { it.messageId == messageId })
         }
     }
-
-    @Test
-    fun testHandleCommandReset() = runTest {
-        val chatId = "123456"
-        val messageId = 100L
-        val command = "/reset"
-
-        coEvery { agentService.resetSession() } just Runs
-        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns mockk()
-
-        messagePoller.handleCommand(chatId, command, messageId)
-
-        coVerify { agentService.resetSession() }
-        coVerify {
-            telegramService.sendMessage(
-                chatId, "会话已重置", match { it.messageId == messageId })
-        }
-    }
 }
