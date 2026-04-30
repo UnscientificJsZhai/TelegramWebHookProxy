@@ -10,6 +10,8 @@ import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
@@ -34,16 +36,39 @@ class MessagePoller @Inject constructor(
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private var job: Job? = null
     private var consumerJob: Job? = null
+    private var settingsJob: Job? = null
+    private var currentToken: String? = null
 
     // 消息队列，容量为 10，存储更新内容及入队时间戳
     private val updateChannel = Channel<Pair<Update, Long>>(10)
 
     /**
-     * 启动轮询。
+     * 启动轮询监听。
      */
     fun start() {
-        if (job != null) return
+        if (settingsJob != null) return
         startQueueConsumer()
+
+        settingsJob = settingsRepository.settingsFlow
+            .onEach { settings ->
+                val newToken = settings.telegramToken
+                if (newToken.isBlank()) {
+                    if (job != null) {
+                        job?.cancel()
+                        job = null
+                        logger.info("Agent poller paused due to empty token.")
+                    }
+                } else if (newToken != currentToken) {
+                    currentToken = newToken
+                    restartPolling()
+                }
+            }.launchIn(scope)
+
+        logger.info("Agent poller observer started.")
+    }
+
+    private fun restartPolling() {
+        job?.cancel()
         job = scope.launch {
             while (isActive) {
                 try {
@@ -60,7 +85,7 @@ class MessagePoller @Inject constructor(
                 }
             }
         }
-        logger.info("Agent poller started.")
+        logger.info("Agent poller started/restarted.")
     }
 
     private suspend fun poll() {
@@ -386,6 +411,8 @@ class MessagePoller @Inject constructor(
     }
 
     override fun close() {
+        settingsJob?.cancel()
+        settingsJob = null
         job?.cancel()
         job = null
         consumerJob?.cancel()
