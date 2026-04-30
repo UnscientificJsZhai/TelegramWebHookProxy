@@ -70,12 +70,6 @@ configure<LicenseReportExtension> {
     renderers = arrayOf(TextReportRenderer("backend-licenses.txt"))
 }
 
-tasks.withType<ShadowJar> {
-    archiveBaseName.set("TelegramWebHookProxy")
-    archiveVersion.set(version.toString())
-    archiveClassifier.set("all")
-}
-
 val createLicenses by tasks.registering {
     group = "build"
     description = "Merges backend and frontend licenses"
@@ -107,13 +101,42 @@ val createLicenses by tasks.registering {
     }
 }
 
-tasks.named<Copy>("processResources") {
-    dependsOn(createLicenses)
-    dependsOn(project(":webui").tasks.named("npmBuild"))
-    from(project(":webui").layout.projectDirectory.dir("dist")) {
-        into("static")
+val isPackagingTaskRequested = gradle.startParameter.taskNames.any {
+    val name = it.lowercase()
+    name.contains("build") || name.contains("assemble") ||
+            name.contains("jar") || name.contains("shadowjar") ||
+            name.contains("dist")
+}
+
+val processFrontendResources by tasks.registering(Copy::class) {
+    group = "build"
+    description = "Assembles frontend resources and licenses for packaging"
+
+    if (isPackagingTaskRequested) {
+        dependsOn(createLicenses)
+        dependsOn(project(":webui").tasks.named("npmBuild"))
+
+        from(project(":webui").layout.projectDirectory.dir("dist")) {
+            into("static")
+        }
+        from(layout.buildDirectory.file("reports/dependency-license/licenses.txt")) {
+            into("licenses")
+        }
     }
-    from(layout.buildDirectory.file("reports/dependency-license/licenses.txt")) {
-        into("licenses")
-    }
+
+    into(layout.buildDirectory.dir("frontend-resources"))
+}
+
+tasks.named<Jar>("jar") {
+    dependsOn(processFrontendResources)
+    from(processFrontendResources.map { it.destinationDir })
+}
+
+tasks.withType<ShadowJar> {
+    archiveBaseName.set("TelegramWebHookProxy")
+    archiveVersion.set(version.toString())
+    archiveClassifier.set("all")
+
+    dependsOn(processFrontendResources)
+    from(processFrontendResources.map { it.destinationDir })
 }
