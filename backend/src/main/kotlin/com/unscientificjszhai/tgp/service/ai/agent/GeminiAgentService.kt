@@ -156,13 +156,7 @@ class GeminiAgentService @Inject constructor(
             }
             val configBuilder = GenerateContentConfig.builder()
             val skills = skillRepository.getSkillSummaries()
-            val skillPrompt = if (skills.isNotEmpty()) {
-                "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" + skills.joinToString(
-                    "\n"
-                ) { "- ID: ${it.id}, Description: ${it.description}" } + "\n\n"
-            } else {
-                ""
-            }
+            val skillPrompt = getSkillPrompt(skills)
 
             val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
                 Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))

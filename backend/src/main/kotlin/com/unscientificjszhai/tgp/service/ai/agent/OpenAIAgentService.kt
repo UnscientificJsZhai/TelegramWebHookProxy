@@ -26,6 +26,7 @@ import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.util.Base64
 import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
@@ -134,12 +135,7 @@ class OpenAIAgentService @Inject constructor(
         }
 
         val skills = skillRepository.getSkillSummaries()
-        val skillPrompt = if (skills.isNotEmpty()) {
-            "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" +
-                    skills.joinToString("\n") { "- ID: ${it.id}, Description: ${it.description}" } + "\n\n"
-        } else {
-            ""
-        }
+        val skillPrompt = getSkillPrompt(skills)
 
         val systemPrompt = (aiSettings.globalContext) + "\n\n" + skillPrompt
         if (systemPrompt.isNotBlank()) {
@@ -170,7 +166,7 @@ class OpenAIAgentService @Inject constructor(
 
         for (media in mediaData) {
             if (media.mimeType.startsWith("image/")) {
-                val base64Data = java.util.Base64.getEncoder().encodeToString(media.data)
+                val base64Data = Base64.getEncoder().encodeToString(media.data)
                 contentParts.add(
                     ChatCompletionContentPart.ofImageUrl(
                         ChatCompletionContentPartImage.builder()
@@ -189,7 +185,7 @@ class OpenAIAgentService @Inject constructor(
                             ChatCompletionContentPartInputAudio.builder()
                                 .inputAudio(
                                     ChatCompletionContentPartInputAudio.InputAudio.builder()
-                                        .data(java.util.Base64.getEncoder().encodeToString(media.data))
+                                        .data(Base64.getEncoder().encodeToString(media.data))
                                         .format(
                                             when {
                                                 media.mimeType.contains("wav") -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
