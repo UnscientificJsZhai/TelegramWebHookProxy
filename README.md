@@ -12,7 +12,7 @@ TelegramWebHookProxy可以用于转发消息到Telegram机器人，只需要一�
 ### AI 功能
 
 - [x] 接入 Google Gemini API 。
-- [ ] 接入 OpenAI SDK。
+- [x] 接入 OpenAI SDK。
 
 - [x] **语音交互**：支持接收并理解 Telegram 语音消息。
 - [x] **小型 Skill 系统**：允许 AI 读写知识库，实现长期记忆与技能扩展。
@@ -90,19 +90,19 @@ java -jar <path-to>/TelegramWebHookProxy-<version>-all.jar
 
 #### 查询参数 (Query Parameters)
 
-| 参数名 | 默认值      | 描述 |
-| :--- |:---------| :--- |
-| `messagefield` | `text`   | 指定 Body 中表示消息内容的字段名。 |
-| `chatidfield` | `chatId` | 指定 Body 中表示目标 Chat ID 的字段名。 |
+| 参数名            | 默认值      | 描述                          |
+|:---------------|:---------|:----------------------------|
+| `messagefield` | `text`   | 指定 Body 中表示消息内容的字段名。        |
+| `chatidfield`  | `chatId` | 指定 Body 中表示目标 Chat ID 的字段名。 |
 
 #### 请求参数 (Request Body)
 
 Body 中的字段名由上述查询参数决定。
 
-| 默认字段名    | 类型 | 必填 | 描述 |
-|:---------|:-------|:---|:--------------------------------------------------- |
-| `chatId` | String | 否 | 目标 Telegram 会话 ID。如果为空，则发送给 Web 管理界面中选择的默认聊天。 |
-| `text`   | String | 是 | 要发送的消息内容。 |
+| 默认字段名    | 类型     | 必填 | 描述                                            |
+|:---------|:-------|:---|:----------------------------------------------|
+| `chatId` | String | 否  | 目标 Telegram 会话 ID。如果为空，则发送给 Web 管理界面中选择的默认聊天。 |
+| `text`   | String | 是  | 要发送的消息内容。                                     |
 
 #### 请求示例
 
