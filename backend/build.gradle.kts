@@ -13,7 +13,7 @@ plugins {
     application
 }
 
-version = "1.1.1"
+version = "1.1.2"
 
 val ktorVersion = "3.4.3"
 val daggerVersion = "2.59.2"
