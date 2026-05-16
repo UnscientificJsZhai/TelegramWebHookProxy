@@ -1,9 +1,11 @@
 package com.unscientificjszhai.tgp.models
 
 import com.unscientificjszhai.tgp.utils.ConfigJson
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -39,6 +41,8 @@ class SettingsTest {
         assertTrue(aiElement.containsKey("geminiApiKey"))
         assertTrue(aiElement.containsKey("openAiApiKey"))
         assertTrue(aiElement.containsKey("openAiBaseUrl"))
+        assertTrue(aiElement.containsKey("autoCleanContextIntervalMinutes"))
+        assertTrue(aiElement.containsKey("silentContextCleanup"))
         assertTrue(aiElement.containsKey("mcpServers"))
     }
 
@@ -52,5 +56,34 @@ class SettingsTest {
         assertTrue(jsonElement.containsKey("provider"), "Provider field should be present even if default")
         assertTrue(jsonElement.containsKey("openAiApiKey"), "openAiApiKey field should be present even if default")
         assertTrue(jsonElement.containsKey("openAiBaseUrl"), "openAiBaseUrl field should be present even if default")
+        assertTrue(
+            jsonElement.containsKey("autoCleanContextIntervalMinutes"),
+            "autoCleanContextIntervalMinutes field should be present even if default",
+        )
+        assertTrue(
+            jsonElement.containsKey("silentContextCleanup"),
+            "silentContextCleanup field should be present even if default",
+        )
+    }
+
+    @Test
+    fun testAISettingsDeserializeOldJsonUsesDefaults() {
+        val jsonString = """
+            {
+              "provider": "GEMINI",
+              "geminiApiKey": "test_key",
+              "openAiApiKey": "",
+              "openAiBaseUrl": "",
+              "agentEnabled": true,
+              "agentChatId": "123",
+              "globalContext": "context",
+              "mcpServers": []
+            }
+        """.trimIndent()
+
+        val aiSettings = ConfigJson.decodeFromString<AISettings>(jsonString)
+
+        assertEquals(0, aiSettings.autoCleanContextIntervalMinutes)
+        assertEquals(false, aiSettings.silentContextCleanup)
     }
 }

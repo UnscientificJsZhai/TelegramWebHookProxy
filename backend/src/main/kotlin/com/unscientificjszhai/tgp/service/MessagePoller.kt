@@ -13,6 +13,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
+import io.ktor.http.isSuccess
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
 import java.util.concurrent.CancellationException
@@ -38,6 +39,7 @@ class MessagePoller @Inject constructor(
     private var consumerJob: Job? = null
     private var settingsJob: Job? = null
     private var currentToken: String? = null
+    private var lastAiReplyAtMillis: Long? = null
 
     // 消息队列，容量为 10，存储更新内容及入队时间戳
     private val updateChannel = Channel<Pair<Update, Long>>(10)
@@ -264,6 +266,8 @@ class MessagePoller @Inject constructor(
         caption: String?,
         messageId: Long,
     ) {
+        cleanContextIfNeeded(chatId)
+
         try {
             telegramService.sendChatAction(chatId, "typing")
         } catch (e: Exception) {
@@ -291,11 +295,14 @@ class MessagePoller @Inject constructor(
 
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
-                    telegramService.sendMessage(
+                    val response = telegramService.sendMessage(
                         chatId,
                         reply,
                         ReplyParameters(messageId = messageId),
                     )
+                    if (response.status.isSuccess()) {
+                        lastAiReplyAtMillis = System.currentTimeMillis()
+                    }
                 }
             } catch (e: Exception) {
                 typingJob.cancel()
@@ -334,6 +341,7 @@ class MessagePoller @Inject constructor(
             "/reset" -> {
                 clearQueue()
                 agentService.resetSession()?.join()
+                lastAiReplyAtMillis = null
                 telegramService.sendMessage(chatId, "会话已重置，待处理消息已清空。", ReplyParameters(messageId))
                 logger.info("Session reset and queue cleared by command in chat $chatId")
             }
@@ -344,6 +352,7 @@ class MessagePoller @Inject constructor(
                     try {
                         clearQueue()
                         agentService.switchModel(requestedModel)?.join()
+                        lastAiReplyAtMillis = null
                         telegramService.sendMessage(
                             chatId,
                             "已切换模型并重置会话，待处理消息已清空：$requestedModel",
@@ -379,6 +388,8 @@ class MessagePoller @Inject constructor(
         text: String,
         messageId: Long,
     ) {
+        cleanContextIfNeeded(chatId)
+
         try {
             telegramService.sendChatAction(chatId, "typing")
         } catch (e: Exception) {
@@ -392,11 +403,14 @@ class MessagePoller @Inject constructor(
                 val reply = agentService.sendMessage(text)
                 typingJob.cancel()
                 if (reply.isNotBlank()) {
-                    telegramService.sendMessage(
+                    val response = telegramService.sendMessage(
                         chatId,
                         reply,
                         ReplyParameters(messageId = messageId),
                     )
+                    if (response.status.isSuccess()) {
+                        lastAiReplyAtMillis = System.currentTimeMillis()
+                    }
                 }
             } catch (e: Exception) {
                 typingJob.cancel()
@@ -407,6 +421,30 @@ class MessagePoller @Inject constructor(
                     ReplyParameters(messageId),
                 )
             }
+        }
+    }
+
+    private suspend fun cleanContextIfNeeded(chatId: String) {
+        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return
+        val intervalMinutes = aiSettings.autoCleanContextIntervalMinutes
+        val lastReplyAt = lastAiReplyAtMillis ?: return
+        if (intervalMinutes <= 0) return
+
+        val elapsedMillis = System.currentTimeMillis() - lastReplyAt
+        if (elapsedMillis < intervalMinutes.minutes.inWholeMilliseconds) return
+
+        try {
+            agentService.resetSession()?.join()
+            lastAiReplyAtMillis = null
+            if (!aiSettings.silentContextCleanup) {
+                telegramService.sendMessage(
+                    chatId,
+                    "检测到距离上次对话已超过 $intervalMinutes 分钟，已自动清理上下文。",
+                )
+            }
+            logger.info("Auto-cleaned AI context after $intervalMinutes minutes without a successful AI reply.")
+        } catch (e: Exception) {
+            logger.warn("Failed to auto-clean AI context", e)
         }
     }
 

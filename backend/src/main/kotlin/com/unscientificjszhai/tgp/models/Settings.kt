@@ -19,6 +19,8 @@ data class AISettings(
     val agentEnabled: Boolean = false,
     val agentChatId: String = "",
     val globalContext: String = "",
+    val autoCleanContextIntervalMinutes: Int = 0,
+    val silentContextCleanup: Boolean = false,
     val mcpServers: List<MCPServerConfig> = emptyList(),
 )
 

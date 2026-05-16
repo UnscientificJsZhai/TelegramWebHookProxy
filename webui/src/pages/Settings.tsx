@@ -47,6 +47,8 @@ interface AISettings {
     agentEnabled: boolean;
     agentChatId: string;
     globalContext: string;
+    autoCleanContextIntervalMinutes: number;
+    silentContextCleanup: boolean;
     mcpServers: MCPServerConfig[];
 }
 
@@ -65,18 +67,32 @@ const defaultAiSettings: AISettings = {
     agentEnabled: false,
     agentChatId: '',
     globalContext: '',
+    autoCleanContextIntervalMinutes: 0,
+    silentContextCleanup: false,
     mcpServers: []
 };
 
 const Settings: React.FC = () => {
     const navigate = useNavigate();
     const [settings, setSettings] = useState<AppSettings | null>(null);
+    const [autoCleanIntervalInput, setAutoCleanIntervalInput] = useState('0');
+    const [autoCleanIntervalError, setAutoCleanIntervalError] = useState(false);
     const [snackbar, setSnackbar] = useState<{ open: boolean, message: string, severity: 'success' | 'error' | 'info' } | null>(null);
 
     useEffect(() => {
         api.get<AppSettings>('/settings')
             .then(response => {
-                setSettings(response.data);
+                const normalizedSettings = {
+                    ...response.data,
+                    ai: response.data.ai ? {
+                        ...defaultAiSettings,
+                        ...response.data.ai,
+                        mcpServers: response.data.ai.mcpServers || []
+                    } : null
+                };
+                setSettings(normalizedSettings);
+                setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
+                setAutoCleanIntervalError(false);
             })
             .catch(error => {
                 console.error('Failed to fetch settings:', error);
@@ -104,6 +120,18 @@ const Settings: React.FC = () => {
             setSettings(prev => {
                 if (!prev) return prev;
                 const ai = prev.ai || defaultAiSettings;
+                if (field === 'autoCleanContextIntervalMinutes') {
+                    setAutoCleanIntervalInput(value);
+                    const valid = /^[1-9]\d*$/.test(value);
+                    setAutoCleanIntervalError((ai.autoCleanContextIntervalMinutes || 0) > 0 && !valid);
+                    return valid ? {
+                        ...prev,
+                        ai: {
+                            ...ai,
+                            autoCleanContextIntervalMinutes: Number.parseInt(value, 10)
+                        }
+                    } : prev;
+                }
                 return {
                     ...prev,
                     ai: {
@@ -118,6 +146,28 @@ const Settings: React.FC = () => {
                 [name]: value
             }));
         }
+    };
+
+    const handleAutoCleanToggle = (event: React.ChangeEvent<HTMLInputElement>) => {
+        if (!settings) return;
+        const enabled = event.target.checked;
+        setSettings(prev => {
+            if (!prev) return prev;
+            const ai = prev.ai || defaultAiSettings;
+            const nextInterval = enabled
+                ? (ai.autoCleanContextIntervalMinutes > 0 ? ai.autoCleanContextIntervalMinutes : 60)
+                : 0;
+            setAutoCleanIntervalInput(String(nextInterval));
+            setAutoCleanIntervalError(false);
+            return {
+                ...prev,
+                ai: {
+                    ...ai,
+                    autoCleanContextIntervalMinutes: nextInterval,
+                    silentContextCleanup: enabled ? ai.silentContextCleanup : false
+                }
+            };
+        });
     };
 
     const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -293,6 +343,10 @@ const Settings: React.FC = () => {
 
     const handleSave = () => {
         if (!settings) return;
+        if ((settings.ai?.autoCleanContextIntervalMinutes || 0) > 0 && autoCleanIntervalError) {
+            setSnackbar({ open: true, message: '清理间隔必须是正整数', severity: 'error' });
+            return;
+        }
 
         // 剥离仅用于 UI 的 _headerString 字段
         const settingsToSave = {
@@ -322,6 +376,7 @@ const Settings: React.FC = () => {
     }
 
     const ai = settings.ai || defaultAiSettings;
+    const autoCleanEnabled = (ai.autoCleanContextIntervalMinutes || 0) > 0;
 
     return (
         <Paper elevation={3} sx={{ p: 4 }}>
@@ -465,6 +520,53 @@ const Settings: React.FC = () => {
                                 multiline
                                 rows={4}
                             />
+                        </Grid>
+
+                        <Grid size={{xs: 12}}>
+                            <Box
+                                sx={{
+                                    display: 'flex',
+                                    flexWrap: 'wrap',
+                                    gap: 3,
+                                    alignItems: 'flex-end'
+                                }}
+                            >
+                                <FormControlLabel
+                                    sx={{ pb: '23px' }}
+                                    control={
+                                        <Checkbox
+                                            checked={autoCleanEnabled}
+                                            onChange={handleAutoCleanToggle}
+                                        />
+                                    }
+                                    label="自动清理上下文"
+                                />
+                                <TextField
+                                    label="清理间隔（分钟）"
+                                    name="ai.autoCleanContextIntervalMinutes"
+                                    type="number"
+                                    value={autoCleanIntervalInput}
+                                    onChange={handleChange}
+                                    variant="outlined"
+                                    disabled={!autoCleanEnabled}
+                                    error={autoCleanIntervalError}
+                                    slotProps={{ htmlInput: { min: 1, step: 1 } }}
+                                    helperText={autoCleanIntervalError ? '请输入正整数' : '关闭开关可停用自动清理'}
+                                    sx={{ width: { xs: '100%', sm: 240 } }}
+                                />
+                                <FormControlLabel
+                                    sx={{ pb: '23px' }}
+                                    control={
+                                        <Checkbox
+                                            checked={ai.silentContextCleanup || false}
+                                            name="ai.silentContextCleanup"
+                                            onChange={handleCheckboxChange}
+                                            disabled={!autoCleanEnabled}
+                                        />
+                                    }
+                                    label="静默清理"
+                                />
+                            </Box>
                         </Grid>
 
                         <Grid size={{xs: 12}}>
