@@ -205,6 +205,7 @@ class TelegramService @Inject constructor(
                             listOf(
                                 BotCommand("model", "切换 Gemini 模型"),
                                 BotCommand("reset", "重置对话上下文"),
+                                BotCommand("keep", "延长上下文自动清理时间"),
                             ),
                     ),
                 )

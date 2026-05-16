@@ -338,6 +338,11 @@ class MessagePoller @Inject constructor(
         val command = parts[0]
 
         when (command) {
+            "/keep" -> {
+                lastAiReplyAtMillis = System.currentTimeMillis()
+                logger.info("Auto-clean context timer refreshed by keep command in chat $chatId")
+            }
+
             "/reset" -> {
                 clearQueue()
                 agentService.resetSession()?.join()

@@ -61,6 +61,21 @@ class MessagePollerTest {
     }
 
     @Test
+    fun testKeepCommandUpdatesLastReplyTimeWithoutReplying() = runTest {
+        val chatId = "123456"
+        val beforeKeep = System.currentTimeMillis()
+
+        messagePoller.handleCommand(chatId, "/keep", 100L)
+
+        val lastReplyAt = getLastAiReplyAtMillis()
+        assert(lastReplyAt != null)
+        assert(lastReplyAt!! >= beforeKeep)
+        coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
+        coVerify(exactly = 0) { agentService.resetSession() }
+        coVerify(exactly = 0) { agentService.sendMessage(any<String>()) }
+    }
+
+    @Test
     fun testAutoCleanDisabledDoesNotResetSession() = runTest {
         val chatId = "123456"
         val userMessage = "Hello AI"
@@ -73,6 +88,34 @@ class MessagePollerTest {
         messagePoller.handleAiMessage(chatId, userMessage, 100L)
 
         coVerify(exactly = 0) { agentService.resetSession() }
+        coVerify { agentService.sendMessage(userMessage) }
+    }
+
+    @Test
+    fun testKeepCommandExtendsAutoCleanWindow() = runTest {
+        val chatId = "123456"
+        val userMessage = "Hello AI"
+        settingsFlow.value = AppSettings(
+            ai = AISettings(
+                agentEnabled = true,
+                agentChatId = chatId,
+                autoCleanContextIntervalMinutes = 5,
+            ),
+        )
+        setLastAiReplyAtMillis(System.currentTimeMillis() - 360_000)
+
+        messagePoller.handleCommand(chatId, "/keep", 100L)
+
+        coEvery { telegramService.sendChatAction(chatId, "typing") } returns mockk()
+        coEvery { agentService.sendMessage(userMessage) } returns "Hello Human"
+        coEvery { telegramService.sendMessage(chatId, "Hello Human", any()) } returns telegramOkResponse()
+
+        messagePoller.handleAiMessage(chatId, userMessage, 101L)
+
+        coVerify(exactly = 0) { agentService.resetSession() }
+        coVerify(exactly = 0) {
+            telegramService.sendMessage(chatId, match { it.contains("自动清理上下文") }, null)
+        }
         coVerify { agentService.sendMessage(userMessage) }
     }
 
