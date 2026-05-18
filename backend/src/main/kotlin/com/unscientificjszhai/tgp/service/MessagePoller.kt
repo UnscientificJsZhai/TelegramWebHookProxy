@@ -375,7 +375,7 @@ class MessagePoller @Inject constructor(
                     val current = agentService.currentModel
                     val available = agentService.availableModels
                     val list = available.joinToString("\n") { model ->
-                        if (model == current) "✅ $model" else "    $model"
+                        if (model == current) "✅ $model" else "      $model"
                     }
                     telegramService.sendMessage(
                         chatId,

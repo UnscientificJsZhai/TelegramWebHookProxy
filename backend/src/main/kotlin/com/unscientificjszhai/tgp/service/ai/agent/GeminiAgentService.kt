@@ -50,14 +50,14 @@ class GeminiAgentService @Inject constructor(
     /**
      * 当前会话使用的模型。
      */
-    override var currentModel: String = "models/gemini-3.1-flash-lite-preview"
+    override var currentModel: String = "models/gemini-3.1-flash-lite"
         private set
 
     /**
      * 可选的模型列表。
      */
     override var availableModels = listOf(
-        "models/gemini-3.1-flash-lite-preview",
+        "models/gemini-3.1-flash-lite",
         "models/gemini-2.5-flash",
     )
 
@@ -119,7 +119,7 @@ class GeminiAgentService @Inject constructor(
      * @param modelName 模型名称。
      */
     override fun switchModel(modelName: String): Job? {
-        if (modelName !in availableModels && modelName != "gemini-2.5-flash") {
+        if (modelName !in availableModels && modelName != "gemini-3.1-flash-lite") {
             throw IllegalArgumentException("Unsupported model: $modelName")
         }
         if (currentModel != modelName) {
