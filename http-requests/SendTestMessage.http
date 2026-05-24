@@ -1,6 +1,0 @@
-POST http://localhost:10178/api/send-message
-Content-Type: application/json
-
-{
-  "text": "IDEA Test Message"
-}

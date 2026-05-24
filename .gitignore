@@ -30,8 +30,8 @@ lerna-debug.log*
 
 # AI agents
 .gemini/
-GEMINI.md
-/doc/
+.codex/
+.antigravitycli/
 
 # 项目数据文件夹
 /config/
