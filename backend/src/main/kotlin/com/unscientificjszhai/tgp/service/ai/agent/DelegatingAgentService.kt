@@ -43,7 +43,7 @@ class DelegatingAgentService @Inject constructor(
 
     init {
         combine(
-            settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) },
+            settingsRepository.settingsFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
         ) { settings, _ -> settings }.onEach { settings ->
             val aiSettings = settings.ai
