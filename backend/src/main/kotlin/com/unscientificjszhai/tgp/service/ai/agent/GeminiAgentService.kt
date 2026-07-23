@@ -17,6 +17,9 @@ import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
 import kotlinx.coroutines.*
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import javax.inject.Inject
 import javax.inject.Provider
@@ -31,6 +34,13 @@ class GeminiAgentService @Inject constructor(
     private val mcpClientService: MCPClientService,
     taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
 ) : AgentService() {
+    private companion object {
+        const val DEFAULT_MODEL = "models/gemini-3.5-flash-lite"
+        const val DEFAULT_MODEL_WITHOUT_PREFIX = "gemini-3.5-flash-lite"
+        const val PREVIOUS_DEFAULT_MODEL = "models/gemini-3.1-flash-lite"
+        const val LEGACY_MODEL = "models/gemini-2.5-flash"
+    }
+
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
 
@@ -50,15 +60,16 @@ class GeminiAgentService @Inject constructor(
     /**
      * 当前会话使用的模型。
      */
-    override var currentModel: String = "models/gemini-3.1-flash-lite"
+    override var currentModel: String = DEFAULT_MODEL
         private set
 
     /**
      * 可选的模型列表。
      */
     override var availableModels = listOf(
-        "models/gemini-3.1-flash-lite",
-        "models/gemini-2.5-flash",
+        DEFAULT_MODEL,
+        PREVIOUS_DEFAULT_MODEL,
+        LEGACY_MODEL,
     )
 
     override fun isAiFeatureEnabled(aiSettings: AISettings) =
@@ -79,8 +90,10 @@ class GeminiAgentService @Inject constructor(
                     }
                     clientOptionsBuilder.proxyOptions(
                         ProxyOptions.builder().type(geminiProxyType).host(proxySettings.host).port(proxySettings.port)
-                            .apply { proxySettings.username?.let { username(it) } }
-                            .apply { proxySettings.password?.let { password(it) } }.build(),
+                            .apply {
+                                proxySettings.username?.let { username(it) }
+                                proxySettings.password?.let { password(it) }
+                            }.build(),
                     )
                 }
 
@@ -119,12 +132,13 @@ class GeminiAgentService @Inject constructor(
      * @param modelName 模型名称。
      */
     override fun switchModel(modelName: String): Job? {
-        if (modelName !in availableModels && modelName != "gemini-3.1-flash-lite") {
+        val normalizedModel = if (modelName == DEFAULT_MODEL_WITHOUT_PREFIX) DEFAULT_MODEL else modelName
+        if (normalizedModel !in availableModels) {
             throw IllegalArgumentException("Unsupported model: $modelName")
         }
-        if (currentModel != modelName) {
+        if (currentModel != normalizedModel) {
             captureHistory()
-            currentModel = modelName
+            currentModel = normalizedModel
             return resetSession()
         }
         return null
@@ -249,19 +263,28 @@ class GeminiAgentService @Inject constructor(
             val functionResponses = mutableListOf<Part>()
 
             for (functionCall in functionCalls) {
-                val fullNameOpt = functionCall.name()
-                if (!fullNameOpt.isPresent) continue
-                val fullName = fullNameOpt.get()
+                val fullName = functionCall.name().getOrNull()
+                val argsMap = functionCall.args().getOrNull() ?: emptyMap()
+                val result = try {
+                    val localProvider = fullName?.let { name -> localFunctionProviders.find { it.canHandle(name) } }
+                    when {
+                        fullName == null -> buildJsonObject {
+                            put("error", "Function call name is missing")
+                        }
 
-                val argsMapOpt = functionCall.args()
-                val argsMap = if (argsMapOpt.isPresent) argsMapOpt.get() else emptyMap()
+                        localProvider == null -> buildJsonObject {
+                            put("error", "Function $fullName not found")
+                        }
 
-                val localProvider = localFunctionProviders.find { it.canHandle(fullName) }
-                if (localProvider != null) {
-                    val result = localProvider.execute(fullName, argsMap)
-                    functionResponses.add(Part.fromFunctionResponse(fullName, result.toMap()))
-                    continue
+                        else -> localProvider.execute(fullName, argsMap)
+                    }
+                } catch (e: Exception) {
+                    logger.error("Failed to execute Gemini function call: $fullName", e)
+                    buildJsonObject {
+                        put("error", e.message ?: "Function $fullName failed")
+                    }
                 }
+                functionResponses.add(createFunctionResponsePart(functionCall, result))
             }
 
             // Send function results back to the model
@@ -271,6 +294,16 @@ class GeminiAgentService @Inject constructor(
         } else {
             return response.text() ?: ""
         }
+    }
+
+    /**
+     * 将工具调用结果转换为与原调用一一对应的 Gemini 响应。
+     */
+    internal fun createFunctionResponsePart(functionCall: FunctionCall, result: JsonObject): Part {
+        val responseBuilder = FunctionResponse.builder().response(result.toMap())
+        functionCall.id().getOrNull()?.let { responseBuilder.id(it) }
+        functionCall.name().getOrNull()?.let { responseBuilder.name(it) }
+        return Part.builder().functionResponse(responseBuilder.build()).build()
     }
 
     override fun close() {

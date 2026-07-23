@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 import com.openai.client.OpenAIClient
 import com.openai.client.okhttp.OpenAIOkHttpClient
 import com.openai.models.ChatModel
+import com.openai.models.ReasoningEffort
 import com.openai.models.chat.completions.*
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.AIProvider
@@ -39,6 +40,11 @@ class OpenAIAgentService @Inject constructor(
     private val mcpClientService: MCPClientService,
     taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
 ) : AgentService() {
+    private companion object {
+        const val DEFAULT_MODEL = "gpt-5.6-luna"
+        val FALLBACK_MODELS = listOf(DEFAULT_MODEL, ChatModel.GPT_4O.toString())
+    }
+
     private val logger = LoggerFactory.getLogger(OpenAIAgentService::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
 
@@ -57,10 +63,11 @@ class OpenAIAgentService @Inject constructor(
     private var client: OpenAIClient? = null
     private var history = mutableListOf<ChatCompletionMessageParam>()
 
-    override var currentModel: String = ChatModel.GPT_4O.toString()
+    override var currentModel: String = DEFAULT_MODEL
         private set
 
     override var availableModels: List<String> = listOf(
+        DEFAULT_MODEL,
         ChatModel.GPT_4O.toString(),
         ChatModel.GPT_4O_MINI.toString()
     )
@@ -114,11 +121,9 @@ class OpenAIAgentService @Inject constructor(
             try {
                 val models = client?.models()?.list()?.data() ?: emptyList()
                 availableModels = models.map { it.id() }
-                if (currentModel !in availableModels && availableModels.isNotEmpty()) {
-                    currentModel = if (ChatModel.GPT_4O.toString() in availableModels) {
-                        ChatModel.GPT_4O.toString()
-                    } else {
-                        availableModels.first()
+                preferredModel(availableModels)?.let { preferredModel ->
+                    if (currentModel !in availableModels) {
+                        currentModel = preferredModel
                     }
                 }
             } catch (e: Exception) {
@@ -235,15 +240,9 @@ class OpenAIAgentService @Inject constructor(
             }
         }
 
-        val paramsBuilder = ChatCompletionCreateParams.builder()
-            .model(ChatModel.of(currentModel))
-            .messages(history)
+        val paramsBuilder = createChatCompletionParams(tools)
 
-        if (tools.isNotEmpty()) {
-            paramsBuilder.tools(tools)
-        }
-
-        val response = client.chat().completions().create(paramsBuilder.build())
+        val response = client.chat().completions().create(paramsBuilder)
         val choice = response.choices().firstOrNull() ?: return ""
         val message = choice.message()
 
@@ -292,6 +291,31 @@ class OpenAIAgentService @Inject constructor(
 
         return message.content().getOrNull() ?: ""
     }
+
+    /**
+     * 根据当前模型构建 Chat Completions 请求参数。
+     */
+    internal fun createChatCompletionParams(tools: List<ChatCompletionTool>): ChatCompletionCreateParams {
+        val paramsBuilder = ChatCompletionCreateParams.builder()
+            .model(ChatModel.of(currentModel))
+            .messages(history)
+
+        if (tools.isNotEmpty()) {
+            paramsBuilder.tools(tools)
+        }
+
+        if (currentModel.startsWith("gpt-5.6")) {
+            paramsBuilder.reasoningEffort(ReasoningEffort.NONE)
+        }
+
+        return paramsBuilder.build()
+    }
+
+    /**
+     * 返回模型列表刷新后应优先使用的模型。
+     */
+    internal fun preferredModel(models: List<String>): String? =
+        FALLBACK_MODELS.firstOrNull { it in models } ?: models.firstOrNull()
 
     override fun close() {
         client = null

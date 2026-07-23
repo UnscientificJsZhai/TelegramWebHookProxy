@@ -20,9 +20,17 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class SkillRepository @Inject constructor() {
+class SkillRepository private constructor(
+    private val configFile: File,
+) {
+    @Inject
+    constructor() : this(File("config/skills.json"))
+
+    companion object {
+        internal fun forTesting(configFile: File): SkillRepository = SkillRepository(configFile)
+    }
+
     private val logger = LoggerFactory.getLogger(SkillRepository::class.java)
-    private val configFile = File("config/skills.json")
 
     private val _skillsUpdateEvent = MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,
