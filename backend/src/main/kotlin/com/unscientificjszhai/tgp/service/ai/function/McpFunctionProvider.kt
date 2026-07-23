@@ -4,6 +4,7 @@ import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.google.genai.types.Type
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
@@ -62,6 +63,8 @@ class McpFunctionProvider(
             buildJsonObject {
                 put("result", json.encodeToJsonElement(result))
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.error("Error executing MCP tool $functionName", e)
             buildJsonObject {

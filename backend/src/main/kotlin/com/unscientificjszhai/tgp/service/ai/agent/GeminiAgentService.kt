@@ -43,7 +43,13 @@ class GeminiAgentService @Inject constructor(
     }
 
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
-    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
+    private val serviceJob = SupervisorJob(parentScope.coroutineContext[Job])
+    private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
+    private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val lifecycleLock = Any()
+    @Volatile
+    private var closed = false
+    private var closeJob: Job? = null
 
     private val localFunctionProviders = listOf(
         HttpCallingFunctionProvider(),
@@ -51,11 +57,15 @@ class GeminiAgentService @Inject constructor(
         ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
         SkillFunctionProvider(skillRepository),
     )
+    /** 串行化对话、重置和关闭，防止 Chat 状态在服务关闭后被旧任务改写。 */
+    private val sessionMutex = Mutex()
+    @Volatile
     private var client: Client? = null
     private var chat: Chat? = null
 
     private var savedHistory: List<Content>? = null
 
+    @Volatile
     private var resetSessionJob: Job? = null
 
     private val modelUpdateMutex = Mutex()
@@ -118,7 +128,7 @@ class GeminiAgentService @Inject constructor(
     /**
      * 保存当前会话的历史记录。
      */
-    private fun captureHistory() {
+    private fun captureHistoryLocked() {
         try {
             chat?.getHistory(true)?.let { history ->
                 if (history.isNotEmpty()) {
@@ -138,6 +148,9 @@ class GeminiAgentService @Inject constructor(
      */
     override fun switchModel(modelName: String): Job? {
         val modelChanged = synchronized(modelStateLock) {
+            if (closed) {
+                return null
+            }
             val normalizedModel = when {
                 modelName in availableModels -> modelName
                 "models/$modelName" in availableModels -> "models/$modelName"
@@ -155,14 +168,16 @@ class GeminiAgentService @Inject constructor(
             }
         }
         if (modelChanged) {
-            captureHistory()
-            return resetSession()
+            return resetSession(captureHistory = true)
         }
         return null
     }
 
     override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
         try {
+            if (closed) {
+                return@withLock null
+            }
             val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
             val models = client?.models ?: return@withLock null
             val refreshedModels = withContext(Dispatchers.IO) {
@@ -186,7 +201,12 @@ class GeminiAgentService @Inject constructor(
     /**
      * 重置当前会话，清空历史记录并重新应用系统提示词。
      */
-    override fun resetSession(): Job? {
+    override fun resetSession(): Job? = resetSession(captureHistory = false)
+
+    private fun resetSession(captureHistory: Boolean): Job? {
+        if (closed) {
+            return null
+        }
         val currentClient = client
         if (currentClient == null) {
             logger.warn("Cannot reset session: Gemini client is not initialized.")
@@ -196,31 +216,54 @@ class GeminiAgentService @Inject constructor(
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
         val functionDeclarations = mutableListOf<FunctionDeclaration>()
         return scope.launch {
-            mcpClientService.connect(aiSettings.mcpServers)
-            localFunctionProviders.forEach { provider ->
-                functionDeclarations.addAll(provider.providedFunctions)
-            }
-            val configBuilder = GenerateContentConfig.builder()
-            val skills = skillRepository.getSkillSummaries()
-            val skillPrompt = getSkillPrompt(skills)
+            sessionMutex.withLock {
+                if (closed) {
+                    return@withLock
+                }
+                if (captureHistory) {
+                    captureHistoryLocked()
+                }
+                mcpClientService.connect(aiSettings.mcpServers)
+                currentCoroutineContext().ensureActive()
+                if (closed) {
+                    return@withLock
+                }
+                localFunctionProviders.forEach { provider ->
+                    functionDeclarations.addAll(provider.providedFunctions)
+                }
+                val configBuilder = GenerateContentConfig.builder()
+                val skills = skillRepository.getSkillSummaries()
+                val skillPrompt = getSkillPrompt(skills)
 
-            val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
-                Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
-            } else {
-                Content.fromParts(Part.fromText(skillPrompt))
-            }
-            configBuilder.systemInstruction(systemInstruction)
+                val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
+                    Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
+                } else {
+                    Content.fromParts(Part.fromText(skillPrompt))
+                }
+                configBuilder.systemInstruction(systemInstruction)
 
-            if (functionDeclarations.isNotEmpty()) {
-                configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
-            }
+                if (functionDeclarations.isNotEmpty()) {
+                    configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
+                }
 
-            try {
-                chat = currentClient.chats.create(currentModel, configBuilder.build())
-                logger.info("Gemini session reset with model: $currentModel")
-            } catch (e: Exception) {
-                logger.error("Failed to create Gemini chat session", e)
-                chat = null
+                try {
+                    val newChat = currentClient.chats.create(currentModel, configBuilder.build())
+                    synchronized(lifecycleLock) {
+                        if (!closed) {
+                            chat = newChat
+                            logger.info("Gemini session reset with model: $currentModel")
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.error("Failed to create Gemini chat session", e)
+                    synchronized(lifecycleLock) {
+                        if (!closed) {
+                            chat = null
+                        }
+                    }
+                }
             }
         }
     }
@@ -259,37 +302,47 @@ class GeminiAgentService @Inject constructor(
         text: String?,
         audioParts: List<Part>,
     ): String {
-        val currentChat = chat ?: resetSessionJob?.run {
-            join()
+        val initialChat = sessionMutex.withLock {
+            check(!closed) { "Gemini client is closed." }
             chat
-        } ?: throw IllegalStateException("Gemini chat session is not initialized.")
-        try {
-            val parts = mutableListOf<Part>()
-            text?.let { parts.add(Part.fromText(it)) }
-            parts.addAll(audioParts)
-
-            val userContent = Content.builder().role("user").parts(parts).build()
-
-            val history = savedHistory
-            val response = if (history != null && currentChat.getHistory(false).isEmpty()) {
-                savedHistory = null
-                currentChat.sendMessage(history + userContent)
-            } else {
-                currentChat.sendMessage(listOf(userContent))
+        }
+        val currentChat = initialChat ?: resetSessionJob?.run {
+            join()
+            sessionMutex.withLock {
+                check(!closed) { "Gemini client is closed." }
+                chat
             }
+        } ?: throw IllegalStateException("Gemini chat session is not initialized.")
+        return sessionMutex.withLock {
+            check(!closed) { "Gemini client is closed." }
+            try {
+                val chatForMessage = chat ?: currentChat
+                val parts = mutableListOf<Part>()
+                text?.let { parts.add(Part.fromText(it)) }
+                parts.addAll(audioParts)
 
-            // Check for tool calls
-            return handleResponse(response, currentChat)
-        } catch (e: ToolCallLimitExceededException) {
-            logger.error("Tool call limit reached for Gemini session", e)
-            savedHistory = null
-            chat = null
-            resetSessionJob = resetSession()
-            resetSessionJob?.join()
-            throw e
-        } catch (e: Exception) {
-            logger.error("Error while sending message to Gemini", e)
-            throw e
+                val userContent = Content.builder().role("user").parts(parts).build()
+
+                val history = savedHistory
+                val response = if (history != null && chatForMessage.getHistory(false).isEmpty()) {
+                    savedHistory = null
+                    chatForMessage.sendMessage(history + userContent)
+                } else {
+                    chatForMessage.sendMessage(listOf(userContent))
+                }
+
+                // Check for tool calls
+                handleResponse(response, chatForMessage)
+            } catch (e: ToolCallLimitExceededException) {
+                logger.error("Tool call limit reached for Gemini session", e)
+                savedHistory = null
+                chat = null
+                resetSessionJob = resetSession()
+                throw e
+            } catch (e: Exception) {
+                logger.error("Error while sending message to Gemini", e)
+                throw e
+            }
         }
     }
 
@@ -319,6 +372,8 @@ class GeminiAgentService @Inject constructor(
 
                         else -> localProvider.execute(fullName, argsMap)
                     }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     logger.error("Failed to execute Gemini function call: $fullName", e)
                     buildJsonObject {
@@ -347,11 +402,24 @@ class GeminiAgentService @Inject constructor(
         return Part.builder().functionResponse(responseBuilder.build()).build()
     }
 
-    override fun close() {
-        client?.close()
-        client = null
-        chat = null
-        mcpClientService.disconnectAll()
-        logger.info("Gemini client closed.")
+    override fun close(): Job? = synchronized(lifecycleLock) {
+        closeJob ?: run {
+            closed = true
+            resetSessionJob?.cancel()
+            serviceJob.cancel()
+            closingScope.launch {
+                val currentClient = sessionMutex.withLock {
+                    val clientToClose = client
+                    client = null
+                    chat = null
+                    savedHistory = null
+                    clientToClose
+                }
+                serviceJob.join()
+                currentClient?.close()
+                val disconnectJob = mcpClientService.disconnectAll()
+                disconnectJob.join()
+            }.also { closeJob = it }
+        }
     }
 }

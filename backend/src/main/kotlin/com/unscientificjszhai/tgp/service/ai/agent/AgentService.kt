@@ -85,8 +85,10 @@ abstract class AgentService {
 
     /**
      * 关闭服务，释放资源。
+     *
+     * @return 异步清理任务；调用方可等待该任务作为服务重建屏障。
      */
-    open fun close() {}
+    open fun close(): Job? = null
 
     /**
      * 获取注入到系统提示词中的 Skill 的描述。

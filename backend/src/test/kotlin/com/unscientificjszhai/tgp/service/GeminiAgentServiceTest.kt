@@ -20,11 +20,17 @@ import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -32,6 +38,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class GeminiAgentServiceTest {
 
@@ -195,6 +203,30 @@ class GeminiAgentServiceTest {
         assertEquals("新会话", service.sendMessage("继续对话"))
         verify(exactly = 1) { chats.create(any<String>(), any<GenerateContentConfig>()) }
         verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
+    }
+
+    @Test
+    fun test关闭会等待在途消息完成后再释放会话() = runBlocking {
+        val chat = mockk<Chat>()
+        val requestStarted = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        every { chat.sendMessage(any<List<Content>>()) } answers {
+            requestStarted.countDown()
+            check(releaseRequest.await(5, TimeUnit.SECONDS))
+            responseWithParts(Part.fromText("完成"))
+        }
+        injectChat(chat)
+
+        val inFlightMessage = async(Dispatchers.Default) { service.sendMessage("第一条消息") }
+        assertTrue(requestStarted.await(5, TimeUnit.SECONDS))
+
+        val closeJob = assertNotNull(service.close())
+        assertFalse(closeJob.isCompleted)
+
+        releaseRequest.countDown()
+        assertEquals("完成", withTimeout(5_000) { inFlightMessage.await() })
+        withTimeout(5_000) { closeJob.join() }
+        assertTrue(closeJob.isCompleted)
     }
 
     private fun responseWithParts(vararg parts: Part): GenerateContentResponse =

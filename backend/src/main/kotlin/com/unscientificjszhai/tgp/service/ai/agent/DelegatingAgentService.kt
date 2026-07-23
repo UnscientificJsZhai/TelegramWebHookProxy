@@ -63,7 +63,7 @@ class DelegatingAgentService @Inject constructor(
                         currentProxy != proxySettings
 
                 if (needsRecreate) {
-                    _currentService?.close()
+                    _currentService?.close()?.join()
                     val newComponent = agentComponentFactory.create()
                     currentAgentComponent = newComponent
                     _currentService = when (aiSettings.provider) {
@@ -80,7 +80,7 @@ class DelegatingAgentService @Inject constructor(
                 }
             } else {
                 if (_currentService != null) {
-                    _currentService?.close()
+                    _currentService?.close()?.join()
                     _currentService = null
                     currentAgentComponent = null
                     currentProvider = null
@@ -120,9 +120,10 @@ class DelegatingAgentService @Inject constructor(
         return currentService.sendMessage(text, mediaData)
     }
 
-    override fun close() {
-        _currentService?.close()
+    override fun close(): Job? {
+        val closeJob = _currentService?.close()
         _currentService = null
         currentAgentComponent = null
+        return closeJob
     }
 }
