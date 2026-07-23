@@ -36,7 +36,6 @@ class GeminiAgentService @Inject constructor(
 ) : AgentService() {
     private companion object {
         const val DEFAULT_MODEL = "models/gemini-3.5-flash-lite"
-        const val DEFAULT_MODEL_WITHOUT_PREFIX = "gemini-3.5-flash-lite"
         const val PREVIOUS_DEFAULT_MODEL = "models/gemini-3.1-flash-lite"
         const val LEGACY_MODEL = "models/gemini-2.5-flash"
     }
@@ -132,7 +131,11 @@ class GeminiAgentService @Inject constructor(
      * @param modelName 模型名称。
      */
     override fun switchModel(modelName: String): Job? {
-        val normalizedModel = if (modelName == DEFAULT_MODEL_WITHOUT_PREFIX) DEFAULT_MODEL else modelName
+        val normalizedModel = when {
+            modelName in availableModels -> modelName
+            "models/$modelName" in availableModels -> "models/$modelName"
+            else -> modelName
+        }
         if (normalizedModel !in availableModels) {
             throw IllegalArgumentException("Unsupported model: $modelName")
         }

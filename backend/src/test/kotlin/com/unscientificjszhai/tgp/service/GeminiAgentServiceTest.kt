@@ -24,6 +24,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 
 class GeminiAgentServiceTest {
 
@@ -61,12 +62,42 @@ class GeminiAgentServiceTest {
     }
 
     @Test
-    fun testSwitchingUnprefixedDefaultModelRetainsSdkPrefix() {
+    fun testSwitchingUnprefixedModelsRetainsSdkPrefix() {
+        listOf(
+            "gemini-3.5-flash-lite" to "models/gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite" to "models/gemini-3.1-flash-lite",
+            "gemini-2.5-flash" to "models/gemini-2.5-flash",
+        ).forEach { (modelName, expectedModel) ->
+            service.switchModel(modelName)
+
+            assertEquals(expectedModel, service.currentModel)
+        }
+    }
+
+    @Test
+    fun testSwitchingPrefixedModelRetainsItsName() {
         service.switchModel("models/gemini-3.1-flash-lite")
 
-        service.switchModel("gemini-3.5-flash-lite")
+        assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
+    }
 
-        assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
+    @Test
+    fun testSwitchingUnprefixedDynamicallyAvailableModelAddsPrefix() {
+        GeminiAgentService::class.java.getDeclaredField("availableModels").apply {
+            isAccessible = true
+            set(service, listOf("models/custom-model"))
+        }
+
+        service.switchModel("custom-model")
+
+        assertEquals("models/custom-model", service.currentModel)
+    }
+
+    @Test
+    fun testSwitchingUnsupportedModelFails() {
+        assertFailsWith<IllegalArgumentException> {
+            service.switchModel("unsupported-model")
+        }
     }
 
     @Test
