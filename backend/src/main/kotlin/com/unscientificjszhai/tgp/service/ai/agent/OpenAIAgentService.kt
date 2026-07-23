@@ -418,7 +418,10 @@ class OpenAIAgentService @Inject constructor(
 
         val paramsBuilder = createChatCompletionParams(tools, history.toList())
 
-        val response = client.chat().completions().create(paramsBuilder)
+        // OpenAI 阻塞客户端会同步执行网络请求，避免占用调用方的默认调度器线程。
+        val response = withContext(Dispatchers.IO) {
+            client.chat().completions().create(paramsBuilder)
+        }
         val choice = response.choices().firstOrNull() ?: return ""
         val message = choice.message()
 

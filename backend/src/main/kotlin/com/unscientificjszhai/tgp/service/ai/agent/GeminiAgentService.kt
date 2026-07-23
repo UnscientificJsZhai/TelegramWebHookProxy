@@ -326,9 +326,13 @@ class GeminiAgentService @Inject constructor(
                 val history = savedHistory
                 val response = if (history != null && chatForMessage.getHistory(false).isEmpty()) {
                     savedHistory = null
-                    chatForMessage.sendMessage(history + userContent)
+                    withContext(Dispatchers.IO) {
+                        chatForMessage.sendMessage(history + userContent)
+                    }
                 } else {
-                    chatForMessage.sendMessage(listOf(userContent))
+                    withContext(Dispatchers.IO) {
+                        chatForMessage.sendMessage(listOf(userContent))
+                    }
                 }
 
                 // Check for tool calls
@@ -385,7 +389,9 @@ class GeminiAgentService @Inject constructor(
 
             // Send function results back to the model
             val content = Content.builder().role("user").parts(functionResponses).build()
-            val finalResponse = currentChat.sendMessage(content)
+            val finalResponse = withContext(Dispatchers.IO) {
+                currentChat.sendMessage(content)
+            }
             return handleResponse(finalResponse, currentChat, toolCallRounds + 1)
         } else {
             return response.text() ?: ""
