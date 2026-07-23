@@ -280,6 +280,13 @@ class GeminiAgentService @Inject constructor(
 
             // Check for tool calls
             return handleResponse(response, currentChat)
+        } catch (e: ToolCallLimitExceededException) {
+            logger.error("Tool call limit reached for Gemini session", e)
+            savedHistory = null
+            chat = null
+            resetSessionJob = resetSession()
+            resetSessionJob?.join()
+            throw e
         } catch (e: Exception) {
             logger.error("Error while sending message to Gemini", e)
             throw e
@@ -289,9 +296,11 @@ class GeminiAgentService @Inject constructor(
     private suspend fun handleResponse(
         response: GenerateContentResponse,
         currentChat: Chat,
+        toolCallRounds: Int = 0,
     ): String {
         val functionCalls = response.functionCalls()
         if (!functionCalls.isNullOrEmpty()) {
+            ensureToolCallRoundIsAllowed(toolCallRounds)
             val functionResponses = mutableListOf<Part>()
 
             for (functionCall in functionCalls) {
@@ -322,7 +331,7 @@ class GeminiAgentService @Inject constructor(
             // Send function results back to the model
             val content = Content.builder().role("user").parts(functionResponses).build()
             val finalResponse = currentChat.sendMessage(content)
-            return handleResponse(finalResponse, currentChat)
+            return handleResponse(finalResponse, currentChat, toolCallRounds + 1)
         } else {
             return response.text() ?: ""
         }

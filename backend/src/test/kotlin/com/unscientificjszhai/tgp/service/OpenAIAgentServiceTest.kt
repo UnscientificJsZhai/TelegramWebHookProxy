@@ -3,9 +3,16 @@ package com.unscientificjszhai.tgp.service
 import com.openai.client.OpenAIClient
 import com.openai.models.ChatModel
 import com.openai.models.ReasoningEffort
+import com.openai.models.chat.completions.ChatCompletion
+import com.openai.models.chat.completions.ChatCompletionCreateParams
+import com.openai.models.chat.completions.ChatCompletionMessage
+import com.openai.models.chat.completions.ChatCompletionMessageFunctionToolCall
+import com.openai.models.chat.completions.ChatCompletionMessageToolCall
 import com.openai.models.models.Model
 import com.openai.models.models.ModelListPage
+import com.openai.services.blocking.ChatService
 import com.openai.services.blocking.ModelService
+import com.openai.services.blocking.chat.ChatCompletionService
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MCPServerConfig
@@ -191,6 +198,29 @@ class OpenAIAgentServiceTest {
     }
 
     @Test
+    fun testToolCallLimitStopsBeforeEleventhToolExecution() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val chatCompletionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        val response = toolCallResponse()
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns chatCompletionService
+        every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            response
+        }
+        injectClient(client)
+
+        val reply = service.sendMessage("持续调用工具")
+
+        assertEquals("Error: 工具调用轮次超过上限（10 轮）。", reply)
+        assertEquals(11, requests.size)
+        assertEquals(31, requests.last().messages().size)
+        assertEquals(31, service.createChatCompletionParams(emptyList()).messages().size)
+    }
+
+    @Test
     fun testGpt56RequestSetsReasoningEffortNone() {
         val params = service.createChatCompletionParams(emptyList())
 
@@ -208,6 +238,39 @@ class OpenAIAgentServiceTest {
 
     private fun injectClient(client: OpenAIClient) {
         OpenAIAgentService::class.java.getDeclaredField("client").apply { isAccessible = true }.set(service, client)
+    }
+
+    private fun toolCallResponse(): ChatCompletion {
+        val toolCalls = listOf("first", "second").map { name ->
+            ChatCompletionMessageToolCall.ofFunction(
+                ChatCompletionMessageFunctionToolCall.builder()
+                    .id("call-$name")
+                    .function(
+                        ChatCompletionMessageFunctionToolCall.Function.builder()
+                            .name("missing_$name")
+                            .arguments("{}")
+                            .build(),
+                    )
+                    .build(),
+            )
+        }
+        val message = ChatCompletionMessage.builder()
+            .content(null)
+            .refusal(null)
+            .toolCalls(toolCalls)
+            .build()
+        val choice = ChatCompletion.Choice.builder()
+            .finishReason(ChatCompletion.Choice.FinishReason.TOOL_CALLS)
+            .index(0)
+            .logprobs(null)
+            .message(message)
+            .build()
+        return ChatCompletion.builder()
+            .id("completion")
+            .choices(listOf(choice))
+            .created(0)
+            .model("test-model")
+            .build()
     }
 
 }

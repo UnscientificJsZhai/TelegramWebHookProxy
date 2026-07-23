@@ -254,7 +254,10 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
-    private suspend fun performChat(client: OpenAIClient): String {
+    private suspend fun performChat(
+        client: OpenAIClient,
+        toolCallRounds: Int = 0,
+    ): String {
         val tools = localFunctionProviders.flatMap { provider ->
             provider.providedOpenAIFunctions.map { func ->
                 ChatCompletionTool.ofFunction(
@@ -271,13 +274,18 @@ class OpenAIAgentService @Inject constructor(
         val choice = response.choices().firstOrNull() ?: return ""
         val message = choice.message()
 
+        val toolCalls = message.toolCalls()
+        if (toolCalls.isPresent) {
+            ensureToolCallRoundIsAllowed(toolCallRounds)
+        }
+
         history.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
 
-        if (message.toolCalls().isPresent) {
-            val toolCalls = message.toolCalls().get()
+        if (toolCalls.isPresent) {
+            val functionToolCalls = toolCalls.get()
             val toolMessages = mutableListOf<ChatCompletionMessageParam>()
 
-            for (toolCall in toolCalls) {
+            for (toolCall in functionToolCalls) {
                 if (toolCall.isFunction()) {
                     val functionToolCall = toolCall.asFunction()
                     val function = functionToolCall.function()
@@ -311,7 +319,7 @@ class OpenAIAgentService @Inject constructor(
             }
 
             history.addAll(toolMessages)
-            return performChat(client)
+            return performChat(client, toolCallRounds + 1)
         }
 
         return message.content().getOrNull() ?: ""

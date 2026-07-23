@@ -1,17 +1,24 @@
 package com.unscientificjszhai.tgp.service
 
 import com.google.genai.Chat
+import com.google.genai.Chats
+import com.google.genai.Client
 import com.google.genai.types.Candidate
 import com.google.genai.types.Content
 import com.google.genai.types.FunctionCall
 import com.google.genai.types.GenerateContentResponse
 import com.google.genai.types.Part
+import com.google.genai.types.GenerateContentConfig
+import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
+import io.mockk.verify
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
@@ -160,6 +167,36 @@ class GeminiAgentServiceTest {
         assertEquals("Function missing_two not found", functionResponses[1].response().get()["error"])
     }
 
+    @Test
+    fun testToolCallsStopAfterMaximumRounds() = runTest {
+        val chat = mockk<Chat>()
+        val newChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
+        val toolCallResponse = responseWithParts(Part.builder().functionCall(functionCall).build())
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chat.sendMessage(any<List<Content>>()) } returns toolCallResponse
+        every { chat.sendMessage(any<Content>()) } returns toolCallResponse
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns newChat
+        every { newChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("新会话"))
+        injectClient(chats)
+        injectChat(chat)
+
+        val exception = assertFailsWith<IllegalStateException> {
+            service.sendMessage("持续调用工具")
+        }
+
+        assertEquals("工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。", exception.message)
+        verify(exactly = 1) { chat.sendMessage(any<List<Content>>()) }
+        verify(exactly = MAX_TOOL_CALL_ROUNDS) { chat.sendMessage(any<Content>()) }
+        assertEquals(newChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
+            isAccessible = true
+        }.get(service))
+        assertEquals("新会话", service.sendMessage("继续对话"))
+        verify(exactly = 1) { chats.create(any<String>(), any<GenerateContentConfig>()) }
+        verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
+    }
+
     private fun responseWithParts(vararg parts: Part): GenerateContentResponse =
         GenerateContentResponse.builder().candidates(
             Candidate.builder().content(
@@ -169,6 +206,12 @@ class GeminiAgentServiceTest {
 
     private fun injectChat(chat: Chat) {
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, chat)
+    }
+
+    private fun injectClient(chats: Chats) {
+        val client = Client.builder().apiKey("test").build()
+        Client::class.java.getDeclaredField("chats").apply { isAccessible = true }.set(client, chats)
+        GeminiAgentService::class.java.getDeclaredField("client").apply { isAccessible = true }.set(service, client)
     }
 
 }

@@ -13,6 +13,21 @@ data class ModelSnapshot(
     val availableModels: List<String>,
 )
 
+internal const val MAX_TOOL_CALL_ROUNDS = 10
+
+internal class ToolCallLimitExceededException : IllegalStateException(
+    "工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。",
+)
+
+/**
+ * 确保本轮工具调用没有超过上限，避免模型持续请求工具而无法生成最终回复。
+ */
+internal fun ensureToolCallRoundIsAllowed(toolCallRounds: Int) {
+    if (toolCallRounds >= MAX_TOOL_CALL_ROUNDS) {
+        throw ToolCallLimitExceededException()
+    }
+}
+
 /**
  * AI 代理服务基类，抽象了 AI 对话的核心逻辑。
  */
