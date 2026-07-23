@@ -9,23 +9,15 @@ import com.unscientificjszhai.tgp.repository.SkillRepository
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.time.Duration.Companion.seconds
 
 class DelegatingAgentServiceTest {
     @Test
@@ -69,11 +61,11 @@ class DelegatingAgentServiceTest {
         )
 
         try {
-            withTimeout(5_000) {
+            withTimeout(5.seconds) {
                 componentCreated.await()
             }
-            withTimeout(5_000) {
-                skillsUpdateEvent.subscriptionCount.filter { it > 0 }.first()
+            withTimeout(5.seconds) {
+                skillsUpdateEvent.subscriptionCount.first { it > 0 }
             }
 
             verify(exactly = 1) { agentComponentFactory.create() }
@@ -82,7 +74,7 @@ class DelegatingAgentServiceTest {
 
             skillsUpdateEvent.emit(Unit)
 
-            withTimeout(5_000) {
+            withTimeout(5.seconds) {
                 sessionReset.await()
             }
             verify(exactly = 1) { openAIAgentService.resetSession() }

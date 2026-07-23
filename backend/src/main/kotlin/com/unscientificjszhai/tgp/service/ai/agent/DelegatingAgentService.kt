@@ -1,12 +1,12 @@
 package com.unscientificjszhai.tgp.service.ai.agent
 
+import com.unscientificjszhai.tgp.di.AgentComponent
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.MediaData
-import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.di.AgentComponent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.combine
@@ -23,13 +23,14 @@ import javax.inject.Singleton
 @Singleton
 class DelegatingAgentService @Inject constructor(
     private val agentComponentFactory: AgentComponent.Factory,
-    private val settingsRepository: SettingsRepository,
+    settingsRepository: SettingsRepository,
     skillRepository: SkillRepository,
     parentScope: CoroutineScope,
 ) : AgentService() {
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
 
     private var currentAgentComponent: AgentComponent? = null
+
     @Volatile
     private var _currentService: AgentService? = null
 

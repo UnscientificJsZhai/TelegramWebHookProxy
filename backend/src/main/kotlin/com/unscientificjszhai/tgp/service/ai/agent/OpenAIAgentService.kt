@@ -6,11 +6,7 @@ import com.openai.models.ChatModel
 import com.openai.models.ReasoningEffort
 import com.openai.models.chat.completions.*
 import com.unscientificjszhai.tgp.di.AgentScope
-import com.unscientificjszhai.tgp.models.AIProvider
-import com.unscientificjszhai.tgp.models.AISettings
-import com.unscientificjszhai.tgp.models.MediaData
-import com.unscientificjszhai.tgp.models.MCPServerConfig
-import com.unscientificjszhai.tgp.models.ProxyType
+import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
@@ -30,7 +26,7 @@ import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
-import java.util.Base64
+import java.util.*
 import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
@@ -53,6 +49,7 @@ class OpenAIAgentService @Inject constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleLock = Any()
+
     @Volatile
     private var closed = false
     private var closeJob: Job? = null
@@ -72,8 +69,10 @@ class OpenAIAgentService @Inject constructor(
     @Volatile
     private var client: OpenAIClient? = null
     private val history = mutableListOf<ChatCompletionMessageParam>()
+
     /** 串行化完整对话与会话重置，避免历史记录交错。 */
     private val sessionMutex = Mutex()
+
     /** 串行化 MCP 连接，确保新连接不会与旧连接并行执行。 */
     private val mcpConnectionMutex = Mutex()
     private val mcpConnectionStateLock = Any()
@@ -81,6 +80,7 @@ class OpenAIAgentService @Inject constructor(
     private var currentMcpConnectionJob: Job? = null
     private val modelUpdateMutex = Mutex()
     private val modelStateLock = Any()
+
     /** 等待会话锁的最新模型选择；只有对应版本的任务可以提交它。 */
     private var desiredModel = DEFAULT_MODEL
     private var modelSelectionVersion = 0L
@@ -149,13 +149,11 @@ class OpenAIAgentService @Inject constructor(
         }
         return launchSessionJob {
             val canReset = synchronized(modelStateLock) {
-                if (closed || modelSelectionVersion != selectionVersion) {
-                    false
-                } else if (currentModel == desiredModel) {
-                    false
-                } else {
+                if (!closed && modelSelectionVersion == selectionVersion && currentModel != desiredModel) {
                     currentModel = desiredModel
                     true
+                } else {
+                    false
                 }
             }
             if (canReset) resetSessionLocked() else null
@@ -333,32 +331,32 @@ class OpenAIAgentService @Inject constructor(
             )
         }
 
-        for (media in mediaData) {
-            if (media.mimeType.startsWith("image/")) {
-                val base64Data = Base64.getEncoder().encodeToString(media.data)
+        for ((data, mimeType) in mediaData) {
+            if (mimeType.startsWith("image/")) {
+                val base64Data = Base64.getEncoder().encodeToString(data)
                 contentParts.add(
                     ChatCompletionContentPart.ofImageUrl(
                         ChatCompletionContentPartImage.builder()
                             .imageUrl(
                                 ChatCompletionContentPartImage.ImageUrl.builder()
-                                    .url("data:${media.mimeType};base64,$base64Data")
+                                    .url("data:$mimeType;base64,$base64Data")
                                     .build()
                             )
                             .build()
                     )
                 )
-            } else if (media.mimeType.startsWith("audio/")) {
+            } else if (mimeType.startsWith("audio/")) {
                 if (currentModel.contains("audio") || currentModel.startsWith("o1") || currentModel.startsWith("o3")) {
                     contentParts.add(
                         ChatCompletionContentPart.ofInputAudio(
                             ChatCompletionContentPartInputAudio.builder()
                                 .inputAudio(
                                     ChatCompletionContentPartInputAudio.InputAudio.builder()
-                                        .data(Base64.getEncoder().encodeToString(media.data))
+                                        .data(Base64.getEncoder().encodeToString(data))
                                         .format(
                                             when {
-                                                media.mimeType.contains("wav") -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
-                                                media.mimeType.contains("mp3") -> ChatCompletionContentPartInputAudio.InputAudio.Format.MP3
+                                                mimeType.contains("wav") -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
+                                                mimeType.contains("mp3") -> ChatCompletionContentPartInputAudio.InputAudio.Format.MP3
                                                 else -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
                                             }
                                         )
@@ -448,7 +446,7 @@ class OpenAIAgentService @Inject constructor(
                         jsonObject?.toMap() ?: throw IllegalArgumentException(arguments)
                     } catch (e: Exception) {
                         logger.error("Failed to parse function arguments: $arguments", e)
-                        emptyMap<String, Any?>()
+                        emptyMap()
                     }
 
                     val provider = localFunctionProviders.find { it.canHandle(name) }

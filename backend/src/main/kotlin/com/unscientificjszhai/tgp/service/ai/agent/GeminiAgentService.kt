@@ -47,6 +47,7 @@ class GeminiAgentService @Inject constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleLock = Any()
+
     @Volatile
     private var closed = false
     private var closeJob: Job? = null
@@ -57,8 +58,10 @@ class GeminiAgentService @Inject constructor(
         ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
         SkillFunctionProvider(skillRepository),
     )
+
     /** 串行化对话、重置和关闭，防止 Chat 状态在服务关闭后被旧任务改写。 */
     private val sessionMutex = Mutex()
+
     @Volatile
     private var client: Client? = null
     private var chat: Chat? = null

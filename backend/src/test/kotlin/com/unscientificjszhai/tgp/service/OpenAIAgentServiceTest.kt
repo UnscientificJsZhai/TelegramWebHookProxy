@@ -3,11 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.openai.client.OpenAIClient
 import com.openai.models.ChatModel
 import com.openai.models.ReasoningEffort
-import com.openai.models.chat.completions.ChatCompletion
-import com.openai.models.chat.completions.ChatCompletionCreateParams
-import com.openai.models.chat.completions.ChatCompletionMessage
-import com.openai.models.chat.completions.ChatCompletionMessageFunctionToolCall
-import com.openai.models.chat.completions.ChatCompletionMessageToolCall
+import com.openai.models.chat.completions.*
 import com.openai.models.models.Model
 import com.openai.models.models.ModelListPage
 import com.openai.services.blocking.ChatService
@@ -21,34 +17,19 @@ import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
-import io.mockk.every
-import io.mockk.mockk
 import io.mockk.coEvery
 import io.mockk.coVerify
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import io.mockk.every
+import io.mockk.mockk
+import kotlinx.coroutines.*
 import java.io.File
 import java.nio.file.Files
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.EmptyCoroutineContext
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertFailsWith
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
+import kotlin.test.*
+import kotlin.time.Duration.Companion.seconds
 
 class OpenAIAgentServiceTest {
 
@@ -299,7 +280,7 @@ class OpenAIAgentServiceTest {
             releaseConnection.await()
         }
         val resettableService = OpenAIAgentService(
-            CoroutineScope(kotlin.coroutines.EmptyCoroutineContext),
+            CoroutineScope(EmptyCoroutineContext),
             settingsRepository,
             skillRepository,
             mcpClientService,
@@ -345,7 +326,7 @@ class OpenAIAgentServiceTest {
             }
         }
         val resettableService = OpenAIAgentService(
-            CoroutineScope(kotlin.coroutines.EmptyCoroutineContext),
+            CoroutineScope(EmptyCoroutineContext),
             settingsRepository,
             skillRepository,
             mcpClientService,
@@ -380,7 +361,7 @@ class OpenAIAgentServiceTest {
             }
         }
         val resettableService = OpenAIAgentService(
-            CoroutineScope(kotlin.coroutines.EmptyCoroutineContext),
+            CoroutineScope(EmptyCoroutineContext),
             settingsRepository,
             skillRepository,
             mcpClientService,
@@ -416,7 +397,7 @@ class OpenAIAgentServiceTest {
             textResponse("在途回复")
         }
         val resettableService = OpenAIAgentService(
-            CoroutineScope(kotlin.coroutines.EmptyCoroutineContext),
+            CoroutineScope(EmptyCoroutineContext),
             settingsRepository,
             skillRepository,
             mcpClientService,
@@ -434,8 +415,8 @@ class OpenAIAgentServiceTest {
         assertFalse(closeJob.isCompleted)
 
         releaseFirstRequest.countDown()
-        assertEquals("在途回复", withTimeout(5_000) { firstMessage.await() })
-        withTimeout(5_000) { closeJob.join() }
+        assertEquals("在途回复", withTimeout(5.seconds) { firstMessage.await() })
+        withTimeout(5.seconds) { closeJob.join() }
 
         assertTrue(resetJob.isCancelled)
         assertTrue(switchJob.isCancelled)
@@ -466,8 +447,8 @@ class OpenAIAgentServiceTest {
         val switchBackToDefault = assertNotNull(service.switchModel("gpt-5.6-luna"))
 
         releaseFirstRequest.countDown()
-        assertEquals("第一条回复", withTimeout(5_000) { firstMessage.await() })
-        withTimeout(5_000) {
+        assertEquals("第一条回复", withTimeout(5.seconds) { firstMessage.await() })
+        withTimeout(5.seconds) {
             switchToGpt4o.join()
             switchBackToDefault.join()
         }

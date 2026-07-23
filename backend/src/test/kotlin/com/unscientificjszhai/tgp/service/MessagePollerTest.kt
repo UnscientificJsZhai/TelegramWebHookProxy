@@ -6,8 +6,8 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSnapshot
-import io.ktor.client.statement.HttpResponse
-import io.ktor.http.HttpStatusCode
+import io.ktor.client.statement.*
+import io.ktor.http.*
 import io.mockk.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -274,7 +274,13 @@ class MessagePollerTest {
         coEvery { telegramService.sendChatAction(chatId, "typing") } returns mockk()
         coEvery { agentService.sendMessage("Hello AI") } returns "Hello Human"
         coEvery { telegramService.sendMessage(chatId, "Hello Human", any()) } throws RuntimeException("send failed")
-        coEvery { telegramService.sendMessage(chatId, match { it.startsWith("AI 处理消息时出错") }, any()) } returns mockk()
+        coEvery {
+            telegramService.sendMessage(
+                chatId,
+                match { it.startsWith("AI 处理消息时出错") },
+                any()
+            )
+        } returns mockk()
 
         messagePoller.handleAiMessage(chatId, "Hello AI", 100L)
 

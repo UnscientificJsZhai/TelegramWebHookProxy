@@ -4,7 +4,7 @@ import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
-import io.ktor.http.isSuccess
+import io.ktor.http.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.launchIn

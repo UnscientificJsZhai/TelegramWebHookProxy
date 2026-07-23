@@ -96,7 +96,7 @@ abstract class AgentService {
      * @param skills Skill列表。
      * @return 拼接后的提示词。如果 [skills] 为空，则返回空白字符串。
      */
-    protected fun getSkillPrompt(skills: List<SkillBrief>):String {
+    protected fun getSkillPrompt(skills: List<SkillBrief>): String {
         return if (skills.isNotEmpty()) {
             "Before doing anything, first try calling the read_skill tool to confirm the correct process. Available Skills:\n" + skills.joinToString(
                 "\n"

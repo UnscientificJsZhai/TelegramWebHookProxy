@@ -2,9 +2,11 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
-import io.mockk.*
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import io.mockk.coEvery
+import io.mockk.coVerify
+import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
 import java.io.File
@@ -28,10 +30,10 @@ class TaskSchedulerServiceTest {
         telegramService = mockk()
         agentService = mockk()
         settingsRepository = mockk(relaxed = true)
-        
+
         val agentProvider = Provider { agentService }
         val testScope = CoroutineScope(EmptyCoroutineContext)
-        
+
         service = TaskSchedulerService(testScope, telegramService, agentProvider)
     }
 
@@ -47,7 +49,7 @@ class TaskSchedulerServiceTest {
     fun testCreateAndListTasks() {
         val id = service.createTask("Test instruction", System.currentTimeMillis() + 10000, LoopMode.ONCE, "12345")
         assertNotNull(id)
-        
+
         val tasks = service.listTasks()
         assertEquals(1, tasks.size)
         assertEquals(id, tasks[0].id)
@@ -74,7 +76,7 @@ class TaskSchedulerServiceTest {
 
         coVerify { agentService.sendMessage(any()) }
         coVerify { telegramService.sendMessage(chatId, match { it.contains("LLM result") }) }
-        
+
         assertEquals(0, service.listTasks().size, "ONCE task should be removed after execution")
     }
 

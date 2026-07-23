@@ -12,6 +12,7 @@ import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.time.Duration.Companion.seconds
 
 class MCPClientServiceTest {
 
@@ -31,7 +32,7 @@ class MCPClientServiceTest {
         coEvery { secondClient.listTools() } returns ListToolsResult(emptyList())
         coEvery { secondClient.close() } returns Unit
 
-        withTimeout(5_000) {
+        withTimeout(5.seconds) {
             service.connect(listOf(firstConfig))
             service.connect(listOf(updatedConfig))
         }
@@ -42,7 +43,7 @@ class MCPClientServiceTest {
         assertEquals(emptyList(), service.getAllTools())
 
         val closeJob: Job = service.disconnectAll()
-        withTimeout(5_000) { closeJob.join() }
+        withTimeout(5.seconds) { closeJob.join() }
         coVerify(exactly = 1) { secondClient.close() }
     }
 }

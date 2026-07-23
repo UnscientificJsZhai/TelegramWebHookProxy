@@ -1,7 +1,7 @@
 package com.unscientificjszhai.tgp.modules
 
-import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.module
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -44,7 +44,7 @@ class APIModuleTest {
             assertEquals(HttpStatusCode.OK, status)
             val responseText = bodyAsText()
             val receivedSettings = Json.decodeFromString<AppSettings>(responseText)
-            
+
             assertEquals("api_token", receivedSettings.telegramToken)
             assertEquals("456", receivedSettings.chatId)
             assertEquals(true, receivedSettings.ai?.agentEnabled)

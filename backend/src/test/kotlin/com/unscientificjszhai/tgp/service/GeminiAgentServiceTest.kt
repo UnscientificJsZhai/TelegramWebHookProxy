@@ -3,12 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.google.genai.Chat
 import com.google.genai.Chats
 import com.google.genai.Client
-import com.google.genai.types.Candidate
-import com.google.genai.types.Content
-import com.google.genai.types.FunctionCall
-import com.google.genai.types.GenerateContentResponse
-import com.google.genai.types.Part
-import com.google.genai.types.GenerateContentConfig
+import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -19,12 +14,8 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
@@ -32,14 +23,8 @@ import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.EmptyCoroutineContext
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertFailsWith
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
+import kotlin.test.*
+import kotlin.time.Duration.Companion.seconds
 
 class GeminiAgentServiceTest {
 
@@ -53,7 +38,8 @@ class GeminiAgentServiceTest {
         tempDirectory = Files.createTempDirectory("gemini-agent-service-test").toFile()
         val testScope = CoroutineScope(EmptyCoroutineContext)
         settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"))
-        skillRepository = com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(File(tempDirectory, "skills.json"))
+        skillRepository =
+            com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(File(tempDirectory, "skills.json"))
         service =
             GeminiAgentService(testScope, settingsRepository, skillRepository, MCPClientService(testScope)) { mockk() }
     }
@@ -224,8 +210,8 @@ class GeminiAgentServiceTest {
         assertFalse(closeJob.isCompleted)
 
         releaseRequest.countDown()
-        assertEquals("完成", withTimeout(5_000) { inFlightMessage.await() })
-        withTimeout(5_000) { closeJob.join() }
+        assertEquals("完成", withTimeout(5.seconds) { inFlightMessage.await() })
+        withTimeout(5.seconds) { closeJob.join() }
         assertTrue(closeJob.isCompleted)
     }
 

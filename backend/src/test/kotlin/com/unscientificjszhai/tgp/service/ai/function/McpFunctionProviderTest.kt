@@ -19,6 +19,5 @@ class McpFunctionProviderTest {
         assertFailsWith<CancellationException> {
             provider.execute("server_tool", emptyMap())
         }
-        Unit
     }
 }

@@ -5,9 +5,8 @@ import com.google.genai.types.Schema
 import com.openai.core.JsonValue
 import com.openai.models.FunctionDefinition
 import com.openai.models.FunctionParameters
-import kotlin.jvm.optionals.getOrNull
-
 import kotlinx.serialization.json.*
+import kotlin.jvm.optionals.getOrNull
 
 /**
  * 本地功能提供者基类。

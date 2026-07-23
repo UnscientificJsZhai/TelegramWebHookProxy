@@ -1,8 +1,6 @@
 package com.unscientificjszhai.tgp.models
 
 import com.unscientificjszhai.tgp.utils.ConfigJson
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -33,7 +31,7 @@ class SettingsTest {
 
         val jsonString = ConfigJson.encodeToString(appSettings)
         val jsonElement = ConfigJson.parseToJsonElement(jsonString).jsonObject
-        
+
         assertTrue(jsonElement.containsKey("ai"))
         val aiElement = jsonElement["ai"]?.jsonObject
         assertNotNull(aiElement)
