@@ -6,13 +6,19 @@ import com.openai.models.ReasoningEffort
 import com.openai.models.models.Model
 import com.openai.models.models.ModelListPage
 import com.openai.services.blocking.ModelService
+import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.coEvery
+import io.mockk.coVerify
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -28,6 +34,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class OpenAIAgentServiceTest {
@@ -153,6 +160,34 @@ class OpenAIAgentServiceTest {
 
         assertEquals(ChatModel.GPT_4O.toString(), service.currentModel)
         assertTrue(service.currentModel in service.availableModels)
+    }
+
+    @Test
+    fun testResetSessionReturnsMcpConnectionJob() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val releaseConnection = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        settingsRepository.saveSettings(AppSettings(ai = AISettings(mcpServers = mcpServers)))
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            releaseConnection.await()
+        }
+        val resettableService = OpenAIAgentService(
+            CoroutineScope(kotlin.coroutines.EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        val resetJob = assertNotNull(resettableService.resetSession())
+        connectionStarted.await()
+        assertFalse(resetJob.isCompleted)
+        releaseConnection.complete(Unit)
+        resetJob.join()
+
+        assertTrue(resetJob.isCompleted)
+        coVerify(exactly = 1) { mcpClientService.connect(mcpServers) }
     }
 
     @Test

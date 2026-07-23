@@ -160,7 +160,7 @@ class OpenAIAgentService @Inject constructor(
     override fun resetSession(): Job? {
         history.clear()
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
-        scope.launch {
+        val mcpConnectionJob = scope.launch {
             mcpClientService.connect(aiSettings.mcpServers)
         }
 
@@ -178,7 +178,7 @@ class OpenAIAgentService @Inject constructor(
             )
         }
         logger.info("OpenAI session reset with model: $currentModel")
-        return null
+        return mcpConnectionJob
     }
 
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String {
