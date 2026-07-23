@@ -20,6 +20,8 @@ import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -62,6 +64,10 @@ class OpenAIAgentService @Inject constructor(
 
     private var client: OpenAIClient? = null
     private var history = mutableListOf<ChatCompletionMessageParam>()
+    private val modelUpdateMutex = Mutex()
+    private val modelStateLock = Any()
+    private var modelSelectionVersion = 0L
+    private var initialModelUpdateJob: Job? = null
 
     override var currentModel: String = DEFAULT_MODEL
         private set
@@ -100,7 +106,7 @@ class OpenAIAgentService @Inject constructor(
                     .build()
 
                 resetSession()
-                updateModel()
+                initialModelUpdateJob = scope.launch { updateModel() }
                 logger.info("OpenAI client initialized.")
             } catch (e: Exception) {
                 logger.error("Failed to initialize OpenAI client", e)
@@ -109,26 +115,45 @@ class OpenAIAgentService @Inject constructor(
     }
 
     override fun switchModel(modelName: String): Job? {
-        if (modelName !in availableModels) {
-            throw IllegalArgumentException("Unsupported model: $modelName")
+        val modelChanged = synchronized(modelStateLock) {
+            if (modelName !in availableModels) {
+                throw IllegalArgumentException("Unsupported model: $modelName")
+            }
+            if (currentModel == modelName) {
+                false
+            } else {
+                currentModel = modelName
+                modelSelectionVersion++
+                true
+            }
         }
-        currentModel = modelName
-        return resetSession()
+        return if (modelChanged) resetSession() else null
     }
 
-    override fun updateModel() {
-        scope.launch {
-            try {
-                val models = client?.models()?.list()?.data() ?: emptyList()
-                availableModels = models.map { it.id() }
+    override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
+        try {
+            val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
+            val models = withContext(Dispatchers.IO) {
+                client?.models()?.list()?.data()
+            } ?: return@withLock null
+            val refreshedModels = models.map { it.id() }
+            synchronized(modelStateLock) {
+                if (modelSelectionVersion != selectionVersion) {
+                    return@withLock null
+                }
+                availableModels = refreshedModels
                 preferredModel(availableModels)?.let { preferredModel ->
                     if (currentModel !in availableModels) {
                         currentModel = preferredModel
                     }
                 }
-            } catch (e: Exception) {
-                logger.error("Failed to update OpenAI models", e)
+                ModelSnapshot(currentModel, availableModels)
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error("Failed to update OpenAI models", e)
+            null
         }
     }
 
@@ -318,6 +343,8 @@ class OpenAIAgentService @Inject constructor(
         FALLBACK_MODELS.firstOrNull { it in models } ?: models.firstOrNull()
 
     override fun close() {
+        initialModelUpdateJob?.cancel()
+        initialModelUpdateJob = null
         client = null
         mcpClientService.disconnectAll()
         logger.info("OpenAI client closed.")

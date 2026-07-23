@@ -17,6 +17,8 @@ import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -55,6 +57,10 @@ class GeminiAgentService @Inject constructor(
     private var savedHistory: List<Content>? = null
 
     private var resetSessionJob: Job? = null
+
+    private val modelUpdateMutex = Mutex()
+    private val modelStateLock = Any()
+    private var modelSelectionVersion = 0L
 
     /**
      * 当前会话使用的模型。
@@ -131,26 +137,49 @@ class GeminiAgentService @Inject constructor(
      * @param modelName 模型名称。
      */
     override fun switchModel(modelName: String): Job? {
-        val normalizedModel = when {
-            modelName in availableModels -> modelName
-            "models/$modelName" in availableModels -> "models/$modelName"
-            else -> modelName
+        val modelChanged = synchronized(modelStateLock) {
+            val normalizedModel = when {
+                modelName in availableModels -> modelName
+                "models/$modelName" in availableModels -> "models/$modelName"
+                else -> modelName
+            }
+            if (normalizedModel !in availableModels) {
+                throw IllegalArgumentException("Unsupported model: $modelName")
+            }
+            if (currentModel == normalizedModel) {
+                false
+            } else {
+                currentModel = normalizedModel
+                modelSelectionVersion++
+                true
+            }
         }
-        if (normalizedModel !in availableModels) {
-            throw IllegalArgumentException("Unsupported model: $modelName")
-        }
-        if (currentModel != normalizedModel) {
+        if (modelChanged) {
             captureHistory()
-            currentModel = normalizedModel
             return resetSession()
         }
         return null
     }
 
-    override fun updateModel() {
-        client?.models?.let { models ->
-            this@GeminiAgentService.availableModels =
+    override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
+        try {
+            val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
+            val models = client?.models ?: return@withLock null
+            val refreshedModels = withContext(Dispatchers.IO) {
                 models.list(ListModelsConfig.builder().build()).mapNotNull { it.name().getOrNull() }
+            }
+            synchronized(modelStateLock) {
+                if (modelSelectionVersion != selectionVersion) {
+                    return@withLock null
+                }
+                availableModels = refreshedModels
+                ModelSnapshot(currentModel, availableModels)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error("Failed to update Gemini models", e)
+            null
         }
     }
 

@@ -30,6 +30,7 @@ class DelegatingAgentService @Inject constructor(
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
 
     private var currentAgentComponent: AgentComponent? = null
+    @Volatile
     private var _currentService: AgentService? = null
 
     private val currentService: AgentService
@@ -105,8 +106,10 @@ class DelegatingAgentService @Inject constructor(
         return currentService.switchModel(modelName)
     }
 
-    override fun updateModel() {
-        currentService.updateModel()
+    override suspend fun updateModel(): ModelSnapshot? {
+        val service = currentService
+        val snapshot = service.updateModel() ?: return null
+        return snapshot.takeIf { _currentService === service }
     }
 
     override fun resetSession(): Job? {

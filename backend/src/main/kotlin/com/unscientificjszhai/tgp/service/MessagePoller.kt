@@ -367,9 +367,17 @@ class MessagePoller @Inject constructor(
                         )
                     }
                 } else {
-                    agentService.updateModel()
-                    val current = agentService.currentModel
-                    val available = agentService.availableModels
+                    val modelSnapshot = agentService.updateModel()
+                    if (modelSnapshot == null) {
+                        telegramService.sendMessage(
+                            chatId,
+                            "获取可用模型列表失败，请稍后重试。",
+                            ReplyParameters(messageId),
+                        )
+                        return
+                    }
+                    val current = modelSnapshot.currentModel
+                    val available = modelSnapshot.availableModels
                     val list = available.joinToString("\n") { model ->
                         if (model == current) "✅ $model" else "      $model"
                     }

@@ -12,18 +12,23 @@ import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class OpenAIAgentServiceTest {
 
@@ -86,14 +91,68 @@ class OpenAIAgentServiceTest {
         every { gpt4oModel.id() } returns ChatModel.GPT_4O.toString()
         injectClient(client)
 
-        service.updateModel()
+        val snapshot = service.updateModel()
 
-        withTimeout(5_000) {
-            while (service.availableModels != listOf("third-party", ChatModel.GPT_4O.toString())) {
-                delay(10)
-            }
-        }
+        assertEquals(listOf("third-party", ChatModel.GPT_4O.toString()), service.availableModels)
         assertEquals(ChatModel.GPT_4O.toString(), service.currentModel)
+        assertEquals(service.currentModel, snapshot?.currentModel)
+        assertEquals(service.availableModels, snapshot?.availableModels)
+    }
+
+    @Test
+    fun testModelRefreshFailureReturnsFalseAndRetainsCachedModels() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val modelService = mockk<ModelService>()
+        every { client.models() } returns modelService
+        every { modelService.list() } throws IllegalStateException("network failure")
+        injectClient(client)
+        val cachedModels = service.availableModels
+
+        assertEquals(null, service.updateModel())
+
+        assertEquals(cachedModels, service.availableModels)
+    }
+
+    @Test
+    fun testModelRefreshPropagatesCancellation() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val modelService = mockk<ModelService>()
+        every { client.models() } returns modelService
+        every { modelService.list() } throws CancellationException("cancelled")
+        injectClient(client)
+
+        assertFailsWith<CancellationException> {
+            service.updateModel()
+        }
+        Unit
+    }
+
+    @Test
+    fun testModelRefreshDoesNotOverrideConcurrentModelSwitch() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val modelService = mockk<ModelService>()
+        val page = mockk<ModelListPage>()
+        val thirdPartyModel = mockk<Model>()
+        val refreshStarted = CountDownLatch(1)
+        val continueRefresh = CountDownLatch(1)
+        every { client.models() } returns modelService
+        every { modelService.list() } answers {
+            refreshStarted.countDown()
+            check(continueRefresh.await(5, TimeUnit.SECONDS))
+            page
+        }
+        every { page.data() } returns listOf(thirdPartyModel)
+        every { thirdPartyModel.id() } returns "third-party"
+        injectClient(client)
+
+        val refreshJob = launch(Dispatchers.Default) { service.updateModel() }
+        assertTrue(refreshStarted.await(5, TimeUnit.SECONDS))
+        service.switchModel(ChatModel.GPT_4O.toString())
+        continueRefresh.countDown()
+        refreshJob.join()
+
+        assertEquals(ChatModel.GPT_4O.toString(), service.currentModel)
+        assertTrue(service.currentModel in service.availableModels)
     }
 
     @Test

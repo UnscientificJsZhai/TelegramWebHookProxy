@@ -6,6 +6,14 @@ import com.unscientificjszhai.tgp.models.SkillBrief
 import kotlinx.coroutines.Job
 
 /**
+ * 一次模型列表刷新得到的一致性快照。
+ */
+data class ModelSnapshot(
+    val currentModel: String,
+    val availableModels: List<String>,
+)
+
+/**
  * AI 代理服务基类，抽象了 AI 对话的核心逻辑。
  */
 abstract class AgentService {
@@ -33,8 +41,10 @@ abstract class AgentService {
 
     /**
      * 更新可用模型列表。
+     *
+     * @return 获取成功后的模型快照；刷新失败或结果已过期时返回 null。
      */
-    abstract fun updateModel()
+    abstract suspend fun updateModel(): ModelSnapshot?
 
     /**
      * 重置当前会话，清空历史记录并重新应用系统提示词。

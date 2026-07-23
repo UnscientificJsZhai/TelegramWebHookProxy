@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSnapshot
 import io.ktor.client.statement.HttpResponse
 import io.ktor.http.HttpStatusCode
 import io.mockk.*
@@ -73,6 +74,46 @@ class MessagePollerTest {
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
         coVerify(exactly = 0) { agentService.resetSession() }
         coVerify(exactly = 0) { agentService.sendMessage(any<String>()) }
+    }
+
+    @Test
+    fun testModelCommandUsesRefreshedModelList() = runTest {
+        val chatId = "123456"
+        coEvery { agentService.updateModel() } returns ModelSnapshot(
+            currentModel = "fresh-model",
+            availableModels = listOf("fresh-model", "another-model"),
+        )
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/model", 100L)
+
+        coVerifyOrder {
+            agentService.updateModel()
+            telegramService.sendMessage(
+                chatId,
+                "当前可用模型列表：\n✅ fresh-model\n      another-model\n\n使用 `/model <模型名称>` 切换模型。",
+                any(),
+            )
+        }
+    }
+
+    @Test
+    fun testModelCommandReportsRefreshFailureWithoutUsingCachedModels() = runTest {
+        val chatId = "123456"
+        coEvery { agentService.updateModel() } returns null
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/model", 100L)
+
+        coVerify {
+            telegramService.sendMessage(
+                chatId,
+                "获取可用模型列表失败，请稍后重试。",
+                any(),
+            )
+        }
+        verify(exactly = 0) { agentService.currentModel }
+        verify(exactly = 0) { agentService.availableModels }
     }
 
     @Test
