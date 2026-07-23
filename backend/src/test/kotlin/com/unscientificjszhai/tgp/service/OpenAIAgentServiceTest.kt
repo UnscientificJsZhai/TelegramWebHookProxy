@@ -19,6 +19,7 @@ import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import io.mockk.every
 import io.mockk.mockk
@@ -198,26 +199,33 @@ class OpenAIAgentServiceTest {
     }
 
     @Test
-    fun testToolCallLimitStopsBeforeEleventhToolExecution() = runBlocking {
+    fun test工具调用达到上限后重置历史并使用新会话继续处理() = runBlocking {
         val client = mockk<OpenAIClient>()
         val chatService = mockk<ChatService>()
         val chatCompletionService = mockk<ChatCompletionService>()
         val requests = mutableListOf<ChatCompletionCreateParams>()
-        val response = toolCallResponse()
+        val toolCallResponse = toolCallResponse()
         every { client.chat() } returns chatService
         every { chatService.completions() } returns chatCompletionService
         every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } answers {
             requests += invocation.args[0] as ChatCompletionCreateParams
-            response
+            if (requests.size <= MAX_TOOL_CALL_ROUNDS + 1) {
+                toolCallResponse
+            } else {
+                textResponse("新会话完成")
+            }
         }
         injectClient(client)
 
-        val reply = service.sendMessage("持续调用工具")
+        val limitReply = service.sendMessage("持续调用工具")
+        val nextReply = service.sendMessage("继续对话")
 
-        assertEquals("Error: 工具调用轮次超过上限（10 轮）。", reply)
-        assertEquals(11, requests.size)
-        assertEquals(31, requests.last().messages().size)
-        assertEquals(31, service.createChatCompletionParams(emptyList()).messages().size)
+        assertEquals("Error: 工具调用轮次超过上限（10 轮）。", limitReply)
+        assertEquals("新会话完成", nextReply)
+        assertEquals(MAX_TOOL_CALL_ROUNDS + 2, requests.size)
+        assertEquals(31, requests[MAX_TOOL_CALL_ROUNDS].messages().size)
+        assertEquals(1, requests.last().messages().size)
+        assertEquals(2, service.createChatCompletionParams(emptyList()).messages().size)
     }
 
     @Test
@@ -261,6 +269,25 @@ class OpenAIAgentServiceTest {
             .build()
         val choice = ChatCompletion.Choice.builder()
             .finishReason(ChatCompletion.Choice.FinishReason.TOOL_CALLS)
+            .index(0)
+            .logprobs(null)
+            .message(message)
+            .build()
+        return ChatCompletion.builder()
+            .id("completion")
+            .choices(listOf(choice))
+            .created(0)
+            .model("test-model")
+            .build()
+    }
+
+    private fun textResponse(content: String): ChatCompletion {
+        val message = ChatCompletionMessage.builder()
+            .content(content)
+            .refusal(null)
+            .build()
+        val choice = ChatCompletion.Choice.builder()
+            .finishReason(ChatCompletion.Choice.FinishReason.STOP)
             .index(0)
             .logprobs(null)
             .message(message)

@@ -248,6 +248,10 @@ class OpenAIAgentService @Inject constructor(
 
         return try {
             performChat(currentClient)
+        } catch (e: ToolCallLimitExceededException) {
+            logger.error("Tool call limit reached for OpenAI session", e)
+            resetSession()
+            "Error: ${e.message}"
         } catch (e: Exception) {
             logger.error("Error while sending message to OpenAI", e)
             "Error: ${e.message}"
