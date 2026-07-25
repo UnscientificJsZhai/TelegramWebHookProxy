@@ -1,5 +1,8 @@
 package com.unscientificjszhai.tgp.service
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.Chat
@@ -18,13 +21,17 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
+import org.slf4j.LoggerFactory
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -408,6 +415,111 @@ class MessagePollerTest {
     }
 
     /**
+     * 验证首次初始化请求抛异常时不会开始常规轮询。
+     *
+     * 验证初始化失败不会保存偏移量，也不会以 `offset = 1` 重放历史消息。
+     */
+    @Test
+    fun testInitialPollingExceptionDoesNotStartRegularPollingOrSaveOffset() = runBlocking {
+        val regularPollCalled = CompletableDeferred<Unit>()
+        prepareInitialPolling()
+        coEvery { telegramService.getUpdates(-1, 0) } throws IllegalStateException("initialization failed")
+        coEvery { telegramService.getUpdates(1, 30) } coAnswers {
+            regularPollCalled.complete(Unit)
+            GetUpdatesResponse(ok = true)
+        }
+
+        messagePoller.use { poller ->
+            poller.start()
+            eventually {
+                coVerify(exactly = 1) { telegramService.getUpdates(-1, 0) }
+            }
+            assertFailsWith<TimeoutCancellationException> {
+                withTimeout(2.seconds) { regularPollCalled.await() }
+            }
+            coVerify(exactly = 0) { telegramService.getUpdates(1, 30) }
+            verify(exactly = 0) { updatesRepository.saveLastUpdateId(any()) }
+        }
+    }
+
+    /**
+     * 验证首次初始化返回 Telegram 错误时不会开始常规轮询。
+     *
+     * 验证 Telegram `ok = false` 响应不会保存偏移量，也不会以 `offset = 1` 重放历史消息。
+     */
+    @Test
+    fun testFailedInitialPollingResponseDoesNotStartRegularPollingOrSaveOffset() = runBlocking {
+        val regularPollCalled = CompletableDeferred<Unit>()
+        val logger = LoggerFactory.getLogger(MessagePoller::class.java) as Logger
+        val logAppender = ListAppender<ILoggingEvent>().also { it.start() }
+        prepareInitialPolling()
+        coEvery { telegramService.getUpdates(-1, 0) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 401,
+            description = "Unauthorized",
+        )
+        coEvery { telegramService.getUpdates(1, 30) } coAnswers {
+            regularPollCalled.complete(Unit)
+            GetUpdatesResponse(ok = true)
+        }
+        logger.addAppender(logAppender)
+
+        messagePoller.start()
+        try {
+            eventually {
+                coVerify(exactly = 1) { telegramService.getUpdates(-1, 0) }
+            }
+            eventually {
+                assertTrue(
+                    logAppender.list.any { event ->
+                        event.throwableProxy?.message?.contains("401") == true &&
+                                event.throwableProxy?.message?.contains("Unauthorized") == true
+                    },
+                )
+            }
+            assertFailsWith<TimeoutCancellationException> {
+                withTimeout(2.seconds) { regularPollCalled.await() }
+            }
+            coVerify(exactly = 0) { telegramService.getUpdates(1, 30) }
+            verify(exactly = 0) { updatesRepository.saveLastUpdateId(any()) }
+        } finally {
+            messagePoller.close()
+            logger.detachAppender(logAppender)
+            logAppender.stop()
+        }
+    }
+
+    /**
+     * 验证首次初始化失败后会在重试成功前保持停止常规轮询。
+     *
+     * 验证下一次轮询会再次执行初始化；只有成功保存最新更新标识后，才会按其后的偏移量长轮询。
+     */
+    @Test
+    fun testInitialPollingRetriesInitializationBeforeStartingRegularPolling() = runBlocking {
+        val initializedUpdateId = 99L
+        prepareInitialPolling()
+        coEvery { telegramService.getUpdates(-1, 0) } throws IllegalStateException("initialization failed") andThen
+                GetUpdatesResponse(ok = true, result = listOf(Update(updateId = initializedUpdateId)))
+        coEvery { telegramService.getUpdates(initializedUpdateId + 1, 30) } returns GetUpdatesResponse(ok = true)
+
+        messagePoller.use { poller ->
+            poller.start()
+            eventually(timeout = 8.seconds) {
+                coVerify(exactly = 2) { telegramService.getUpdates(-1, 0) }
+                verify(exactly = 1) { updatesRepository.saveLastUpdateId(initializedUpdateId) }
+                coVerify(atLeast = 1) { telegramService.getUpdates(initializedUpdateId + 1, 30) }
+            }
+            coVerifyOrder {
+                telegramService.getUpdates(-1, 0)
+                telegramService.getUpdates(-1, 0)
+                updatesRepository.saveLastUpdateId(initializedUpdateId)
+                telegramService.getUpdates(initializedUpdateId + 1, 30)
+            }
+            coVerify(exactly = 0) { telegramService.getUpdates(1, 30) }
+        }
+    }
+
+    /**
      * 验证轮询仅在队列处理结束后保存更新偏移量。
      *
      * 验证在队列消费者完成前不保存偏移量，并按更新标识而非 Telegram 返回列表的顺序逐条保存。
@@ -561,8 +673,26 @@ class MessagePollerTest {
         every { updatesRepository.saveLastUpdateId(any()) } returns Unit
     }
 
-    private suspend fun eventually(assertion: () -> Unit) {
-        withTimeout(2.seconds) {
+    private fun prepareInitialPolling() {
+        var lastUpdateId = 0L
+        settingsFlow.value = settingsFlow.value.copy(telegramToken = "test-token")
+        messagePoller = MessagePoller(
+            CoroutineScope(Dispatchers.Default),
+            telegramService,
+            agentService,
+            settingsRepository,
+            updatesRepository,
+        )
+        every { updatesRepository.lastUpdateId } answers { lastUpdateId }
+        every { updatesRepository.chatsFlow } returns MutableStateFlow(emptyList())
+        every { updatesRepository.saveChats(any()) } returns Unit
+        every { updatesRepository.saveLastUpdateId(any()) } answers {
+            lastUpdateId = firstArg()
+        }
+    }
+
+    private suspend fun eventually(timeout: kotlin.time.Duration = 2.seconds, assertion: () -> Unit) {
+        withTimeout(timeout) {
             while (true) {
                 try {
                     assertion()

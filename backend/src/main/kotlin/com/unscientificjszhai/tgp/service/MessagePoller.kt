@@ -111,15 +111,18 @@ class MessagePoller @Inject constructor(
 
         if (lastStoredId == 0L) {
             // 第一次运行，先获取最新的 updateId 以避免处理历史消息
-            try {
-                val initialResponse = telegramService.getUpdates(offset = -1, timeout = 0)
-                if (initialResponse.ok && initialResponse.result.isNotEmpty()) {
-                    lastStoredId = initialResponse.result.last().updateId
-                    updatesRepository.saveLastUpdateId(lastStoredId)
-                    logger.info("Initialized lastUpdateId to $lastStoredId")
-                }
-            } catch (e: Exception) {
-                logger.warn("Failed to initialize lastUpdateId", e)
+            val initialResponse = telegramService.getUpdates(offset = -1, timeout = 0)
+            if (!initialResponse.ok) {
+                throw IllegalStateException(
+                    "Failed to initialize lastUpdateId: Telegram API error " +
+                            "${initialResponse.errorCode ?: "unknown"}: " +
+                            (initialResponse.description ?: "no description"),
+                )
+            }
+            if (initialResponse.result.isNotEmpty()) {
+                lastStoredId = initialResponse.result.last().updateId
+                updatesRepository.saveLastUpdateId(lastStoredId)
+                logger.info("Initialized lastUpdateId to $lastStoredId")
             }
             delay(1000.milliseconds)
         }
