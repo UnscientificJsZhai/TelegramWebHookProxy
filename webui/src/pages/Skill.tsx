@@ -39,6 +39,10 @@ const SkillPage: React.FC = () => {
     const [total, setTotal] = useState(0);
     const pageSize = 10;
 
+    const showSnackbar = (message: string, severity: 'success' | 'error') => {
+        setSnackbar({ open: true, message, severity });
+    };
+
     const fetchSkills = useCallback(async () => {
         try {
             const data = await getSkills(page, pageSize);
@@ -51,7 +55,11 @@ const SkillPage: React.FC = () => {
     }, [page]);
 
     useEffect(() => {
-        fetchSkills();
+        const timeoutId = window.setTimeout(() => {
+            void fetchSkills();
+        }, 0);
+
+        return () => window.clearTimeout(timeoutId);
     }, [fetchSkills]);
 
     const handleOpen = (skill?: Skill) => {
@@ -99,10 +107,6 @@ const SkillPage: React.FC = () => {
             console.error('Failed to delete skill:', error);
             showSnackbar('删除技能失败', 'error');
         }
-    };
-
-    const showSnackbar = (message: string, severity: 'success' | 'error') => {
-        setSnackbar({ open: true, message, severity });
     };
 
     const handlePageChange = (_event: React.ChangeEvent<unknown>, value: number) => {

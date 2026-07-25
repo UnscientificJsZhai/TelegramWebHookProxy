@@ -355,7 +355,11 @@ const Settings: React.FC = () => {
             ...settings,
             ai: settings.ai ? {
                 ...settings.ai,
-                mcpServers: settings.ai.mcpServers.map(({ _headerString, ...server }) => server)
+                mcpServers: settings.ai.mcpServers.map((server) => {
+                    const serverToSave = { ...server };
+                    delete serverToSave._headerString;
+                    return serverToSave;
+                })
             } : null
         };
 
