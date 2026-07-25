@@ -2,6 +2,11 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.Chat
+import com.unscientificjszhai.tgp.models.ChatInfo
+import com.unscientificjszhai.tgp.models.GetUpdatesResponse
+import com.unscientificjszhai.tgp.models.Message
+import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
@@ -9,12 +14,19 @@ import com.unscientificjszhai.tgp.service.ai.agent.ModelSnapshot
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.mockk.*
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * 消息轮询服务的命令、AI 回复和上下文清理行为测试设计。
@@ -393,6 +405,173 @@ class MessagePollerTest {
         messagePoller.handleAiMessage(chatId, "Hello AI", 100L)
 
         assert(getLastAiReplyAtMillis() == null)
+    }
+
+    /**
+     * 验证轮询仅在队列处理结束后保存更新偏移量。
+     *
+     * 验证在队列消费者完成前不保存偏移量，并按更新标识而非 Telegram 返回列表的顺序逐条保存。
+     */
+    @Test
+    fun testPollSavesOffsetsAfterQueueProcessingInUpdateIdOrder() = runBlocking(
+        Dispatchers.Default.limitedParallelism(1),
+    ) {
+        val processingStarted = CompletableDeferred<Unit>()
+        val allowProcessingToFinish = CompletableDeferred<Unit>()
+        val chat = Chat(id = 123456, type = "private", firstName = "Test")
+        val pendingUpdate = Update(
+            updateId = 11,
+            message = Message(messageId = 100, chat = chat, text = "pending"),
+        )
+
+        preparePolling(chat)
+        coEvery { telegramService.getUpdates(11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(Update(updateId = 12), pendingUpdate),
+        )
+        coEvery { telegramService.sendChatAction("123456", "typing") } returns telegramOkResponse()
+        coEvery { agentService.sendMessage("pending") } coAnswers {
+            processingStarted.complete(Unit)
+            allowProcessingToFinish.await()
+            "reply"
+        }
+        coEvery { telegramService.sendMessage("123456", "reply", any()) } returns telegramOkResponse()
+
+        messagePoller.use {
+            messagePoller.start()
+            withTimeout(2.seconds) { processingStarted.await() }
+            verify(exactly = 0) { updatesRepository.saveLastUpdateId(any()) }
+
+            allowProcessingToFinish.complete(Unit)
+            eventually {
+                verify(exactly = 1) { updatesRepository.saveLastUpdateId(11) }
+                verify(exactly = 1) { updatesRepository.saveLastUpdateId(12) }
+            }
+            verifyOrder {
+                updatesRepository.saveLastUpdateId(11)
+                updatesRepository.saveLastUpdateId(12)
+            }
+        }
+    }
+
+    /**
+     * 验证关闭期间不会确认正在处理的更新。
+     *
+     * 验证消费者取消后，等待中的 AI 调用被取消且没有写入对应更新偏移量。
+     */
+    @Test
+    fun testClosingPollerDoesNotSaveInFlightUpdateOffset() = runBlocking(
+        Dispatchers.Default.limitedParallelism(1),
+    ) {
+        val processingStarted = CompletableDeferred<Unit>()
+        val processingCancelled = CompletableDeferred<Unit>()
+        val neverCompletes = CompletableDeferred<Unit>()
+        val chat = Chat(id = 123456, type = "private", firstName = "Test")
+        val pendingUpdate = Update(
+            updateId = 11,
+            message = Message(messageId = 100, chat = chat, text = "pending"),
+        )
+
+        preparePolling(chat)
+        coEvery { telegramService.getUpdates(11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(pendingUpdate),
+        )
+        coEvery { telegramService.sendChatAction("123456", "typing") } returns telegramOkResponse()
+        coEvery { agentService.sendMessage("pending") } coAnswers {
+            processingStarted.complete(Unit)
+            try {
+                neverCompletes.await()
+                "reply"
+            } finally {
+                processingCancelled.complete(Unit)
+            }
+        }
+
+        messagePoller.use {
+            messagePoller.start()
+            withTimeout(2.seconds) { processingStarted.await() }
+
+            messagePoller.close()
+
+            withTimeout(2.seconds) { processingCancelled.await() }
+            verify(exactly = 0) { updatesRepository.saveLastUpdateId(any()) }
+        }
+    }
+
+    /**
+     * 验证业务异常处理完既有反馈后仍会确认更新。
+     *
+     * 验证 AI 调用失败时，消费者在发送错误提示后推进偏移量，避免 Telegram 重复投递该更新。
+     */
+    @Test
+    fun testPollSavesOffsetAfterBusinessFailureFeedback() = runBlocking(
+        Dispatchers.Default.limitedParallelism(1),
+    ) {
+        val chat = Chat(id = 123456, type = "private", firstName = "Test")
+        val failedUpdate = Update(
+            updateId = 11,
+            message = Message(messageId = 100, chat = chat, text = "failure"),
+        )
+
+        preparePolling(chat)
+        coEvery { telegramService.getUpdates(11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(failedUpdate),
+        )
+        coEvery { telegramService.sendChatAction("123456", "typing") } returns telegramOkResponse()
+        coEvery { agentService.sendMessage("failure") } throws IllegalStateException("agent failure")
+        coEvery {
+            telegramService.sendMessage(
+                "123456",
+                match { it.startsWith("AI 处理消息时出错") },
+                any(),
+            )
+        } returns telegramOkResponse()
+
+        messagePoller.use {
+            messagePoller.start()
+            eventually {
+                verify(exactly = 1) { updatesRepository.saveLastUpdateId(11) }
+            }
+            coVerify {
+                telegramService.sendMessage(
+                    "123456",
+                    match { it.startsWith("AI 处理消息时出错") },
+                    any(),
+                )
+            }
+        }
+    }
+
+    private fun preparePolling(chat: Chat) {
+        settingsFlow.value = settingsFlow.value.copy(telegramToken = "test-token")
+        messagePoller = MessagePoller(
+            CoroutineScope(Dispatchers.Default),
+            telegramService,
+            agentService,
+            settingsRepository,
+            updatesRepository,
+        )
+        every { updatesRepository.lastUpdateId } returns 10L
+        every { updatesRepository.chatsFlow } returns MutableStateFlow(
+            listOf(ChatInfo(id = chat.id.toString(), title = chat.firstName!!, type = chat.type)),
+        )
+        every { updatesRepository.saveChats(any()) } returns Unit
+        every { updatesRepository.saveLastUpdateId(any()) } returns Unit
+    }
+
+    private suspend fun eventually(assertion: () -> Unit) {
+        withTimeout(2.seconds) {
+            while (true) {
+                try {
+                    assertion()
+                    return@withTimeout
+                } catch (_: AssertionError) {
+                    delay(10.milliseconds)
+                }
+            }
+        }
     }
 
     private fun setLastAiReplyAtMillis(value: Long?) {

@@ -22,14 +22,16 @@ import kotlin.time.Duration.Companion.minutes
  * 后台轮询 Telegram 更新，并将授权聊天的消息依次交给 AI 代理处理。
  *
  * 调用 [start] 后服务持续观察机器人令牌并管理轮询协程；调用 [close] 会停止所有内部协程。
- * 单条消息自入队起最多处理十分钟，队列满时会直接回复失败提示。
+ * 单条消息自入队起最多处理十分钟，队列满时会直接回复失败提示。更新的偏移量仅在对应更新结束
+ * 队列处理后保存；关闭时内存队列及在途任务会被丢弃，未保存偏移量的更新会在下次轮询时由
+ * Telegram 重投。
  *
  * @constructor 创建消息轮询服务。
  * @param parentScope 持有轮询和队列消费者的父协程作用域；取消该作用域会停止内部协程。
  * @param telegramService 与 Telegram Bot API 通信的服务。
  * @param agentService 处理文本和媒体消息的 AI 代理服务。
  * @param settingsRepository 提供机器人与 AI 设置的仓储。
- * @param updatesRepository 持久化聊天信息和已处理更新标识的仓储。
+ * @param updatesRepository 持久化聊天信息和已完成队列处理的更新标识的仓储。
  */
 @Singleton
 class MessagePoller @Inject constructor(
@@ -47,8 +49,14 @@ class MessagePoller @Inject constructor(
     private var currentToken: String? = null
     private var lastAiReplyAtMillis: Long? = null
 
-    // 消息队列，容量为 10，存储更新内容及入队时间戳
-    private val updateChannel = Channel<Pair<Update, Long>>(10)
+    // 消息队列，容量为 10，存储更新内容、入队时间戳及处理完成信号。
+    private val updateChannel = Channel<QueuedUpdate>(10)
+
+    private data class QueuedUpdate(
+        val update: Update,
+        val entryTime: Long,
+        val completion: CompletableDeferred<Unit>,
+    )
 
     /**
      * 启动设置监听、消息队列消费者和按需轮询。
@@ -120,7 +128,7 @@ class MessagePoller @Inject constructor(
         val response = telegramService.getUpdates(offset = offset, timeout = 30)
 
         if (response.ok) {
-            var lastId = lastStoredId
+            val completions = mutableListOf<Pair<Long, CompletableDeferred<Unit>>>()
             val currentChats = updatesRepository.chatsFlow.value.associateBy { it.id }.toMutableMap()
             var chatsUpdated = false
 
@@ -143,18 +151,25 @@ class MessagePoller @Inject constructor(
                 }
 
                 try {
-                    handleUpdate(update)
+                    completions += update.updateId to enqueueUpdate(update)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     logger.error("Error handling update ${update.updateId}", e)
+                    completions += update.updateId to completedSignal()
                 }
-                lastId = update.updateId
             }
 
             if (chatsUpdated) {
                 updatesRepository.saveChats(currentChats.values.toList())
             }
-            if (lastId > lastStoredId) {
-                updatesRepository.saveLastUpdateId(lastId)
+
+            for ((updateId, completion) in completions.sortedBy { it.first }) {
+                completion.await()
+                if (updateId > lastStoredId) {
+                    updatesRepository.saveLastUpdateId(updateId)
+                    lastStoredId = updateId
+                }
             }
         }
         delay(1000.milliseconds)
@@ -166,8 +181,9 @@ class MessagePoller @Inject constructor(
     private fun startQueueConsumer() {
         if (consumerJob != null) return
         consumerJob = scope.launch {
-            updateChannel.receiveAsFlow().collect { (update, entryTime) ->
-                val deadline = entryTime + 10.minutes.inWholeMilliseconds
+            updateChannel.receiveAsFlow().collect { queuedUpdate ->
+                val update = queuedUpdate.update
+                val deadline = queuedUpdate.entryTime + 10.minutes.inWholeMilliseconds
                 val now = System.currentTimeMillis()
                 val remaining = (deadline - now).coerceAtLeast(0)
 
@@ -178,9 +194,14 @@ class MessagePoller @Inject constructor(
                     }
                 } catch (_: TimeoutCancellationException) {
                     handleProcessingTimeout(update)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     logger.error("Error processing update ${update.updateId}", e)
                 }
+
+                currentCoroutineContext().ensureActive()
+                queuedUpdate.completion.complete(Unit)
             }
         }
     }
@@ -229,34 +250,50 @@ class MessagePoller @Inject constructor(
      *
      * @param update 要检查的 Telegram 更新，不能为空；不含可处理消息时不会产生副作用。
      */
+    @Suppress("unused")
     suspend fun handleUpdate(update: Update) {
-        val message = update.message ?: return
+        enqueueUpdate(update)
+    }
+
+    private suspend fun enqueueUpdate(update: Update): CompletableDeferred<Unit> {
+        val message = update.message ?: return completedSignal()
         val text = message.text
         val voice = message.voice
-        if (text == null && voice == null) return
+        if (text == null && voice == null) return completedSignal()
 
         val chatId = message.chat.id.toString()
-        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return
+        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return completedSignal()
 
-        if (!aiSettings.agentEnabled) return
+        if (!aiSettings.agentEnabled) return completedSignal()
 
-        if (chatId == aiSettings.agentChatId) {
-            // 尝试入队，如果不成功（队列满）则直接回复失败
-            val result = updateChannel.trySend(update to System.currentTimeMillis())
-            if (result.isFailure) {
-                logger.warn("Update ${update.updateId} rejected: Queue is full.")
-                try {
-                    telegramService.sendMessage(
-                        chatId,
-                        "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
-                        ReplyParameters(messageId = message.messageId),
-                    )
-                } catch (e: Exception) {
-                    logger.warn("Failed to send queue full notification", e)
-                }
+        if (chatId != aiSettings.agentChatId) return completedSignal()
+
+        val completion = CompletableDeferred<Unit>()
+        // 尝试入队，如果不成功（队列满）则直接回复失败
+        val result = updateChannel.trySend(
+            QueuedUpdate(update, System.currentTimeMillis(), completion),
+        )
+        if (result.isFailure) {
+            logger.warn("Update ${update.updateId} rejected: Queue is full.")
+            try {
+                telegramService.sendMessage(
+                    chatId,
+                    "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
+                    ReplyParameters(messageId = message.messageId),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn("Failed to send queue full notification", e)
             }
+            completion.complete(Unit)
         }
+
+        return completion
     }
+
+    private fun completedSignal(): CompletableDeferred<Unit> =
+        CompletableDeferred<Unit>().also { it.complete(Unit) }
 
     /**
      * 发送“输入中”事件的任务。
@@ -348,7 +385,9 @@ class MessagePoller @Inject constructor(
      */
     private fun clearQueue() {
         var count = 0
-        while (updateChannel.tryReceive().isSuccess) {
+        while (true) {
+            val queuedUpdate = updateChannel.tryReceive().getOrNull() ?: break
+            queuedUpdate.completion.complete(Unit)
             count++
         }
         if (count > 0) {
