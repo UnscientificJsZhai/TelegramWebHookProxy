@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.modules
 
 import com.unscientificjszhai.tgp.di.AppComponent
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
 import io.ktor.client.statement.*
@@ -24,16 +25,17 @@ fun Application.apiModule(appComponent: AppComponent) {
             post("/settings") {
                 val newSettings = call.receive<AppSettings>()
                 val oldSettings = settingsRepository.settingsFlow.value
-                settingsRepository.saveSettings(newSettings)
+                val settingsToSave = newSettings.clearSelectedModelWhenProviderOrApiKeyChanges(oldSettings)
+                settingsRepository.saveSettings(settingsToSave)
 
-                if (newSettings.telegramToken != oldSettings.telegramToken ||
-                    newSettings.ai?.agentEnabled != oldSettings.ai?.agentEnabled
+                if (settingsToSave.telegramToken != oldSettings.telegramToken ||
+                    settingsToSave.ai?.agentEnabled != oldSettings.ai?.agentEnabled
                 ) {
-                    if (newSettings.telegramToken.isNotBlank()) {
+                    if (settingsToSave.telegramToken.isNotBlank()) {
                         try {
                             telegramService.updateBotCommands(
-                                newSettings.telegramToken,
-                                newSettings.ai?.agentEnabled == true,
+                                settingsToSave.telegramToken,
+                                settingsToSave.ai?.agentEnabled == true,
                             )
                         } catch (e: Exception) {
                             application.log.error("Failed to update bot commands: ${e.message}")
@@ -114,5 +116,21 @@ fun Application.apiModule(appComponent: AppComponent) {
                 }
             }
         }
+    }
+}
+
+private fun AppSettings.clearSelectedModelWhenProviderOrApiKeyChanges(oldSettings: AppSettings): AppSettings {
+    val newAiSettings = ai ?: return this
+    val oldAiSettings = oldSettings.ai
+    val providerChanged = oldAiSettings?.provider != newAiSettings.provider
+    val apiKeyChanged = when (newAiSettings.provider) {
+        AIProvider.GEMINI -> oldAiSettings?.geminiApiKey != newAiSettings.geminiApiKey
+        AIProvider.OPENAI -> oldAiSettings?.openAiApiKey != newAiSettings.openAiApiKey
+    }
+
+    return if (providerChanged || apiKeyChanged) {
+        copy(ai = newAiSettings.copy(selectedModel = ""))
+    } else {
+        this
     }
 }

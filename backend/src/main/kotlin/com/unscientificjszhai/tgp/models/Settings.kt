@@ -16,6 +16,7 @@ data class AISettings(
     val geminiApiKey: String = "",
     val openAiApiKey: String = "",
     val openAiBaseUrl: String = "",
+    val selectedModel: String = "",
     val agentEnabled: Boolean = false,
     val agentChatId: String = "",
     val globalContext: String = "",

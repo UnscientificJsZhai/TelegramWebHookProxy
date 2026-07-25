@@ -9,6 +9,7 @@ import com.openai.models.models.ModelListPage
 import com.openai.services.blocking.ChatService
 import com.openai.services.blocking.ModelService
 import com.openai.services.blocking.chat.ChatCompletionService
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MCPServerConfig
@@ -76,6 +77,68 @@ class OpenAIAgentServiceTest {
         assertEquals("gpt-4o", service.preferredModel(listOf("third-party", "gpt-4o")))
         assertEquals("third-party", service.preferredModel(listOf("third-party", "gpt-4o-mini")))
         assertEquals(null, service.preferredModel(emptyList()))
+    }
+
+    @Test
+    fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.OPENAI, selectedModel = "gpt-4o")),
+        )
+
+        val restoredService = newService()
+
+        assertEquals("gpt-4o", restoredService.currentModel)
+    }
+
+    @Test
+    fun testSuccessfulRefreshClearsInvalidPersistedModelAndFallsBack() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val modelService = mockk<ModelService>()
+        val page = mockk<ModelListPage>()
+        val fallbackModel = mockk<Model>()
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    selectedModel = "gpt-5.6-luna",
+                ),
+            ),
+        )
+        every { client.models() } returns modelService
+        every { modelService.list() } returns page
+        every { page.data() } returns listOf(fallbackModel)
+        every { fallbackModel.id() } returns "fallback-model"
+        setPrivateField("configuredApiKey", "test-key")
+        setPrivateField("configuredBaseUrl", "")
+        injectClient(client)
+
+        service.updateModel()
+
+        assertEquals("fallback-model", service.currentModel)
+        assertEquals("", settingsRepository.settingsFlow.value.ai?.selectedModel)
+    }
+
+    @Test
+    fun testFailedRefreshRetainsPersistedSelectedModel() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val modelService = mockk<ModelService>()
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    selectedModel = "gpt-5.6-luna",
+                ),
+            ),
+        )
+        every { client.models() } returns modelService
+        every { modelService.list() } throws IllegalStateException("network failure")
+        injectClient(client)
+
+        assertEquals(null, service.updateModel())
+
+        assertEquals("gpt-5.6-luna", settingsRepository.settingsFlow.value.ai?.selectedModel)
     }
 
     @Test
@@ -655,6 +718,20 @@ class OpenAIAgentServiceTest {
 
     private fun injectClient(client: OpenAIClient) {
         OpenAIAgentService::class.java.getDeclaredField("client").apply { isAccessible = true }.set(service, client)
+    }
+
+    private fun newService(): OpenAIAgentService {
+        val testScope = CoroutineScope(EmptyCoroutineContext)
+        return OpenAIAgentService(
+            testScope,
+            settingsRepository,
+            skillRepository,
+            MCPClientService(testScope),
+        ) { mockk() }
+    }
+
+    private fun setPrivateField(name: String, value: Any?) {
+        OpenAIAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(service, value)
     }
 
     private fun toolCallResponse(): ChatCompletion {

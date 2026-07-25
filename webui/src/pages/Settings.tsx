@@ -44,6 +44,7 @@ interface AISettings {
     geminiApiKey: string;
     openAiApiKey: string;
     openAiBaseUrl: string;
+    selectedModel: string;
     agentEnabled: boolean;
     agentChatId: string;
     globalContext: string;
@@ -64,6 +65,7 @@ const defaultAiSettings: AISettings = {
     geminiApiKey: '',
     openAiApiKey: '',
     openAiBaseUrl: '',
+    selectedModel: '',
     agentEnabled: false,
     agentChatId: '',
     globalContext: '',

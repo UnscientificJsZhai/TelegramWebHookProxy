@@ -3,6 +3,8 @@ package com.unscientificjszhai.tgp.service
 import com.google.genai.Chat
 import com.google.genai.Chats
 import com.google.genai.Client
+import com.google.genai.Models
+import com.google.genai.Pager
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
@@ -60,6 +62,53 @@ class GeminiAgentServiceTest {
             ),
             service.availableModels,
         )
+    }
+
+    @Test
+    fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(selectedModel = "models/gemini-custom")),
+        )
+
+        val restoredService = newService()
+
+        assertEquals("models/gemini-custom", restoredService.currentModel)
+    }
+
+    @Test
+    fun testSuccessfulRefreshClearsInvalidPersistedModelAndFallsBack() = runBlocking {
+        val models = mockk<Models>()
+        val pager = mockk<Pager<Model>>()
+        val chats = mockk<Chats>()
+        val fallbackChat = mockk<Chat>()
+        val fallbackModel = Model.builder().name("models/fallback-model").build()
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(geminiApiKey = "test-key", selectedModel = "models/gemini-3.5-flash-lite")),
+        )
+        every { models.list(any<ListModelsConfig>()) } returns pager
+        every { pager.iterator() } returns mutableListOf(fallbackModel).iterator()
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns fallbackChat
+        setPrivateField("configuredApiKey", "test-key")
+        injectClient(chats, models)
+
+        service.updateModel()
+
+        assertEquals("models/fallback-model", service.currentModel)
+        assertEquals("", settingsRepository.settingsFlow.value.ai?.selectedModel)
+    }
+
+    @Test
+    fun testFailedRefreshRetainsPersistedSelectedModel() = runBlocking {
+        val models = mockk<Models>()
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(geminiApiKey = "test-key", selectedModel = "models/gemini-3.5-flash-lite")),
+        )
+        every { models.list(any<ListModelsConfig>()) } throws IllegalStateException("network failure")
+        injectClient(mockk(), models)
+
+        assertEquals(null, service.updateModel())
+
+        assertEquals("models/gemini-3.5-flash-lite", settingsRepository.settingsFlow.value.ai?.selectedModel)
     }
 
     @Test
@@ -226,10 +275,27 @@ class GeminiAgentServiceTest {
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, chat)
     }
 
-    private fun injectClient(chats: Chats) {
+    private fun injectClient(chats: Chats, models: Models? = null) {
         val client = Client.builder().apiKey("test").build()
         Client::class.java.getDeclaredField("chats").apply { isAccessible = true }.set(client, chats)
+        models?.let {
+            Client::class.java.getDeclaredField("models").apply { isAccessible = true }.set(client, it)
+        }
         GeminiAgentService::class.java.getDeclaredField("client").apply { isAccessible = true }.set(service, client)
+    }
+
+    private fun newService(): GeminiAgentService {
+        val testScope = CoroutineScope(EmptyCoroutineContext)
+        return GeminiAgentService(
+            testScope,
+            settingsRepository,
+            skillRepository,
+            MCPClientService(testScope),
+        ) { mockk() }
+    }
+
+    private fun setPrivateField(name: String, value: Any?) {
+        GeminiAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(service, value)
     }
 
 }

@@ -117,6 +117,41 @@ class MessagePollerTest {
     }
 
     @Test
+    fun testModelCommandPersistsCanonicalModelNameAfterSuccessfulSwitch() = runTest {
+        val chatId = "123456"
+        every { agentService.switchModel("gemini-test") } returns completedJob()
+        every { agentService.currentModel } returns "models/gemini-test"
+        every { settingsRepository.saveSettings(any()) } returns Unit
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/model gemini-test", 100L)
+
+        verify {
+            settingsRepository.saveSettings(
+                match { it.ai?.selectedModel == "models/gemini-test" },
+            )
+        }
+        coVerify {
+            telegramService.sendMessage(
+                chatId,
+                "已切换模型并重置会话，待处理消息已清空：models/gemini-test",
+                any(),
+            )
+        }
+    }
+
+    @Test
+    fun testResetCommandDoesNotPersistSelectedModel() = runTest {
+        val chatId = "123456"
+        every { agentService.resetSession() } returns completedJob()
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/reset", 100L)
+
+        verify(exactly = 0) { settingsRepository.saveSettings(any()) }
+    }
+
+    @Test
     fun testAutoCleanDisabledDoesNotResetSession() = runTest {
         val chatId = "123456"
         val userMessage = "Hello AI"
@@ -303,4 +338,6 @@ class MessagePollerTest {
         mockk {
             every { status } returns HttpStatusCode.OK
         }
+
+    private fun completedJob(): Job = Job().also { it.complete() }
 }

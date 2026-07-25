@@ -353,10 +353,12 @@ class MessagePoller @Inject constructor(
                     try {
                         clearQueue()
                         agentService.switchModel(requestedModel)?.join()
+                        persistSelectedModel()
                         lastAiReplyAtMillis = null
+                        val activeModel = agentService.currentModel
                         telegramService.sendMessage(
                             chatId,
-                            "已切换模型并重置会话，待处理消息已清空：$requestedModel",
+                            "已切换模型并重置会话，待处理消息已清空：$activeModel",
                             ReplyParameters(messageId),
                         )
                     } catch (_: Exception) {
@@ -389,6 +391,18 @@ class MessagePoller @Inject constructor(
                 }
             }
             // 可以添加更多指令
+        }
+    }
+
+    /** Persist the canonical name reported by the active provider after a successful model switch. */
+    private fun persistSelectedModel() {
+        val settings = settingsRepository.settingsFlow.value
+        val aiSettings = settings.ai ?: return
+        val selectedModel = agentService.currentModel
+        if (aiSettings.selectedModel != selectedModel) {
+            settingsRepository.saveSettings(
+                settings.copy(ai = aiSettings.copy(selectedModel = selectedModel)),
+            )
         }
     }
 

@@ -4,8 +4,10 @@ import com.google.genai.Chat
 import com.google.genai.Client
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.di.AgentScope
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.MediaData
+import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
@@ -74,6 +76,9 @@ class GeminiAgentService @Inject constructor(
     private val modelUpdateMutex = Mutex()
     private val modelStateLock = Any()
     private var modelSelectionVersion = 0L
+    private var initialModelUpdateJob: Job? = null
+    private var configuredApiKey: String? = null
+    private var configuredProxy: ProxySettings? = null
 
     /**
      * 当前会话使用的模型。
@@ -98,8 +103,14 @@ class GeminiAgentService @Inject constructor(
         val aiSettings = settings.ai
         val proxySettings = settings.proxy
 
-        if (aiSettings != null && isAiFeatureEnabled(aiSettings)) {
+        if (aiSettings?.provider == AIProvider.GEMINI) {
+            restoreSelectedModel(aiSettings.selectedModel)
+        }
+
+        if (aiSettings != null && aiSettings.provider == AIProvider.GEMINI && isAiFeatureEnabled(aiSettings)) {
             try {
+                configuredApiKey = aiSettings.geminiApiKey
+                configuredProxy = proxySettings
                 val clientOptionsBuilder = ClientOptions.builder()
                 if (proxySettings != null) {
                     val geminiProxyType = when (proxySettings.type) {
@@ -119,6 +130,7 @@ class GeminiAgentService @Inject constructor(
                     Client.builder().apiKey(aiSettings.geminiApiKey).clientOptions(clientOptionsBuilder.build()).build()
 
                 this.resetSessionJob = resetSession()
+                initialModelUpdateJob = scope.launch { updateModel() }
                 logger.info("Gemini client initialized.")
             } catch (e: Exception) {
                 logger.error("Failed to initialize Gemini client", e)
@@ -186,13 +198,24 @@ class GeminiAgentService @Inject constructor(
             val refreshedModels = withContext(Dispatchers.IO) {
                 models.list(ListModelsConfig.builder().build()).mapNotNull { it.name().getOrNull() }
             }
-            synchronized(modelStateLock) {
+            val refreshResult = synchronized(modelStateLock) {
                 if (modelSelectionVersion != selectionVersion) {
                     return@withLock null
                 }
                 availableModels = refreshedModels
-                ModelSnapshot(currentModel, availableModels)
+                val invalidModel = currentModel.takeUnless { it in availableModels }
+                val fallbackModel = invalidModel?.let { preferredModel(availableModels) }
+                if (fallbackModel != null) {
+                    currentModel = fallbackModel
+                    modelSelectionVersion++
+                }
+                Triple(ModelSnapshot(currentModel, availableModels), fallbackModel != null, invalidModel)
             }
+            if (refreshResult.second) {
+                resetSession()?.join()
+            }
+            refreshResult.third?.let(::clearPersistedSelectedModel)
+            refreshResult.first
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -411,9 +434,34 @@ class GeminiAgentService @Inject constructor(
         return Part.builder().functionResponse(responseBuilder.build()).build()
     }
 
+    private fun restoreSelectedModel(selectedModel: String) {
+        if (selectedModel.isNotBlank()) {
+            currentModel = selectedModel
+        }
+    }
+
+    private fun preferredModel(models: List<String>): String? =
+        listOf(DEFAULT_MODEL, PREVIOUS_DEFAULT_MODEL, LEGACY_MODEL).firstOrNull { it in models } ?: models.firstOrNull()
+
+    /** See OpenAIAgentService: only a successful, still-current client may invalidate persistence. */
+    private fun clearPersistedSelectedModel(invalidModel: String) {
+        val settings = settingsRepository.settingsFlow.value
+        val aiSettings = settings.ai
+        if (
+            aiSettings?.provider == AIProvider.GEMINI &&
+            aiSettings.geminiApiKey == configuredApiKey &&
+            settings.proxy == configuredProxy &&
+            aiSettings.selectedModel == invalidModel
+        ) {
+            settingsRepository.saveSettings(settings.copy(ai = aiSettings.copy(selectedModel = "")))
+        }
+    }
+
     override fun close(): Job? = synchronized(lifecycleLock) {
         closeJob ?: run {
             closed = true
+            initialModelUpdateJob?.cancel()
+            initialModelUpdateJob = null
             resetSessionJob?.cancel()
             serviceJob.cancel()
             closingScope.launch {

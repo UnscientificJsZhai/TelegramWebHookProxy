@@ -85,6 +85,9 @@ class OpenAIAgentService @Inject constructor(
     private var desiredModel = DEFAULT_MODEL
     private var modelSelectionVersion = 0L
     private var initialModelUpdateJob: Job? = null
+    private var configuredApiKey: String? = null
+    private var configuredBaseUrl: String? = null
+    private var configuredProxy: ProxySettings? = null
 
     @Volatile
     override var currentModel: String = DEFAULT_MODEL
@@ -106,8 +109,15 @@ class OpenAIAgentService @Inject constructor(
         val aiSettings = settings.ai
         val proxySettings = settings.proxy
 
+        if (aiSettings?.provider == AIProvider.OPENAI) {
+            restoreSelectedModel(aiSettings.selectedModel)
+        }
+
         if (aiSettings != null && aiSettings.provider == AIProvider.OPENAI && isAiFeatureEnabled(aiSettings)) {
             try {
+                configuredApiKey = aiSettings.openAiApiKey
+                configuredBaseUrl = aiSettings.openAiBaseUrl
+                configuredProxy = proxySettings
                 client = OpenAIOkHttpClient.builder()
                     .apiKey(aiSettings.openAiApiKey)
                     .apply {
@@ -172,29 +182,28 @@ class OpenAIAgentService @Inject constructor(
             }
             val refreshedModels = models.map { it.id() }
             val refreshResult = sessionMutex.withLock {
-                val (snapshot, fallbackModelChanged) = synchronized(modelStateLock) {
+                val (snapshot, fallbackModelChanged, invalidModel) = synchronized(modelStateLock) {
                     if (closed || modelSelectionVersion != selectionVersion) {
                         return@withLock null
                     }
                     availableModels = refreshedModels
+                    val invalidDesiredModel = desiredModel.takeUnless { it in availableModels }
                     var modelChanged = false
-                    val fallbackModel = desiredModel.takeIf { it in availableModels }
-                        ?: preferredModel(availableModels)
+                    val fallbackModel = invalidDesiredModel?.let { preferredModel(availableModels) }
                     fallbackModel?.let { preferredModel ->
-                        if (desiredModel !in availableModels) {
-                            desiredModel = preferredModel
-                            modelSelectionVersion++
-                        }
+                        desiredModel = preferredModel
+                        modelSelectionVersion++
                         if (currentModel !in availableModels) {
                             currentModel = preferredModel
                             modelChanged = true
                         }
                     }
-                    ModelSnapshot(currentModel, availableModels) to modelChanged
+                    Triple(ModelSnapshot(currentModel, availableModels), modelChanged, invalidDesiredModel)
                 }
-                snapshot to if (fallbackModelChanged) resetSessionLocked() else null
+                Triple(snapshot, if (fallbackModelChanged) resetSessionLocked() else null, invalidModel)
             } ?: return@withLock null
             awaitMcpConnectionJob(refreshResult.second)
+            refreshResult.third?.let(::clearPersistedSelectedModel)
             refreshResult.first
         } catch (e: CancellationException) {
             throw e
@@ -510,6 +519,31 @@ class OpenAIAgentService @Inject constructor(
      */
     internal fun preferredModel(models: List<String>): String? =
         FALLBACK_MODELS.firstOrNull { it in models } ?: models.firstOrNull()
+
+    private fun restoreSelectedModel(selectedModel: String) {
+        if (selectedModel.isNotBlank()) {
+            desiredModel = selectedModel
+            currentModel = selectedModel
+        }
+    }
+
+    /**
+     * A failed list request must not change persistence. After a successful list request, clear a
+     * model only when this still represents the client that produced that list.
+     */
+    private fun clearPersistedSelectedModel(invalidModel: String) {
+        val settings = settingsRepository.settingsFlow.value
+        val aiSettings = settings.ai
+        if (
+            aiSettings?.provider == AIProvider.OPENAI &&
+            aiSettings.openAiApiKey == configuredApiKey &&
+            aiSettings.openAiBaseUrl == configuredBaseUrl &&
+            settings.proxy == configuredProxy &&
+            aiSettings.selectedModel == invalidModel
+        ) {
+            settingsRepository.saveSettings(settings.copy(ai = aiSettings.copy(selectedModel = "")))
+        }
+    }
 
     override fun close(): Job? = synchronized(lifecycleLock) {
         closeJob ?: run {

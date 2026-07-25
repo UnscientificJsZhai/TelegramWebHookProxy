@@ -16,6 +16,7 @@ class SettingsTest {
             chatId = "123",
             ai = AISettings(
                 geminiApiKey = "test_key",
+                selectedModel = "models/gemini-test",
                 agentEnabled = true,
                 agentChatId = "123",
                 globalContext = "context",
@@ -39,6 +40,7 @@ class SettingsTest {
         assertTrue(aiElement.containsKey("geminiApiKey"))
         assertTrue(aiElement.containsKey("openAiApiKey"))
         assertTrue(aiElement.containsKey("openAiBaseUrl"))
+        assertTrue(aiElement.containsKey("selectedModel"))
         assertTrue(aiElement.containsKey("autoCleanContextIntervalMinutes"))
         assertTrue(aiElement.containsKey("silentContextCleanup"))
         assertTrue(aiElement.containsKey("mcpServers"))
@@ -54,6 +56,7 @@ class SettingsTest {
         assertTrue(jsonElement.containsKey("provider"), "Provider field should be present even if default")
         assertTrue(jsonElement.containsKey("openAiApiKey"), "openAiApiKey field should be present even if default")
         assertTrue(jsonElement.containsKey("openAiBaseUrl"), "openAiBaseUrl field should be present even if default")
+        assertTrue(jsonElement.containsKey("selectedModel"), "selectedModel field should be present even if default")
         assertTrue(
             jsonElement.containsKey("autoCleanContextIntervalMinutes"),
             "autoCleanContextIntervalMinutes field should be present even if default",
@@ -83,5 +86,6 @@ class SettingsTest {
 
         assertEquals(0, aiSettings.autoCleanContextIntervalMinutes)
         assertEquals(false, aiSettings.silentContextCleanup)
+        assertEquals("", aiSettings.selectedModel)
     }
 }
