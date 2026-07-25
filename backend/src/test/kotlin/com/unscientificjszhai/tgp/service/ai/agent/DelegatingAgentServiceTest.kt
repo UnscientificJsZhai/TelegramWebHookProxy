@@ -85,6 +85,66 @@ class DelegatingAgentServiceTest {
         }
     }
 
+    @Test
+    fun `模型选择变更由设置流切换模型且不会额外重置会话`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val openAIAgentService = mockk<OpenAIAgentService>(relaxed = true)
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val settingsFlow = MutableStateFlow(initialSettings)
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val componentCreated = CompletableDeferred<Unit>()
+        val modelSwitched = CompletableDeferred<Unit>()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns settingsFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } answers {
+            componentCreated.complete(Unit)
+            agentComponent
+        }
+        every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.switchModel("models/gemini-next") } answers {
+            modelSwitched.complete(Unit)
+            null
+        }
+        every { openAIAgentService.close() } returns Job().apply { complete() }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) {
+                componentCreated.await()
+            }
+            settingsFlow.value = initialSettings.copy(
+                ai = initialSettings.ai!!.copy(selectedModel = "models/gemini-next"),
+            )
+            withTimeout(5.seconds) {
+                modelSwitched.await()
+            }
+
+            verify(exactly = 1) { openAIAgentService.switchModel("models/gemini-next") }
+            verify(exactly = 0) { openAIAgentService.resetSession() }
+        } finally {
+            delegatingAgentService.close()?.join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
     /**
      * 保持 StateFlow 的订阅语义，仅额外记录显式读取当前值的次数。
      */

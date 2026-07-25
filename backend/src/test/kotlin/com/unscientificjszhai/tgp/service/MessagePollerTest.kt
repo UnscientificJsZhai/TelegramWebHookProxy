@@ -117,10 +117,9 @@ class MessagePollerTest {
     }
 
     @Test
-    fun testModelCommandPersistsCanonicalModelNameAfterSuccessfulSwitch() = runTest {
+    fun testModelCommandPersistsCanonicalModelNameAndLetsSettingsFlowSwitchIt() = runTest {
         val chatId = "123456"
-        every { agentService.switchModel("gemini-test") } returns completedJob()
-        every { agentService.currentModel } returns "models/gemini-test"
+        every { agentService.availableModels } returns listOf("models/gemini-test")
         every { settingsRepository.saveSettings(any()) } returns Unit
         coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
 
@@ -131,10 +130,11 @@ class MessagePollerTest {
                 match { it.ai?.selectedModel == "models/gemini-test" },
             )
         }
+        verify(exactly = 0) { agentService.switchModel(any()) }
         coVerify {
             telegramService.sendMessage(
                 chatId,
-                "已切换模型并重置会话，待处理消息已清空：models/gemini-test",
+                "已保存模型选择，正在切换模型并重置会话，待处理消息已清空：models/gemini-test",
                 any(),
             )
         }

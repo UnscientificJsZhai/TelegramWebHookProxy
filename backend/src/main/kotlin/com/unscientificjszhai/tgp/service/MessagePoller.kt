@@ -351,14 +351,16 @@ class MessagePoller @Inject constructor(
                 if (parts.size > 1) {
                     val requestedModel = parts[1].trim()
                     try {
+                        val selectedModel = agentService.availableModels.firstOrNull { model ->
+                            model == requestedModel ||
+                                    model.removePrefix("models/") == requestedModel.removePrefix("models/")
+                        } ?: throw IllegalArgumentException("Unsupported model: $requestedModel")
                         clearQueue()
-                        agentService.switchModel(requestedModel)?.join()
-                        persistSelectedModel()
+                        persistSelectedModel(selectedModel)
                         lastAiReplyAtMillis = null
-                        val activeModel = agentService.currentModel
                         telegramService.sendMessage(
                             chatId,
-                            "已切换模型并重置会话，待处理消息已清空：$activeModel",
+                            "已保存模型选择，正在切换模型并重置会话，待处理消息已清空：$selectedModel",
                             ReplyParameters(messageId),
                         )
                     } catch (_: Exception) {
@@ -394,11 +396,10 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    /** Persist the canonical name reported by the active provider after a successful model switch. */
-    private fun persistSelectedModel() {
+    /** Persist a model selection; DelegatingAgentService applies it from settingsFlow. */
+    private fun persistSelectedModel(selectedModel: String) {
         val settings = settingsRepository.settingsFlow.value
         val aiSettings = settings.ai ?: return
-        val selectedModel = agentService.currentModel
         if (aiSettings.selectedModel != selectedModel) {
             settingsRepository.saveSettings(
                 settings.copy(ai = aiSettings.copy(selectedModel = selectedModel)),

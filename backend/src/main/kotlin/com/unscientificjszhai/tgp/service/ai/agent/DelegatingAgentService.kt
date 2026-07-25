@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 import com.unscientificjszhai.tgp.di.AgentComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -41,14 +42,20 @@ class DelegatingAgentService @Inject constructor(
     private var currentApiKey: String? = null
     private var currentBaseUrl: String? = null
     private var currentProxy: ProxySettings? = null
+    private var lastHandledSettings: AppSettings? = null
 
     init {
         combine(
             settingsRepository.settingsFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
         ) { settings, _ -> settings }.onEach { settings ->
+            val previousAiSettings = lastHandledSettings?.ai
             val aiSettings = settings.ai
             val proxySettings = settings.proxy
+            val selectedModelChanged = previousAiSettings != null &&
+                    previousAiSettings.selectedModel != aiSettings?.selectedModel
+            val onlySelectedModelChanged = selectedModelChanged &&
+                    previousAiSettings.copy(selectedModel = "") == aiSettings?.copy(selectedModel = "")
 
             if (aiSettings != null && aiSettings.agentEnabled) {
                 val apiKey = when (aiSettings.provider) {
@@ -77,7 +84,7 @@ class DelegatingAgentService @Inject constructor(
                     currentProxy = proxySettings
                     logger.info("Agent component recreated for provider: ${aiSettings.provider}")
                 } else {
-                    _currentService?.resetSession()?.join()
+                    applySettingsChange(aiSettings, selectedModelChanged, onlySelectedModelChanged)
                 }
             } else {
                 if (_currentService != null) {
@@ -91,7 +98,43 @@ class DelegatingAgentService @Inject constructor(
                     logger.info("Agent service disabled.")
                 }
             }
+            lastHandledSettings = settings
         }.launchIn(parentScope)
+    }
+
+    /**
+     * Apply settings changes in one place. A model selection has its own reset in
+     * [AgentService.switchModel], so it must not be followed by a generic reset.
+     */
+    private suspend fun applySettingsChange(
+        aiSettings: AISettings,
+        selectedModelChanged: Boolean,
+        onlySelectedModelChanged: Boolean,
+    ) {
+        if (!selectedModelChanged) {
+            _currentService?.resetSession()?.join()
+            return
+        }
+
+        if (aiSettings.selectedModel.isBlank()) {
+            if (!onlySelectedModelChanged) {
+                _currentService?.resetSession()?.join()
+            }
+            return
+        }
+
+        val modelSwitchJob = try {
+            _currentService?.switchModel(aiSettings.selectedModel)
+        } catch (e: IllegalArgumentException) {
+            logger.warn("Ignoring unsupported model from settings: ${aiSettings.selectedModel}", e)
+            null
+        }
+
+        if (modelSwitchJob != null) {
+            modelSwitchJob.join()
+        } else if (!onlySelectedModelChanged) {
+            _currentService?.resetSession()?.join()
+        }
     }
 
     override val currentModel: String
