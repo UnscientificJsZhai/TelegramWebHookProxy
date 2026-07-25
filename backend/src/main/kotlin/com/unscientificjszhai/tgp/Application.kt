@@ -18,11 +18,21 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.json.Json
 
+/**
+ * 启动监听 `0.0.0.0:10178` 的 Netty HTTP 服务器。
+ *
+ * 此方法会阻塞当前线程，直至服务器停止。
+ */
 fun main() {
     embeddedServer(Netty, port = 10178, host = "0.0.0.0", module = Application::module)
         .start(wait = true)
 }
 
+/**
+ * 配置应用的序列化、依赖注入、业务路由和静态资源路由。
+ *
+ * @receiver 已创建且尚未停止的 Ktor 应用实例。
+ */
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
 

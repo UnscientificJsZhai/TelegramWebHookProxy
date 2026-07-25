@@ -16,6 +16,9 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 
+/**
+ * 消息轮询服务的命令、AI 回复和上下文清理行为测试设计。
+ */
 class MessagePollerTest {
 
     private lateinit var telegramService: TelegramService
@@ -40,6 +43,11 @@ class MessagePollerTest {
         )
     }
 
+    /**
+     * 验证文本 AI 消息处理的设计。
+     *
+     * 验证代理回复会被发送为对原消息的回复。
+     */
     @Test
     fun testHandleAiMessage() = runTest {
         val chatId = "123456"
@@ -61,6 +69,11 @@ class MessagePollerTest {
         }
     }
 
+    /**
+     * 验证 `/keep` 命令更新上下文计时的设计。
+     *
+     * 验证命令只刷新最后回复时间而不发送消息。
+     */
     @Test
     fun testKeepCommandUpdatesLastReplyTimeWithoutReplying() = runTest {
         val chatId = "123456"
@@ -76,6 +89,11 @@ class MessagePollerTest {
         coVerify(exactly = 0) { agentService.sendMessage(any<String>()) }
     }
 
+    /**
+     * 验证 `/model` 查询命令刷新模型列表的设计。
+     *
+     * 验证返回内容使用最新模型快照而非旧缓存。
+     */
     @Test
     fun testModelCommandUsesRefreshedModelList() = runTest {
         val chatId = "123456"
@@ -97,6 +115,11 @@ class MessagePollerTest {
         }
     }
 
+    /**
+     * 验证 `/model` 刷新失败时的反馈设计。
+     *
+     * 验证刷新失败会提示错误且不会回退展示缓存模型。
+     */
     @Test
     fun testModelCommandReportsRefreshFailureWithoutUsingCachedModels() = runTest {
         val chatId = "123456"
@@ -116,6 +139,11 @@ class MessagePollerTest {
         verify(exactly = 0) { agentService.availableModels }
     }
 
+    /**
+     * 验证 `/model` 选择模型的持久化设计。
+     *
+     * 验证规范模型名称会保存，并由设置流触发后续模型切换。
+     */
     @Test
     fun testModelCommandPersistsCanonicalModelNameAndLetsSettingsFlowSwitchIt() = runTest {
         val chatId = "123456"
@@ -140,6 +168,11 @@ class MessagePollerTest {
         }
     }
 
+    /**
+     * 验证 `/reset` 命令的模型选择保留设计。
+     *
+     * 验证重置会话不会修改已保存的模型选择。
+     */
     @Test
     fun testResetCommandDoesNotPersistSelectedModel() = runTest {
         val chatId = "123456"
@@ -151,6 +184,11 @@ class MessagePollerTest {
         verify(exactly = 0) { settingsRepository.saveSettings(any()) }
     }
 
+    /**
+     * 验证关闭自动清理时的会话保留设计。
+     *
+     * 验证处理消息不会重置当前会话。
+     */
     @Test
     fun testAutoCleanDisabledDoesNotResetSession() = runTest {
         val chatId = "123456"
@@ -167,6 +205,11 @@ class MessagePollerTest {
         coVerify { agentService.sendMessage(userMessage) }
     }
 
+    /**
+     * 验证 `/keep` 命令延长自动清理窗口的设计。
+     *
+     * 验证命令执行后在清理窗口内处理消息不会重置会话。
+     */
     @Test
     fun testKeepCommandExtendsAutoCleanWindow() = runTest {
         val chatId = "123456"
@@ -195,6 +238,11 @@ class MessagePollerTest {
         coVerify { agentService.sendMessage(userMessage) }
     }
 
+    /**
+     * 验证自动清理期限未到时的会话保留设计。
+     *
+     * 验证未超过配置间隔不会触发会话重置。
+     */
     @Test
     fun testAutoCleanNotExpiredDoesNotResetSession() = runTest {
         val chatId = "123456"
@@ -221,6 +269,11 @@ class MessagePollerTest {
         coVerify { agentService.sendMessage(userMessage) }
     }
 
+    /**
+     * 验证自动清理到期后的处理顺序设计。
+     *
+     * 验证先重置会话并发送通知，再将消息交给 AI 处理。
+     */
     @Test
     fun testAutoCleanExpiredSendsNoticeThenProcessesMessage() = runTest {
         val chatId = "123456"
@@ -249,6 +302,11 @@ class MessagePollerTest {
         }
     }
 
+    /**
+     * 验证静默自动清理的通知设计。
+     *
+     * 验证会话会重置但不会发送自动清理提示。
+     */
     @Test
     fun testSilentAutoCleanDoesNotSendNotice() = runTest {
         val chatId = "123456"
@@ -277,6 +335,11 @@ class MessagePollerTest {
         coVerify { agentService.sendMessage(userMessage) }
     }
 
+    /**
+     * 验证成功发送 AI 回复后的计时更新设计。
+     *
+     * 验证仅在回复发送成功后更新最后回复时间。
+     */
     @Test
     fun testSuccessfulAiReplyUpdatesLastReplyTime() = runTest {
         val chatId = "123456"
@@ -290,6 +353,11 @@ class MessagePollerTest {
         assert(getLastAiReplyAtMillis() != null)
     }
 
+    /**
+     * 验证空 AI 回复的计时处理设计。
+     *
+     * 验证空回复不会更新最后回复时间。
+     */
     @Test
     fun testBlankAiReplyDoesNotUpdateLastReplyTime() = runTest {
         val chatId = "123456"
@@ -302,6 +370,11 @@ class MessagePollerTest {
         assert(getLastAiReplyAtMillis() == null)
     }
 
+    /**
+     * 验证 AI 回复发送失败时的计时处理设计。
+     *
+     * 验证发送异常不会更新最后回复时间。
+     */
     @Test
     fun testSendFailureDoesNotUpdateLastReplyTime() = runTest {
         val chatId = "123456"

@@ -7,12 +7,24 @@ import com.unscientificjszhai.tgp.repository.SkillRepository
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
+/**
+ * 提供读取和保存技能内容的模型函数。
+ *
+ * 写入操作会直接持久化到 [SkillRepository]，因此调用方应仅传入允许保存的技能内容。
+ *
+ * @param skillRepository 用于读取和保存技能的仓库。
+ */
 class SkillFunctionProvider(
     private val skillRepository: SkillRepository
 ) : LocalFunctionProvider() {
 
     private val logger = LoggerFactory.getLogger(this::class.java)
 
+    /**
+     * 获取读取与保存技能的函数声明。
+     *
+     * @return 包含 `read_skill` 和 `write_skill` 的函数声明列表。
+     */
     override val providedFunctions: List<FunctionDeclaration> by lazy {
         val readSkillSchemaJson = buildJsonObject {
             put("type", "OBJECT")
@@ -61,6 +73,15 @@ class SkillFunctionProvider(
         )
     }
 
+    /**
+     * 执行技能读取或保存函数。
+     *
+     * @param functionName 要执行的函数名称；非 [providedFunctions] 中声明的名称会得到 `error` 结果。
+     * @param args 函数参数映射。读取要求字符串 `id`；保存要求字符串 `description` 和 `content`，
+     * 可选字符串 `id` 用于更新既有技能，非字符串的可选 `id` 按缺失处理并创建新技能。
+     * @return 查询成功时包含技能字段、保存成功时包含 `status` 和 `id` 的 JSON 对象；参数无效、
+     * 技能不存在或函数不受支持时包含 `error` 字段。
+     */
     override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
         logger.debug("Processing function {} {}", functionName, args)
 

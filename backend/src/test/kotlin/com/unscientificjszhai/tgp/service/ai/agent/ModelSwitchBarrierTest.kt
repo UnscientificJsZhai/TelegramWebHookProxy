@@ -10,7 +10,15 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
+/**
+ * 模型切换屏障代次与请求协调的测试设计。
+ */
 class ModelSwitchBarrierTest {
+    /**
+     * 验证完成新代次时释放较早等待者的设计。
+     *
+     * 验证完成一个代次会释放其自身及所有更早待处理代次。
+     */
     @Test
     fun `completing a generation releases every older pending generation`() = runTest {
         val barrier = ModelSwitchBarrier()
@@ -34,6 +42,11 @@ class ModelSwitchBarrierTest {
         assertFalse(barrier.isSwitching)
     }
 
+    /**
+     * 验证较早代次完成不会误释放较新等待者的设计。
+     *
+     * 验证较新代次仍会保持等待状态。
+     */
     @Test
     fun `completion of an older generation does not release waiters for a newer one`() = runTest {
         val barrier = ModelSwitchBarrier()
@@ -55,6 +68,11 @@ class ModelSwitchBarrierTest {
         assertFalse(barrier.isSwitching)
     }
 
+    /**
+     * 验证取消失败写入对应代次的恢复设计。
+     *
+     * 验证取消较新代次后，较早待处理代次仍可等待完成。
+     */
     @Test
     fun `cancelling a failed newer write restores the older pending generation`() = runTest {
         val barrier = ModelSwitchBarrier()
@@ -70,6 +88,11 @@ class ModelSwitchBarrierTest {
         waitingRequest.await()
     }
 
+    /**
+     * 验证模型切换等待先前请求的设计。
+     *
+     * 验证切换会等待在其代次前已获准的请求结束。
+     */
     @Test
     fun `a switch waits for requests admitted before its generation`() = runTest {
         val barrier = ModelSwitchBarrier()

@@ -24,7 +24,15 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
+/**
+ * 代理委派服务对设置流和模型切换屏障的协作测试设计。
+ */
 class DelegatingAgentServiceTest {
+    /**
+     * 验证初始设置订阅和技能更新的处理设计。
+     *
+     * 验证初始订阅仅创建一次组件，技能更新会重置会话。
+     */
     @Test
     fun `StateFlow 初始订阅只创建一次组件且技能更新会重置会话`() = runBlocking {
         val settingsRepository = mockk<SettingsRepository>()
@@ -93,6 +101,11 @@ class DelegatingAgentServiceTest {
         }
     }
 
+    /**
+     * 验证模型选择设置变更的处理设计。
+     *
+     * 验证设置流会切换模型，且不会额外重置会话。
+     */
     @Test
     fun `模型选择变更由设置流切换模型且不会额外重置会话`() = runBlocking {
         val settingsRepository = mockk<SettingsRepository>()
@@ -165,6 +178,11 @@ class DelegatingAgentServiceTest {
         }
     }
 
+    /**
+     * 验证消息发送等待最新模型切换代次的设计。
+     *
+     * 验证屏障未完成时发送操作会等待对应切换完成。
+     */
     @Test
     fun `sendMessage waits for the latest model switch generation`() = runBlocking {
         val settingsRepository = mockk<SettingsRepository>()
@@ -229,6 +247,11 @@ class DelegatingAgentServiceTest {
         }
     }
 
+    /**
+     * 验证合并设置快照释放模型切换代次的设计。
+     *
+     * 验证最新快照会释放其覆盖的全部待处理代次。
+     */
     @Test
     fun `latest conflated settings snapshot releases all covered switch generations`() = runBlocking {
         val settingsRepository = mockk<SettingsRepository>()

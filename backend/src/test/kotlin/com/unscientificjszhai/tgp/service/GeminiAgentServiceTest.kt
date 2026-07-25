@@ -28,6 +28,9 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
 
+/**
+ * Gemini 代理服务模型、工具调用和关闭行为的测试设计。
+ */
 class GeminiAgentServiceTest {
 
     private lateinit var settingsRepository: SettingsRepository
@@ -51,6 +54,11 @@ class GeminiAgentServiceTest {
         tempDirectory.deleteRecursively()
     }
 
+    /**
+     * 验证初始模型状态的设计。
+     *
+     * 验证服务使用预期默认模型并提供初始可选模型列表。
+     */
     @Test
     fun testDefaultModelAndInitialAvailableModels() {
         assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
@@ -64,6 +72,11 @@ class GeminiAgentServiceTest {
         )
     }
 
+    /**
+     * 验证刷新前恢复持久化模型选择的设计。
+     *
+     * 验证服务创建时会先采用已保存的有效模型。
+     */
     @Test
     fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
         settingsRepository.saveSettings(
@@ -75,6 +88,11 @@ class GeminiAgentServiceTest {
         assertEquals("models/gemini-custom", restoredService.currentModel)
     }
 
+    /**
+     * 验证成功刷新对无效已选模型的回退设计。
+     *
+     * 验证无效持久化模型会被清空并切换到可用回退模型。
+     */
     @Test
     fun testSuccessfulRefreshClearsInvalidPersistedModelAndFallsBack() = runBlocking {
         val models = mockk<Models>()
@@ -97,6 +115,11 @@ class GeminiAgentServiceTest {
         assertEquals("", settingsRepository.settingsFlow.value.ai?.selectedModel)
     }
 
+    /**
+     * 验证刷新失败时保留模型选择的设计。
+     *
+     * 验证请求模型列表失败不会覆盖已持久化的模型。
+     */
     @Test
     fun testFailedRefreshRetainsPersistedSelectedModel() = runBlocking {
         val models = mockk<Models>()
@@ -111,6 +134,11 @@ class GeminiAgentServiceTest {
         assertEquals("models/gemini-3.5-flash-lite", settingsRepository.settingsFlow.value.ai?.selectedModel)
     }
 
+    /**
+     * 验证切换无前缀模型时的名称规范化设计。
+     *
+     * 验证服务会保留 SDK 所需的 `models/` 前缀。
+     */
     @Test
     fun testSwitchingUnprefixedModelsRetainsSdkPrefix() {
         listOf(
@@ -124,6 +152,11 @@ class GeminiAgentServiceTest {
         }
     }
 
+    /**
+     * 验证切换已有前缀模型的设计。
+     *
+     * 验证模型名称不会被重复添加或修改前缀。
+     */
     @Test
     fun testSwitchingPrefixedModelRetainsItsName() {
         service.switchModel("models/gemini-3.1-flash-lite")
@@ -131,6 +164,11 @@ class GeminiAgentServiceTest {
         assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
     }
 
+    /**
+     * 验证动态可用模型切换时的名称规范化设计。
+     *
+     * 验证无前缀的动态模型会以 SDK 兼容名称保存。
+     */
     @Test
     fun testSwitchingUnprefixedDynamicallyAvailableModelAddsPrefix() {
         GeminiAgentService::class.java.getDeclaredField("availableModels").apply {
@@ -143,6 +181,11 @@ class GeminiAgentServiceTest {
         assertEquals("models/custom-model", service.currentModel)
     }
 
+    /**
+     * 验证不支持模型的拒绝设计。
+     *
+     * 验证切换到不在可用列表中的模型会抛出参数异常。
+     */
     @Test
     fun testSwitchingUnsupportedModelFails() {
         assertFailsWith<IllegalArgumentException> {
@@ -150,6 +193,11 @@ class GeminiAgentServiceTest {
         }
     }
 
+    /**
+     * 验证工具调用响应标识保留的设计。
+     *
+     * 验证生成的函数响应包含原调用的标识和名称。
+     */
     @Test
     fun testFunctionResponseRetainsCallIdAndName() {
         val functionCall = FunctionCall.builder()
@@ -169,6 +217,11 @@ class GeminiAgentServiceTest {
         assertEquals("ok", response.response().get()["status"])
     }
 
+    /**
+     * 验证无调用标识的旧版工具调用兼容设计。
+     *
+     * 验证旧版调用仍可生成可用的函数响应。
+     */
     @Test
     fun testLegacyFunctionCallWithoutIdStillGeneratesResponse() {
         val functionCall = FunctionCall.builder()
@@ -186,6 +239,11 @@ class GeminiAgentServiceTest {
         assertEquals("failed", response.response().get()["error"])
     }
 
+    /**
+     * 验证未知工具调用的错误响应设计。
+     *
+     * 验证每个未知调用都会得到与其标识和名称对应的错误响应。
+     */
     @Test
     fun testUnknownFunctionCallsProduceMatchingErrorResponses() = runTest {
         val chat = mockk<Chat>()
@@ -210,6 +268,11 @@ class GeminiAgentServiceTest {
         assertEquals("Function missing_two not found", functionResponses[1].response().get()["error"])
     }
 
+    /**
+     * 验证工具调用轮次上限的设计。
+     *
+     * 验证达到最大轮次后会停止调用并报告异常。
+     */
     @Test
     fun testToolCallsStopAfterMaximumRounds() = runTest {
         val chat = mockk<Chat>()
@@ -240,6 +303,11 @@ class GeminiAgentServiceTest {
         verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
     }
 
+    /**
+     * 验证关闭服务时等待在途消息的设计。
+     *
+     * 验证会话资源仅在已开始的消息处理完成后才释放。
+     */
     @Test
     fun test关闭会等待在途消息完成后再释放会话() = runBlocking {
         val chat = mockk<Chat>()

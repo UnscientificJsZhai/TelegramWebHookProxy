@@ -18,11 +18,23 @@ import org.slf4j.LoggerFactory
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * 管理到 MCP 服务器的连接，并提供已发现工具的查询与调用能力。
+ *
+ * 服务维护当前连接配置的快照；调用 [connect] 会将连接状态同步为传入配置，调用
+ * [disconnectAll] 返回的任务完成后不再保留任何服务器连接。
+ */
 @Singleton
 class MCPClientService internal constructor(
     parentScope: CoroutineScope,
     private val clientFactory: () -> Client,
 ) {
+    /**
+     * 使用默认 MCP 客户端创建器创建服务。
+     *
+     * @param parentScope 服务后台连接与断开任务所属的协程作用域；取消该作用域会取消
+     * 服务启动的任务。
+     */
     @Inject
     constructor(parentScope: CoroutineScope) : this(
         parentScope,
@@ -60,6 +72,15 @@ class MCPClientService internal constructor(
     @Volatile
     private var connectionState = ConnectionState()
 
+    /**
+     * 将已连接的服务器同步为指定配置，并发现各服务器提供的工具。
+     *
+     * 此方法会断开未包含在 [configs] 中或配置已变化的服务器。网络连接失败会被记录，
+     * 但不会阻止处理其余服务器；取消协程时会关闭正在建立的客户端并重新抛出取消异常。
+     *
+     * @param configs 目标 MCP 服务器配置列表；列表为空时断开所有当前服务器，服务器名称应在
+     * 列表内唯一。
+     */
     suspend fun connect(configs: List<MCPServerConfig>) = connectionMutex.withLock {
         val newNames = configs.map { it.name }.toSet()
         val toRemove = connectionState.clients.keys - newNames
@@ -109,6 +130,11 @@ class MCPClientService internal constructor(
         }
     }
 
+    /**
+     * 异步断开所有当前 MCP 服务器。
+     *
+     * @return 执行断开操作的任务；等待该任务完成后，服务不再保留服务器连接或工具快照。
+     */
     fun disconnectAll(): Job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
         connectionMutex.withLock {
             connectionState.clients.keys.toList().forEach { disconnectLocked(it) }
@@ -135,11 +161,28 @@ class MCPClientService internal constructor(
         }
     }
 
+    /**
+     * 获取当前所有已连接服务器发现到的工具。
+     *
+     * @return 服务器名称与工具组成的列表；未连接任何服务器或未发现工具时返回空列表。列表
+     * 顺序来自当前连接快照，不应视为稳定排序。
+     */
     fun getAllTools(): List<Pair<String, Tool>> =
         connectionState.serverTools.flatMap { (serverName, tools) ->
             tools.map { serverName to it }
         }
 
+    /**
+     * 调用指定 MCP 服务器上的工具。
+     *
+     * 调用会与连接变更串行执行，避免在工具调用期间关闭目标客户端。
+     *
+     * @param serverName 已连接 MCP 服务器的名称。
+     * @param toolName 目标服务器已提供的工具名称。
+     * @param args 传递给工具的参数映射；值可为 `null`，其键和值应符合工具的输入架构。
+     * @return MCP 服务器返回的工具调用结果。
+     * @throws IllegalStateException 当 [serverName] 对应的服务器尚未连接时抛出。
+     */
     suspend fun callTool(
         serverName: String,
         toolName: String,

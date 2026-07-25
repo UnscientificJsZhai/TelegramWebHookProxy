@@ -9,7 +9,15 @@ import kotlin.jvm.optionals.getOrNull
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
+/**
+ * 本地函数提供者转换 OpenAI 函数定义的测试设计。
+ */
 class LocalFunctionProviderTest {
+    /**
+     * 为函数声明转换测试提供固定输入的本地函数提供者。
+     *
+     * 用于验证转换结果保留声明中的名称、描述和参数架构。
+     */
 
     private class TestFunctionProvider : LocalFunctionProvider() {
         override val providedFunctions: List<FunctionDeclaration> = listOf(
@@ -40,6 +48,11 @@ class LocalFunctionProviderTest {
         }
     }
 
+    /**
+     * 验证本地函数定义转换的设计。
+     *
+     * 验证转换结果包含函数名称、描述及参数架构的关键字段。
+     */
     @Test
     fun testProvidedOpenAIFunctionsConversion() {
         val provider = TestFunctionProvider()
@@ -54,7 +67,7 @@ class LocalFunctionProviderTest {
         val params = weatherFunc.parameters()
         val paramsString = params.toString()
 
-        // Verify that the converted schema contains key elements
+        // 验证转换后的参数架构包含关键字段。
         assertTrue(paramsString.contains("location"), "Params should contain 'location'")
         assertTrue(paramsString.contains("object"), "Params should contain 'object'")
         assertTrue(paramsString.contains("string"), "Params should contain 'string'")

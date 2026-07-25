@@ -13,7 +13,9 @@ import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
 /**
- * 提供 HTTP API 调用能力的本地功能提供者。
+ * 提供通过模型函数调用 HTTP API 的能力。
+ *
+ * 单次请求最长等待 60 秒。函数调用错误会以 JSON 中的 `error` 字段返回，协程取消会继续向上抛出。
  */
 class HttpCallingFunctionProvider : LocalFunctionProvider() {
     private val logger = LoggerFactory.getLogger(HttpCallingFunctionProvider::class.java)
@@ -25,6 +27,11 @@ class HttpCallingFunctionProvider : LocalFunctionProvider() {
             }
         }
 
+    /**
+     * 获取 `call_http_api` 函数的声明。
+     *
+     * 该函数要求提供 URL，可选请求方法、请求头和文本请求体。
+     */
     override val providedFunctions: List<FunctionDeclaration> by lazy {
         val callHttpApiSchemaJson =
             buildJsonObject {
@@ -75,6 +82,18 @@ class HttpCallingFunctionProvider : LocalFunctionProvider() {
         )
     }
 
+    /**
+     * 执行 HTTP 函数调用。
+     *
+     * 调用会发起网络 I/O，协程取消会停止等待并向上抛出取消异常。
+     *
+     * @param functionName 要执行的函数名称；仅 `call_http_api` 会发起请求。
+     * @param args 函数参数映射。`call_http_api` 要求 `url` 为字符串；可选 `method`、`headers` 和
+     * `body` 字段会按函数声明处理。
+     * @return 成功时包含 HTTP 状态码和响应正文的 JSON 对象；函数不受支持或请求失败时包含
+     * `error` 字段的 JSON 对象。
+     * @throws CancellationException 当调用方取消协程时抛出。
+     */
     override suspend fun execute(
         functionName: String,
         args: Map<String, Any?>,

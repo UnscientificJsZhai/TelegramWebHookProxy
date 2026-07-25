@@ -31,6 +31,18 @@ import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
 
+/**
+ * 基于 OpenAI API 维护对话会话并执行模型工具调用的 AI 代理服务。
+ *
+ * 服务在创建时根据当前设置初始化 OpenAI 客户端；会话重置会同步 MCP 工具和技能提示词。
+ * 调用 [close] 返回的任务完成后，服务持有的客户端与 MCP 连接均已释放。
+ *
+ * @param parentScope 服务任务所属的父协程作用域。
+ * @param settingsRepository 提供 OpenAI、MCP 和代理设置的仓库。
+ * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
+ * @param mcpClientService 管理会话可调用的 MCP 工具连接。
+ * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ */
 @AgentScope
 class OpenAIAgentService @Inject constructor(
     parentScope: CoroutineScope,
@@ -89,10 +101,18 @@ class OpenAIAgentService @Inject constructor(
     private var configuredBaseUrl: String? = null
     private var configuredProxy: ProxySettings? = null
 
+    /**
+     * 获取当前会话实际使用的 OpenAI 模型名称。
+     */
     @Volatile
     override var currentModel: String = DEFAULT_MODEL
         private set
 
+    /**
+     * 获取当前可供选择的 OpenAI 模型名称列表。
+     *
+     * 列表由 [updateModel] 刷新，初始值包含内置回退模型。
+     */
     @Volatile
     override var availableModels: List<String> = listOf(
         DEFAULT_MODEL,
@@ -101,6 +121,12 @@ class OpenAIAgentService @Inject constructor(
     )
         private set
 
+    /**
+     * 判断给定设置是否启用了 OpenAI 代理。
+     *
+     * @param aiSettings 要检查的 AI 设置。
+     * @return 已启用代理且 OpenAI API 密钥非空时返回 `true`，否则返回 `false`。
+     */
     override fun isAiFeatureEnabled(aiSettings: AISettings): Boolean =
         aiSettings.agentEnabled && aiSettings.openAiApiKey.isNotBlank()
 
@@ -143,6 +169,15 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
+    /**
+     * 切换当前会话使用的 OpenAI 模型。
+     *
+     * 模型切换会异步重置会话；只有仍代表最新模型选择的任务可以提交切换结果。
+     *
+     * @param modelName 要切换到的模型名称，必须存在于 [availableModels]。
+     * @return 已开始切换时返回重置会话的任务；模型未改变或服务已关闭时返回 `null`。
+     * @throws IllegalArgumentException 当 [modelName] 不在 [availableModels] 中时抛出。
+     */
     override fun switchModel(modelName: String): Job? {
         val selectionVersion = synchronized(modelStateLock) {
             if (closed) {
@@ -170,6 +205,13 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
+    /**
+     * 从 OpenAI API 刷新可用模型列表。
+     *
+     * 若当前选择的模型不再可用，会选择内置回退模型并重置会话；刷新失败不会修改当前模型列表。
+     *
+     * @return 刷新成功后的模型快照；客户端不可用、服务已关闭或刷新结果过期时返回 `null`。
+     */
     override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
         try {
             if (closed) {
@@ -213,6 +255,11 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
+    /**
+     * 异步重置当前会话并重新应用系统提示词、技能与 MCP 工具。
+     *
+     * @return 已开始重置时返回对应任务；服务已关闭时返回 `null`。
+     */
     override fun resetSession(): Job? = if (closed) null else launchSessionJob(::resetSessionLocked)
 
     /**
@@ -326,6 +373,19 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
+    /**
+     * 向当前会话发送文本和媒体数据，并返回模型最终回复。
+     *
+     * 图像会以内联数据发送；仅模型名称包含 `audio` 或以 `o1`、`o3` 开头时会发送音频。
+     * 不支持的媒体或空消息会被忽略。
+     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。
+     *
+     * @param text 可选的配文或指令内容；为 `null` 或空白时不创建文本内容片段。
+     * @param mediaData 要发送的媒体数据列表；可为空，元素的 MIME 类型决定其处理方式。
+     * @return 模型最终回复文本；没有可发送内容或模型未返回文本时返回空字符串。工具调用或其他
+     * 可恢复错误会返回以 `Error:` 开头的文本。
+     * @throws IllegalStateException 当服务已关闭或 OpenAI 客户端尚未初始化时抛出。
+     */
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String = sessionMutex.withLock {
         check(!closed) { "OpenAI client is closed." }
         val currentClient = client ?: throw IllegalStateException("OpenAI client is not initialized.")
@@ -528,8 +588,7 @@ class OpenAIAgentService @Inject constructor(
     }
 
     /**
-     * A failed list request must not change persistence. After a successful list request, clear a
-     * model only when this still represents the client that produced that list.
+     * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
      */
     private fun clearPersistedSelectedModel(invalidModel: String) {
         val settings = settingsRepository.settingsFlow.value
@@ -545,6 +604,13 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
+    /**
+     * 关闭 OpenAI 会话任务与 MCP 连接。
+     *
+     * 重复调用会返回同一个清理任务。
+     *
+     * @return 异步关闭任务；等待该任务完成后不再保留会话状态和 MCP 连接。
+     */
     override fun close(): Job = synchronized(lifecycleLock) {
         closeJob ?: run {
             closed = true

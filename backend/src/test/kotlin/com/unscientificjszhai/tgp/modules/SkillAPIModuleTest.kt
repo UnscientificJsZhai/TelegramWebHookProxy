@@ -11,6 +11,9 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import kotlin.test.*
 
+/**
+ * 技能 HTTP API 的测试设计。
+ */
 class SkillAPIModuleTest {
 
     private val skillsFile = File("config/skills.json")
@@ -29,6 +32,11 @@ class SkillAPIModuleTest {
         }
     }
 
+    /**
+     * 验证技能 API 的增删查流程设计。
+     *
+     * 验证空列表、新增多个技能、读取列表及删除技能后的结果均正确。
+     */
     @Test
     fun testSkillsApi() = testApplication {
         application {

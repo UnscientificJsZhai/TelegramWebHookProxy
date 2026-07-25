@@ -13,6 +13,14 @@ import io.ktor.server.routing.*
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
+/**
+ * 注册应用设置、聊天记录和消息发送的 HTTP API 路由。
+ *
+ * 该方法会向接收者追加路由，并在处理请求时读写设置、聊天记录和 Telegram 服务。
+ *
+ * @receiver 已创建且尚未停止的 Ktor 应用实例。
+ * @param appComponent 提供路由所需应用级依赖的组件。
+ */
 fun Application.apiModule(appComponent: AppComponent) {
     val settingsRepository = appComponent.settingsRepository
     val telegramService = appComponent.telegramService

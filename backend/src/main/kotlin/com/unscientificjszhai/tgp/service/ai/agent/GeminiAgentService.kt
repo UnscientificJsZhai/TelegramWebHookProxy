@@ -30,6 +30,18 @@ import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
 import com.google.genai.types.ProxyType as GeminiProxyType
 
+/**
+ * 基于 Gemini API 维护对话会话并执行模型工具调用的 AI 代理服务。
+ *
+ * 服务在创建时根据当前设置初始化 Gemini 客户端，并在会话重置时同步 MCP 工具和技能提示词。
+ * 调用 [close] 返回的任务完成后，服务持有的客户端与 MCP 连接均已释放。
+ *
+ * @param parentScope 服务任务所属的父协程作用域。
+ * @param settingsRepository 提供 Gemini、MCP 和代理设置的仓库。
+ * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
+ * @param mcpClientService 管理会话可调用的 MCP 工具连接。
+ * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ */
 @AgentScope
 class GeminiAgentService @Inject constructor(
     parentScope: CoroutineScope,
@@ -81,13 +93,16 @@ class GeminiAgentService @Inject constructor(
     private var configuredProxy: ProxySettings? = null
 
     /**
-     * 当前会话使用的模型。
+     * 获取当前会话实际使用的 Gemini 模型名称。
      */
     override var currentModel: String = DEFAULT_MODEL
         private set
 
     /**
-     * 可选的模型列表。
+     * 获取或更新当前可供选择的 Gemini 模型名称列表。
+     *
+     * 列表由 [updateModel] 刷新，初始值包含内置回退模型；调用方可赋值空列表或自定义列表，
+     * 后续刷新会覆盖该值。
      */
     override var availableModels = listOf(
         DEFAULT_MODEL,
@@ -95,6 +110,12 @@ class GeminiAgentService @Inject constructor(
         LEGACY_MODEL,
     )
 
+    /**
+     * 判断给定设置是否启用了 Gemini 代理。
+     *
+     * @param aiSettings 要检查的 AI 设置。
+     * @return 已启用代理且 Gemini API 密钥非空时返回 `true`，否则返回 `false`。
+     */
     override fun isAiFeatureEnabled(aiSettings: AISettings) =
         aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
 
@@ -159,7 +180,12 @@ class GeminiAgentService @Inject constructor(
     /**
      * 切换当前会话使用的模型。
      *
-     * @param modelName 模型名称。
+     * 模型名称可以省略 `models/` 前缀。实际切换时会保存当前历史记录并异步重建会话。
+     *
+     * @param modelName 要切换到的模型名称，必须存在于 [availableModels]，或在补上 `models/`
+     * 前缀后存在于该列表。
+     * @return 已开始切换时返回重置会话的任务；模型未改变或服务已关闭时返回 `null`。
+     * @throws IllegalArgumentException 当 [modelName] 不在 [availableModels] 中时抛出。
      */
     override fun switchModel(modelName: String): Job? {
         val modelChanged = synchronized(modelStateLock) {
@@ -188,6 +214,13 @@ class GeminiAgentService @Inject constructor(
         return null
     }
 
+    /**
+     * 从 Gemini API 刷新可用模型列表。
+     *
+     * 若当前模型不再可用，会选择内置回退模型并重置会话；刷新失败不会修改当前模型列表。
+     *
+     * @return 刷新成功后的模型快照；客户端不可用、服务已关闭或刷新结果过期时返回 `null`。
+     */
     override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
         try {
             if (closed) {
@@ -225,7 +258,9 @@ class GeminiAgentService @Inject constructor(
     }
 
     /**
-     * 重置当前会话，清空历史记录并重新应用系统提示词。
+     * 异步重置当前会话并重新应用系统提示词、技能与 MCP 工具。
+     *
+     * @return 已开始重置时返回对应任务；服务已关闭或 Gemini 客户端不可用时返回 `null`。
      */
     override fun resetSession(): Job? = resetSession(captureHistory = false)
 
@@ -297,17 +332,25 @@ class GeminiAgentService @Inject constructor(
     /**
      * 发送文本消息并获取回复。
      *
-     * @param text 消息内容。
-     * @return Gemini 的回复文本。
+     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。
+     *
+     * @param text 要发送的文本消息；空字符串会作为空文本部分发送。
+     * @return Gemini 的回复文本；模型未提供文本时返回空字符串。
+     * @throws IllegalStateException 当服务已关闭或无法建立 Gemini 会话时抛出。
+     * @throws ToolCallLimitExceededException 当连续工具调用达到上限时抛出。
      */
     override suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
 
     /**
-     * 发送包含语音数据的消息并获取回复。
+     * 发送包含媒体数据的消息并获取回复。
      *
-     * @param text 配文或指令内容（可选）。
-     * @param mediaData 包含媒体数据的列表。
-     * @return Gemini 的回复文本。
+     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。
+     *
+     * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
+     * @param mediaData 要发送的媒体数据列表；可为空，元素会作为 Gemini 内联数据发送。
+     * @return Gemini 的回复文本；模型未提供文本时返回空字符串。
+     * @throws IllegalStateException 当服务已关闭或无法建立 Gemini 会话时抛出。
+     * @throws ToolCallLimitExceededException 当连续工具调用达到上限时抛出。
      */
     override suspend fun sendMessage(
         text: String?,
@@ -361,7 +404,7 @@ class GeminiAgentService @Inject constructor(
                     }
                 }
 
-                // Check for tool calls
+                // 检查模型是否请求调用工具。
                 handleResponse(response, chatForMessage)
             } catch (e: ToolCallLimitExceededException) {
                 logger.error("Tool call limit reached for Gemini session", e)
@@ -413,7 +456,7 @@ class GeminiAgentService @Inject constructor(
                 functionResponses.add(createFunctionResponsePart(functionCall, result))
             }
 
-            // Send function results back to the model
+            // 将工具调用结果回传给模型。
             val content = Content.builder().role("user").parts(functionResponses).build()
             val finalResponse = withContext(Dispatchers.IO) {
                 currentChat.sendMessage(content)
@@ -426,6 +469,10 @@ class GeminiAgentService @Inject constructor(
 
     /**
      * 将工具调用结果转换为与原调用一一对应的 Gemini 响应。
+     *
+     * @param functionCall 模型发出的原始工具调用；其标识和名称会复制到响应中。
+     * @param result 工具执行结果的 JSON 对象。
+     * @return 可作为 Gemini 函数响应发送的内容片段。
      */
     internal fun createFunctionResponsePart(functionCall: FunctionCall, result: JsonObject): Part {
         val responseBuilder = FunctionResponse.builder().response(result.toMap())
@@ -443,7 +490,9 @@ class GeminiAgentService @Inject constructor(
     private fun preferredModel(models: List<String>): String? =
         listOf(DEFAULT_MODEL, PREVIOUS_DEFAULT_MODEL, LEGACY_MODEL).firstOrNull { it in models } ?: models.firstOrNull()
 
-    /** See OpenAIAgentService: only a successful, still-current client may invalidate persistence. */
+    /**
+     * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
+     */
     private fun clearPersistedSelectedModel(invalidModel: String) {
         val settings = settingsRepository.settingsFlow.value
         val aiSettings = settings.ai
@@ -457,6 +506,13 @@ class GeminiAgentService @Inject constructor(
         }
     }
 
+    /**
+     * 关闭 Gemini 客户端、会话任务与 MCP 连接。
+     *
+     * 重复调用会返回同一个清理任务。
+     *
+     * @return 异步关闭任务；等待该任务完成后不再保留 Gemini 客户端和 MCP 连接。
+     */
     override fun close(): Job = synchronized(lifecycleLock) {
         closeJob ?: run {
             closed = true

@@ -8,6 +8,14 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 
+/**
+ * 注册技能的分页查询、新增和删除 HTTP API 路由。
+ *
+ * 该方法会向接收者追加路由，并在处理请求时读写技能仓库。
+ *
+ * @receiver 已创建且尚未停止的 Ktor 应用实例。
+ * @param appComponent 提供技能仓库的应用级组件。
+ */
 fun Application.skillAPIModule(appComponent: AppComponent) {
     val skillRepository = appComponent.skillRepository
 

@@ -16,6 +16,9 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
+/**
+ * 设置仓储与模型切换屏障协作的测试设计。
+ */
 class SettingsRepositoryBarrierTest {
     private val tempDirectory = createTempDirectory("settings-barrier-test").toFile()
 
@@ -24,6 +27,11 @@ class SettingsRepositoryBarrierTest {
         tempDirectory.deleteRecursively()
     }
 
+    /**
+     * 验证会开启模型切换屏障的设置范围。
+     *
+     * 验证仅影响代理生命周期的设置变更会创建屏障代次。
+     */
     @Test
     fun `only agent lifecycle settings open a model switch barrier`() {
         val barrier = ModelSwitchBarrier()
@@ -69,6 +77,11 @@ class SettingsRepositoryBarrierTest {
         assertTrue(barrier.isSwitching)
     }
 
+    /**
+     * 验证无关保存对待处理屏障代次的传递设计。
+     *
+     * 验证最新设置快照会携带仍待处理的最高代次。
+     */
     @Test
     fun `unrelated save carries an open generation to its latest settings snapshot`() {
         val barrier = ModelSwitchBarrier()
@@ -88,6 +101,11 @@ class SettingsRepositoryBarrierTest {
         assertEquals(generation, latestUpdate.switchGeneration)
     }
 
+    /**
+     * 验证合并设置快照释放屏障代次的设计。
+     *
+     * 验证最新生命周期快照会释放被合并的较早代次。
+     */
     @Test
     fun `latest lifecycle snapshot releases conflated earlier generations`() {
         val barrier = ModelSwitchBarrier()
@@ -119,6 +137,11 @@ class SettingsRepositoryBarrierTest {
         assertFalse(barrier.isSwitching)
     }
 
+    /**
+     * 验证设置写入失败时的屏障回滚设计。
+     *
+     * 验证失败写入创建的屏障代次会被取消。
+     */
     @Test
     fun `a failed settings write cancels its switch generation`() {
         val barrier = ModelSwitchBarrier()

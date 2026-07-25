@@ -10,6 +10,9 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.*
 
+/**
+ * 技能函数提供者读取和写入行为的测试设计。
+ */
 class SkillFunctionProviderTest {
 
     private lateinit var skillRepository: SkillRepository
@@ -21,6 +24,11 @@ class SkillFunctionProviderTest {
         provider = SkillFunctionProvider(skillRepository)
     }
 
+    /**
+     * 验证读取已有技能的设计。
+     *
+     * 验证函数返回技能标识、描述和内容。
+     */
     @Test
     fun testReadSkill() = runTest {
         val skill = Skill(id = "123", description = "Test Skill", content = "Test Content")
@@ -35,6 +43,11 @@ class SkillFunctionProviderTest {
         verify { skillRepository.getSkillById("123") }
     }
 
+    /**
+     * 验证读取不存在技能的错误处理设计。
+     *
+     * 验证函数返回错误结果并查询目标标识。
+     */
     @Test
     fun testReadSkillNotFound() = runTest {
         every { skillRepository.getSkillById(any()) } returns null
@@ -46,6 +59,11 @@ class SkillFunctionProviderTest {
         verify { skillRepository.getSkillById("456") }
     }
 
+    /**
+     * 验证新增技能的函数调用设计。
+     *
+     * 验证函数保存新技能并返回成功状态和生成标识。
+     */
     @Test
     fun testWriteNewSkill() = runTest {
         val description = "New Skill"
@@ -60,6 +78,11 @@ class SkillFunctionProviderTest {
         verify { skillRepository.saveSkill(match { it.description == description && it.content == content }) }
     }
 
+    /**
+     * 验证更新技能的函数调用设计。
+     *
+     * 验证函数使用给定标识保存更新内容并返回该标识。
+     */
     @Test
     fun testWriteUpdateSkill() = runTest {
         val id = "789"

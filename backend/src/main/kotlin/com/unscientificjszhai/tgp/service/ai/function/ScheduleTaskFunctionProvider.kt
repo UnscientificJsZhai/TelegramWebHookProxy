@@ -10,11 +10,24 @@ import java.text.SimpleDateFormat
 import java.util.*
 import javax.inject.Provider
 
+/**
+ * 提供创建、查询和取消 AI 定时任务的模型函数。
+ *
+ * 所有任务操作均委托给 [TaskSchedulerService]，创建任务时使用当前 AI 设置中的代理会话标识。
+ *
+ * @param taskSchedulerService 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ * @param settingsRepository 提供创建任务所需代理会话标识的设置仓库。
+ */
 class ScheduleTaskFunctionProvider(
     private val taskSchedulerService: Provider<TaskSchedulerService>,
     private val settingsRepository: SettingsRepository
 ) : LocalFunctionProvider() {
 
+    /**
+     * 获取创建、列出和取消定时任务的函数声明。
+     *
+     * @return 包含 `create_scheduled_task`、`list_scheduled_tasks` 和 `cancel_scheduled_task` 的列表。
+     */
     override val providedFunctions: List<FunctionDeclaration> by lazy {
         val createScheduledTaskSchemaJson = buildJsonObject {
             put("type", "OBJECT")
@@ -79,6 +92,15 @@ class ScheduleTaskFunctionProvider(
         )
     }
 
+    /**
+     * 执行定时任务相关函数。
+     *
+     * @param functionName 要执行的函数名称；非 [providedFunctions] 中声明的名称会得到 `error` 结果。
+     * @param args 函数参数映射；创建任务要求字符串 `instruction` 和 `executionTime`，后者格式必须为
+     * `yyyy-MM-dd HH:mm:ss` 或 `+<整数><s|m|h|d>`。可选 `loopMode` 必须为 `ONCE`、`HOURLY`、
+     * `DAILY` 或 `WEEKLY`；取消任务要求字符串 `taskId`，列出任务时忽略该映射。
+     * @return 操作结果的 JSON 对象；参数缺失、格式错误、未配置会话或不支持的函数名称时包含 `error` 字段。
+     */
     override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject =
         when (functionName) {
             "create_scheduled_task" -> createScheduledTask(args)

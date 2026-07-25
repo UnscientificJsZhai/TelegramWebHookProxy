@@ -32,6 +32,9 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
 
+/**
+ * OpenAI 代理服务的模型刷新、会话生命周期、并发与请求参数测试设计。
+ */
 class OpenAIAgentServiceTest {
 
     private lateinit var settingsRepository: SettingsRepository
@@ -58,6 +61,11 @@ class OpenAIAgentServiceTest {
         tempDirectory.deleteRecursively()
     }
 
+    /**
+     * 验证初始模型选择的设计。
+     *
+     * 验证默认模型为 Luna，且可选列表保留 GPT-4o。
+     */
     @Test
     fun testDefaultModelIsLunaAndRetainsGpt4oOptions() {
         assertEquals("gpt-5.6-luna", service.currentModel)
@@ -71,6 +79,11 @@ class OpenAIAgentServiceTest {
         )
     }
 
+    /**
+     * 验证首选模型回退顺序的设计。
+     *
+     * 验证服务会按既定优先级从可用模型中选择回退值。
+     */
     @Test
     fun testPreferredModelFallbackOrder() {
         assertEquals("gpt-5.6-luna", service.preferredModel(listOf("gpt-5.6-luna", "gpt-4o")))
@@ -79,6 +92,11 @@ class OpenAIAgentServiceTest {
         assertEquals(null, service.preferredModel(emptyList()))
     }
 
+    /**
+     * 验证刷新前恢复持久化模型选择的设计。
+     *
+     * 验证服务创建时会先采用已保存的有效模型。
+     */
     @Test
     fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
         settingsRepository.saveSettings(
@@ -90,6 +108,11 @@ class OpenAIAgentServiceTest {
         assertEquals("gpt-4o", restoredService.currentModel)
     }
 
+    /**
+     * 验证成功刷新对无效已选模型的回退设计。
+     *
+     * 验证无效持久化模型会被清空并切换到可用回退模型。
+     */
     @Test
     fun testSuccessfulRefreshClearsInvalidPersistedModelAndFallsBack() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -119,6 +142,11 @@ class OpenAIAgentServiceTest {
         assertEquals("", settingsRepository.settingsFlow.value.ai?.selectedModel)
     }
 
+    /**
+     * 验证刷新失败时保留模型选择的设计。
+     *
+     * 验证请求模型列表失败不会覆盖已持久化的模型。
+     */
     @Test
     fun testFailedRefreshRetainsPersistedSelectedModel() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -141,6 +169,11 @@ class OpenAIAgentServiceTest {
         assertEquals("gpt-5.6-luna", settingsRepository.settingsFlow.value.ai?.selectedModel)
     }
 
+    /**
+     * 验证 Luna 不可用时的模型回退设计。
+     *
+     * 验证刷新模型列表后会选择 GPT-4o 作为回退模型。
+     */
     @Test
     fun testModelRefreshFallsBackToGpt4oWhenLunaUnavailable() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -163,6 +196,11 @@ class OpenAIAgentServiceTest {
         assertEquals(service.availableModels, snapshot?.availableModels)
     }
 
+    /**
+     * 验证模型刷新失败时的缓存保留设计。
+     *
+     * 验证方法返回失败且现有可用模型列表不变。
+     */
     @Test
     fun testModelRefreshFailureReturnsFalseAndRetainsCachedModels() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -177,6 +215,11 @@ class OpenAIAgentServiceTest {
         assertEquals(cachedModels, service.availableModels)
     }
 
+    /**
+     * 验证模型刷新取消的传播设计。
+     *
+     * 验证底层调用取消会原样传递给调用方。
+     */
     @Test
     fun testModelRefreshPropagatesCancellation() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -191,6 +234,11 @@ class OpenAIAgentServiceTest {
         Unit
     }
 
+    /**
+     * 验证模型刷新与并发切换的竞争处理设计。
+     *
+     * 验证已开始的刷新不会覆盖并发完成的模型选择。
+     */
     @Test
     fun testModelRefreshDoesNotOverrideConcurrentModelSwitch() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -219,6 +267,11 @@ class OpenAIAgentServiceTest {
         assertTrue(service.currentModel in service.availableModels)
     }
 
+    /**
+     * 验证排队模型切换与已开始刷新之间的竞争处理设计。
+     *
+     * 验证排队切换会阻止已开始的刷新覆盖最终选择。
+     */
     @Test
     fun test排队模型切换会阻止已开始的模型刷新覆盖选择() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -267,6 +320,11 @@ class OpenAIAgentServiceTest {
         assertTrue(ChatModel.GPT_4O.toString() in service.availableModels)
     }
 
+    /**
+     * 验证回退模型刷新与在途消息的协调设计。
+     *
+     * 验证服务会等待在途消息结束后再重置会话并应用回退模型。
+     */
     @Test
     fun testFallback模型刷新会等待在途消息后重置会话() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -331,6 +389,11 @@ class OpenAIAgentServiceTest {
         assertTrue(requests.last().messages()[1].isUser())
     }
 
+    /**
+     * 验证重置会话的 MCP 连接任务返回设计。
+     *
+     * 验证重置操作返回并启动新的 MCP 连接任务。
+     */
     @Test
     fun testResetSessionReturnsMcpConnectionJob() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
@@ -359,6 +422,11 @@ class OpenAIAgentServiceTest {
         coVerify(exactly = 1) { mcpClientService.connect(mcpServers) }
     }
 
+    /**
+     * 验证连续重置时 MCP 连接的串行设计。
+     *
+     * 验证后一连接仅在前一连接任务结束后启动。
+     */
     @Test
     fun test连续重置会在前一MCP连接结束后启动新连接() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
@@ -408,6 +476,11 @@ class OpenAIAgentServiceTest {
         coVerify(exactly = 2) { mcpClientService.connect(mcpServers) }
     }
 
+    /**
+     * 验证取消重置时 MCP 连接任务的处理设计。
+     *
+     * 验证取消会终止并等待相关连接任务结束。
+     */
     @Test
     fun test取消重置会取消并等待MCP连接任务() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
@@ -440,6 +513,11 @@ class OpenAIAgentServiceTest {
         coVerify(exactly = 1) { mcpClientService.connect(mcpServers) }
     }
 
+    /**
+     * 验证关闭服务对排队重置的处理设计。
+     *
+     * 验证关闭会取消尚未执行的重置且不会建立 MCP 连接。
+     */
     @Test
     fun test关闭会取消排队重置且不会连接MCP() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
@@ -486,6 +564,11 @@ class OpenAIAgentServiceTest {
         coVerify(exactly = 0) { mcpClientService.connect(mcpServers) }
     }
 
+    /**
+     * 验证被新选择失效的排队模型切换设计。
+     *
+     * 验证失效切换不会重置会话或覆盖最新选择。
+     */
     @Test
     fun test排队模型切换被最新选择失效且不会重置会话() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -521,6 +604,11 @@ class OpenAIAgentServiceTest {
         assertEquals(2, service.createChatCompletionParams(emptyList()).messages().size)
     }
 
+    /**
+     * 验证工具调用达到上限后的会话恢复设计。
+     *
+     * 验证历史会被重置，后续处理使用新会话继续执行。
+     */
     @Test
     fun test工具调用达到上限后重置历史并使用新会话继续处理() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -551,6 +639,11 @@ class OpenAIAgentServiceTest {
         assertEquals(2, service.createChatCompletionParams(emptyList()).messages().size)
     }
 
+    /**
+     * 验证发送消息取消的传播设计。
+     *
+     * 验证底层请求取消会原样传递给调用方。
+     */
     @Test
     fun test发送消息取消会向调用方透传() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -567,6 +660,11 @@ class OpenAIAgentServiceTest {
         Unit
     }
 
+    /**
+     * 验证重置会话与在途请求的协调设计。
+     *
+     * 验证重置等待在途请求完成且新会话不保留旧历史。
+     */
     @Test
     fun test重置会等待在途请求且不会保留旧历史() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -599,6 +697,11 @@ class OpenAIAgentServiceTest {
         assertTrue(historyAfterReset.single().isSystem())
     }
 
+    /**
+     * 验证模型切换与在途请求的协调设计。
+     *
+     * 验证切换等待在途请求完成，并在重置后使用新模型。
+     */
     @Test
     fun test模型切换会等待在途请求并在重置后使用新模型() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -649,6 +752,11 @@ class OpenAIAgentServiceTest {
         assertEquals(1, requests.last().messages().size)
     }
 
+    /**
+     * 验证并发消息的对话事务串行设计。
+     *
+     * 验证并发请求会按完整对话事务顺序执行。
+     */
     @Test
     fun test并发消息会按完整对话事务串行执行() = runBlocking {
         val client = mockk<OpenAIClient>()
@@ -700,6 +808,11 @@ class OpenAIAgentServiceTest {
         assertTrue(requests.last().messages()[1].isAssistant())
     }
 
+    /**
+     * 验证 GPT-5.6 请求的推理强度参数设计。
+     *
+     * 验证请求会显式设置不使用推理强度。
+     */
     @Test
     fun testGpt56RequestSetsReasoningEffortNone() = runBlocking {
         val params = service.createChatCompletionParams(emptyList())
@@ -707,6 +820,11 @@ class OpenAIAgentServiceTest {
         assertEquals(ReasoningEffort.NONE, params.reasoningEffort().get())
     }
 
+    /**
+     * 验证旧模型请求的推理强度兼容设计。
+     *
+     * 验证旧模型请求不会设置该参数。
+     */
     @Test
     fun testLegacyModelRequestDoesNotSetReasoningEffort() = runBlocking {
         service.switchModel(ChatModel.GPT_4O.toString())?.join()

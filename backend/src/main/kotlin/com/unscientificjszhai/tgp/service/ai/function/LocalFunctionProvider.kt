@@ -9,16 +9,23 @@ import kotlinx.serialization.json.*
 import kotlin.jvm.optionals.getOrNull
 
 /**
- * 本地功能提供者基类。
+ * 定义可供 AI 模型调用的本地函数提供者契约。
+ *
+ * 实现类通过 [providedFunctions] 描述其支持的函数，并通过 [execute] 处理与函数声明匹配
+ * 的调用。
  */
 abstract class LocalFunctionProvider {
     /**
-     * 该提供者支持的所有函数声明。
+     * 获取该提供者支持的所有函数声明。
+     *
+     * 函数名称应在同一提供者内唯一，并与 [execute] 可处理的名称保持一致。
      */
     abstract val providedFunctions: List<FunctionDeclaration>
 
     /**
-     * 获取 OpenAI 格式的函数声明列表。
+     * 将 [providedFunctions] 转换为 OpenAI 格式的函数声明列表。
+     *
+     * @return 与 [providedFunctions] 顺序一致的 OpenAI 函数定义；未提供函数时返回空列表。
      */
     val providedOpenAIFunctions: List<FunctionDefinition>
         get() = providedFunctions.map { func ->
@@ -32,26 +39,34 @@ abstract class LocalFunctionProvider {
     /**
      * 检查该提供者是否可以处理指定的函数。
      *
-     * @param functionName 函数名。
-     * @return 如果可以处理则返回 true。
+     * @param functionName 要检查的函数名称；空字符串在未声明同名函数时返回 `false`。
+     * @return [providedFunctions] 中包含 [functionName] 时返回 `true`，否则返回 `false`。
      */
     open fun canHandle(functionName: String): Boolean = providedFunctions.any { it.name().orElse(null) == functionName }
 
     /**
-     * 执行具体的函数逻辑。
+     * 执行指定函数的业务逻辑。
      *
-     * @param functionName 函数名。
-     * @param args 参数列表。
-     * @return 执行结果 JsonObject。
+     * @param functionName 要执行的函数名称；调用方通常应传入满足 [canHandle] 的名称，未匹配名称
+     * 的处理方式由实现类定义。
+     * @param args 函数参数映射；值可为 `null`，键和值必须满足该函数声明的输入架构。
+     * @return 函数执行结果的 JSON 对象；具体字段由实现类定义。
      */
     abstract suspend fun execute(
         functionName: String,
         args: Map<String, Any?>,
     ): JsonObject
 
+    /**
+     * 提供函数参数格式转换工具。
+     */
     companion object {
         /**
-         * 将 JsonObject 转换为 Map<String, Any?>。
+         * 将 JSON 对象递归转换为 Kotlin 参数映射。
+         *
+         * @receiver 要转换的 JSON 对象。
+         * @return 键与原 JSON 对象一致的映射；JSON `null` 转换为 Kotlin `null`，数组和嵌套对象
+         * 分别转换为列表和嵌套映射。
          */
         fun JsonObject.toMap(): Map<String, Any?> =
             this.mapValues { (_, value) ->

@@ -14,8 +14,16 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.time.Duration.Companion.seconds
 
+/**
+ * MCP 客户端连接更新行为的测试设计。
+ */
 class MCPClientServiceTest {
 
+    /**
+     * 验证同名 MCP 配置更新时的重连设计。
+     *
+     * 验证旧连接会关闭，且服务会使用新配置建立连接。
+     */
     @Test
     fun test同名MCP配置变更会关闭旧连接后重新连接() = kotlinx.coroutines.runBlocking {
         val firstClient = mockk<Client>()

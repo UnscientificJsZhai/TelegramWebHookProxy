@@ -12,8 +12,16 @@ import kotlinx.serialization.json.Json
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
+/**
+ * 设置 HTTP API 的测试设计。
+ */
 class APIModuleTest {
 
+    /**
+     * 验证设置 API 的读写设计。
+     *
+     * 验证写入的完整设置可通过读取接口无损获取。
+     */
     @Test
     fun testSettingsApi() = testApplication {
         application {
@@ -54,6 +62,11 @@ class APIModuleTest {
         }
     }
 
+    /**
+     * 验证设置 API 清空已选模型的设计。
+     *
+     * 验证仅提供商或当前提供商的 API 密钥变更会清空已选模型，普通更新会保留该值。
+     */
     @Test
     fun testSettingsApiClearsSelectedModelOnlyForProviderOrActiveApiKeyChanges() = testApplication {
         application {

@@ -19,7 +19,17 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 
 /**
- * 后台机器人轮询服务，负责监听 Telegram 消息并执行指令或调用 AI。
+ * 后台轮询 Telegram 更新，并将授权聊天的消息依次交给 AI 代理处理。
+ *
+ * 调用 [start] 后服务持续观察机器人令牌并管理轮询协程；调用 [close] 会停止所有内部协程。
+ * 单条消息自入队起最多处理十分钟，队列满时会直接回复失败提示。
+ *
+ * @constructor 创建消息轮询服务。
+ * @param parentScope 持有轮询和队列消费者的父协程作用域；取消该作用域会停止内部协程。
+ * @param telegramService 与 Telegram Bot API 通信的服务。
+ * @param agentService 处理文本和媒体消息的 AI 代理服务。
+ * @param settingsRepository 提供机器人与 AI 设置的仓储。
+ * @param updatesRepository 持久化聊天信息和已处理更新标识的仓储。
  */
 @Singleton
 class MessagePoller @Inject constructor(
@@ -41,7 +51,9 @@ class MessagePoller @Inject constructor(
     private val updateChannel = Channel<Pair<Update, Long>>(10)
 
     /**
-     * 启动轮询监听。
+     * 启动设置监听、消息队列消费者和按需轮询。
+     *
+     * 重复调用不会创建额外协程；机器人令牌为空时轮询保持暂停，令牌变更时会自动重启轮询。
      */
     fun start() {
         if (settingsJob != null) return
@@ -209,6 +221,14 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 接收单条 Telegram 更新，并在满足 AI 设置时将其加入处理队列。
+     *
+     * 仅处理包含文本或语音消息、AI 已启用且聊天标识等于配置值的更新；队列已满时会向该消息
+     * 发送失败提示而不入队。
+     *
+     * @param update 要检查的 Telegram 更新，不能为空；不含可处理消息时不会产生副作用。
+     */
     suspend fun handleUpdate(update: Update) {
         val message = update.message ?: return
         val text = message.text
@@ -256,6 +276,17 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 下载语音文件并将其作为媒体消息交给 AI 代理处理。
+     *
+     * 处理期间会持续发送“正在输入”状态；AI 的非空回复会作为对原消息的回复发送。下载、代理
+     * 调用或发送回复失败时会向聊天发送错误提示。
+     *
+     * @param chatId 接收回复的聊天标识，不能为空。
+     * @param voice 要处理的 Telegram 语音文件，必须包含有效的文件标识。
+     * @param caption 语音消息的可选说明文字；没有说明时为 `null`。
+     * @param messageId 原始 Telegram 消息标识，用于关联回复。
+     */
     suspend fun handleVoiceMessage(
         chatId: String,
         voice: Voice,
@@ -325,6 +356,16 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 处理 AI 聊天中的机器人命令。
+     *
+     * 支持 `/keep`、`/reset` 和 `/model`；命令可能重置会话、清空待处理队列或持久化模型选择，
+     * 并会向聊天发送相应反馈。首个空白分隔字段以外的命令会被忽略。
+     *
+     * @param chatId 发送命令的聊天标识，不能为空。
+     * @param text 完整命令文本；首个空白分隔字段作为命令，其余内容作为命令参数。
+     * @param messageId 原始 Telegram 消息标识，用于关联回复。
+     */
     suspend fun handleCommand(
         chatId: String,
         text: String,
@@ -395,7 +436,11 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    /** Persist a model selection; DelegatingAgentService applies it from settingsFlow. */
+    /**
+     * 持久化用户选择的模型，由代理服务从设置流中应用。
+     *
+     * @param selectedModel 要保存的规范模型名称，不能为空；与当前选择相同时不写入设置。
+     */
     private fun persistSelectedModel(selectedModel: String) {
         val settings = settingsRepository.settingsFlow.value
         val aiSettings = settings.ai ?: return
@@ -406,6 +451,15 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 将文本消息交给 AI 代理，并将非空回复发送回原聊天。
+     *
+     * 处理期间会持续发送“正在输入”状态；代理调用或发送回复失败时会向聊天发送错误提示。
+     *
+     * @param chatId 接收回复的聊天标识，不能为空。
+     * @param text 要发送给 AI 的文本，不能为空。
+     * @param messageId 原始 Telegram 消息标识，用于关联回复。
+     */
     suspend fun handleAiMessage(
         chatId: String,
         text: String,
@@ -471,6 +525,11 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 停止设置监听、轮询和队列消费者。
+     *
+     * 此方法可重复调用；已取消的协程不会再次取消。
+     */
     override fun close() {
         settingsJob?.cancel()
         settingsJob = null

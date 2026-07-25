@@ -14,6 +14,9 @@ import javax.inject.Provider
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 
+/**
+ * 定时任务服务创建、取消和执行行为的测试设计。
+ */
 class TaskSchedulerServiceTest {
 
     private lateinit var telegramService: TelegramService
@@ -45,6 +48,11 @@ class TaskSchedulerServiceTest {
         service.close()
     }
 
+    /**
+     * 验证创建和列出任务的设计。
+     *
+     * 验证创建后的任务会出现在任务列表中。
+     */
     @Test
     fun testCreateAndListTasks() {
         val id = service.createTask("Test instruction", System.currentTimeMillis() + 10000, LoopMode.ONCE, "12345")
@@ -56,6 +64,11 @@ class TaskSchedulerServiceTest {
         assertEquals("Test instruction", tasks[0].instruction)
     }
 
+    /**
+     * 验证取消任务的设计。
+     *
+     * 验证取消后任务不会保留在任务列表中。
+     */
     @Test
     fun testCancelTask() {
         val id = service.createTask("Test instruction", System.currentTimeMillis() + 10000, LoopMode.ONCE, "12345")
@@ -63,6 +76,11 @@ class TaskSchedulerServiceTest {
         assertEquals(0, service.listTasks().size)
     }
 
+    /**
+     * 验证单次任务的执行设计。
+     *
+     * 验证任务到期后会调用代理并向目标聊天发送结果。
+     */
     @Test
     fun testExecuteTask() = runTest {
         val chatId = "12345"
@@ -80,6 +98,11 @@ class TaskSchedulerServiceTest {
         assertEquals(0, service.listTasks().size, "ONCE task should be removed after execution")
     }
 
+    /**
+     * 验证循环任务的执行设计。
+     *
+     * 验证任务执行后会按循环规则重新调度。
+     */
     @Test
     fun testExecuteCyclicTask() = runTest {
         val chatId = "12345"

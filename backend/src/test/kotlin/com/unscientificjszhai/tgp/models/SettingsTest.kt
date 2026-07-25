@@ -7,8 +7,16 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
+/**
+ * 应用与 AI 设置序列化兼容性的测试设计。
+ */
 class SettingsTest {
 
+    /**
+     * 验证完整应用设置的序列化设计。
+     *
+     * 验证序列化结果包含 AI 配置及其关键字段。
+     */
     @Test
     fun testAppSettingsSerialization() {
         val appSettings = AppSettings(
@@ -46,13 +54,18 @@ class SettingsTest {
         assertTrue(aiElement.containsKey("mcpServers"))
     }
 
+    /**
+     * 验证 AI 设置默认值的序列化设计。
+     *
+     * 验证默认值字段不会在序列化时被省略。
+     */
     @Test
     fun testAISettingsDefaultValuesInSerialization() {
         val aiSettings = AISettings()
         val jsonString = ConfigJson.encodeToString(aiSettings)
         val jsonElement = ConfigJson.parseToJsonElement(jsonString).jsonObject
 
-        // 验证即使是默认值，也会被序列化出来
+        // 验证默认值字段仍会写入序列化结果。
         assertTrue(jsonElement.containsKey("provider"), "Provider field should be present even if default")
         assertTrue(jsonElement.containsKey("openAiApiKey"), "openAiApiKey field should be present even if default")
         assertTrue(jsonElement.containsKey("openAiBaseUrl"), "openAiBaseUrl field should be present even if default")
@@ -67,6 +80,11 @@ class SettingsTest {
         )
     }
 
+    /**
+     * 验证旧版 AI 设置 JSON 的反序列化兼容设计。
+     *
+     * 验证缺失的新增字段会使用当前定义的默认值。
+     */
     @Test
     fun testAISettingsDeserializeOldJsonUsesDefaults() {
         val jsonString = """
