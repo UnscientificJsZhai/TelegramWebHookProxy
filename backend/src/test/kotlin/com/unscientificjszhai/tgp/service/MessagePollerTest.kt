@@ -134,7 +134,7 @@ class MessagePollerTest {
         coVerify {
             telegramService.sendMessage(
                 chatId,
-                "已保存模型选择，正在切换模型并重置会话，待处理消息已清空：models/gemini-test",
+                "已保存模型选择，正在切换模型并重置会话：models/gemini-test",
                 any(),
             )
         }

@@ -355,12 +355,11 @@ class MessagePoller @Inject constructor(
                             model == requestedModel ||
                                     model.removePrefix("models/") == requestedModel.removePrefix("models/")
                         } ?: throw IllegalArgumentException("Unsupported model: $requestedModel")
-                        clearQueue()
                         persistSelectedModel(selectedModel)
                         lastAiReplyAtMillis = null
                         telegramService.sendMessage(
                             chatId,
-                            "已保存模型选择，正在切换模型并重置会话，待处理消息已清空：$selectedModel",
+                            "已保存模型选择，正在切换模型并重置会话：$selectedModel",
                             ReplyParameters(messageId),
                         )
                     } catch (_: Exception) {

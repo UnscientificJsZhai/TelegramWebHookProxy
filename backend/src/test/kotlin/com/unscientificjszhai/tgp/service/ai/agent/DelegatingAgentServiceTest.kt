@@ -5,7 +5,10 @@ import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SettingsUpdate
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -17,6 +20,8 @@ import kotlinx.coroutines.flow.first
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
 class DelegatingAgentServiceTest {
@@ -35,12 +40,14 @@ class DelegatingAgentServiceTest {
             ),
         )
         val settingsFlow = ValueReadTrackingStateFlow(MutableStateFlow(initialSettings))
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
         val skillsUpdateEvent = MutableSharedFlow<Unit>()
         val componentCreated = CompletableDeferred<Unit>()
         val sessionReset = CompletableDeferred<Unit>()
         val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
         every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
         every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
         every { agentComponentFactory.create() } answers {
             componentCreated.complete(Unit)
@@ -57,6 +64,7 @@ class DelegatingAgentServiceTest {
             agentComponentFactory,
             settingsRepository,
             skillRepository,
+            ModelSwitchBarrier(),
             serviceScope,
         )
 
@@ -100,12 +108,16 @@ class DelegatingAgentServiceTest {
             ),
         )
         val settingsFlow = MutableStateFlow(initialSettings)
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
         val skillsUpdateEvent = MutableSharedFlow<Unit>()
         val componentCreated = CompletableDeferred<Unit>()
         val modelSwitched = CompletableDeferred<Unit>()
+        val modelSwitchJob = Job()
+        val barrier = ModelSwitchBarrier()
         val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
         every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
         every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
         every { agentComponentFactory.create() } answers {
             componentCreated.complete(Unit)
@@ -114,7 +126,7 @@ class DelegatingAgentServiceTest {
         every { agentComponent.openAIAgentService } returns openAIAgentService
         every { openAIAgentService.switchModel("models/gemini-next") } answers {
             modelSwitched.complete(Unit)
-            null
+            modelSwitchJob
         }
         every { openAIAgentService.close() } returns Job().apply { complete() }
 
@@ -122,6 +134,7 @@ class DelegatingAgentServiceTest {
             agentComponentFactory,
             settingsRepository,
             skillRepository,
+            barrier,
             serviceScope,
         )
 
@@ -129,15 +142,151 @@ class DelegatingAgentServiceTest {
             withTimeout(5.seconds) {
                 componentCreated.await()
             }
-            settingsFlow.value = initialSettings.copy(
+            val switchedSettings = initialSettings.copy(
                 ai = initialSettings.ai!!.copy(selectedModel = "models/gemini-next"),
             )
+            settingsFlow.value = switchedSettings
+            settingsUpdateFlow.value = SettingsUpdate(switchedSettings, 1, barrier.beginSwitch())
             withTimeout(5.seconds) {
                 modelSwitched.await()
+            }
+            assertTrue(barrier.isSwitching)
+            modelSwitchJob.complete()
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) yield()
             }
 
             verify(exactly = 1) { openAIAgentService.switchModel("models/gemini-next") }
             verify(exactly = 0) { openAIAgentService.resetSession() }
+        } finally {
+            delegatingAgentService.close()?.join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    @Test
+    fun `sendMessage waits for the latest model switch generation`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val openAIAgentService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val componentCreated = CompletableDeferred<Unit>()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } answers {
+            componentCreated.complete(Unit)
+            agentComponent
+        }
+        every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.close() } returns Job().apply { complete() }
+        coEvery { openAIAgentService.sendMessage("hello", emptyList()) } returns "reply"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { componentCreated.await() }
+
+            val firstGeneration = barrier.beginSwitch()
+            val secondGeneration = barrier.beginSwitch()
+            val response = async { delegatingAgentService.sendMessage("hello") }
+
+            yield()
+            coVerify(exactly = 0) { openAIAgentService.sendMessage("hello", emptyList()) }
+
+            barrier.complete(firstGeneration)
+            yield()
+            assertFalse(response.isCompleted)
+            coVerify(exactly = 0) { openAIAgentService.sendMessage("hello", emptyList()) }
+
+            barrier.complete(secondGeneration)
+            assertEquals("reply", withTimeout(5.seconds) { response.await() })
+            coVerify(exactly = 1) { openAIAgentService.sendMessage("hello", emptyList()) }
+        } finally {
+            delegatingAgentService.close()?.join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    @Test
+    fun `latest conflated settings snapshot releases all covered switch generations`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val openAIAgentService = mockk<OpenAIAgentService>(relaxed = true)
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val componentCreated = CompletableDeferred<Unit>()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        val firstGeneration = barrier.beginSwitch()
+        val firstSettings = initialSettings.copy(
+            ai = initialSettings.ai!!.copy(globalContext = "first context"),
+        )
+        settingsUpdateFlow.value = SettingsUpdate(firstSettings, 1, firstGeneration)
+
+        val latestGeneration = barrier.beginSwitch()
+        val latestSettings = firstSettings.copy(
+            ai = firstSettings.ai!!.copy(globalContext = "latest context"),
+        )
+        settingsUpdateFlow.value = SettingsUpdate(latestSettings, 2, latestGeneration)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } answers {
+            componentCreated.complete(Unit)
+            agentComponent
+        }
+        every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.close() } returns Job().apply { complete() }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { componentCreated.await() }
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) yield()
+            }
+
+            assertFalse(barrier.isSwitching)
+            verify(exactly = 1) { agentComponentFactory.create() }
         } finally {
             delegatingAgentService.close()?.join()
             serviceScope.cancel()

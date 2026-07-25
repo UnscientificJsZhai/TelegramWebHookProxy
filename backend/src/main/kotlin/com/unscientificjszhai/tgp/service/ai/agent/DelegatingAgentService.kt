@@ -8,6 +8,7 @@ import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.combine
@@ -26,6 +27,7 @@ class DelegatingAgentService @Inject constructor(
     private val agentComponentFactory: AgentComponent.Factory,
     settingsRepository: SettingsRepository,
     skillRepository: SkillRepository,
+    private val modelSwitchBarrier: ModelSwitchBarrier,
     parentScope: CoroutineScope,
 ) : AgentService() {
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
@@ -46,9 +48,10 @@ class DelegatingAgentService @Inject constructor(
 
     init {
         combine(
-            settingsRepository.settingsFlow,
+            settingsRepository.settingsUpdateFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
-        ) { settings, _ -> settings }.onEach { settings ->
+        ) { settingsUpdate, _ -> settingsUpdate }.onEach { settingsUpdate ->
+            val settings = settingsUpdate.settings
             val previousAiSettings = lastHandledSettings?.ai
             val aiSettings = settings.ai
             val proxySettings = settings.proxy
@@ -57,54 +60,80 @@ class DelegatingAgentService @Inject constructor(
             val onlySelectedModelChanged = selectedModelChanged &&
                     previousAiSettings.copy(selectedModel = "") == aiSettings?.copy(selectedModel = "")
 
-            if (aiSettings != null && aiSettings.agentEnabled) {
-                val apiKey = when (aiSettings.provider) {
-                    AIProvider.OPENAI -> aiSettings.openAiApiKey
-                    else -> aiSettings.geminiApiKey
+            try {
+                if (settingsUpdate.switchGeneration != null) {
+                    modelSwitchBarrier.awaitInFlightRequests()
                 }
-                val baseUrl = aiSettings.openAiBaseUrl
-
-                val needsRecreate = _currentService == null ||
-                        currentProvider != aiSettings.provider ||
-                        currentApiKey != apiKey ||
-                        currentBaseUrl != baseUrl ||
-                        currentProxy != proxySettings
-
-                if (needsRecreate) {
-                    _currentService?.close()?.join()
-                    val newComponent = agentComponentFactory.create()
-                    currentAgentComponent = newComponent
-                    _currentService = when (aiSettings.provider) {
-                        AIProvider.OPENAI -> newComponent.openAIAgentService
-                        else -> newComponent.geminiAgentService
+                if (aiSettings != null && aiSettings.agentEnabled) {
+                    val apiKey = when (aiSettings.provider) {
+                        AIProvider.OPENAI -> aiSettings.openAiApiKey
+                        else -> aiSettings.geminiApiKey
                     }
-                    currentProvider = aiSettings.provider
-                    currentApiKey = apiKey
-                    currentBaseUrl = baseUrl
-                    currentProxy = proxySettings
-                    logger.info("Agent component recreated for provider: ${aiSettings.provider}")
+                    val baseUrl = aiSettings.openAiBaseUrl
+
+                    val needsRecreate = _currentService == null ||
+                            currentProvider != aiSettings.provider ||
+                            currentApiKey != apiKey ||
+                            currentBaseUrl != baseUrl ||
+                            currentProxy != proxySettings
+
+                    if (needsRecreate) {
+                        recreateAgent(aiSettings, apiKey, baseUrl, proxySettings)
+                    } else {
+                        applySettingsChange(aiSettings, selectedModelChanged, onlySelectedModelChanged)
+                    }
                 } else {
-                    applySettingsChange(aiSettings, selectedModelChanged, onlySelectedModelChanged)
+                    if (_currentService != null) {
+                        _currentService?.close()?.join()
+                        _currentService = null
+                        currentAgentComponent = null
+                        currentProvider = null
+                        currentApiKey = null
+                        currentBaseUrl = null
+                        currentProxy = null
+                        logger.info("Agent service disabled.")
+                    }
                 }
-            } else {
-                if (_currentService != null) {
-                    _currentService?.close()?.join()
-                    _currentService = null
-                    currentAgentComponent = null
-                    currentProvider = null
-                    currentApiKey = null
-                    currentBaseUrl = null
-                    currentProxy = null
-                    logger.info("Agent service disabled.")
-                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Failed to apply AI settings; keeping the current agent when available.", e)
+            } finally {
+                lastHandledSettings = settings
+                modelSwitchBarrier.completeThrough(settingsUpdate.switchGeneration)
             }
-            lastHandledSettings = settings
         }.launchIn(parentScope)
     }
 
     /**
-     * Apply settings changes in one place. A model selection has its own reset in
-     * [AgentService.switchModel], so it must not be followed by a generic reset.
+     * 在销毁活跃组件前先创建替代组件。这样即使创建本身失败，仍可保留可用的
+     * 代理。
+     */
+    private suspend fun recreateAgent(
+        aiSettings: AISettings,
+        apiKey: String,
+        baseUrl: String,
+        proxySettings: ProxySettings?,
+    ) {
+        val newComponent = agentComponentFactory.create()
+        val newService = when (aiSettings.provider) {
+            AIProvider.OPENAI -> newComponent.openAIAgentService
+            AIProvider.GEMINI -> newComponent.geminiAgentService
+        }
+
+        _currentService?.close()?.join()
+        currentAgentComponent = newComponent
+        _currentService = newService
+        currentProvider = aiSettings.provider
+        currentApiKey = apiKey
+        currentBaseUrl = baseUrl
+        currentProxy = proxySettings
+        logger.info("Agent component recreated for provider: ${aiSettings.provider}")
+    }
+
+    /**
+     * 在同一处应用设置变更。模型选择会在 [AgentService.switchModel] 中进行专门
+     * 重置，因此之后不能再执行通用重置。
      */
     private suspend fun applySettingsChange(
         aiSettings: AISettings,
@@ -161,7 +190,9 @@ class DelegatingAgentService @Inject constructor(
     }
 
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String {
-        return currentService.sendMessage(text, mediaData)
+        return modelSwitchBarrier.runWhenReady {
+            currentService.sendMessage(text, mediaData)
+        }
     }
 
     override fun close(): Job? {
