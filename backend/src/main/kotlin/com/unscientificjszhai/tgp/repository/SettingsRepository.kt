@@ -5,19 +5,27 @@ import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.serialization.json.*
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class SettingsRepository
-@Inject
-constructor() {
-    private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
+class SettingsRepository private constructor(
+    private val configFile: File,
+) {
+    @Inject
+    constructor() : this(File("config/settings.json"))
 
-    private val configFile = File("config/settings.json")
+    companion object {
+        internal fun forTesting(configFile: File): SettingsRepository = SettingsRepository(configFile)
+    }
+
+    private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
 
     private val _settingsFlow = MutableStateFlow(loadSettings())
     val settingsFlow: StateFlow<AppSettings> = _settingsFlow.asStateFlow()

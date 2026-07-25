@@ -67,7 +67,7 @@ docker run -d \
 构建完成后运行 Shadow Jar：
 
 ```bash
-java -jar backend/build/libs/TelegramWebHookProxy-1.1.2-all.jar
+java -jar backend/build/libs/TelegramWebHookProxy-1.1.3-all.jar
 ```
 
 服务默认监听 `0.0.0.0:10178`，并在当前工作目录下读写 `config/`。

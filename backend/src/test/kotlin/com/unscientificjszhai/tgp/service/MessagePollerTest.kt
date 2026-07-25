@@ -5,8 +5,9 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
-import io.ktor.client.statement.HttpResponse
-import io.ktor.http.HttpStatusCode
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSnapshot
+import io.ktor.client.statement.*
+import io.ktor.http.*
 import io.mockk.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -73,6 +74,81 @@ class MessagePollerTest {
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
         coVerify(exactly = 0) { agentService.resetSession() }
         coVerify(exactly = 0) { agentService.sendMessage(any<String>()) }
+    }
+
+    @Test
+    fun testModelCommandUsesRefreshedModelList() = runTest {
+        val chatId = "123456"
+        coEvery { agentService.updateModel() } returns ModelSnapshot(
+            currentModel = "fresh-model",
+            availableModels = listOf("fresh-model", "another-model"),
+        )
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/model", 100L)
+
+        coVerifyOrder {
+            agentService.updateModel()
+            telegramService.sendMessage(
+                chatId,
+                "当前可用模型列表：\n✅ fresh-model\n      another-model\n\n使用 `/model <模型名称>` 切换模型。",
+                any(),
+            )
+        }
+    }
+
+    @Test
+    fun testModelCommandReportsRefreshFailureWithoutUsingCachedModels() = runTest {
+        val chatId = "123456"
+        coEvery { agentService.updateModel() } returns null
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/model", 100L)
+
+        coVerify {
+            telegramService.sendMessage(
+                chatId,
+                "获取可用模型列表失败，请稍后重试。",
+                any(),
+            )
+        }
+        verify(exactly = 0) { agentService.currentModel }
+        verify(exactly = 0) { agentService.availableModels }
+    }
+
+    @Test
+    fun testModelCommandPersistsCanonicalModelNameAfterSuccessfulSwitch() = runTest {
+        val chatId = "123456"
+        every { agentService.switchModel("gemini-test") } returns completedJob()
+        every { agentService.currentModel } returns "models/gemini-test"
+        every { settingsRepository.saveSettings(any()) } returns Unit
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/model gemini-test", 100L)
+
+        verify {
+            settingsRepository.saveSettings(
+                match { it.ai?.selectedModel == "models/gemini-test" },
+            )
+        }
+        coVerify {
+            telegramService.sendMessage(
+                chatId,
+                "已切换模型并重置会话，待处理消息已清空：models/gemini-test",
+                any(),
+            )
+        }
+    }
+
+    @Test
+    fun testResetCommandDoesNotPersistSelectedModel() = runTest {
+        val chatId = "123456"
+        every { agentService.resetSession() } returns completedJob()
+        coEvery { telegramService.sendMessage(chatId, any(), any()) } returns telegramOkResponse()
+
+        messagePoller.handleCommand(chatId, "/reset", 100L)
+
+        verify(exactly = 0) { settingsRepository.saveSettings(any()) }
     }
 
     @Test
@@ -233,7 +309,13 @@ class MessagePollerTest {
         coEvery { telegramService.sendChatAction(chatId, "typing") } returns mockk()
         coEvery { agentService.sendMessage("Hello AI") } returns "Hello Human"
         coEvery { telegramService.sendMessage(chatId, "Hello Human", any()) } throws RuntimeException("send failed")
-        coEvery { telegramService.sendMessage(chatId, match { it.startsWith("AI 处理消息时出错") }, any()) } returns mockk()
+        coEvery {
+            telegramService.sendMessage(
+                chatId,
+                match { it.startsWith("AI 处理消息时出错") },
+                any()
+            )
+        } returns mockk()
 
         messagePoller.handleAiMessage(chatId, "Hello AI", 100L)
 
@@ -256,4 +338,6 @@ class MessagePollerTest {
         mockk {
             every { status } returns HttpStatusCode.OK
         }
+
+    private fun completedJob(): Job = Job().also { it.complete() }
 }

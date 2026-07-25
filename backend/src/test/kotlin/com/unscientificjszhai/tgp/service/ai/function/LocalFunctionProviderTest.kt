@@ -5,9 +5,9 @@ import com.google.genai.types.Schema
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import org.junit.Test
+import kotlin.jvm.optionals.getOrNull
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-import kotlin.jvm.optionals.getOrNull
 
 class LocalFunctionProviderTest {
 
@@ -17,7 +17,8 @@ class LocalFunctionProviderTest {
                 .name("get_weather")
                 .description("Get current weather in a location")
                 .parameters(
-                    Schema.fromJson("""
+                    Schema.fromJson(
+                        """
                         {
                             "type": "OBJECT",
                             "properties": {
@@ -28,7 +29,8 @@ class LocalFunctionProviderTest {
                             },
                             "required": ["location"]
                         }
-                    """.trimIndent())
+                    """.trimIndent()
+                    )
                 )
                 .build()
         )
@@ -48,10 +50,10 @@ class LocalFunctionProviderTest {
 
         assertEquals("get_weather", weatherFunc.name())
         assertEquals("Get current weather in a location", weatherFunc.description().getOrNull())
-        
+
         val params = weatherFunc.parameters()
         val paramsString = params.toString()
-        
+
         // Verify that the converted schema contains key elements
         assertTrue(paramsString.contains("location"), "Params should contain 'location'")
         assertTrue(paramsString.contains("object"), "Params should contain 'object'")

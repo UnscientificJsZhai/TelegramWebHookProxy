@@ -44,6 +44,7 @@ interface AISettings {
     geminiApiKey: string;
     openAiApiKey: string;
     openAiBaseUrl: string;
+    selectedModel: string;
     agentEnabled: boolean;
     agentChatId: string;
     globalContext: string;
@@ -64,6 +65,7 @@ const defaultAiSettings: AISettings = {
     geminiApiKey: '',
     openAiApiKey: '',
     openAiBaseUrl: '',
+    selectedModel: '',
     agentEnabled: false,
     agentChatId: '',
     globalContext: '',
@@ -353,7 +355,11 @@ const Settings: React.FC = () => {
             ...settings,
             ai: settings.ai ? {
                 ...settings.ai,
-                mcpServers: settings.ai.mcpServers.map(({ _headerString, ...server }) => server)
+                mcpServers: settings.ai.mcpServers.map((server) => {
+                    const serverToSave = { ...server };
+                    delete serverToSave._headerString;
+                    return serverToSave;
+                })
             } : null
         };
 

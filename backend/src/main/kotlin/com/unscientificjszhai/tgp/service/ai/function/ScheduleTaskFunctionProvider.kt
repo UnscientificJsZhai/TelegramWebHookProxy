@@ -5,10 +5,10 @@ import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
-import javax.inject.Provider
 import kotlinx.serialization.json.*
 import java.text.SimpleDateFormat
 import java.util.*
+import javax.inject.Provider
 
 class ScheduleTaskFunctionProvider(
     private val taskSchedulerService: Provider<TaskSchedulerService>,
@@ -25,11 +25,17 @@ class ScheduleTaskFunctionProvider(
                 })
                 put("executionTime", buildJsonObject {
                     put("type", "STRING")
-                    put("description", "The time to execute the task, in 'yyyy-MM-dd HH:mm:ss' format or a relative time like '+1h', '+30m'.")
+                    put(
+                        "description",
+                        "The time to execute the task, in 'yyyy-MM-dd HH:mm:ss' format or a relative time like '+1h', '+30m'."
+                    )
                 })
                 put("loopMode", buildJsonObject {
                     put("type", "STRING")
-                    put("description", "The loop mode of the task. Available values: ONCE, HOURLY, DAILY, WEEKLY. Default is ONCE.")
+                    put(
+                        "description",
+                        "The loop mode of the task. Available values: ONCE, HOURLY, DAILY, WEEKLY. Default is ONCE."
+                    )
                 })
             })
             put("required", buildJsonArray {
@@ -82,8 +88,10 @@ class ScheduleTaskFunctionProvider(
         }
 
     private fun createScheduledTask(args: Map<String, Any?>): JsonObject {
-        val instruction = args["instruction"] as? String ?: return buildJsonObject { put("error", "Missing instruction") }
-        val executionTimeStr = args["executionTime"] as? String ?: return buildJsonObject { put("error", "Missing executionTime") }
+        val instruction =
+            args["instruction"] as? String ?: return buildJsonObject { put("error", "Missing instruction") }
+        val executionTimeStr =
+            args["executionTime"] as? String ?: return buildJsonObject { put("error", "Missing executionTime") }
         val loopModeStr = (args["loopMode"] as? String)?.uppercase() ?: "ONCE"
 
         val loopMode = try {
@@ -95,17 +103,34 @@ class ScheduleTaskFunctionProvider(
         val executionTime = try {
             parseExecutionTime(executionTimeStr)
         } catch (_: Exception) {
-            return buildJsonObject { put("error", "Invalid executionTime format: $executionTimeStr. Expected 'yyyy-MM-dd HH:mm:ss' or relative time like '+1h'.") }
+            return buildJsonObject {
+                put(
+                    "error",
+                    "Invalid executionTime format: $executionTimeStr. Expected 'yyyy-MM-dd HH:mm:ss' or relative time like '+1h'."
+                )
+            }
         }
 
         val agentChatId = settingsRepository.settingsFlow.value.ai?.agentChatId
-            ?: return buildJsonObject { put("error", "Agent Chat ID is not configured. Please set it in settings first.") }
+            ?: return buildJsonObject {
+                put(
+                    "error",
+                    "Agent Chat ID is not configured. Please set it in settings first."
+                )
+            }
 
         val taskId = taskSchedulerService.get().createTask(instruction, executionTime, loopMode, agentChatId)
         return buildJsonObject {
             put("status", "success")
             put("taskId", taskId)
-            put("message", "Task created successfully. Next execution at: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date(executionTime))}")
+            put(
+                "message",
+                "Task created successfully. Next execution at: ${
+                    SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(
+                        Date(executionTime)
+                    )
+                }"
+            )
         }
     }
 

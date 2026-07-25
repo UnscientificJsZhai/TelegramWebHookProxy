@@ -9,8 +9,6 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeToSequence
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -20,9 +18,17 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class SkillRepository @Inject constructor() {
+class SkillRepository private constructor(
+    private val configFile: File,
+) {
+    @Inject
+    constructor() : this(File("config/skills.json"))
+
+    companion object {
+        internal fun forTesting(configFile: File): SkillRepository = SkillRepository(configFile)
+    }
+
     private val logger = LoggerFactory.getLogger(SkillRepository::class.java)
-    private val configFile = File("config/skills.json")
 
     private val _skillsUpdateEvent = MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,

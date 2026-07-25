@@ -8,6 +8,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
@@ -111,6 +112,8 @@ class HttpCallingFunctionProvider : LocalFunctionProvider() {
                 put("status", response.status.value)
                 put("body", response.bodyAsText())
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.error("Error calling HTTP API", e)
             buildJsonObject {

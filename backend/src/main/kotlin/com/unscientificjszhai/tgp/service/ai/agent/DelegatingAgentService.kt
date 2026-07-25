@@ -1,12 +1,12 @@
 package com.unscientificjszhai.tgp.service.ai.agent
 
+import com.unscientificjszhai.tgp.di.AgentComponent
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.MediaData
-import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.di.AgentComponent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.combine
@@ -23,13 +23,15 @@ import javax.inject.Singleton
 @Singleton
 class DelegatingAgentService @Inject constructor(
     private val agentComponentFactory: AgentComponent.Factory,
-    private val settingsRepository: SettingsRepository,
+    settingsRepository: SettingsRepository,
     skillRepository: SkillRepository,
     parentScope: CoroutineScope,
 ) : AgentService() {
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
 
     private var currentAgentComponent: AgentComponent? = null
+
+    @Volatile
     private var _currentService: AgentService? = null
 
     private val currentService: AgentService
@@ -42,7 +44,7 @@ class DelegatingAgentService @Inject constructor(
 
     init {
         combine(
-            settingsRepository.settingsFlow.onStart { emit(settingsRepository.settingsFlow.value) },
+            settingsRepository.settingsFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
         ) { settings, _ -> settings }.onEach { settings ->
             val aiSettings = settings.ai
@@ -62,7 +64,7 @@ class DelegatingAgentService @Inject constructor(
                         currentProxy != proxySettings
 
                 if (needsRecreate) {
-                    _currentService?.close()
+                    _currentService?.close()?.join()
                     val newComponent = agentComponentFactory.create()
                     currentAgentComponent = newComponent
                     _currentService = when (aiSettings.provider) {
@@ -79,7 +81,7 @@ class DelegatingAgentService @Inject constructor(
                 }
             } else {
                 if (_currentService != null) {
-                    _currentService?.close()
+                    _currentService?.close()?.join()
                     _currentService = null
                     currentAgentComponent = null
                     currentProvider = null
@@ -105,8 +107,10 @@ class DelegatingAgentService @Inject constructor(
         return currentService.switchModel(modelName)
     }
 
-    override fun updateModel() {
-        currentService.updateModel()
+    override suspend fun updateModel(): ModelSnapshot? {
+        val service = currentService
+        val snapshot = service.updateModel() ?: return null
+        return snapshot.takeIf { _currentService === service }
     }
 
     override fun resetSession(): Job? {
@@ -117,9 +121,10 @@ class DelegatingAgentService @Inject constructor(
         return currentService.sendMessage(text, mediaData)
     }
 
-    override fun close() {
-        _currentService?.close()
+    override fun close(): Job? {
+        val closeJob = _currentService?.close()
         _currentService = null
         currentAgentComponent = null
+        return closeJob
     }
 }

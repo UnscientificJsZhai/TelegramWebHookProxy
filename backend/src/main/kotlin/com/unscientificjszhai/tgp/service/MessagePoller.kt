@@ -1,19 +1,15 @@
 package com.unscientificjszhai.tgp.service
 
-import com.unscientificjszhai.tgp.models.ChatInfo
-import com.unscientificjszhai.tgp.models.MediaData
-import com.unscientificjszhai.tgp.models.ReplyParameters
-import com.unscientificjszhai.tgp.models.Update
-import com.unscientificjszhai.tgp.models.Voice
+import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import io.ktor.http.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
-import io.ktor.http.isSuccess
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
 import java.util.concurrent.CancellationException
@@ -357,10 +353,12 @@ class MessagePoller @Inject constructor(
                     try {
                         clearQueue()
                         agentService.switchModel(requestedModel)?.join()
+                        persistSelectedModel()
                         lastAiReplyAtMillis = null
+                        val activeModel = agentService.currentModel
                         telegramService.sendMessage(
                             chatId,
-                            "已切换模型并重置会话，待处理消息已清空：$requestedModel",
+                            "已切换模型并重置会话，待处理消息已清空：$activeModel",
                             ReplyParameters(messageId),
                         )
                     } catch (_: Exception) {
@@ -371,9 +369,17 @@ class MessagePoller @Inject constructor(
                         )
                     }
                 } else {
-                    agentService.updateModel()
-                    val current = agentService.currentModel
-                    val available = agentService.availableModels
+                    val modelSnapshot = agentService.updateModel()
+                    if (modelSnapshot == null) {
+                        telegramService.sendMessage(
+                            chatId,
+                            "获取可用模型列表失败，请稍后重试。",
+                            ReplyParameters(messageId),
+                        )
+                        return
+                    }
+                    val current = modelSnapshot.currentModel
+                    val available = modelSnapshot.availableModels
                     val list = available.joinToString("\n") { model ->
                         if (model == current) "✅ $model" else "      $model"
                     }
@@ -385,6 +391,18 @@ class MessagePoller @Inject constructor(
                 }
             }
             // 可以添加更多指令
+        }
+    }
+
+    /** Persist the canonical name reported by the active provider after a successful model switch. */
+    private fun persistSelectedModel() {
+        val settings = settingsRepository.settingsFlow.value
+        val aiSettings = settings.ai ?: return
+        val selectedModel = agentService.currentModel
+        if (aiSettings.selectedModel != selectedModel) {
+            settingsRepository.saveSettings(
+                settings.copy(ai = aiSettings.copy(selectedModel = selectedModel)),
+            )
         }
     }
 

@@ -33,7 +33,7 @@ class SkillRepositoryTest {
     fun testSaveAndGetAllSkills() {
         val skill = Skill(description = "Test Description", content = "Test Content")
         repository.saveSkill(skill)
-        
+
         val skills = repository.getAllSkills().items
         assertEquals(1, skills.size)
         assertEquals("Test Description", skills[0].description)
@@ -44,7 +44,7 @@ class SkillRepositoryTest {
     fun testGetSkillById() {
         val skill = Skill(description = "Test Description", content = "Test Content")
         repository.saveSkill(skill)
-        
+
         val retrieved = repository.getSkillById(skill.id)
         assertNotNull(retrieved)
         assertEquals(skill.id, retrieved.id)
@@ -55,10 +55,10 @@ class SkillRepositoryTest {
     fun testUpdateSkill() {
         val skill = Skill(description = "Old Description", content = "Old Content")
         repository.saveSkill(skill)
-        
+
         val updatedSkill = skill.copy(description = "New Description")
         repository.saveSkill(updatedSkill)
-        
+
         val skills = repository.getAllSkills().items
         assertEquals(1, skills.size)
         assertEquals("New Description", skills[0].description)
@@ -70,7 +70,7 @@ class SkillRepositoryTest {
         val skill = Skill(description = "Test Description", content = "Test Content")
         repository.saveSkill(skill)
         assertEquals(1, repository.getAllSkills().items.size)
-        
+
         repository.deleteSkill(skill.id)
         assertEquals(0, repository.getAllSkills().items.size)
     }
@@ -87,7 +87,7 @@ class SkillRepositoryTest {
 
         val skill = Skill(description = "Event Test", content = "Content")
         repository.saveSkill(skill)
-        
+
         // Wait a bit for the event to be processed
         delay(100.milliseconds)
         assertEquals(1, events.size)

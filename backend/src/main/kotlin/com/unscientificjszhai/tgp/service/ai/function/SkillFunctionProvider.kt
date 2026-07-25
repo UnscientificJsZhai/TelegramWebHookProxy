@@ -83,7 +83,8 @@ class SkillFunctionProvider(
 
             "write_skill" -> {
                 val id = args["id"] as? String
-                val description = args["description"] as? String ?: return buildJsonObject { put("error", "Missing description") }
+                val description =
+                    args["description"] as? String ?: return buildJsonObject { put("error", "Missing description") }
                 val content = args["content"] as? String ?: return buildJsonObject { put("error", "Missing content") }
 
                 val skill = if (id != null) {
