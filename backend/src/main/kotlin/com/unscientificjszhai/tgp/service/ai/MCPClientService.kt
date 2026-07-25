@@ -28,7 +28,7 @@ class MCPClientService internal constructor(
         parentScope,
         {
             Client(
-                Implementation(name = "telegram-webhook-proxy", version = "1.0.0"),
+                Implementation(name = "telegram-webhook-proxy", version = "1.1.3"),
             )
         },
     )
