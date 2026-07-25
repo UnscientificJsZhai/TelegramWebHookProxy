@@ -6,9 +6,9 @@ evaluationDependsOn(":webui")
 
 plugins {
     kotlin("jvm")
-    kotlin("plugin.serialization") version "2.2.20"
+    kotlin("plugin.serialization") version "2.4.10"
     kotlin("kapt")
-    id("com.github.johnrengelman.shadow") version "8.1.1"
+    id("com.gradleup.shadow") version "8.3.11"
     id("com.github.jk1.dependency-license-report") version "2.9"
     application
 }
@@ -54,6 +54,7 @@ dependencies {
 
     implementation("com.google.dagger:dagger:$daggerVersion")
     kapt("com.google.dagger:dagger-compiler:$daggerVersion")
+    kapt("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.10")
 
     // Testing
     testImplementation("org.jetbrains.kotlin:kotlin-test")
