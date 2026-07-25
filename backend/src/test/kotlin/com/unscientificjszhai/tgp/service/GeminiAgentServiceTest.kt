@@ -255,7 +255,7 @@ class GeminiAgentServiceTest {
         val inFlightMessage = async(Dispatchers.Default) { service.sendMessage("第一条消息") }
         assertTrue(requestStarted.await(5, TimeUnit.SECONDS))
 
-        val closeJob = assertNotNull(service.close())
+        val closeJob = service.close()
         assertFalse(closeJob.isCompleted)
 
         releaseRequest.countDown()

@@ -474,7 +474,7 @@ class OpenAIAgentServiceTest {
         val resetJob = assertNotNull(resettableService.resetSession())
         val switchJob = assertNotNull(resettableService.switchModel(ChatModel.GPT_4O.toString()))
 
-        val closeJob = assertNotNull(resettableService.close())
+        val closeJob = resettableService.close()
         assertFalse(closeJob.isCompleted)
 
         releaseFirstRequest.countDown()

@@ -109,12 +109,6 @@ class MCPClientService internal constructor(
         }
     }
 
-    fun disconnect(name: String): Job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
-        connectionMutex.withLock {
-            disconnectLocked(name)
-        }
-    }
-
     fun disconnectAll(): Job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
         connectionMutex.withLock {
             connectionState.clients.keys.toList().forEach { disconnectLocked(it) }

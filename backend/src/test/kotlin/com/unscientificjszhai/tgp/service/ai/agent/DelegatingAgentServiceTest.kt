@@ -51,7 +51,7 @@ class DelegatingAgentServiceTest {
             sessionReset.complete(Unit)
             null
         }
-        every { openAIAgentService.close() } returns null
+        every { openAIAgentService.close() } returns Job().apply { complete() }
 
         val delegatingAgentService = DelegatingAgentService(
             agentComponentFactory,

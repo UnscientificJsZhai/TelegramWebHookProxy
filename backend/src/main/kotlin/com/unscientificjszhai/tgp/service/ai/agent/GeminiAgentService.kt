@@ -457,7 +457,7 @@ class GeminiAgentService @Inject constructor(
         }
     }
 
-    override fun close(): Job? = synchronized(lifecycleLock) {
+    override fun close(): Job = synchronized(lifecycleLock) {
         closeJob ?: run {
             closed = true
             initialModelUpdateJob?.cancel()
