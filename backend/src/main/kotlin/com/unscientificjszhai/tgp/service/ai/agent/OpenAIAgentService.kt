@@ -13,6 +13,8 @@ import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
@@ -35,7 +37,7 @@ import kotlin.jvm.optionals.getOrNull
  * 基于 OpenAI API 维护对话会话并执行模型工具调用的 AI 代理服务。
  *
  * 服务在创建时根据当前设置初始化 OpenAI 客户端；会话重置会同步 MCP 工具和技能提示词。
- * 调用 [close] 返回的任务完成后，服务持有的客户端与 MCP 连接均已释放。
+ * 调用 [close] 返回的任务完成后，服务持有的 OpenAI SDK 客户端、HTTP 工具客户端与 MCP 连接均已释放。
  *
  * @param parentScope 服务任务所属的父协程作用域。
  * @param settingsRepository 提供 OpenAI、MCP 和代理设置的仓库。
@@ -65,18 +67,21 @@ class OpenAIAgentService @Inject constructor(
     @Volatile
     private var closed = false
     private var closeJob: Job? = null
+    private var closeCompletion: CompletableDeferred<Unit>? = null
 
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
     }
 
-    private val localFunctionProviders = listOf(
-        HttpCallingFunctionProvider(),
+    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsRepository)
+    private var localFunctionProviders = listOf(
+        httpCallingFunctionProvider,
         McpFunctionProvider(mcpClientService),
         ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
         SkillFunctionProvider(skillRepository),
     )
+    private var localFunctionRouter = LocalFunctionRouter(localFunctionProviders)
 
     @Volatile
     private var client: OpenAIClient? = null
@@ -97,6 +102,9 @@ class OpenAIAgentService @Inject constructor(
     private var desiredModel = DEFAULT_MODEL
     private var modelSelectionVersion = 0L
     private var initialModelUpdateJob: Job? = null
+
+    @Volatile
+    private var initialMcpConnectionJob: Job? = null
     private var configuredApiKey: String? = null
     private var configuredBaseUrl: String? = null
     private var configuredProxy: ProxySettings? = null
@@ -160,14 +168,33 @@ class OpenAIAgentService @Inject constructor(
                     }
                     .build()
 
-                resetSession()
-                initialModelUpdateJob = scope.launch { updateModel() }
+                initialMcpConnectionJob = resetSession()
+                    ?: failedInitializationJob()
+                initialModelUpdateJob = scope.launch {
+                    initialMcpConnectionJob?.join()
+                    if (initialMcpConnectionJob?.isCancelled == false) {
+                        updateModel()
+                    }
+                }
                 logger.info("OpenAI client initialized.")
             } catch (e: Exception) {
                 logger.error("Failed to initialize OpenAI client", e)
+                client = null
+                initialMcpConnectionJob = failedInitializationJob()
             }
         }
     }
+
+    /**
+     * 获取创建时首轮 MCP 连接的完成任务。
+     *
+     * 有效 OpenAI 配置会在构造时启动该任务；任务正常完成表示初始 MCP 连接和工具快照已完成，取消
+     * 表示初始化任务本身未就绪。[MCPClientService] 会将单个服务器连接错误降级处理，因此此类错误不会
+     * 单独使任务取消。未启用 OpenAI 时返回 `null`。
+     *
+     * @return 初始 MCP 连接任务；没有需要连接的初始 OpenAI 实例时返回 `null`。
+     */
+    override fun initializationJob(): Job? = initialMcpConnectionJob
 
     /**
      * 切换当前会话使用的 OpenAI 模型。
@@ -275,8 +302,17 @@ class OpenAIAgentService @Inject constructor(
                 mcpConnectionJob = sessionMutex.withLock {
                     if (closed) null else action()
                 }
-            } finally {
                 awaitMcpConnectionJob(mcpConnectionJob)
+                if (mcpConnectionJob?.isCancelled == true) {
+                    throw CancellationException("MCP connection did not complete")
+                }
+                if (!closed && mcpConnectionJob?.isCancelled == false) {
+                    functionRouter().refresh()
+                }
+            } finally {
+                withContext(NonCancellable) {
+                    mcpConnectionJob?.takeIf { !it.isCompleted }?.cancelAndJoin()
+                }
             }
         }
     }
@@ -378,13 +414,18 @@ class OpenAIAgentService @Inject constructor(
      *
      * 图像会以内联数据发送；仅模型名称包含 `audio` 或以 `o1`、`o3` 开头时会发送音频。
      * 不支持的媒体或空消息会被忽略。
-     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。
+     * 此挂起函数会与会话重置串行执行。用户消息、模型工具调用和工具结果先在本地暂存，只有收到
+     * 不含工具调用的最终 assistant 消息后才会一次性提交；失败或取消不会影响既有成功会话。工具已
+     * 产生的外部副作用无法撤销，重试具有至少一次语义。
      *
      * @param text 可选的配文或指令内容；为 `null` 或空白时不创建文本内容片段。
      * @param mediaData 要发送的媒体数据列表；可为空，元素的 MIME 类型决定其处理方式。
-     * @return 模型最终回复文本；没有可发送内容或模型未返回文本时返回空字符串。工具调用或其他
-     * 可恢复错误会返回以 `Error:` 开头的文本。
+     * @return 模型最终回复文本；没有可发送内容或模型未返回文本时返回空字符串。以 `Error:` 开头的
+     * 文本是模型的正常回复。
+     * @throws AgentTurnFailedException 当 API、协议、工具调用上限或其他非取消错误导致本次回合未完成时
+     * 抛出；本次回合历史不会提交。
      * @throws IllegalStateException 当服务已关闭或 OpenAI 客户端尚未初始化时抛出。
+     * @throws CancellationException 当调用协程、模型调用或工具调用被取消时抛出。
      */
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String = sessionMutex.withLock {
         check(!closed) { "OpenAI client is closed." }
@@ -440,30 +481,42 @@ class OpenAIAgentService @Inject constructor(
             }
         }
 
-        if (contentParts.isNotEmpty()) {
-            history.add(
+        if (contentParts.isEmpty()) {
+            return@withLock ""
+        }
+
+        try {
+            val tentativeHistory = history.toMutableList()
+            tentativeHistory.add(
                 ChatCompletionMessageParam.ofUser(
                     ChatCompletionUserMessageParam.builder()
                         .contentOfArrayOfContentParts(contentParts)
                         .build()
                 )
             )
-        } else {
-            return@withLock ""
-        }
-
-        try {
-            performChatLocked(currentClient)
+            val reply = performChatLocked(currentClient, tentativeHistory)
+            history.addAll(tentativeHistory.drop(history.size))
+            reply
         } catch (e: CancellationException) {
             throw e
-        } catch (e: ToolCallLimitExceededException) {
-            logger.error("Tool call limit reached for OpenAI session", e)
-            resetSessionLocked()
-            "Error: ${e.message}"
+        } catch (e: AgentTurnFailedException) {
+            throw e
         } catch (e: Exception) {
             logger.error("Error while sending message to OpenAI", e)
-            "Error: ${e.message}"
+            throw AgentTurnFailedException("OpenAI 代理回合未完成。", e)
         }
+    }
+
+    private fun functionRouter(): LocalFunctionRouter {
+        val currentProviders = localFunctionProviders
+        if (!localFunctionRouter.uses(currentProviders)) {
+            localFunctionRouter = LocalFunctionRouter(currentProviders)
+        }
+        return localFunctionRouter
+    }
+
+    private fun failedInitializationJob(): Job = Job().also {
+        it.cancel(CancellationException("OpenAI agent initialization failed"))
     }
 
     /**
@@ -471,78 +524,182 @@ class OpenAIAgentService @Inject constructor(
      */
     private suspend fun performChatLocked(
         client: OpenAIClient,
+        tentativeHistory: MutableList<ChatCompletionMessageParam>,
+        functionRouteSnapshot: LocalFunctionRouteSnapshot = functionRouter().refresh(),
         toolCallRounds: Int = 0,
     ): String {
-        val tools = localFunctionProviders.flatMap { provider ->
-            provider.providedOpenAIFunctions.map { func ->
-                ChatCompletionTool.ofFunction(
-                    ChatCompletionFunctionTool.builder()
-                        .function(func)
-                        .build()
-                )
-            }
+        val tools = functionRouteSnapshot.providedOpenAIFunctions().map { func ->
+            ChatCompletionTool.ofFunction(
+                ChatCompletionFunctionTool.builder()
+                    .function(func)
+                    .build()
+            )
         }
 
-        val paramsBuilder = createChatCompletionParams(tools, history.toList())
+        val paramsBuilder = createChatCompletionParams(tools, tentativeHistory)
 
         // OpenAI 阻塞客户端会同步执行网络请求，避免占用调用方的默认调度器线程。
         val response = withContext(Dispatchers.IO) {
             client.chat().completions().create(paramsBuilder)
         }
-        val choice = response.choices().firstOrNull() ?: return ""
+        val choice = response.choices().firstOrNull()
+            ?: throw AgentTurnFailedException("OpenAI 响应未包含 assistant 消息。")
         val message = choice.message()
-
         val toolCalls = message.toolCalls()
-        if (toolCalls.isPresent) {
-            ensureToolCallRoundIsAllowed(toolCallRounds)
-        }
 
-        history.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
-
-        if (toolCalls.isPresent) {
-            val functionToolCalls = toolCalls.get()
-            val toolMessages = mutableListOf<ChatCompletionMessageParam>()
-
-            for (toolCall in functionToolCalls) {
-                if (toolCall.isFunction()) {
-                    val functionToolCall = toolCall.asFunction()
-                    val function = functionToolCall.function()
-                    val name = function.name()
-                    val arguments = function.arguments()
-
-                    val argsMap = try {
-                        val jsonObject = json.parseToJsonElement(arguments) as? JsonObject
-                        jsonObject?.toMap() ?: throw IllegalArgumentException(arguments)
-                    } catch (e: Exception) {
-                        logger.error("Failed to parse function arguments: $arguments", e)
-                        emptyMap()
-                    }
-
-                    val provider = localFunctionProviders.find { it.canHandle(name) }
-                    val result = provider?.execute(name, argsMap)
-                        ?: buildJsonObject {
-                            put("error", "Function $name not found")
-                        }
-                    currentCoroutineContext().ensureActive()
-
-                    toolMessages.add(
-                        ChatCompletionMessageParam.ofTool(
-                            ChatCompletionToolMessageParam.builder()
-                                .toolCallId(functionToolCall.id())
-                                .content(json.encodeToString(result))
-                                .build()
-                        )
-                    )
-
+        return when (choice.finishReason()) {
+            ChatCompletion.Choice.FinishReason.STOP -> {
+                if (toolCalls.isPresent) {
+                    throw AgentTurnFailedException("OpenAI 最终响应不应包含工具调用。")
                 }
+                tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
+                message.content().getOrNull() ?: ""
             }
 
-            history.addAll(toolMessages)
-            return performChatLocked(client, toolCallRounds + 1)
+            ChatCompletion.Choice.FinishReason.TOOL_CALLS -> {
+                ensureToolCallRoundIsAllowed(toolCallRounds)
+                val validatedToolCalls = validateToolCalls(toolCalls)
+                tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
+                val toolMessages = validatedToolCalls.map { (toolCall, toolCallId) ->
+                    val result = executeToolCall(toolCall, functionRouteSnapshot)
+                    currentCoroutineContext().ensureActive()
+                    createToolMessage(toolCallId, result)
+                }
+                tentativeHistory.addAll(toolMessages)
+                performChatLocked(client, tentativeHistory, functionRouteSnapshot, toolCallRounds + 1)
+            }
+
+            else -> throw AgentTurnFailedException("OpenAI 响应未完成本次代理回合。")
+        }
+    }
+
+    /**
+     * 验证一批工具调用可被完整、无歧义地回传给模型。
+     *
+     * 此校验必须先于 assistant 消息暂存和任一工具执行。每个调用都需要唯一的非空标识，并必须能够
+     * 构造对应的工具结果；任一调用不满足条件时整批回合失败。
+     *
+     * @param toolCalls assistant 消息中可选的工具调用列表。
+     * @return 与原顺序一致的工具调用及其已验证标识。
+     * @throws AgentTurnFailedException 当工具调用缺失、为空、标识无效或无法构造工具结果时抛出。
+     */
+    private fun validateToolCalls(
+        toolCalls: Optional<List<ChatCompletionMessageToolCall>>,
+    ): List<Pair<ChatCompletionMessageToolCall, String>> {
+        val calls = toolCalls.getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+            ?: throw AgentTurnFailedException("OpenAI 工具调用缺失或为空。")
+        val validatedCalls = calls.map { toolCall ->
+            val toolCallId = toolCall.validToolCallId()
+                ?: throw AgentTurnFailedException("OpenAI 工具调用缺少有效标识。")
+            try {
+                createToolMessage(toolCallId, toolError("tool_call_validation"))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                throw AgentTurnFailedException("OpenAI 工具调用无法构造结果。", e)
+            }
+            toolCall to toolCallId
+        }
+        if (validatedCalls.map { it.second }.toSet().size != validatedCalls.size) {
+            throw AgentTurnFailedException("OpenAI 工具调用标识重复。")
+        }
+        return validatedCalls
+    }
+
+    /**
+     * 将一个已验证标识和工具结果转换为 OpenAI 工具消息。
+     *
+     * @param toolCallId 已验证的非空工具调用标识。
+     * @param result 要回传给模型的 JSON 对象。
+     * @return 与 [toolCallId] 对应的工具消息参数。
+     */
+    private fun createToolMessage(toolCallId: String, result: JsonObject): ChatCompletionMessageParam =
+        ChatCompletionMessageParam.ofTool(
+            ChatCompletionToolMessageParam.builder()
+                .toolCallId(toolCallId)
+                .content(json.encodeToString(result))
+                .build()
+        )
+
+    /**
+     * 为一个 OpenAI 工具调用生成可回传给模型的 JSON 结果。
+     *
+     * 非函数调用、未知函数、非法参数和提供者失败均转换为稳定的错误对象；取消始终向上传播。
+     *
+     * @param toolCall 模型返回的工具调用。
+     * @return 可作为工具消息内容编码的 JSON 对象。
+     * @throws CancellationException 当当前协程或工具提供者被取消时抛出。
+     */
+    private suspend fun executeToolCall(
+        toolCall: ChatCompletionMessageToolCall,
+        functionRouteSnapshot: LocalFunctionRouteSnapshot,
+    ): JsonObject {
+        if (!toolCall.isFunction()) {
+            return toolError("unsupported_tool")
         }
 
-        return message.content().getOrNull() ?: ""
+        return try {
+            val function = toolCall.asFunction().function()
+            val name = function.name()
+            val args = parseToolArguments(function.arguments()) ?: return toolError("invalid_arguments")
+            if (!functionRouteSnapshot.canHandle(name)) return toolError("unknown_tool")
+            try {
+                functionRouteSnapshot.execute(name, args)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("OpenAI tool provider failed: {}", name, e)
+                toolError("tool_execution_failed")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn("OpenAI returned an invalid function tool call", e)
+            toolError("invalid_tool_call")
+        }
     }
+
+    /**
+     * 解析函数参数，且只接受 JSON 对象，避免向提供者传入不符合函数契约的数据。
+     *
+     * @param arguments 模型返回的原始 JSON 参数文本。
+     * @return 参数对象转换后的映射；文本非法或根元素不是对象时返回 `null`。
+     */
+    private fun parseToolArguments(arguments: String): Map<String, Any?>? =
+        try {
+            (json.parseToJsonElement(arguments) as? JsonObject)?.toMap()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+
+    /**
+     * 创建不包含提供者异常详情的有限错误结果。
+     *
+     * @param code 供模型判断失败类别的固定错误码。
+     * @return 仅包含固定错误码字段的 JSON 对象。
+     */
+    private fun toolError(code: String): JsonObject = buildJsonObject { put("error", code) }
+
+    /**
+     * 读取工具调用中可用于工具响应的标识。
+     *
+     * @return 非空白标识；调用类型未知、标识缺失或无效时返回 `null`。
+     */
+    private fun ChatCompletionMessageToolCall.validToolCallId(): String? =
+        try {
+            when {
+                isFunction() -> asFunction().id().takeIf { it.isNotBlank() }
+                isCustom() -> asCustom().id().takeIf { it.isNotBlank() }
+                else -> null
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
 
     /**
      * 根据当前模型构建 Chat Completions 请求参数。
@@ -605,28 +762,67 @@ class OpenAIAgentService @Inject constructor(
     }
 
     /**
-     * 关闭 OpenAI 会话任务与 MCP 连接。
+     * 关闭 OpenAI SDK 客户端、会话任务及其工具连接。
      *
-     * 重复调用会返回同一个清理任务。
+     * 首次调用在返回前会拒绝新的消息、会话重置和模型刷新。重复调用会返回同一个等待任务；若调用方
+     * 取消此前返回的等待任务，后续调用会提供新的等待任务，
+     * 而不会取消已启动的资源清理。等待任务完成后，正在进行的模型刷新已退出，OpenAI SDK 客户端、
+     * HTTP 工具客户端和 MCP 连接均已释放。
      *
-     * @return 异步关闭任务；等待该任务完成后不再保留会话状态和 MCP 连接。
+     * @return 异步关闭任务；等待该任务完成后服务不再保留会话状态或网络资源。
      */
     override fun close(): Job = synchronized(lifecycleLock) {
-        closeJob ?: run {
+        val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
             closed = true
             initialModelUpdateJob?.cancel()
             initialModelUpdateJob = null
+            initialMcpConnectionJob?.cancel()
             serviceJob.cancel()
-            closingScope.launch {
-                sessionMutex.withLock {
-                    client = null
-                    history.clear()
-                    cancelCurrentMcpConnection()
+            closeCompletion = newCompletion
+            closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                closeResources(newCompletion)
+            }
+        }
+        if (closeJob == null || closeJob?.isCancelled == true) {
+            closeJob = closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    completion.await()
                 }
-                serviceJob.join()
-                val disconnectJob = mcpClientService.disconnectAll()
-                disconnectJob.join()
-            }.also { closeJob = it }
+            }
+        }
+        closeJob!!
+    }
+
+    /**
+     * 在独立且不可取消的作用域中释放本服务拥有的资源。
+     *
+     * 先摘取会话中的 SDK 客户端，再等待已取消的服务任务和模型刷新退出，确保 SDK 客户端不会与在途
+     * 请求并发关闭。各资源的关闭通过嵌套的 `finally` 串联，以便前一资源关闭失败时仍继续清理。
+     */
+    private suspend fun closeResources(completion: CompletableDeferred<Unit>) = withContext(NonCancellable) {
+        try {
+            val detachedClient = sessionMutex.withLock {
+                val currentClient = client
+                client = null
+                history.clear()
+                cancelCurrentMcpConnection()
+                currentClient
+            }
+            serviceJob.join()
+            modelUpdateMutex.withLock { }
+            try {
+                detachedClient?.close()
+            } finally {
+                try {
+                    httpCallingFunctionProvider.close()
+                } finally {
+                    mcpClientService.close().join()
+                }
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to close OpenAI agent resources", e)
+        } finally {
+            completion.complete(Unit)
         }
     }
 }

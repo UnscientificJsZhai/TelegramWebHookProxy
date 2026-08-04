@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import dagger.Component
 import javax.inject.Singleton
 
@@ -28,6 +29,13 @@ interface AppComponent {
 
     /** 创建和执行定时任务的服务。 */
     val taskSchedulerService: TaskSchedulerService
+
+    /**
+     * 管理当前 AI 提供商代理的应用级委派服务。
+     *
+     * 应用停止时必须调用其 [AgentService.close] 并等待返回的任务，以释放当前 Agent 组件持有的资源。
+     */
+    val agentService: AgentService
 
     /**
      * 返回用于创建代理服务子组件的工厂。

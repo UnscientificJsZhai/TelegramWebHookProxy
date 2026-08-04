@@ -7,6 +7,8 @@ import com.unscientificjszhai.tgp.modules.apiModule
 import com.unscientificjszhai.tgp.modules.messagePollerModule
 import com.unscientificjszhai.tgp.modules.skillAPIModule
 import com.unscientificjszhai.tgp.modules.taskSchedulerModule
+import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
@@ -16,6 +18,9 @@ import io.ktor.server.netty.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
 /**
@@ -31,18 +36,18 @@ fun main() {
 /**
  * 配置应用的序列化、依赖注入、业务路由和静态资源路由。
  *
- * 此方法会注册一次 [ApplicationStopped] 监听器，以关闭 [TelegramService][com.unscientificjszhai.tgp.service.TelegramService]；
- * 应由应用生命周期只调用一次。
+ * 此方法会注册一次 [ApplicationStopped] 监听器，以关闭
+ * [TelegramService][com.unscientificjszhai.tgp.service.TelegramService] 和当前 AI 代理；代理关闭会等待其
+ * 异步资源清理完成。应由应用生命周期只调用一次。
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
  */
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
     val telegramService = appComponent.telegramService
+    val agentService = appComponent.agentService
 
-    monitor.subscribe(ApplicationStopped) {
-        telegramService.close()
-    }
+    registerApplicationStopCleanup(telegramService, agentService)
 
     install(ContentNegotiation) {
         json(
@@ -73,6 +78,29 @@ fun Application.module() {
         singlePageApplication {
             staticResources("/", "static") {
                 default("index.html")
+            }
+        }
+    }
+}
+
+/**
+ * 注册应用停止时的 Telegram 与 AI 代理资源清理。
+ *
+ * 代理服务的异步关闭任务会在停止事件返回前完成，避免 Agent 组件持有的 MCP 连接在应用停止后继续运行。
+ *
+ * @receiver 已创建且尚未停止的 Ktor 应用实例。
+ * @param telegramService 应用停止时应关闭的 Telegram 服务。
+ * @param agentService 应用停止时应关闭并等待清理完成的 AI 代理服务。
+ */
+internal fun Application.registerApplicationStopCleanup(
+    telegramService: TelegramService,
+    agentService: AgentService,
+) {
+    monitor.subscribe(ApplicationStopped) {
+        telegramService.close()
+        runBlocking {
+            withContext(NonCancellable) {
+                agentService.close()?.join()
             }
         }
     }

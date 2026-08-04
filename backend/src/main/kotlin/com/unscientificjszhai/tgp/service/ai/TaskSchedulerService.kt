@@ -3,12 +3,15 @@ package com.unscientificjszhai.tgp.service.ai
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +21,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -37,6 +44,8 @@ import kotlin.time.Duration.Companion.minutes
  * 对应的 Telegram 会话。调用 [close] 会停止后续扫描；[start] 与 [close] 应在同一生命周期
  * 控制路径中调用。任务执行完成后的状态只有在持久化成功后才会从内存移除或推进，因此发生
  * 存储故障时保留任务并按至少一次语义重试，而非承诺 exactly-once。
+ * 代理未完成或抛出普通异常时也会保留任务供后续扫描重试。代理正常返回后，结果投递仅作尽力而为
+ * 处理：Telegram 请求抛错或返回非成功结果只会记录日志，不会再次调用代理，也不保证跨重启投递。
  *
  * @param parentScope 后台扫描任务所属的协程作用域；取消该作用域会停止扫描。
  * @param telegramService 用于投递任务执行结果的 Telegram 服务。
@@ -160,8 +169,16 @@ class TaskSchedulerService private constructor(
         val validated = when (val read = storage.readValidatedAndRecover(::decodeTasks)) {
             AtomicJsonRead.Missing -> emptyList()
             is AtomicJsonRead.Valid -> read.value
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException("定时任务文件及备份均已损坏，拒绝覆盖现场。", read.cause)
-            is AtomicJsonRead.IoFailure -> throw IllegalStateException("定时任务文件尚不可读取，拒绝覆盖现场。", read.cause)
+            is AtomicJsonRead.Corrupt -> throw IllegalStateException(
+                "定时任务文件及备份均已损坏，拒绝覆盖现场。",
+                read.cause
+            )
+
+            is AtomicJsonRead.IoFailure -> throw IllegalStateException(
+                "定时任务文件尚不可读取，拒绝覆盖现场。",
+                read.cause
+            )
+
             is AtomicJsonRead.RecoveryFailed ->
                 throw IllegalStateException("有效定时任务备份无法恢复主文件，拒绝覆盖现场。", read.cause)
 
@@ -186,6 +203,8 @@ class TaskSchedulerService private constructor(
             while (isActive) {
                 try {
                     scanAndExecute()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     logger.error("Error during task scanning", e)
                 }
@@ -200,7 +219,8 @@ class TaskSchedulerService private constructor(
      *
      * 候选任务会在短临界区内声明执行权；并发扫描不会重复执行同一任务。代理调用和 Telegram
      * I/O 永远不在状态锁内运行。存储可恢复性未决时会在短锁内重新验证并重载任务；验证失败
-     * 时本轮不执行任务，后续扫描会重试。
+     * 时本轮不执行任务，后续扫描会重试。无论本批任务正常结束、失败或取消，已声明但尚未执行的
+     * 任务都会释放执行权，供后续扫描重试。
      *
      * @throws CancellationException 扫描或任务执行被取消时抛出；被取消的任务不会推进或删除。
      */
@@ -220,41 +240,80 @@ class TaskSchedulerService private constructor(
             }
         }
 
-        for (task in tasksToExecute) {
-            try {
+        try {
+            for (task in tasksToExecute) {
                 executeTask(task)
-            } finally {
-                stateLock.withLock { executingTaskIds.remove(task.id) }
             }
+        } finally {
+            stateLock.withLock { tasksToExecute.forEach { executingTaskIds.remove(it.id) } }
         }
     }
 
+    /**
+     * 执行一个已声明执行权的任务，并仅在代理正常返回后推进其持久化状态。
+     *
+     * Telegram 结果投递为尽力而为操作；其失败不重跑代理。代理失败会保留任务以供下一轮扫描重试，
+     * 取消会向上传播且不会推进任务。
+     *
+     * @param task 已到期且已被当前扫描声明执行权的任务。
+     * @throws CancellationException 当代理调用、Telegram 调用或当前协程被取消时抛出。
+     */
     private suspend fun executeTask(task: ScheduledTask) {
         logger.info("Executing task: {} - {}", task.id, task.instruction)
-        var completedExecutionAttempt = false
+        var agentTurnCompleted = false
         try {
             val result = agentService.get()
                 .sendMessage("以下是一个定时任务指令：\n${task.instruction}\n\n请直接执行并返回结果。")
             if (result.isNotBlank()) {
-                telegramService.sendMessage(task.agentChatId, "⏰ 定时任务执行结果：\n\n$result")
+                deliverTaskResult(task, result)
             }
-            completedExecutionAttempt = true
+            agentTurnCompleted = true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: AgentTurnFailedException) {
+            logger.warn("Agent turn for task {} was not completed; it will be retried", task.id, e)
+        } catch (e: Exception) {
+            logger.error("Agent execution for task {} failed; it will be retried", task.id, e)
+        } finally {
+            if (agentTurnCompleted) {
+                updateTaskAfterExecution(task)
+            }
+        }
+    }
+
+    /**
+     * 尽力向 Telegram 投递已完成代理回合的结果。
+     *
+     * 非取消失败和 API 非成功响应只记录日志，避免因投递问题重复执行可能带外部副作用的代理回合。
+     *
+     * @param task 已完成代理回合的任务。
+     * @param result 要发送给任务会话的非空结果文本。
+     * @throws CancellationException 当当前协程或 Telegram 调用被取消时抛出。
+     */
+    private suspend fun deliverTaskResult(task: ScheduledTask, result: String) {
+        try {
+            val response = telegramService.sendMessage(task.agentChatId, "⏰ 定时任务执行结果：\n\n$result")
+            if (!response.isTelegramOk()) {
+                logger.warn("Telegram did not accept task result for {}", task.id)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to execute task ${task.id}", e)
-            try {
-                telegramService.sendMessage(task.agentChatId, "❌ 定时任务执行失败：${task.id}\n错误信息：${e.message}")
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (notificationError: Exception) {
-                logger.error("Failed to send task failure notification for ${task.id}", notificationError)
-            }
-            completedExecutionAttempt = true
-        } finally {
-            if (completedExecutionAttempt) {
-                updateTaskAfterExecution(task)
-            }
+            logger.error("Failed to send task result for {}", task.id, e)
+        }
+    }
+
+    /**
+     * 判断 Telegram HTTP 响应是否同时具有成功状态码和 API `ok: true` 标记。
+     *
+     * @receiver 已完整读取的 Telegram 响应快照。
+     * @return HTTP 状态成功且响应 JSON 的 `ok` 字段为 `true` 时返回 `true`，否则返回 `false`。
+     */
+    private fun TelegramApiResponse.isTelegramOk(): Boolean {
+        return status.isSuccess() && try {
+            Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
+        } catch (e: Exception) {
+            false
         }
     }
 

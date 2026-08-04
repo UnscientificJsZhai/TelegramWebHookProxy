@@ -1,5 +1,7 @@
 package com.unscientificjszhai.tgp.service
 
+import com.google.genai.types.FunctionDeclaration
+import com.google.genai.types.Schema
 import com.openai.client.OpenAIClient
 import com.openai.models.ChatModel
 import com.openai.models.ReasoningEffort
@@ -16,13 +18,21 @@ import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
+import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -423,6 +433,53 @@ class OpenAIAgentServiceTest {
     }
 
     /**
+     * 验证启用 OpenAI 的新实例只会在首轮 MCP 连接与工具快照完成后报告就绪。
+     */
+    @Test
+    fun `initial OpenAI readiness waits for the MCP connection`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val releaseConnection = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            releaseConnection.await()
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val initializedService = OpenAIAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        try {
+            connectionStarted.await()
+            val readiness = assertNotNull(initializedService.initializationJob())
+            assertFalse(readiness.isCompleted)
+
+            releaseConnection.complete(Unit)
+            readiness.join()
+
+            assertFalse(readiness.isCancelled)
+        } finally {
+            releaseConnection.complete(Unit)
+            initializedService.close().join()
+        }
+    }
+
+    /**
      * 验证连续重置时 MCP 连接的串行设计。
      *
      * 验证后一连接仅在前一连接任务结束后启动。
@@ -528,7 +585,7 @@ class OpenAIAgentServiceTest {
         val releaseFirstRequest = CountDownLatch(1)
         val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
         settingsRepository.saveSettings(AppSettings(ai = AISettings(mcpServers = mcpServers)))
-        every { mcpClientService.disconnectAll() } returns Job().apply { complete() }
+        every { mcpClientService.close() } returns Job().apply { complete() }
         every { mcpClientService.getAllTools() } returns emptyList()
         every { client.chat() } returns chatService
         every { chatService.completions() } returns chatCompletionService
@@ -562,6 +619,196 @@ class OpenAIAgentServiceTest {
         assertTrue(resetJob.isCancelled)
         assertTrue(switchJob.isCancelled)
         coVerify(exactly = 0) { mcpClientService.connect(mcpServers) }
+        verify(exactly = 1) { mcpClientService.close() }
+    }
+
+    /**
+     * 验证 OpenAI SDK 客户端的终态关闭设计。
+     *
+     * 验证重复关闭不会重复关闭同一 SDK 客户端。
+     */
+    @Test
+    fun test关闭会恰好关闭OpenAISDK客户端一次() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val closingService = newService(mcpClientService)
+        injectClient(closingService, client)
+
+        withTimeout(5.seconds) { closingService.close().join() }
+        withTimeout(5.seconds) { closingService.close().join() }
+
+        verify(exactly = 1) { client.close() }
+        verify(exactly = 1) { mcpClientService.close() }
+    }
+
+    /**
+     * 验证关闭状态发布与后续调用的竞争处理设计。
+     *
+     * 验证 [OpenAIAgentService.close] 返回后立即并发发起的消息、会话重置和模型刷新均不会启动工作。
+     */
+    @Test
+    fun test关闭返回后并发消息重置和模型刷新均被拒绝() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val mcpClientService = mockk<MCPClientService>()
+        val mcpCloseJob = Job()
+        every { mcpClientService.close() } returns mcpCloseJob
+        val closingService = newService(mcpClientService)
+        injectClient(closingService, client)
+
+        val closeJob = closingService.close()
+        assertFalse(closeJob.isCompleted)
+        val sendFailure = async(Dispatchers.Default) {
+            try {
+                closingService.sendMessage("关闭后的消息")
+                null
+            } catch (e: Exception) {
+                e
+            }
+        }
+        val resetJob = async(Dispatchers.Default) { closingService.resetSession() }
+        val refreshResult = async(Dispatchers.Default) { closingService.updateModel() }
+
+        assertIs<IllegalStateException>(sendFailure.await())
+        assertEquals(null, resetJob.await())
+        assertEquals(null, refreshResult.await())
+        verify(exactly = 0) { client.chat() }
+        verify(exactly = 0) { client.models() }
+        coVerify(exactly = 0) { mcpClientService.connect(any()) }
+
+        mcpCloseJob.complete()
+        withTimeout(5.seconds) { closeJob.join() }
+    }
+
+    /**
+     * 验证 OpenAI 关闭在调用方取消等待任务后仍会完成其所属 MCP 服务的终态清理。
+     *
+     * MCP 清理未完成时，重试关闭取得的等待任务不能提前完成。
+     */
+    @Test
+    fun `OpenAI close survives cancellation of its returned wait job`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val mcpClientService = mockk<MCPClientService>()
+        val mcpCloseJob = Job()
+        val mcpCloseCalled = CompletableDeferred<Unit>()
+        every { mcpClientService.close() } answers {
+            mcpCloseCalled.complete(Unit)
+            mcpCloseJob
+        }
+        val closingService = OpenAIAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+        injectClient(closingService, client)
+
+        val cancelledWaitJob = closingService.close()
+        cancelledWaitJob.cancel()
+        val retryWaitJob = closingService.close()
+        withTimeout(5.seconds) { mcpCloseCalled.await() }
+        assertFalse(retryWaitJob.isCompleted)
+
+        mcpCloseJob.complete()
+        withTimeout(5.seconds) { retryWaitJob.join() }
+        verify(exactly = 1) { client.close() }
+        verify(exactly = 1) { mcpClientService.close() }
+    }
+
+    /**
+     * 验证 SDK 客户端关闭失败时的资源清理设计。
+     *
+     * 验证 SDK 关闭异常不会跳过 HTTP 工具客户端或 MCP 连接的关闭。
+     */
+    @Test
+    fun testSDK关闭异常仍关闭HTTP工具和MCP连接() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val httpCallingFunctionProvider = mockk<HttpCallingFunctionProvider>()
+        val mcpClientService = mockk<MCPClientService>()
+        every { client.close() } throws IllegalStateException("SDK close failure")
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val closingService = newService(mcpClientService)
+        setPrivateField(closingService, "httpCallingFunctionProvider", httpCallingFunctionProvider)
+        injectClient(closingService, client)
+
+        withTimeout(5.seconds) { closingService.close().join() }
+
+        verify(exactly = 1) { client.close() }
+        verify(exactly = 1) { httpCallingFunctionProvider.close() }
+        verify(exactly = 1) { mcpClientService.close() }
+    }
+
+    /**
+     * 验证关闭与在途模型刷新的协调设计。
+     *
+     * 验证关闭会等待已经取得 SDK 客户端的模型刷新退出后，再关闭该客户端。
+     */
+    @Test
+    fun test关闭等待在途模型刷新后再关闭SDK客户端() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val modelService = mockk<ModelService>()
+        val page = mockk<ModelListPage>()
+        val mcpClientService = mockk<MCPClientService>()
+        val refreshStarted = CountDownLatch(1)
+        val releaseRefresh = CountDownLatch(1)
+        every { client.models() } returns modelService
+        every { modelService.list() } answers {
+            refreshStarted.countDown()
+            check(releaseRefresh.await(5, TimeUnit.SECONDS))
+            page
+        }
+        every { page.data() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val closingService = newService(mcpClientService)
+        injectClient(closingService, client)
+
+        val refreshJob = async(Dispatchers.Default) { closingService.updateModel() }
+        assertTrue(refreshStarted.await(5, TimeUnit.SECONDS))
+        val closeJob = closingService.close()
+
+        assertFalse(closeJob.isCompleted)
+        verify(exactly = 0) { client.close() }
+        releaseRefresh.countDown()
+        assertEquals(null, withTimeout(5.seconds) { refreshJob.await() })
+        withTimeout(5.seconds) { closeJob.join() }
+
+        verify(exactly = 1) { client.close() }
+    }
+
+    /**
+     * 验证初始模型刷新取消与 SDK 关闭的协调设计。
+     *
+     * 验证服务关闭会先取消并等待初始模型刷新任务完成，再关闭 SDK 客户端。
+     */
+    @Test
+    fun test关闭等待初始模型刷新取消完成后再关闭SDK客户端() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val mcpClientService = mockk<MCPClientService>()
+        val initialRefreshCancelling = CompletableDeferred<Unit>()
+        val releaseInitialRefresh = CompletableDeferred<Unit>()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val closingService = newService(mcpClientService)
+        injectClient(closingService, client)
+        val initialRefreshJob = serviceScope(closingService).launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                initialRefreshCancelling.complete(Unit)
+                withContext(NonCancellable) { releaseInitialRefresh.await() }
+            }
+        }
+        setPrivateField(closingService, "initialModelUpdateJob", initialRefreshJob)
+
+        val closeJob = closingService.close()
+        withTimeout(5.seconds) { initialRefreshCancelling.await() }
+        assertFalse(closeJob.isCompleted)
+        verify(exactly = 0) { client.close() }
+
+        releaseInitialRefresh.complete(Unit)
+        withTimeout(5.seconds) { initialRefreshJob.join() }
+        withTimeout(5.seconds) { closeJob.join() }
+
+        verify(exactly = 1) { client.close() }
     }
 
     /**
@@ -605,17 +852,19 @@ class OpenAIAgentServiceTest {
     }
 
     /**
-     * 验证工具调用达到上限后的会话恢复设计。
+     * 验证工具调用达到上限后的事务回滚设计。
      *
-     * 验证历史会被重置，后续处理使用新会话继续执行。
+     * 验证失败会抛出未完成回合异常，且不会清空既有会话。
      */
     @Test
-    fun test工具调用达到上限后重置历史并使用新会话继续处理() = runBlocking {
+    fun test工具调用达到上限后回滚历史并保留后续会话() = runBlocking {
         val client = mockk<OpenAIClient>()
         val chatService = mockk<ChatService>()
         val chatCompletionService = mockk<ChatCompletionService>()
         val requests = mutableListOf<ChatCompletionCreateParams>()
-        val toolCallResponse = toolCallResponse()
+        val providerCalls = mutableListOf<String>()
+        val toolCallResponse = toolCallResponse(functionToolCall("call-limit", "success", "{}"))
+        setPrivateField("localFunctionProviders", listOf(RecordingFunctionProvider(providerCalls)))
         every { client.chat() } returns chatService
         every { chatService.completions() } returns chatCompletionService
         every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } answers {
@@ -628,15 +877,166 @@ class OpenAIAgentServiceTest {
         }
         injectClient(client)
 
-        val limitReply = service.sendMessage("持续调用工具")
+        assertFailsWith<AgentTurnFailedException> {
+            service.sendMessage("持续调用工具")
+        }
+        assertTrue(service.createChatCompletionParams(emptyList()).messages().isEmpty())
         val nextReply = service.sendMessage("继续对话")
 
-        assertEquals("Error: 工具调用轮次超过上限（10 轮）。", limitReply)
         assertEquals("新会话完成", nextReply)
         assertEquals(MAX_TOOL_CALL_ROUNDS + 2, requests.size)
-        assertEquals(31, requests[MAX_TOOL_CALL_ROUNDS].messages().size)
+        assertEquals(21, requests[MAX_TOOL_CALL_ROUNDS].messages().size)
         assertEquals(1, requests.last().messages().size)
         assertEquals(2, service.createChatCompletionParams(emptyList()).messages().size)
+        assertEquals(List(MAX_TOOL_CALL_ROUNDS) { "success" }, providerCalls)
+    }
+
+    /**
+     * 验证每个有效工具标识均紧邻对应工具结果，且可恢复的工具错误不会中断回合。
+     */
+    @Test
+    fun `tool results preserve every valid id and stable errors`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val chatCompletionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        val providerCalls = mutableListOf<String>()
+        setPrivateField("localFunctionProviders", listOf(RecordingFunctionProvider(providerCalls)))
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns chatCompletionService
+        every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            when (requests.size) {
+                1 -> toolCallResponse(
+                    functionToolCall("call-success", "success", "{}"),
+                    functionToolCall("call-invalid", "success", "[]"),
+                    functionToolCall("call-unknown", "unknown", "{}"),
+                    functionToolCall("call-throws", "throws", "{}"),
+                    customToolCall("call-custom"),
+                )
+
+                2 -> textResponse("完成")
+                else -> error("不应发起额外模型请求")
+            }
+        }
+        injectClient(client)
+
+        assertEquals("完成", service.sendMessage("执行工具"))
+        assertEquals(listOf("success", "throws"), providerCalls)
+        val toolMessages = requests[1].messages().filter { it.isTool() }
+        assertEquals(
+            listOf("call-success", "call-invalid", "call-unknown", "call-throws", "call-custom"),
+            toolMessages.map { it.asTool().toolCallId() },
+        )
+        assertEquals(
+            listOf(null, "invalid_arguments", "unknown_tool", "tool_execution_failed", "unsupported_tool"),
+            toolMessages.map { toolMessage ->
+                Json.parseToJsonElement(toolMessage.asTool().content().asText())
+                    .let { it as JsonObject }["error"]?.toString()?.removeSurrounding("\"")
+            },
+        )
+        assertEquals(8, service.createChatCompletionParams(emptyList()).messages().size)
+    }
+
+    /**
+     * 验证工具已执行后模型失败或取消时只回滚历史，不回滚外部工具副作用。
+     */
+    @Test
+    fun `model failure and cancellation after a tool keep the prior history`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val chatCompletionService = mockk<ChatCompletionService>()
+        val providerCalls = mutableListOf<String>()
+        val responses = ArrayDeque<Any>(
+            listOf(
+                textResponse("既有回复"),
+                toolCallResponse(functionToolCall("call-fail", "success", "{}")),
+                IllegalStateException("upstream failure"),
+                toolCallResponse(functionToolCall("call-cancel", "success", "{}")),
+                CancellationException("cancelled"),
+            ),
+        )
+        setPrivateField("localFunctionProviders", listOf(RecordingFunctionProvider(providerCalls)))
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns chatCompletionService
+        every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } answers {
+            when (val response = responses.removeFirst()) {
+                is ChatCompletion -> response
+                is Exception -> throw response
+                else -> error("未知响应")
+            }
+        }
+        injectClient(client)
+
+        assertEquals("既有回复", service.sendMessage("既有消息"))
+        val baseline = service.createChatCompletionParams(emptyList()).messages()
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("会失败") }
+        assertEquals(baseline, service.createChatCompletionParams(emptyList()).messages())
+        assertFailsWith<CancellationException> { service.sendMessage("会取消") }
+        assertEquals(baseline, service.createChatCompletionParams(emptyList()).messages())
+        assertEquals(listOf("success", "success"), providerCalls)
+    }
+
+    /**
+     * 验证一批工具调用中任一标识无效或重复时，整批均不会执行且不会提交。
+     */
+    @Test
+    fun `invalid tool ids fail the whole batch before executing providers`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val chatCompletionService = mockk<ChatCompletionService>()
+        val providerCalls = mutableListOf<String>()
+        setPrivateField("localFunctionProviders", listOf(RecordingFunctionProvider(providerCalls)))
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns chatCompletionService
+        every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } returnsMany listOf(
+            textResponse("既有回复"),
+            toolCallResponse(
+                functionToolCall("call-valid", "success", "{}"),
+                functionToolCall("", "success", "{}"),
+            ),
+            toolCallResponse(
+                functionToolCall("call-duplicate", "success", "{}"),
+                functionToolCall("call-duplicate", "success", "{}"),
+            ),
+        )
+        injectClient(client)
+
+        assertEquals("既有回复", service.sendMessage("既有消息"))
+        val baseline = service.createChatCompletionParams(emptyList()).messages()
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("混合标识调用") }
+        assertEquals(baseline, service.createChatCompletionParams(emptyList()).messages())
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("重复标识调用") }
+        assertEquals(baseline, service.createChatCompletionParams(emptyList()).messages())
+        assertTrue(providerCalls.isEmpty())
+    }
+
+    /**
+     * 验证仅停止完成原因可提交终态 assistant，未完成或自相矛盾的协议响应会回滚回合。
+     */
+    @Test
+    fun `non terminal OpenAI finish reasons roll back the turn`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val chatCompletionService = mockk<ChatCompletionService>()
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns chatCompletionService
+        every { chatCompletionService.create(any<ChatCompletionCreateParams>()) } returnsMany listOf(
+            textResponse("既有回复"),
+            textResponse("被截断", ChatCompletion.Choice.FinishReason.LENGTH),
+            textResponse("被过滤", ChatCompletion.Choice.FinishReason.CONTENT_FILTER),
+            responseWithoutToolCalls(ChatCompletion.Choice.FinishReason.TOOL_CALLS),
+            responseWithoutToolCalls(ChatCompletion.Choice.FinishReason.FUNCTION_CALL),
+            toolCallResponse(ChatCompletion.Choice.FinishReason.STOP, functionToolCall("call-stop", "success", "{}")),
+        )
+        injectClient(client)
+
+        assertEquals("既有回复", service.sendMessage("既有消息"))
+        val baseline = service.createChatCompletionParams(emptyList()).messages()
+        repeat(5) {
+            assertFailsWith<AgentTurnFailedException> { service.sendMessage("协议失败$it") }
+            assertEquals(baseline, service.createChatCompletionParams(emptyList()).messages())
+        }
     }
 
     /**
@@ -834,45 +1234,70 @@ class OpenAIAgentServiceTest {
         assertFalse(params.reasoningEffort().isPresent)
     }
 
-    private fun injectClient(client: OpenAIClient) {
-        OpenAIAgentService::class.java.getDeclaredField("client").apply { isAccessible = true }.set(service, client)
+    private fun injectClient(client: OpenAIClient) = injectClient(service, client)
+
+    private fun injectClient(target: OpenAIAgentService, client: OpenAIClient) {
+        setPrivateField(target, "client", client)
     }
 
-    private fun newService(): OpenAIAgentService {
+    private fun newService(mcpClientService: MCPClientService? = null): OpenAIAgentService {
         val testScope = CoroutineScope(EmptyCoroutineContext)
         return OpenAIAgentService(
             testScope,
             settingsRepository,
             skillRepository,
-            MCPClientService(testScope),
+            mcpClientService ?: MCPClientService(testScope),
         ) { mockk() }
     }
 
     private fun setPrivateField(name: String, value: Any?) {
-        OpenAIAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(service, value)
+        setPrivateField(service, name, value)
     }
 
-    private fun toolCallResponse(): ChatCompletion {
-        val toolCalls = listOf("first", "second").map { name ->
-            ChatCompletionMessageToolCall.ofFunction(
-                ChatCompletionMessageFunctionToolCall.builder()
-                    .id("call-$name")
-                    .function(
-                        ChatCompletionMessageFunctionToolCall.Function.builder()
-                            .name("missing_$name")
-                            .arguments("{}")
-                            .build(),
-                    )
-                    .build(),
-            )
-        }
+    private fun setPrivateField(target: OpenAIAgentService, name: String, value: Any?) {
+        OpenAIAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(target, value)
+    }
+
+    private fun serviceScope(target: OpenAIAgentService): CoroutineScope =
+        OpenAIAgentService::class.java.getDeclaredField("scope").apply { isAccessible = true }
+            .get(target) as CoroutineScope
+
+    private fun toolCallResponse(): ChatCompletion = toolCallResponse(
+        ChatCompletion.Choice.FinishReason.TOOL_CALLS,
+        functionToolCall("call-first", "missing_first", "{}"),
+        functionToolCall("call-second", "missing_second", "{}"),
+    )
+
+    private fun toolCallResponse(vararg toolCalls: ChatCompletionMessageToolCall): ChatCompletion =
+        toolCallResponse(ChatCompletion.Choice.FinishReason.TOOL_CALLS, *toolCalls)
+
+    private fun toolCallResponse(
+        finishReason: ChatCompletion.Choice.FinishReason,
+        vararg toolCalls: ChatCompletionMessageToolCall,
+    ): ChatCompletion {
         val message = ChatCompletionMessage.builder()
             .content(null)
             .refusal(null)
-            .toolCalls(toolCalls)
+            .toolCalls(toolCalls.toList())
             .build()
+        return completionResponse(message, finishReason)
+    }
+
+    private fun responseWithoutToolCalls(finishReason: ChatCompletion.Choice.FinishReason): ChatCompletion =
+        completionResponse(
+            ChatCompletionMessage.builder()
+                .content(null)
+                .refusal(null)
+                .build(),
+            finishReason,
+        )
+
+    private fun completionResponse(
+        message: ChatCompletionMessage,
+        finishReason: ChatCompletion.Choice.FinishReason,
+    ): ChatCompletion {
         val choice = ChatCompletion.Choice.builder()
-            .finishReason(ChatCompletion.Choice.FinishReason.TOOL_CALLS)
+            .finishReason(finishReason)
             .index(0)
             .logprobs(null)
             .message(message)
@@ -885,23 +1310,65 @@ class OpenAIAgentServiceTest {
             .build()
     }
 
-    private fun textResponse(content: String): ChatCompletion {
+    private fun functionToolCall(
+        id: String,
+        name: String,
+        arguments: String,
+    ): ChatCompletionMessageToolCall =
+        ChatCompletionMessageToolCall.ofFunction(
+            ChatCompletionMessageFunctionToolCall.builder()
+                .id(id)
+                .function(
+                    ChatCompletionMessageFunctionToolCall.Function.builder()
+                        .name(name)
+                        .arguments(arguments)
+                        .build(),
+                )
+                .build(),
+        )
+
+    private fun customToolCall(id: String): ChatCompletionMessageToolCall =
+        ChatCompletionMessageToolCall.ofCustom(
+            ChatCompletionMessageCustomToolCall.builder()
+                .id(id)
+                .custom(
+                    ChatCompletionMessageCustomToolCall.Custom.builder()
+                        .name("custom")
+                        .input("input")
+                        .build(),
+                )
+                .build(),
+        )
+
+    private class RecordingFunctionProvider(
+        private val calls: MutableList<String>,
+    ) : LocalFunctionProvider() {
+        override val providedFunctions: List<FunctionDeclaration> = listOf("success", "throws").map { name ->
+            FunctionDeclaration.builder()
+                .name(name)
+                .parameters(Schema.fromJson("""{"type":"OBJECT"}"""))
+                .build()
+        }
+
+        override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
+            calls += functionName
+            return when (functionName) {
+                "success" -> buildJsonObject { put("status", "ok") }
+                "throws" -> throw IllegalStateException("provider secret should not be exposed")
+                else -> error("不支持的测试函数")
+            }
+        }
+    }
+
+    private fun textResponse(
+        content: String,
+        finishReason: ChatCompletion.Choice.FinishReason = ChatCompletion.Choice.FinishReason.STOP,
+    ): ChatCompletion {
         val message = ChatCompletionMessage.builder()
             .content(content)
             .refusal(null)
             .build()
-        val choice = ChatCompletion.Choice.builder()
-            .finishReason(ChatCompletion.Choice.FinishReason.STOP)
-            .index(0)
-            .logprobs(null)
-            .message(message)
-            .build()
-        return ChatCompletion.builder()
-            .id("completion")
-            .choices(listOf(choice))
-            .created(0)
-            .model("test-model")
-            .build()
+        return completionResponse(message, finishReason)
     }
 
 }

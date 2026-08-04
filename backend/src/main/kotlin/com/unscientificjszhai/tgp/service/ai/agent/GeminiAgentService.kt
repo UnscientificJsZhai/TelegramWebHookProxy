@@ -15,6 +15,8 @@ import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
 import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
@@ -65,25 +67,36 @@ class GeminiAgentService @Inject constructor(
     @Volatile
     private var closed = false
     private var closeJob: Job? = null
+    private var closeCompletion: CompletableDeferred<Unit>? = null
 
+    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsRepository)
     private val localFunctionProviders = listOf(
-        HttpCallingFunctionProvider(),
+        httpCallingFunctionProvider,
         McpFunctionProvider(mcpClientService),
         ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
         SkillFunctionProvider(skillRepository),
     )
+    private val localFunctionRouter = LocalFunctionRouter(localFunctionProviders)
 
     /** 串行化对话、重置和关闭，防止 Chat 状态在服务关闭后被旧任务改写。 */
     private val sessionMutex = Mutex()
 
     @Volatile
     private var client: Client? = null
+
+    @Volatile
     private var chat: Chat? = null
+
+    @Volatile
+    private var chatFunctionRouteSnapshot: LocalFunctionRouteSnapshot? = null
 
     private var savedHistory: List<Content>? = null
 
     @Volatile
     private var resetSessionJob: Job? = null
+
+    @Volatile
+    private var initialReadinessJob: Job? = null
 
     private val modelUpdateMutex = Mutex()
     private val modelStateLock = Any()
@@ -151,14 +164,41 @@ class GeminiAgentService @Inject constructor(
                     Client.builder().apiKey(aiSettings.geminiApiKey).clientOptions(clientOptionsBuilder.build()).build()
 
                 this.resetSessionJob = resetSession()
+                initialReadinessJob = createInitialReadinessJob(resetSessionJob)
                 initialModelUpdateJob = scope.launch { updateModel() }
                 logger.info("Gemini client initialized.")
             } catch (e: Exception) {
                 logger.error("Failed to initialize Gemini client", e)
                 client = null
                 chat = null
+                chatFunctionRouteSnapshot = null
+                initialReadinessJob = failedInitializationJob()
             }
         }
+    }
+
+    /**
+     * 获取创建时首轮 MCP 连接、工具快照和聊天会话创建的完成任务。
+     *
+     * 任务正常完成表示服务可发布；任务取消表示构造、会话创建或初始化任务本身失败。
+     * [MCPClientService] 对单个服务器连接错误采取降级处理，因此该错误不会使本任务取消。未启用 Gemini
+     * 时返回 `null`。
+     *
+     * @return 初始会话就绪任务；无需初始化时返回 `null`。
+     */
+    override fun initializationJob(): Job? = initialReadinessJob
+
+    private fun createInitialReadinessJob(resetJob: Job?): Job = resetJob?.let { initialResetJob ->
+        scope.launch {
+            initialResetJob.join()
+            if (initialResetJob.isCancelled || chat == null) {
+                throw CancellationException("Gemini agent initialization failed")
+            }
+        }
+    } ?: failedInitializationJob()
+
+    private fun failedInitializationJob(): Job = Job().also {
+        it.cancel(CancellationException("Gemini agent initialization failed"))
     }
 
     /**
@@ -275,7 +315,6 @@ class GeminiAgentService @Inject constructor(
         }
 
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
-        val functionDeclarations = mutableListOf<FunctionDeclaration>()
         return scope.launch {
             sessionMutex.withLock {
                 if (closed) {
@@ -289,9 +328,8 @@ class GeminiAgentService @Inject constructor(
                 if (closed) {
                     return@withLock
                 }
-                localFunctionProviders.forEach { provider ->
-                    functionDeclarations.addAll(provider.providedFunctions)
-                }
+                val functionRouteSnapshot = localFunctionRouter.refresh()
+                val functionDeclarations = functionRouteSnapshot.providedFunctions()
                 val configBuilder = GenerateContentConfig.builder()
                 val skills = skillRepository.getSkillSummaries()
                 val skillPrompt = getSkillPrompt(skills)
@@ -312,6 +350,7 @@ class GeminiAgentService @Inject constructor(
                     synchronized(lifecycleLock) {
                         if (!closed) {
                             chat = newChat
+                            chatFunctionRouteSnapshot = functionRouteSnapshot
                             logger.info("Gemini session reset with model: $currentModel")
                         }
                     }
@@ -322,6 +361,7 @@ class GeminiAgentService @Inject constructor(
                     synchronized(lifecycleLock) {
                         if (!closed) {
                             chat = null
+                            chatFunctionRouteSnapshot = null
                         }
                     }
                 }
@@ -373,19 +413,20 @@ class GeminiAgentService @Inject constructor(
     ): String {
         val initialChat = sessionMutex.withLock {
             check(!closed) { "Gemini client is closed." }
-            chat
+            chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) }
         }
         val currentChat = initialChat ?: resetSessionJob?.run {
             join()
             sessionMutex.withLock {
                 check(!closed) { "Gemini client is closed." }
-                chat
+                chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) }
             }
         } ?: throw IllegalStateException("Gemini chat session is not initialized.")
         return sessionMutex.withLock {
             check(!closed) { "Gemini client is closed." }
             try {
-                val chatForMessage = chat ?: currentChat
+                val activeChat = chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) } ?: currentChat
+                val chatForMessage = activeChat.first
                 val parts = mutableListOf<Part>()
                 text?.let { parts.add(Part.fromText(it)) }
                 parts.addAll(audioParts)
@@ -405,11 +446,12 @@ class GeminiAgentService @Inject constructor(
                 }
 
                 // 检查模型是否请求调用工具。
-                handleResponse(response, chatForMessage)
+                handleResponse(response, chatForMessage, activeChat.second)
             } catch (e: ToolCallLimitExceededException) {
                 logger.error("Tool call limit reached for Gemini session", e)
                 savedHistory = null
                 chat = null
+                chatFunctionRouteSnapshot = null
                 resetSessionJob = resetSession()
                 throw e
             } catch (e: Exception) {
@@ -422,6 +464,7 @@ class GeminiAgentService @Inject constructor(
     private suspend fun handleResponse(
         response: GenerateContentResponse,
         currentChat: Chat,
+        functionRouteSnapshot: LocalFunctionRouteSnapshot,
         toolCallRounds: Int = 0,
     ): String {
         val functionCalls = response.functionCalls()
@@ -433,17 +476,16 @@ class GeminiAgentService @Inject constructor(
                 val fullName = functionCall.name().getOrNull()
                 val argsMap = functionCall.args().getOrNull() ?: emptyMap()
                 val result = try {
-                    val localProvider = fullName?.let { name -> localFunctionProviders.find { it.canHandle(name) } }
                     when {
                         fullName == null -> buildJsonObject {
                             put("error", "Function call name is missing")
                         }
 
-                        localProvider == null -> buildJsonObject {
+                        !functionRouteSnapshot.canHandle(fullName) -> buildJsonObject {
                             put("error", "Function $fullName not found")
                         }
 
-                        else -> localProvider.execute(fullName, argsMap)
+                        else -> functionRouteSnapshot.execute(fullName, argsMap)
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -461,7 +503,7 @@ class GeminiAgentService @Inject constructor(
             val finalResponse = withContext(Dispatchers.IO) {
                 currentChat.sendMessage(content)
             }
-            return handleResponse(finalResponse, currentChat, toolCallRounds + 1)
+            return handleResponse(finalResponse, currentChat, functionRouteSnapshot, toolCallRounds + 1)
         } else {
             return response.text() ?: ""
         }
@@ -509,30 +551,51 @@ class GeminiAgentService @Inject constructor(
     /**
      * 关闭 Gemini 客户端、会话任务与 MCP 连接。
      *
-     * 重复调用会返回同一个清理任务。
+     * 重复调用会返回同一个等待任务；若调用方取消此前返回的等待任务，后续调用会提供新的等待任务，
+     * 而不会取消已启动的资源清理。
      *
      * @return 异步关闭任务；等待该任务完成后不再保留 Gemini 客户端和 MCP 连接。
      */
     override fun close(): Job = synchronized(lifecycleLock) {
-        closeJob ?: run {
+        val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
             closed = true
             initialModelUpdateJob?.cancel()
             initialModelUpdateJob = null
             resetSessionJob?.cancel()
             serviceJob.cancel()
-            closingScope.launch {
-                val currentClient = sessionMutex.withLock {
-                    val clientToClose = client
-                    client = null
-                    chat = null
-                    savedHistory = null
-                    clientToClose
+            closeCompletion = newCompletion
+            closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    try {
+                        try {
+                            val currentClient = sessionMutex.withLock {
+                                val clientToClose = client
+                                client = null
+                                chat = null
+                                savedHistory = null
+                                clientToClose
+                            }
+                            serviceJob.join()
+                            currentClient?.close()
+                            httpCallingFunctionProvider.close()
+                        } finally {
+                            mcpClientService.close().join()
+                        }
+                    } catch (e: Exception) {
+                        logger.error("Failed to close Gemini agent resources", e)
+                    } finally {
+                        newCompletion.complete(Unit)
+                    }
                 }
-                serviceJob.join()
-                currentClient?.close()
-                val disconnectJob = mcpClientService.disconnectAll()
-                disconnectJob.join()
-            }.also { closeJob = it }
+            }
         }
+        if (closeJob == null || closeJob?.isCancelled == true) {
+            closeJob = closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    completion.await()
+                }
+            }
+        }
+        closeJob!!
     }
 }

@@ -2,7 +2,9 @@ package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.AIProvider
+import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
+import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.models.validateProxySettings
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
@@ -268,17 +270,23 @@ class SettingsRepository private constructor(
     }
 
     private fun materializeSettingsCandidate(candidate: SettingsCandidate): LoadedSettings = when (candidate) {
-        is SettingsCandidate.Decoded -> LoadedSettings(
-            settings = candidate.settings,
-            hasInvalidProxy = candidate.settings.proxy.isInvalidProxy(),
-        )
+        is SettingsCandidate.Decoded -> candidate.settings.failClosedHttpToolSettings().let { settings ->
+            LoadedSettings(
+                settings = settings,
+                hasInvalidProxy = settings.proxy.isInvalidProxy(),
+            )
+        }
 
-        is SettingsCandidate.Protected -> LoadedSettings(candidate.settings, hasInvalidProxy = true)
+        is SettingsCandidate.Protected -> LoadedSettings(
+            candidate.settings.failClosedHttpToolSettings(),
+            hasInvalidProxy = true,
+        )
 
         is SettingsCandidate.Migratable -> {
             try {
-                storage.commit(ConfigJson.encodeToString(candidate.settings).toByteArray(StandardCharsets.UTF_8))
-                LoadedSettings(candidate.settings, hasInvalidProxy = false)
+                val settings = candidate.settings.failClosedHttpToolSettings()
+                storage.commit(ConfigJson.encodeToString(settings).toByteArray(StandardCharsets.UTF_8))
+                LoadedSettings(settings, hasInvalidProxy = false)
             } catch (e: Exception) {
                 logger.error("Could not persist migrated legacy proxy; keeping original file protected", e)
                 LoadedSettings(candidate.protectedSettings, hasInvalidProxy = true)
@@ -299,8 +307,8 @@ class SettingsRepository private constructor(
      * 主文件替换前失败时会取消本次已登记的代理切换屏障，并将异常继续抛给调用方。
      *
      * @param settings 要保存的完整设置，不能为空；其内容将整体覆盖当前内存和配置文件中的设置。
-     * @throws IllegalArgumentException 代理设置不合法，或历史非法代理尚未被显式替换为合法代理时抛出；
-     * 不会改变屏障、文件或任何设置流。
+     * @throws IllegalArgumentException 代理或 HTTP 工具设置不合法，或历史非法代理尚未被显式替换为
+     * 合法代理时抛出；不会改变屏障、文件或任何设置流。
      * @throws Exception 配置文件无法编码或原子提交，设置文件不可读取或可恢复性未验证，设置文件及备份
      * 均已损坏，或有效备份无法恢复主文件时抛出。恢复出有效磁盘设置时会先发布该快照，并抛出
      * [StorageRecoveredRetryException]；调用方必须基于新快照重试。
@@ -312,6 +320,7 @@ class SettingsRepository private constructor(
             throw IllegalArgumentException("历史代理设置不合法，必须显式提供合法代理后才能保存设置。")
         }
         validateProxySettings(settings.proxy)
+        settings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
 
         val previousSettings = _settingsFlow.value
         val switchGeneration = if (settings.requiresAgentLifecycleBarrier(previousSettings)) {
@@ -353,6 +362,15 @@ class SettingsRepository private constructor(
 private fun ProxySettings?.isInvalidProxy(): Boolean = runCatching {
     validateProxySettings(this)
 }.isFailure
+
+private fun AppSettings.failClosedHttpToolSettings(): AppSettings {
+    val aiSettings = ai ?: return this
+    return if (runCatching { validateHttpToolSettings(aiSettings.httpToolSettings) }.isSuccess) {
+        this
+    } else {
+        copy(ai = aiSettings.copy(httpToolSettings = HttpToolSettings()))
+    }
+}
 
 private data class LoadedSettings(
     val settings: AppSettings,
@@ -412,13 +430,17 @@ private fun AppSettings.requiresAgentLifecycleBarrier(previous: AppSettings): Bo
     val effectiveApiKeyChanged = previous.effectiveApiKey() != effectiveApiKey()
     val openAiBaseUrlChanged = previousAi?.openAiBaseUrl != aiSettings?.openAiBaseUrl
     val agentEnabledChanged = (previousAi?.agentEnabled ?: false) != (aiSettings?.agentEnabled ?: false)
+    val httpToolSettingsChanged = previousAi?.httpToolSettings != aiSettings?.httpToolSettings
+    val mcpServersChanged = previousAi?.mcpServers != aiSettings?.mcpServers
 
     return providerChanged ||
             selectedModelChanged ||
             effectiveApiKeyChanged ||
             openAiBaseUrlChanged ||
             previous.proxy != proxy ||
-            agentEnabledChanged
+            agentEnabledChanged ||
+            httpToolSettingsChanged ||
+            mcpServersChanged
 }
 
 private fun AppSettings.effectiveApiKey(): String? = ai?.let { aiSettings ->

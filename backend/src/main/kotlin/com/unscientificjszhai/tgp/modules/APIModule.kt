@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
+import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.models.validateProxySettings
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -44,6 +45,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                 val settingsToSave = newSettings.clearSelectedModelWhenProviderOrApiKeyChanges(oldSettings)
                 try {
                     validateProxySettings(settingsToSave.proxy)
+                    settingsToSave.ai?.httpToolSettings?.let(::validateHttpToolSettings)
                     settingsRepository.saveSettings(settingsToSave)
                 } catch (e: IllegalArgumentException) {
                     call.respond(HttpStatusCode.BadRequest, e.message ?: "代理设置不合法。")
@@ -82,6 +84,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                 val newSettings = currentSettings.copy(chatId = request.chatId)
                 try {
                     validateProxySettings(newSettings.proxy)
+                    newSettings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
                     settingsRepository.saveSettings(newSettings)
                 } catch (e: IllegalArgumentException) {
                     call.respond(HttpStatusCode.BadRequest, e.message ?: "代理设置不合法。")

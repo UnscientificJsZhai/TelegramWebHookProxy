@@ -53,6 +53,7 @@ class SettingsTest {
         assertTrue(aiElement.containsKey("autoCleanContextIntervalMinutes"))
         assertTrue(aiElement.containsKey("silentContextCleanup"))
         assertTrue(aiElement.containsKey("mcpServers"))
+        assertTrue(aiElement.containsKey("httpToolSettings"))
     }
 
     /**
@@ -78,6 +79,10 @@ class SettingsTest {
         assertTrue(
             jsonElement.containsKey("silentContextCleanup"),
             "silentContextCleanup field should be present even if default",
+        )
+        assertTrue(
+            jsonElement.containsKey("httpToolSettings"),
+            "httpToolSettings field should be present even if default",
         )
     }
 
@@ -106,6 +111,52 @@ class SettingsTest {
         assertEquals(0, aiSettings.autoCleanContextIntervalMinutes)
         assertEquals(false, aiSettings.silentContextCleanup)
         assertEquals("", aiSettings.selectedModel)
+        assertEquals(false, aiSettings.httpToolSettings.enabled)
+        assertTrue(aiSettings.httpToolSettings.targets.isEmpty())
+    }
+
+    /**
+     * 验证 HTTP 工具仅接受精确固定目标、受限 HTTP loopback 例外及硬配置上限。
+     */
+    @Test
+    fun `HTTP tool validation accepts only bounded fixed targets`() {
+        validateHttpToolSettings(
+            HttpToolSettings(
+                enabled = true,
+                requestTimeoutMillis = 30_000,
+                maxConcurrentRequests = 4,
+                targets = listOf(
+                    HttpCallTarget(
+                        id = "local-post",
+                        scheme = "http",
+                        host = "127.0.0.1",
+                        port = 8080,
+                        path = "/hook",
+                        method = HttpToolMethod.POST,
+                        allowedCidrs = listOf("127.0.0.1/32"),
+                    ),
+                ),
+            ),
+        )
+
+        listOf(
+            HttpCallTarget("wildcard", host = "*.example.com", path = "/hook"),
+            HttpCallTarget("query", host = "api.example.com", path = "/hook?debug=true"),
+            HttpCallTarget("encoded-dot", host = "api.example.com", path = "/hook/%2e%2e/admin"),
+            HttpCallTarget("encoded-slash", host = "api.example.com", path = "/hook%2Fadmin"),
+            HttpCallTarget("encoded-backslash", host = "api.example.com", path = "/hook%5Cadmin"),
+            HttpCallTarget("redirect", scheme = "ftp", host = "api.example.com", path = "/hook"),
+            HttpCallTarget("http-host", scheme = "http", host = "localhost", path = "/hook"),
+            HttpCallTarget("http-cidr", scheme = "http", host = "127.0.0.1", path = "/hook"),
+        ).forEach { target ->
+            assertFailsWith<IllegalArgumentException> { validateHttpCallTarget(target) }
+        }
+        assertFailsWith<IllegalArgumentException> {
+            validateHttpToolSettings(HttpToolSettings(requestTimeoutMillis = 30_001))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            validateHttpToolSettings(HttpToolSettings(maxConcurrentRequests = 5))
+        }
     }
 
     /**

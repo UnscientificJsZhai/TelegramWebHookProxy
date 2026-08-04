@@ -4,6 +4,8 @@ import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.HttpCallTarget
+import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -74,6 +76,36 @@ class APIModuleTest {
             assertEquals("system prompt", receivedSettings.ai?.globalContext)
         }
         assertEquals(testSettings, repository.settingsFlow.value)
+    }
+
+    /**
+     * 验证设置 API 会在进入仓储前拒绝不安全的 HTTP 工具目标。
+     */
+    @Test
+    fun `settings API rejects invalid HTTP tool targets`() = withTestApi { repository, _, _ ->
+        val unsafe = AppSettings(
+            ai = AISettings(
+                httpToolSettings = HttpToolSettings(
+                    enabled = true,
+                    targets = listOf(
+                        HttpCallTarget(
+                            id = "unsafe",
+                            scheme = "http",
+                            host = "localhost",
+                            path = "/admin",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        client.post("/api/settings") {
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            setBody(Json.encodeToString(unsafe))
+        }.apply {
+            assertEquals(HttpStatusCode.BadRequest, status)
+        }
+        assertEquals(AppSettings(), repository.settingsFlow.value)
     }
 
     /**
@@ -151,36 +183,37 @@ class APIModuleTest {
      * 验证非法代理和未知协议会返回 400，且不会保存设置或更新机器人指令。
      */
     @Test
-    fun `invalid settings requests return bad request without side effects`() = withTestApi { repository, telegramService, configFile ->
-        val original = AppSettings(telegramToken = "100:original", chatId = "old-chat")
-        repository.saveSettings(original)
-        val originalContent = configFile.readText()
+    fun `invalid settings requests return bad request without side effects`() =
+        withTestApi { repository, telegramService, configFile ->
+            val original = AppSettings(telegramToken = "100:original", chatId = "old-chat")
+            repository.saveSettings(original)
+            val originalContent = configFile.readText()
 
-        client.post("/api/settings") {
-            contentType(ContentType.Application.Json)
-            setBody(
-                Json.encodeToString(
-                    original.copy(
-                        telegramToken = "200:new",
-                        proxy = ProxySettings("proxy.example.com", 0, ProxyType.HTTP),
+            client.post("/api/settings") {
+                contentType(ContentType.Application.Json)
+                setBody(
+                    Json.encodeToString(
+                        original.copy(
+                            telegramToken = "200:new",
+                            proxy = ProxySettings("proxy.example.com", 0, ProxyType.HTTP),
+                        ),
                     ),
-                ),
-            )
-        }.apply {
-            assertEquals(HttpStatusCode.BadRequest, status)
-        }
+                )
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
 
-        client.post("/api/settings") {
-            contentType(ContentType.Application.Json)
-            setBody("""{"proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"}}""")
-        }.apply {
-            assertEquals(HttpStatusCode.BadRequest, status)
-        }
+            client.post("/api/settings") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
 
-        assertEquals(original, repository.settingsFlow.value)
-        assertEquals(originalContent, configFile.readText())
-        coVerify(exactly = 0) { telegramService.updateBotCommands(any(), any()) }
-    }
+            assertEquals(original, repository.settingsFlow.value)
+            assertEquals(originalContent, configFile.readText())
+            coVerify(exactly = 0) { telegramService.updateBotCommands(any(), any()) }
+        }
 
     /**
      * 验证历史未知代理类型不会在更新默认聊天时被静默覆盖，完整设置可显式修复它。
@@ -289,7 +322,10 @@ class APIModuleTest {
                 }
                 assertEquals("100:backup", repository.settingsFlow.value.telegramToken)
                 assertEquals("new-chat", repository.settingsFlow.value.chatId)
-                assertEquals("100:backup", ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken)
+                assertEquals(
+                    "100:backup",
+                    ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken
+                )
             }
         } finally {
             temporaryDirectory.deleteRecursively()

@@ -4,12 +4,14 @@ import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
+import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
@@ -89,7 +91,7 @@ class TaskSchedulerServiceTest {
         service.createTask(instruction, System.currentTimeMillis() - 1000, LoopMode.ONCE, chatId)
 
         coEvery { agentService.sendMessage(any()) } returns "LLM result"
-        coEvery { telegramService.sendMessage(any(), any()) } returns mockk()
+        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
@@ -112,7 +114,7 @@ class TaskSchedulerServiceTest {
         service.createTask(instruction, executionTime, LoopMode.HOURLY, chatId)
 
         coEvery { agentService.sendMessage(any()) } returns "LLM result"
-        coEvery { telegramService.sendMessage(any(), any()) } returns mockk()
+        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
@@ -178,7 +180,7 @@ class TaskSchedulerServiceTest {
             primaryReplaceFailingOperations(),
         )
         coEvery { agentService.sendMessage(any()) } returns "result"
-        coEvery { telegramService.sendMessage(any(), any()) } returns mockk()
+        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
@@ -269,7 +271,8 @@ class TaskSchedulerServiceTest {
     @Test
     fun `scan revalidates recovered backup before executing due task`() = runTest {
         val backupFile = File(tempDirectory, "schedule.json.bak")
-        val recoveredTask = ScheduledTask("backup", "instruction", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val recoveredTask =
+            ScheduledTask("backup", "instruction", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         scheduleFile.writeText("[ invalid")
         backupFile.writeText(ConfigJson.encodeToString(listOf(recoveredTask)))
         var blockBackupRead = true
@@ -290,13 +293,96 @@ class TaskSchedulerServiceTest {
             fileOperations,
         )
         coEvery { agentService.sendMessage(any()) } returns "done"
-        coEvery { telegramService.sendMessage(any(), any()) } returns mockk()
+        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
 
         blockBackupRead = false
         service.scanAndExecute()
 
         coVerify { agentService.sendMessage(any()) }
         assertTrue(service.listTasks().isEmpty())
+    }
+
+    /**
+     * 验证未完成代理回合和普通代理异常都会保留一次性任务，以便后续扫描至少一次重试。
+     */
+    @Test
+    fun `failed agent turns keep one shot tasks for retry`() = runTest {
+        val incompleteTask =
+            service.createTask("incomplete", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } throws AgentTurnFailedException("未完成")
+
+        service.scanAndExecute()
+
+        assertEquals(listOf(incompleteTask), service.listTasks().map { it.id })
+        coVerify(exactly = 0) { telegramService.sendMessage(any(), any()) }
+
+        coEvery { agentService.sendMessage(any()) } throws IllegalStateException("ordinary failure")
+        service.scanAndExecute()
+
+        assertEquals(listOf(incompleteTask), service.listTasks().map { it.id })
+        coVerify(exactly = 2) { agentService.sendMessage(any()) }
+    }
+
+    /**
+     * 验证模型正常返回的 `Error:` 文本仍会完成任务，而不是作为代理失败重试。
+     */
+    @Test
+    fun `normal error text completes task`() = runTest {
+        service.createTask("normal error text", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } returns "Error: 模型正常文本"
+        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+
+        service.scanAndExecute()
+
+        assertTrue(service.listTasks().isEmpty())
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+    }
+
+    /**
+     * 验证代理完成后的 Telegram 投递失败不会再次调用代理，也不会保留已完成的任务。
+     */
+    @Test
+    fun `result delivery failure does not rerun completed agent turn`() = runTest {
+        service.createTask("delivery throw", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } returns "done"
+        coEvery { telegramService.sendMessage(any(), any()) } throws IOException("delivery failure")
+
+        service.scanAndExecute()
+
+        assertTrue(service.listTasks().isEmpty())
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+    }
+
+    /**
+     * 验证 Telegram API 非 `ok` 响应同样不会重跑已经完成的代理回合。
+     */
+    @Test
+    fun `non ok result delivery does not rerun completed agent turn`() = runTest {
+        service.createTask("delivery non ok", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } returns "done"
+        coEvery { telegramService.sendMessage(any(), any()) } returns TelegramApiResponse(
+            HttpStatusCode.OK,
+            """{"ok":false}""",
+        )
+
+        service.scanAndExecute()
+
+        assertTrue(service.listTasks().isEmpty())
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+    }
+
+    /**
+     * 验证结果投递期间的取消会向上传播，且不会推进已经完成的代理回合。
+     */
+    @Test
+    fun `cancelled result delivery keeps one shot task for retry`() = runTest {
+        val taskId = service.createTask("delivery cancel", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } returns "done"
+        coEvery { telegramService.sendMessage(any(), any()) } throws CancellationException("delivery cancelled")
+
+        assertFailsWith<CancellationException> { service.scanAndExecute() }
+
+        assertEquals(listOf(taskId), service.listTasks().map { it.id })
     }
 
     /**
@@ -312,6 +398,31 @@ class TaskSchedulerServiceTest {
         assertEquals(listOf(taskId), service.listTasks().map { it.id })
     }
 
+    /**
+     * 验证一批任务中前一项取消后，未执行任务的执行权会释放并可在下次扫描执行。
+     */
+    @Test
+    fun `cancellation releases unexecuted task claims for the next scan`() = runTest {
+        service.createTask("first", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        service.createTask("second", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        var attempts = 0
+        coEvery { agentService.sendMessage(any()) } coAnswers {
+            if (++attempts == 1) {
+                throw CancellationException("first task cancelled")
+            }
+            "done"
+        }
+        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+
+        assertFailsWith<CancellationException> { service.scanAndExecute() }
+        coVerify(exactly = 0) { agentService.sendMessage(match { it.contains("second") }) }
+
+        service.scanAndExecute()
+
+        assertTrue(service.listTasks().isEmpty())
+        coVerify(exactly = 1) { agentService.sendMessage(match { it.contains("second") }) }
+    }
+
     private fun primaryReplaceFailingOperations(targetFile: File = scheduleFile): AtomicJsonFileOperations =
         object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
             override fun atomicReplace(source: Path, target: Path) {
@@ -321,4 +432,7 @@ class TaskSchedulerServiceTest {
                 DefaultAtomicJsonFileOperations.atomicReplace(source, target)
             }
         }
+
+    private fun successfulTelegramResponse(): TelegramApiResponse =
+        TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 }

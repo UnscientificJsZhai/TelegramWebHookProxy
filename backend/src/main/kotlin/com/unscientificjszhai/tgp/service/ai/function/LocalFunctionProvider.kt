@@ -58,6 +58,20 @@ abstract class LocalFunctionProvider {
     ): JsonObject
 
     /**
+     * 捕获当前声明函数的不可变执行绑定。
+     *
+     * 默认实现会在函数存在时绑定当前提供者和函数名称。具有动态路由状态的实现应覆盖此方法，捕获与
+     * 当前声明对应的真实目标，避免后续刷新改变已向模型声明的调用含义。
+     *
+     * @param functionName 要捕获的函数名称；必须是当前提供者已声明的名称。
+     * @return 可执行的不可变绑定；函数未声明时返回 `null`。
+     */
+    internal open fun snapshotCall(functionName: String): LocalFunctionCall? =
+        functionName.takeIf(::canHandle)?.let { name ->
+            LocalFunctionCall { args -> execute(name, args) }
+        }
+
+    /**
      * 提供函数参数格式转换工具。
      */
     companion object {
@@ -94,49 +108,49 @@ abstract class LocalFunctionProvider {
                 is JsonArray -> this.map { it.toAny() }
                 is JsonObject -> this.toMap()
             }
-    }
 
-    private fun convertGeminiSchemaToOpenAI(geminiSchema: Schema): FunctionParameters {
-        val schemaMap = recursiveConvertSchema(geminiSchema)
-        return FunctionParameters.builder()
-            .putAllAdditionalProperties(schemaMap.mapValues { JsonValue.from(it.value) })
-            .build()
-    }
+        internal fun convertGeminiSchemaToOpenAI(geminiSchema: Schema): FunctionParameters {
+            val schemaMap = recursiveConvertSchema(geminiSchema)
+            return FunctionParameters.builder()
+                .putAllAdditionalProperties(schemaMap.mapValues { JsonValue.from(it.value) })
+                .build()
+        }
 
-    private fun recursiveConvertSchema(geminiSchema: Schema): Map<String, Any?> {
-        val map = mutableMapOf<String, Any?>()
+        private fun recursiveConvertSchema(geminiSchema: Schema): Map<String, Any?> {
+            val map = mutableMapOf<String, Any?>()
 
-        val type = geminiSchema.type()?.getOrNull()?.toString()
-        if (type != null) {
-            map["type"] = when (type.uppercase()) {
-                "OBJECT" -> "object"
-                "ARRAY" -> "array"
-                "STRING" -> "string"
-                "NUMBER" -> "number"
-                "INTEGER" -> "integer"
-                "BOOLEAN" -> "boolean"
-                else -> "string"
+            val type = geminiSchema.type()?.getOrNull()?.toString()
+            if (type != null) {
+                map["type"] = when (type.uppercase()) {
+                    "OBJECT" -> "object"
+                    "ARRAY" -> "array"
+                    "STRING" -> "string"
+                    "NUMBER" -> "number"
+                    "INTEGER" -> "integer"
+                    "BOOLEAN" -> "boolean"
+                    else -> "string"
+                }
             }
-        }
 
-        geminiSchema.description()?.ifPresent { map["description"] = it }
+            geminiSchema.description()?.ifPresent { map["description"] = it }
 
-        geminiSchema.properties()?.ifPresent { props ->
-            val propertiesMap = mutableMapOf<String, Any?>()
-            props.forEach { (name, schema) ->
-                propertiesMap[name] = recursiveConvertSchema(schema)
+            geminiSchema.properties()?.ifPresent { props ->
+                val propertiesMap = mutableMapOf<String, Any?>()
+                props.forEach { (name, schema) ->
+                    propertiesMap[name] = recursiveConvertSchema(schema)
+                }
+                map["properties"] = propertiesMap
             }
-            map["properties"] = propertiesMap
-        }
 
-        geminiSchema.required()?.ifPresent { required ->
-            map["required"] = required
-        }
+            geminiSchema.required()?.ifPresent { required ->
+                map["required"] = required
+            }
 
-        geminiSchema.items()?.ifPresent { items ->
-            map["items"] = recursiveConvertSchema(items)
-        }
+            geminiSchema.items()?.ifPresent { items ->
+                map["items"] = recursiveConvertSchema(items)
+            }
 
-        return map
+            return map
+        }
     }
 }

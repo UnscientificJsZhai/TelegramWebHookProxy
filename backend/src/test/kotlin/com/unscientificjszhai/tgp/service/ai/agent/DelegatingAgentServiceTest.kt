@@ -95,7 +95,7 @@ class DelegatingAgentServiceTest {
             }
             verify(exactly = 1) { openAIAgentService.resetSession() }
         } finally {
-            delegatingAgentService.close()?.join()
+            delegatingAgentService.close().join()
             serviceScope.cancel()
             serviceScope.coroutineContext[Job]?.join()
         }
@@ -172,7 +172,7 @@ class DelegatingAgentServiceTest {
             verify(exactly = 1) { openAIAgentService.switchModel("models/gemini-next") }
             verify(exactly = 0) { openAIAgentService.resetSession() }
         } finally {
-            delegatingAgentService.close()?.join()
+            delegatingAgentService.close().join()
             serviceScope.cancel()
             serviceScope.coroutineContext[Job]?.join()
         }
@@ -211,6 +211,7 @@ class DelegatingAgentServiceTest {
             agentComponent
         }
         every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.initializationJob() } returns null
         every { openAIAgentService.close() } returns Job().apply { complete() }
         coEvery { openAIAgentService.sendMessage("hello", emptyList()) } returns "reply"
 
@@ -241,7 +242,7 @@ class DelegatingAgentServiceTest {
             assertEquals("reply", withTimeout(5.seconds) { response.await() })
             coVerify(exactly = 1) { openAIAgentService.sendMessage("hello", emptyList()) }
         } finally {
-            delegatingAgentService.close()?.join()
+            delegatingAgentService.close().join()
             serviceScope.cancel()
             serviceScope.coroutineContext[Job]?.join()
         }
@@ -311,7 +312,316 @@ class DelegatingAgentServiceTest {
             assertFalse(barrier.isSwitching)
             verify(exactly = 1) { agentComponentFactory.create() }
         } finally {
-            delegatingAgentService.close()?.join()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证代理重建时新组件的发布顺序。
+     *
+     * 替代组件可先开始初始化，但委派服务会保留旧代理，直到旧代理的关闭任务结束后才发布新代理。
+     */
+    @Test
+    fun `重建会等待旧代理关闭后才发布已创建的新代理`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val newComponent = mockk<AgentComponent>()
+        val oldService = mockk<OpenAIAgentService>()
+        val newService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "old-key",
+                agentEnabled = true,
+            ),
+        )
+        val replacementSettings = initialSettings.copy(
+            ai = initialSettings.ai!!.copy(openAiApiKey = "new-key"),
+        )
+        val settingsFlow = MutableStateFlow(initialSettings)
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val firstComponentCreated = CompletableDeferred<Unit>()
+        val newConnectionStarted = CompletableDeferred<Unit>()
+        val oldCloseStarted = CompletableDeferred<Unit>()
+        val initialMcpConnection = Job()
+        val releaseOldClose = Job()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } returnsMany listOf(oldComponent, newComponent)
+        every { oldComponent.openAIAgentService } answers {
+            firstComponentCreated.complete(Unit)
+            oldService
+        }
+        every { newComponent.openAIAgentService } answers {
+            newConnectionStarted.complete(Unit)
+            newService
+        }
+        every { oldService.initializationJob() } returns null
+        every { newService.initializationJob() } returns initialMcpConnection
+        every { oldService.close() } answers {
+            oldCloseStarted.complete(Unit)
+            releaseOldClose
+        }
+        every { newService.close() } returns Job().apply { complete() }
+        every { oldService.currentModel } returns "old-model"
+        every { newService.currentModel } returns "new-model"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { firstComponentCreated.await() }
+            settingsFlow.value = replacementSettings
+            settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, barrier.beginSwitch())
+
+            withTimeout(5.seconds) { newConnectionStarted.await() }
+            assertFalse(oldCloseStarted.isCompleted)
+            initialMcpConnection.complete()
+            withTimeout(5.seconds) { oldCloseStarted.await() }
+            assertEquals("old-model", delegatingAgentService.currentModel)
+
+            releaseOldClose.complete()
+            withTimeout(5.seconds) {
+                while (delegatingAgentService.currentModel != "new-model") yield()
+            }
+            assertEquals("new-model", delegatingAgentService.currentModel)
+            verify(exactly = 1) { oldService.close() }
+        } finally {
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证 Gemini 替代实例会先完成首轮 MCP/会话初始化，再关闭旧代理。
+     */
+    @Test
+    fun `Gemini replacement waits for readiness before closing the old agent`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val newComponent = mockk<AgentComponent>()
+        val oldService = mockk<OpenAIAgentService>()
+        val newService = mockk<GeminiAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "old-key", agentEnabled = true),
+        )
+        val replacementSettings = initialSettings.copy(
+            ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key", agentEnabled = true),
+        )
+        val settingsFlow = MutableStateFlow(initialSettings)
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val firstComponentCreated = CompletableDeferred<Unit>()
+        val replacementCreated = CompletableDeferred<Unit>()
+        val oldCloseStarted = CompletableDeferred<Unit>()
+        val geminiReadiness = Job()
+        val releaseOldClose = Job()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } returnsMany listOf(oldComponent, newComponent)
+        every { oldComponent.openAIAgentService } answers {
+            firstComponentCreated.complete(Unit)
+            oldService
+        }
+        every { newComponent.geminiAgentService } answers {
+            replacementCreated.complete(Unit)
+            newService
+        }
+        every { oldService.initializationJob() } returns null
+        every { newService.initializationJob() } returns geminiReadiness
+        every { oldService.close() } answers {
+            oldCloseStarted.complete(Unit)
+            releaseOldClose
+        }
+        every { newService.close() } returns Job().apply { complete() }
+        every { oldService.currentModel } returns "old-model"
+        every { newService.currentModel } returns "gemini-model"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            ModelSwitchBarrier(),
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { firstComponentCreated.await() }
+            settingsFlow.value = replacementSettings
+            settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, null)
+
+            withTimeout(5.seconds) { replacementCreated.await() }
+            assertFalse(oldCloseStarted.isCompleted)
+            assertEquals("old-model", delegatingAgentService.currentModel)
+
+            geminiReadiness.complete()
+            withTimeout(5.seconds) { oldCloseStarted.await() }
+            releaseOldClose.complete()
+            withTimeout(5.seconds) {
+                while (delegatingAgentService.currentModel != "gemini-model") yield()
+            }
+        } finally {
+            geminiReadiness.complete()
+            releaseOldClose.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证 Gemini 初始化任务取消时关闭替代实例并保留已发布的旧代理。
+     *
+     * 单个 MCP 服务器的连接错误由 MCP 客户端降级处理，不属于本测试的初始化任务取消情形。
+     */
+    @Test
+    fun `cancelled Gemini initialization keeps the old agent`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val newComponent = mockk<AgentComponent>()
+        val oldService = mockk<OpenAIAgentService>()
+        val newService = mockk<GeminiAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "old-key", agentEnabled = true),
+        )
+        val replacementSettings = initialSettings.copy(
+            ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key", agentEnabled = true),
+        )
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val firstComponentCreated = CompletableDeferred<Unit>()
+        val replacementCreated = CompletableDeferred<Unit>()
+        val failedReadiness = Job().apply { cancel() }
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+        every { agentComponentFactory.create() } returnsMany listOf(oldComponent, newComponent)
+        every { oldComponent.openAIAgentService } answers {
+            firstComponentCreated.complete(Unit)
+            oldService
+        }
+        every { newComponent.geminiAgentService } answers {
+            replacementCreated.complete(Unit)
+            newService
+        }
+        every { newService.initializationJob() } returns failedReadiness
+        every { oldService.initializationJob() } returns null
+        every { oldService.close() } returns Job().apply { complete() }
+        every { newService.close() } returns Job().apply { complete() }
+        every { oldService.currentModel } returns "old-model"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            ModelSwitchBarrier(),
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { firstComponentCreated.await() }
+            withTimeout(5.seconds) {
+                while (runCatching { delegatingAgentService.currentModel }.getOrNull() != "old-model") yield()
+            }
+            settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, null)
+            withTimeout(5.seconds) { replacementCreated.await() }
+            withTimeout(5.seconds) {
+                while (delegatingAgentService.currentModel != "old-model") yield()
+            }
+
+            verify(exactly = 0) { oldService.close() }
+            verify(exactly = 1) { newService.close() }
+        } finally {
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证委派服务关闭在调用方取消等待任务后仍会关闭当前代理。
+     *
+     * 重试关闭会提供可等待的任务，直到已开始的代理清理结束。
+     */
+    @Test
+    fun `Delegating close survives cancellation of its returned wait job`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val agentService = mockk<OpenAIAgentService>()
+        val settings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(settings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val agentCreated = CompletableDeferred<Unit>()
+        val agentCloseCalled = CompletableDeferred<Unit>()
+        val agentCloseJob = Job()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(settings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } returns agentComponent
+        every { agentComponent.openAIAgentService } answers {
+            agentCreated.complete(Unit)
+            agentService
+        }
+        every { agentService.initializationJob() } returns null
+        every { agentService.close() } answers {
+            agentCloseCalled.complete(Unit)
+            agentCloseJob
+        }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            ModelSwitchBarrier(),
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { agentCreated.await() }
+            val cancelledWaitJob = delegatingAgentService.close()
+            cancelledWaitJob.cancel()
+            val retryWaitJob = delegatingAgentService.close()
+
+            withTimeout(5.seconds) { agentCloseCalled.await() }
+            assertFalse(retryWaitJob.isCompleted)
+
+            agentCloseJob.complete()
+            withTimeout(5.seconds) { retryWaitJob.join() }
+            verify(exactly = 1) { agentService.close() }
+        } finally {
             serviceScope.cancel()
             serviceScope.coroutineContext[Job]?.join()
         }

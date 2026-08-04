@@ -3,6 +3,9 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.HttpCallTarget
+import com.unscientificjszhai.tgp.models.HttpToolSettings
+import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -79,6 +82,108 @@ class SettingsRepositoryBarrierTest {
         settings = settings.copy(ai = settings.ai!!.copy(agentEnabled = false))
         repository.saveSettings(settings)
         assertTrue(barrier.isSwitching)
+    }
+
+    /**
+     * 验证 HTTP 工具边界变更会进入代理生命周期屏障，避免旧会话继续声明旧目标。
+     */
+    @Test
+    fun `HTTP tool settings changes open a model switch barrier`() {
+        val barrier = ModelSwitchBarrier()
+        val repository = SettingsRepository.forTesting(File(tempDirectory, "http-tool-barrier.json"), barrier)
+        val initial = AppSettings(ai = AISettings(agentEnabled = true, geminiApiKey = "key"))
+        repository.saveSettings(initial)
+        barrier.complete(barrier.latestPendingGeneration())
+
+        repository.saveSettings(
+            initial.copy(
+                ai = initial.ai!!.copy(
+                    httpToolSettings = HttpToolSettings(
+                        targets = listOf(HttpCallTarget("public", host = "api.example.com", path = "/v1/status")),
+                    ),
+                ),
+            ),
+        )
+
+        assertTrue(barrier.isSwitching)
+    }
+
+    /**
+     * 验证 MCP 连接配置变化会阻止旧代理继续使用其工具声明。
+     */
+    @Test
+    fun `MCP server settings changes open a model switch barrier`() {
+        val barrier = ModelSwitchBarrier()
+        val repository = SettingsRepository.forTesting(File(tempDirectory, "mcp-server-barrier.json"), barrier)
+        val initial = AppSettings(
+            ai = AISettings(
+                agentEnabled = true,
+                geminiApiKey = "key",
+                mcpServers = listOf(MCPServerConfig("first", "https://first.example/mcp")),
+            ),
+        )
+        repository.saveSettings(initial)
+        barrier.complete(barrier.latestPendingGeneration())
+
+        repository.saveSettings(
+            initial.copy(
+                ai = initial.ai!!.copy(
+                    mcpServers = listOf(MCPServerConfig("second", "https://second.example/mcp")),
+                ),
+            ),
+        )
+
+        assertTrue(barrier.isSwitching)
+    }
+
+    /**
+     * 验证历史非法 HTTP 工具设置在加载时安全禁用，且仓储不会持久化新的非法目标。
+     */
+    @Test
+    fun `invalid persisted HTTP tool settings fail closed and saves are validated`() {
+        val configFile = File(tempDirectory, "invalid-http-tool.json")
+        configFile.writeText(
+            """
+            {
+              "ai": {
+                "httpToolSettings": {
+                  "enabled": true,
+                  "targets": [{
+                    "id": "unsafe",
+                    "scheme": "http",
+                    "host": "localhost",
+                    "port": 8080,
+                    "path": "/admin",
+                    "method": "GET"
+                  }]
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+        val repository = SettingsRepository.forTesting(configFile)
+
+        assertFalse(repository.settingsFlow.value.ai!!.httpToolSettings.enabled)
+        assertTrue(repository.settingsFlow.value.ai!!.httpToolSettings.targets.isEmpty())
+        assertFailsWith<IllegalArgumentException> {
+            repository.saveSettings(
+                AppSettings(
+                    ai = AISettings(
+                        httpToolSettings = HttpToolSettings(
+                            enabled = true,
+                            targets = listOf(
+                                HttpCallTarget(
+                                    id = "unsafe",
+                                    scheme = "http",
+                                    host = "localhost",
+                                    path = "/admin",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
     }
 
     /**
@@ -166,7 +271,8 @@ class SettingsRepositoryBarrierTest {
      */
     @Test
     fun `telegram token generation records rapid restoration without unrelated changes`() {
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "token-generation.json"), ModelSwitchBarrier())
+        val repository =
+            SettingsRepository.forTesting(File(tempDirectory, "token-generation.json"), ModelSwitchBarrier())
         val initialGeneration = repository.telegramTokenUpdateFlow.value.generation
 
         repository.saveSettings(AppSettings(telegramToken = "100:A"))

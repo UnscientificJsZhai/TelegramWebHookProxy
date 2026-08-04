@@ -9,8 +9,15 @@ import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -23,7 +30,8 @@ import javax.inject.Singleton
  * 根据应用设置创建并代理当前 AI 提供商的服务实例。
  *
  * 设置或技能发生变化时，此服务会重建或重置底层代理；发送消息会等待模型切换屏障放行，
- * 以避免请求使用已被替换的服务。
+ * 以避免请求使用已被替换的服务。该屏障仅协调此委派服务的消息和组件重建，不表示应用内所有
+ * AI 相关操作都被全局串行化。
  *
  * @param agentComponentFactory 用于创建提供商专属代理组件的工厂。
  * @param settingsRepository 提供 AI 与代理设置变更的仓库。
@@ -64,6 +72,15 @@ class DelegatingAgentService @Inject constructor(
     )
 
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
+    private val lifecycleLock = Any()
+    private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    @Volatile
+    private var closed = false
+
+    private var closeJob: Job? = null
+    private var closeCompletion: CompletableDeferred<Unit>? = null
+    private var settingsJob: Job? = null
 
     private var currentAgentComponent: AgentComponent? = null
 
@@ -80,7 +97,7 @@ class DelegatingAgentService @Inject constructor(
     private var lastHandledSettings: AppSettings? = null
 
     init {
-        combine(
+        settingsJob = combine(
             settingsRepository.settingsUpdateFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
         ) { settingsUpdate, _ -> settingsUpdate }.onEach { settingsUpdate ->
@@ -94,6 +111,9 @@ class DelegatingAgentService @Inject constructor(
                     previousAiSettings.copy(selectedModel = "") == aiSettings?.copy(selectedModel = "")
 
             try {
+                if (closed) {
+                    return@onEach
+                }
                 if (settingsUpdate.switchGeneration != null) {
                     modelSwitchBarrier.awaitInFlightRequests()
                 }
@@ -104,11 +124,13 @@ class DelegatingAgentService @Inject constructor(
                     }
                     val baseUrl = aiSettings.openAiBaseUrl
 
-                    val needsRecreate = _currentService == null ||
-                            currentProvider != aiSettings.provider ||
-                            currentApiKey != apiKey ||
-                            currentBaseUrl != baseUrl ||
-                            currentProxy != proxySettings
+                    val needsRecreate = synchronized(lifecycleLock) {
+                        _currentService == null ||
+                                currentProvider != aiSettings.provider ||
+                                currentApiKey != apiKey ||
+                                currentBaseUrl != baseUrl ||
+                                currentProxy != proxySettings
+                    }
 
                     if (needsRecreate) {
                         recreateAgent(aiSettings, apiKey, baseUrl, proxySettings)
@@ -116,16 +138,7 @@ class DelegatingAgentService @Inject constructor(
                         applySettingsChange(aiSettings, selectedModelChanged, onlySelectedModelChanged)
                     }
                 } else {
-                    if (_currentService != null) {
-                        _currentService?.close()?.join()
-                        _currentService = null
-                        currentAgentComponent = null
-                        currentProvider = null
-                        currentApiKey = null
-                        currentBaseUrl = null
-                        currentProxy = null
-                        logger.info("Agent service disabled.")
-                    }
+                    disableAgent()
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -139,8 +152,9 @@ class DelegatingAgentService @Inject constructor(
     }
 
     /**
-     * 在销毁活跃组件前先创建替代组件。这样即使创建本身失败，仍可保留可用的
-     * 代理。
+     * 在销毁活跃组件前先创建替代组件。这样即使创建本身失败，仍可保留可用的代理。替代组件创建后，
+     * 必须先等待旧代理关闭，才可发布新代理；不同组件的 MCP 资源相互隔离，因此旧代理关闭不会影响
+     * 已开始连接的新代理。
      */
     private suspend fun recreateAgent(
         aiSettings: AISettings,
@@ -154,14 +168,74 @@ class DelegatingAgentService @Inject constructor(
             AIProvider.GEMINI -> newComponent.geminiAgentService
         }
 
-        _currentService?.close()?.join()
-        currentAgentComponent = newComponent
-        _currentService = newService
-        currentProvider = aiSettings.provider
-        currentApiKey = apiKey
-        currentBaseUrl = baseUrl
-        currentProxy = proxySettings
-        logger.info("Agent component recreated for provider: ${aiSettings.provider}")
+        var published = false
+        try {
+            if (!newService.awaitReady()) {
+                logger.warn("Replacement agent did not complete initialization; retaining the current agent.")
+                return
+            }
+            val previousService = synchronized(lifecycleLock) {
+                if (closed) null else _currentService
+            }
+            if (closed) {
+                return
+            }
+
+            previousService?.close()?.join()
+            published = synchronized(lifecycleLock) {
+                if (closed || _currentService !== previousService) {
+                    false
+                } else {
+                    currentAgentComponent = newComponent
+                    _currentService = newService
+                    currentProvider = aiSettings.provider
+                    currentApiKey = apiKey
+                    currentBaseUrl = baseUrl
+                    currentProxy = proxySettings
+                    true
+                }
+            }
+            if (published) {
+                logger.info("Agent component recreated for provider: ${aiSettings.provider}")
+            }
+        } finally {
+            if (!published) {
+                withContext(NonCancellable) {
+                    newService.close()?.join()
+                }
+            }
+        }
+    }
+
+    /**
+     * 关闭当前已发布的代理并清除其配置记录。
+     */
+    private suspend fun disableAgent() {
+        val serviceToClose = synchronized(lifecycleLock) { _currentService }
+        serviceToClose?.close()?.join()
+        val disabled = synchronized(lifecycleLock) {
+            if (_currentService !== serviceToClose) {
+                false
+            } else {
+                clearCurrentAgentLocked()
+                true
+            }
+        }
+        if (disabled && serviceToClose != null) {
+            logger.info("Agent service disabled.")
+        }
+    }
+
+    /**
+     * 调用方必须持有 [lifecycleLock]，以清除当前已发布代理的引用和配置记录。
+     */
+    private fun clearCurrentAgentLocked() {
+        _currentService = null
+        currentAgentComponent = null
+        currentProvider = null
+        currentApiKey = null
+        currentBaseUrl = null
+        currentProxy = null
     }
 
     /**
@@ -268,7 +342,10 @@ class DelegatingAgentService @Inject constructor(
      * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
      * @param mediaData 要发送的媒体数据列表；可为空。
      * @return 底层代理生成的回复文本；未生成可返回内容时返回空字符串。
+     * @throws AgentTurnFailedException 当当前 OpenAI 代理未完成回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务尚未初始化、已禁用或已关闭时抛出。
+     * @throws Exception 当当前非 OpenAI 代理以其原有语义报告失败时抛出。
+     * @throws CancellationException 当模型切换屏障、当前代理或调用协程被取消时原样抛出。
      */
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String {
         return modelSwitchBarrier.runWhenReady {
@@ -277,14 +354,43 @@ class DelegatingAgentService @Inject constructor(
     }
 
     /**
-     * 关闭当前底层代理并清除服务引用。
+     * 终态关闭当前底层代理并清除服务引用。
      *
-     * @return 底层代理有异步清理工作时返回对应任务；不存在代理或无需清理时返回 `null`。
+     * 首次调用会停止设置订阅，并等待当前代理及任何正在进行的重建安全完成清理；重复调用返回同一个
+     * 等待任务。调用方取消等待任务不会取消清理，后续调用会提供新的等待任务。关闭后服务不再发布新的
+     * 代理。
+     *
+     * @return 幂等的异步清理任务；等待其完成后当前 Agent 组件持有的资源均已释放。
      */
-    override fun close(): Job? {
-        val closeJob = _currentService?.close()
-        _currentService = null
-        currentAgentComponent = null
-        return closeJob
+    override fun close(): Job = synchronized(lifecycleLock) {
+        val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
+            closed = true
+            val settingsJobToStop = settingsJob
+            settingsJob = null
+            settingsJobToStop?.cancel()
+            val serviceToClose = _currentService
+            clearCurrentAgentLocked()
+            closeCompletion = newCompletion
+            closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    try {
+                        settingsJobToStop?.join()
+                        serviceToClose?.close()?.join()
+                    } catch (e: Exception) {
+                        logger.error("Failed to close delegating agent resources", e)
+                    } finally {
+                        newCompletion.complete(Unit)
+                    }
+                }
+            }
+        }
+        if (closeJob == null || closeJob?.isCancelled == true) {
+            closeJob = closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    completion.await()
+                }
+            }
+        }
+        closeJob!!
     }
 }

@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.di
 
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import dagger.Subcomponent
 
 /**
@@ -12,6 +13,13 @@ import dagger.Subcomponent
 @AgentScope
 @Subcomponent
 interface AgentComponent {
+    /**
+     * 此代理作用域专属的 MCP 连接服务。
+     *
+     * 同一组件内的代理服务复用该实例；不同 [AgentComponent] 的实例与其 HTTP 客户端相互隔离。
+     */
+    val mcpClientService: MCPClientService
+
     /** Gemini 协议对应的代理服务。 */
     val geminiAgentService: GeminiAgentService
 

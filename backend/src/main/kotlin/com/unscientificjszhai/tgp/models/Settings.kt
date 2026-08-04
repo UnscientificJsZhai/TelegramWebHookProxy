@@ -1,6 +1,8 @@
 package com.unscientificjszhai.tgp.models
 
 import kotlinx.serialization.Serializable
+import java.net.Inet6Address
+import java.net.InetAddress
 
 /**
  * 应用运行所需的持久化设置。
@@ -34,6 +36,7 @@ data class AppSettings(
  * @property autoCleanContextIntervalMinutes 自动清理会话上下文的间隔，单位为分钟；`0` 表示不自动清理。
  * @property silentContextCleanup 是否在自动清理上下文时保持静默。
  * @property mcpServers 要连接的 MCP 服务器配置；空列表表示不连接 MCP 服务器。
+ * @property httpToolSettings 模型 HTTP 工具的受限出站设置；默认禁用且不声明工具。
  */
 @Serializable
 data class AISettings(
@@ -48,7 +51,209 @@ data class AISettings(
     val autoCleanContextIntervalMinutes: Int = 0,
     val silentContextCleanup: Boolean = false,
     val mcpServers: List<MCPServerConfig> = emptyList(),
+    val httpToolSettings: HttpToolSettings = HttpToolSettings(),
 )
+
+/**
+ * 模型 HTTP 工具的持久化边界设置。
+ *
+ * 工具仅在 [enabled] 为 `true` 且至少存在一个合法目标时声明。请求超时和并发数仅可在
+ * 本类型规定的硬上限内配置，目标以完整固定的 URL 组成部分表示，模型不能覆盖它们。
+ *
+ * @property enabled 是否向模型声明 HTTP 工具；`false` 时任何调用都会被拒绝。
+ * @property targets 允许调用的固定 HTTP 目标；为空时不声明工具。
+ * @property requestTimeoutMillis 单次 HTTP 请求超时，单位为毫秒，必须在 `1..30000` 范围内。
+ * @property maxConcurrentRequests 此提供者允许的并发 HTTP 请求数，必须在 `1..4` 范围内。
+ */
+@Serializable
+data class HttpToolSettings(
+    val enabled: Boolean = false,
+    val targets: List<HttpCallTarget> = emptyList(),
+    val requestTimeoutMillis: Long = 10_000,
+    val maxConcurrentRequests: Int = 2,
+)
+
+/**
+ * 由模型 HTTP 工具调用的精确固定目标。
+ *
+ * [scheme]、[host]、[port]、[path] 和 [method] 共同组成唯一请求地址。模型只能传递
+ * [id] 和 POST 请求的 JSON 文本，不能添加查询参数、请求头或覆盖任何目标字段。
+ *
+ * @property id 目标的稳定标识，长度为 `1..64`，只能包含 ASCII 字母、数字、`-` 和 `_`。
+ * @property scheme 固定协议，只能为小写 `https` 或受限的 `http`。
+ * @property host 固定的裸主机名或 IP 地址，不含 URL、端口、通配符或用户信息。
+ * @property port 固定端口，必须在 `1..65535` 范围内。
+ * @property path 固定的绝对路径，必须以 `/` 开始且不含查询、片段、百分号编码或路径遍历段。
+ * @property method 固定请求方法；v1 仅支持 GET 和 POST。
+ * @property allowedCidrs 允许 DNS 结果使用的精确单 IP CIDR 例外；每项只能是 `/32` 或 `/128`。
+ */
+@Serializable
+data class HttpCallTarget(
+    val id: String,
+    val scheme: String = "https",
+    val host: String,
+    val port: Int = 443,
+    val path: String,
+    val method: HttpToolMethod = HttpToolMethod.GET,
+    val allowedCidrs: List<String> = emptyList(),
+)
+
+/**
+ * HTTP 工具目标允许的固定请求方法。
+ */
+@Serializable
+enum class HttpToolMethod {
+    /** 不带请求体的读取请求。 */
+    GET,
+
+    /** 仅允许携带受限 JSON 请求体的写入请求。 */
+    POST,
+}
+
+/**
+ * 校验模型 HTTP 工具配置是否满足出站边界。
+ *
+ * 校验不进行 DNS 查询或网络 I/O。调用方必须在接收配置和持久化配置前各调用一次；运行时
+ * 仍会在实际 DNS 查询与执行前重新校验快照。
+ *
+ * @param settings 要校验的 HTTP 工具设置；即使 [HttpToolSettings.enabled] 为 `false`，其中已
+ * 配置的目标也必须满足相同的语法和边界约束。
+ * @throws IllegalArgumentException 目标、CIDR、超时或并发数不符合固定边界时抛出。
+ */
+fun validateHttpToolSettings(settings: HttpToolSettings) {
+    require(settings.targets.size <= MAX_HTTP_TOOL_TARGETS) { "HTTP 工具目标不能超过 $MAX_HTTP_TOOL_TARGETS 个。" }
+    require(settings.requestTimeoutMillis in 1..MAX_HTTP_TOOL_TIMEOUT_MILLIS) {
+        "HTTP 工具超时必须在 1..$MAX_HTTP_TOOL_TIMEOUT_MILLIS 毫秒范围内。"
+    }
+    require(settings.maxConcurrentRequests in 1..MAX_HTTP_TOOL_CONCURRENCY) {
+        "HTTP 工具并发数必须在 1..$MAX_HTTP_TOOL_CONCURRENCY 范围内。"
+    }
+
+    val ids = HashSet<String>()
+    settings.targets.forEach { target ->
+        validateHttpCallTarget(target)
+        require(ids.add(target.id)) { "HTTP 工具目标标识不能重复。" }
+    }
+}
+
+/**
+ * 校验单个模型 HTTP 工具目标是否为精确、可隔离的固定目标。
+ *
+ * @param target 要校验的固定目标。
+ * @throws IllegalArgumentException 目标包含 URL 可变部分、不受支持的方法或不安全的 HTTP 例外时抛出。
+ */
+fun validateHttpCallTarget(target: HttpCallTarget) {
+    require(target.id.length in 1..MAX_HTTP_TOOL_TARGET_ID_LENGTH && target.id.all(::isHttpToolIdCharacter)) {
+        "HTTP 工具目标标识格式不合法。"
+    }
+    require(target.scheme == HTTPS_SCHEME || target.scheme == HTTP_SCHEME) { "HTTP 工具仅支持 https 或受限 http。" }
+    require(target.host.length in 1..MAX_HTTP_TOOL_HOST_LENGTH && isValidHttpToolHost(target.host)) {
+        "HTTP 工具主机必须是固定的裸主机名或 IP 地址。"
+    }
+    require(target.port in 1..65535) { "HTTP 工具端口必须在 1..65535 范围内。" }
+    require(target.path.length in 1..MAX_HTTP_TOOL_PATH_LENGTH && isValidHttpToolPath(target.path)) {
+        "HTTP 工具路径必须是固定的绝对路径，且不能包含查询、片段、百分号编码或路径遍历。"
+    }
+    val bracketLength = if (target.host.contains(':')) 2 else 0
+    val urlLength = target.scheme.length + 3 + target.host.length + bracketLength +
+            1 + target.port.toString().length + target.path.length
+    require(urlLength <= MAX_HTTP_TOOL_URL_LENGTH) { "HTTP 工具固定 URL 不能超过 $MAX_HTTP_TOOL_URL_LENGTH 个字符。" }
+    require(target.allowedCidrs.size <= MAX_HTTP_TOOL_CIDR_EXCEPTIONS) {
+        "HTTP 工具 CIDR 例外不能超过 $MAX_HTTP_TOOL_CIDR_EXCEPTIONS 个。"
+    }
+    val cidrs = target.allowedCidrs.map(::parseExactHttpToolCidr)
+    require(cidrs.distinct().size == cidrs.size) { "HTTP 工具 CIDR 例外不能重复。" }
+
+    if (target.scheme == HTTP_SCHEME) {
+        val hostAddress = parseHttpToolLiteralAddress(target.host)
+        require(hostAddress != null && (target.host == LOOPBACK_IPV4 || target.host == LOOPBACK_IPV6)) {
+            "HTTP 工具仅允许精确的 127.0.0.1 或 ::1 目标。"
+        }
+        require(cidrs.size == 1 && cidrs.single().address == hostAddress) {
+            "HTTP loopback 目标必须配置与主机完全一致的单 IP CIDR 例外。"
+        }
+    }
+}
+
+internal const val MAX_HTTP_TOOL_TARGETS = 32
+internal const val MAX_HTTP_TOOL_TIMEOUT_MILLIS = 30_000L
+internal const val MAX_HTTP_TOOL_CONCURRENCY = 4
+internal const val MAX_HTTP_TOOL_TARGET_ID_LENGTH = 64
+internal const val MAX_HTTP_TOOL_HOST_LENGTH = 253
+internal const val MAX_HTTP_TOOL_PATH_LENGTH = 2_048
+internal const val MAX_HTTP_TOOL_URL_LENGTH = 4_096
+internal const val MAX_HTTP_TOOL_CIDR_EXCEPTIONS = 8
+internal const val HTTPS_SCHEME = "https"
+internal const val HTTP_SCHEME = "http"
+internal const val LOOPBACK_IPV4 = "127.0.0.1"
+internal const val LOOPBACK_IPV6 = "::1"
+
+internal data class ExactHttpToolCidr(val address: InetAddress)
+
+internal fun parseExactHttpToolCidr(value: String): ExactHttpToolCidr {
+    require(value.length in 4..MAX_HTTP_TOOL_HOST_LENGTH && value.count { it == '/' } == 1) {
+        "HTTP 工具 CIDR 必须是精确的单 IP CIDR。"
+    }
+    val separator = value.indexOf('/')
+    val addressText = value.substring(0, separator)
+    val prefixText = value.substring(separator + 1)
+    val address = parseHttpToolLiteralAddress(addressText)
+        ?: throw IllegalArgumentException("HTTP 工具 CIDR 必须使用字面 IP 地址。")
+    val expectedPrefix = address.address.size * 8
+    require(prefixText.toIntOrNull() == expectedPrefix && prefixText.all(Char::isDigit)) {
+        "HTTP 工具 CIDR 例外必须是精确的 /$expectedPrefix 单 IP 地址。"
+    }
+    return ExactHttpToolCidr(address)
+}
+
+internal fun parseHttpToolLiteralAddress(value: String): InetAddress? = when {
+    isValidHttpToolIpv4Address(value) ->
+        InetAddress.getByAddress(value.split('.').map(String::toInt).map(Int::toByte).toByteArray())
+
+    isValidIpv6Address(value) -> runCatching { InetAddress.getByName(value) }
+        .getOrNull()
+        ?.takeIf { it is Inet6Address && !it.isIpv4MappedAddress() }
+
+    else -> null
+}
+
+private fun isHttpToolIdCharacter(character: Char): Boolean =
+    character.isAsciiLetterOrDigit() || character == '-' || character == '_'
+
+private fun Char.isAsciiLetterOrDigit(): Boolean =
+    this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9'
+
+private fun isValidHttpToolHost(host: String): Boolean =
+    !host.contains('*') &&
+            !host.any { it.isWhitespace() || it.isISOControl() } &&
+            !host.contains("://") &&
+            !host.any { it == '/' || it == '?' || it == '#' || it == '@' || it == '[' || it == ']' } &&
+            when {
+                host.contains(':') -> parseHttpToolLiteralAddress(host) is Inet6Address
+                host.all { it.isDigit() || it == '.' } -> isValidHttpToolIpv4Address(host) || isValidHostname(host)
+                else -> isValidHostname(host)
+            }
+
+private fun isValidHttpToolPath(path: String): Boolean {
+    if (!path.startsWith('/') || path.contains('?') || path.contains('#') || path.contains('*') || path.contains('%')) return false
+    if (path.any { it.isWhitespace() || it.isISOControl() || it == '\\' }) return false
+    return path.split('/').none { it == "." || it == ".." }
+}
+
+private fun isValidHttpToolIpv4Address(host: String): Boolean {
+    val octets = host.split('.')
+    return octets.size == 4 && octets.all { octet ->
+        octet.isNotEmpty() &&
+                octet.all(Char::isDigit) &&
+                (octet == "0" || !octet.startsWith('0')) &&
+                octet.toIntOrNull()?.let { it in 0..255 } == true
+    }
+}
+
+private fun Inet6Address.isIpv4MappedAddress(): Boolean {
+    val bytes = address
+    return bytes.take(10).all { it == 0.toByte() } && bytes[10] == 0xff.toByte() && bytes[11] == 0xff.toByte()
+}
 
 /**
  * 可选的 AI 服务提供方。

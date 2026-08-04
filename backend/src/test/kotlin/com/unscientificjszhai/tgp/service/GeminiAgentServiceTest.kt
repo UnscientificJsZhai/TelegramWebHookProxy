@@ -6,12 +6,16 @@ import com.google.genai.Client
 import com.google.genai.Models
 import com.google.genai.Pager
 import com.google.genai.types.*
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
@@ -86,6 +90,53 @@ class GeminiAgentServiceTest {
         val restoredService = newService()
 
         assertEquals("models/gemini-custom", restoredService.currentModel)
+    }
+
+    /**
+     * 验证启用 Gemini 的新实例会等待首轮 MCP 连接、工具快照和聊天会话创建后才报告就绪。
+     */
+    @Test
+    fun `initial Gemini readiness waits for the MCP connection and chat`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val releaseConnection = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.GEMINI,
+                    geminiApiKey = "test-key",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            releaseConnection.await()
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val initializedService = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        try {
+            connectionStarted.await()
+            val readiness = assertNotNull(initializedService.initializationJob())
+            assertFalse(readiness.isCompleted)
+
+            releaseConnection.complete(Unit)
+            readiness.join()
+
+            assertFalse(readiness.isCancelled)
+        } finally {
+            releaseConnection.complete(Unit)
+            initializedService.close().join()
+        }
     }
 
     /**
@@ -295,9 +346,15 @@ class GeminiAgentServiceTest {
         assertEquals("工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。", exception.message)
         verify(exactly = 1) { chat.sendMessage(any<List<Content>>()) }
         verify(exactly = MAX_TOOL_CALL_ROUNDS) { chat.sendMessage(any<Content>()) }
-        assertEquals(newChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
+        val chatField = GeminiAgentService::class.java.getDeclaredField("chat").apply {
             isAccessible = true
-        }.get(service))
+        }
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) {
+                while (chatField.get(service) == null) delay(10)
+            }
+        }
+        assertEquals(newChat, chatField.get(service))
         assertEquals("新会话", service.sendMessage("继续对话"))
         verify(exactly = 1) { chats.create(any<String>(), any<GenerateContentConfig>()) }
         verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
@@ -332,6 +389,42 @@ class GeminiAgentServiceTest {
         assertTrue(closeJob.isCompleted)
     }
 
+    /**
+     * 验证 Gemini 关闭在调用方取消等待任务后仍会完成客户端和所属 MCP 服务的终态清理。
+     *
+     * MCP 清理未完成时，重试关闭取得的等待任务不能提前完成。
+     */
+    @Test
+    fun `Gemini close survives cancellation of its returned wait job`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val client = mockk<Client>()
+        val mcpCloseJob = Job()
+        val mcpCloseCalled = CompletableDeferred<Unit>()
+        every { client.close() } returns Unit
+        every { mcpClientService.close() } answers {
+            mcpCloseCalled.complete(Unit)
+            mcpCloseJob
+        }
+        val closingService = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+        setPrivateField(closingService, "client", client)
+
+        val cancelledWaitJob = closingService.close()
+        cancelledWaitJob.cancel()
+        val retryWaitJob = closingService.close()
+        withTimeout(5.seconds) { mcpCloseCalled.await() }
+        assertFalse(retryWaitJob.isCompleted)
+
+        mcpCloseJob.complete()
+        withTimeout(5.seconds) { retryWaitJob.join() }
+        verify(exactly = 1) { client.close() }
+        verify(exactly = 1) { mcpClientService.close() }
+    }
+
     private fun responseWithParts(vararg parts: Part): GenerateContentResponse =
         GenerateContentResponse.builder().candidates(
             Candidate.builder().content(
@@ -341,6 +434,9 @@ class GeminiAgentServiceTest {
 
     private fun injectChat(chat: Chat) {
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, chat)
+        GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
+            isAccessible = true
+        }.set(service, LocalFunctionRouter(emptyList()).refresh())
     }
 
     private fun injectClient(chats: Chats, models: Models? = null) {
@@ -364,6 +460,10 @@ class GeminiAgentServiceTest {
 
     private fun setPrivateField(name: String, value: Any?) {
         GeminiAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(service, value)
+    }
+
+    private fun setPrivateField(target: GeminiAgentService, name: String, value: Any?) {
+        GeminiAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(target, value)
     }
 
 }
