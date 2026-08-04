@@ -4,8 +4,7 @@ import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
-import com.unscientificjszhai.tgp.models.validateHttpToolSettings
-import com.unscientificjszhai.tgp.models.validateProxySettings
+import com.unscientificjszhai.tgp.repository.SettingsRevisionMismatchException
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -30,9 +29,24 @@ fun Application.apiModule(appComponent: AppComponent) {
     routing {
         route("/api") {
             get("/settings") {
-                call.respond(settingsRepository.settingsFlow.value)
+                val snapshot = settingsRepository.currentSettingsSnapshot()
+                call.response.headers.append(HttpHeaders.ETag, snapshot.revision.toStrongETag())
+                call.respond(snapshot.settings)
             }
             post("/settings") {
+                val expectedRevision = when (val parsed = call.request.headers.parseSingleStrongETag()) {
+                    IfMatchResult.Missing -> {
+                        call.respond(PRECONDITION_REQUIRED, "必须提供 If-Match 设置修订值。")
+                        return@post
+                    }
+
+                    IfMatchResult.Invalid -> {
+                        call.respond(HttpStatusCode.BadRequest, "If-Match 必须是单个合法强 ETag。")
+                        return@post
+                    }
+
+                    is IfMatchResult.Valid -> parsed.revision
+                }
                 val newSettings = try {
                     call.receive<AppSettings>()
                 } catch (e: CancellationException) {
@@ -41,12 +55,13 @@ fun Application.apiModule(appComponent: AppComponent) {
                     call.respond(HttpStatusCode.BadRequest, "设置请求格式不合法。")
                     return@post
                 }
-                val oldSettings = settingsRepository.settingsFlow.value
-                val settingsToSave = newSettings.clearSelectedModelWhenProviderOrApiKeyChanges(oldSettings)
-                try {
-                    validateProxySettings(settingsToSave.proxy)
-                    settingsToSave.ai?.httpToolSettings?.let(::validateHttpToolSettings)
-                    settingsRepository.saveSettings(settingsToSave)
+                val update = try {
+                    settingsRepository.updateSettings(expectedRevision) { currentSettings ->
+                        newSettings.clearSelectedModelWhenProviderOrApiKeyChanges(currentSettings)
+                    }
+                } catch (_: SettingsRevisionMismatchException) {
+                    call.respond(HttpStatusCode.PreconditionFailed, "设置已被其他操作修改。")
+                    return@post
                 } catch (e: IllegalArgumentException) {
                     call.respond(HttpStatusCode.BadRequest, e.message ?: "代理设置不合法。")
                     return@post
@@ -55,21 +70,26 @@ fun Application.apiModule(appComponent: AppComponent) {
                     return@post
                 }
 
-                if (settingsToSave.telegramToken != oldSettings.telegramToken ||
-                    settingsToSave.ai?.agentEnabled != oldSettings.ai?.agentEnabled
+                val oldSettings = update.previous.settings
+                val savedSettings = update.current.settings
+                val oldEffectiveProvider = oldSettings.ai?.takeIf { it.agentEnabled }?.provider
+                val newEffectiveProvider = savedSettings.ai?.takeIf { it.agentEnabled }?.provider
+                if (savedSettings.telegramToken != oldSettings.telegramToken ||
+                    newEffectiveProvider != oldEffectiveProvider
                 ) {
-                    if (settingsToSave.telegramToken.isNotBlank()) {
+                    if (savedSettings.telegramToken.isNotBlank()) {
                         try {
                             telegramService.updateBotCommands(
-                                settingsToSave.telegramToken,
-                                settingsToSave.ai?.agentEnabled == true,
+                                savedSettings.telegramToken,
+                                newEffectiveProvider,
                             )
                         } catch (e: Exception) {
                             application.log.error("Failed to update bot commands: ${e.message}")
                         }
                     }
                 }
-                call.respond(HttpStatusCode.OK)
+                call.response.headers.append(HttpHeaders.ETag, update.current.revision.toStrongETag())
+                call.respond(HttpStatusCode.OK, savedSettings)
             }
             post("/settings/chat") {
                 val request = try {
@@ -80,12 +100,10 @@ fun Application.apiModule(appComponent: AppComponent) {
                     call.respond(HttpStatusCode.BadRequest, "聊天设置请求格式不合法。")
                     return@post
                 }
-                val currentSettings = settingsRepository.settingsFlow.value
-                val newSettings = currentSettings.copy(chatId = request.chatId)
                 try {
-                    validateProxySettings(newSettings.proxy)
-                    newSettings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
-                    settingsRepository.saveSettings(newSettings)
+                    settingsRepository.updateSettings { currentSettings ->
+                        currentSettings.copy(chatId = request.chatId)
+                    }
                 } catch (e: IllegalArgumentException) {
                     call.respond(HttpStatusCode.BadRequest, e.message ?: "代理设置不合法。")
                     return@post
@@ -162,6 +180,26 @@ fun Application.apiModule(appComponent: AppComponent) {
         }
     }
 }
+
+private val PRECONDITION_REQUIRED = HttpStatusCode(428, "Precondition Required")
+private val STRONG_ETAG = Regex("\"([0-9a-f]{64})\"")
+
+private sealed interface IfMatchResult {
+    data object Missing : IfMatchResult
+    data object Invalid : IfMatchResult
+    data class Valid(val revision: String) : IfMatchResult
+}
+
+private fun Headers.parseSingleStrongETag(): IfMatchResult {
+    val values = getAll(HttpHeaders.IfMatch) ?: return IfMatchResult.Missing
+    if (values.size != 1) {
+        return IfMatchResult.Invalid
+    }
+    val match = STRONG_ETAG.matchEntire(values.single().trim()) ?: return IfMatchResult.Invalid
+    return IfMatchResult.Valid(match.groupValues[1])
+}
+
+private fun String.toStrongETag(): String = "\"$this\""
 
 private fun AppSettings.clearSelectedModelWhenProviderOrApiKeyChanges(oldSettings: AppSettings): AppSettings {
     val newAiSettings = ai ?: return this

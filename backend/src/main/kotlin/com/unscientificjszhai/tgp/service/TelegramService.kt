@@ -39,15 +39,18 @@ data class TelegramApiResponse(
 /**
  * 封装 Telegram Bot API 的 HTTP 调用，并根据当前代理设置维护客户端。
  *
- * 设置中的代理发生变化时，会先创建候选客户端，再在短同步临界区内替换当前客户端。正在使用已退休
- * 客户端的请求可以完成，最后一个请求结束后客户端只会关闭一次。历史配置中的非法代理只会为
- * Telegram 禁用代理，不会影响持久化设置或其他服务。
+ * 每个使用当前设置的默认请求都会在开始时与 Telegram token 生命周期串行地捕获 token；捕获后的
+ * 在途请求可继续使用该 token 完成，保存操作返回后新开始的默认请求则会使用新 token。设置中的代理
+ * 发生变化时，会先创建候选客户端，再在短同步临界区内替换当前客户端。正在使用已退休客户端的请求
+ * 可以完成，最后一个请求结束后客户端只会关闭一次。历史配置中的非法代理只会为 Telegram 禁用代理，
+ * 不会影响持久化设置或其他服务。
  */
 class TelegramService private constructor(
     parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository,
     private val clientFactory: (ProxySettings?) -> HttpClient,
+    private val clientInstalledObserver: (ProxySettings?) -> Unit,
     @Suppress("UNUSED_PARAMETER") testConstructorMarker: Unit,
 ) : AutoCloseable {
     /**
@@ -63,21 +66,26 @@ class TelegramService private constructor(
         parentScope: CoroutineScope,
         settingsRepository: SettingsRepository,
         updatesRepository: UpdatesRepository,
-    ) : this(parentScope, settingsRepository, updatesRepository, ::createDefaultClient, Unit)
+    ) : this(parentScope, settingsRepository, updatesRepository, ::createDefaultClient, {}, Unit)
 
     internal constructor(
         parentScope: CoroutineScope,
         settingsRepository: SettingsRepository,
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
-    ) : this(parentScope, settingsRepository, updatesRepository, clientFactory, Unit)
+    ) : this(parentScope, settingsRepository, updatesRepository, clientFactory, {}, Unit)
+
+    internal constructor(
+        parentScope: CoroutineScope,
+        settingsRepository: SettingsRepository,
+        updatesRepository: UpdatesRepository,
+        clientFactory: (ProxySettings?) -> HttpClient,
+        clientInstalledObserver: (ProxySettings?) -> Unit,
+    ) : this(parentScope, settingsRepository, updatesRepository, clientFactory, clientInstalledObserver, Unit)
 
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private val logger = LoggerFactory.getLogger(TelegramService::class.java)
     private val clientLock = Any()
-
-    @Volatile
-    private var requestSettings: AppSettings = settingsRepository.settingsFlow.value
     private var activeClient: ClientLease? = null
     private var installedProxy: ProxySettings? = null
     private var invalidProxyWarningIssued = false
@@ -85,8 +93,9 @@ class TelegramService private constructor(
     private val settingsSubscription: Job
 
     init {
+        val initialSettings = settingsRepository.settingsFlow.value
         val initialProxy = telegramProxyOrNull(
-            proxy = requestSettings.proxy,
+            proxy = initialSettings.proxy,
             hasHistoricalInvalidProxy = settingsRepository.hasHistoricalInvalidProxy,
         )
         activeClient = ClientLease(createClient(initialProxy))
@@ -94,7 +103,7 @@ class TelegramService private constructor(
         settingsSubscription = settingsRepository.settingsFlow
             .onEach { newSettings ->
                 try {
-                    updateSettings(newSettings)
+                    updateProxyClient(newSettings)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -103,8 +112,8 @@ class TelegramService private constructor(
             }.launchIn(scope)
     }
 
-    private fun updateSettings(newSettings: AppSettings) {
-        requestSettings = newSettings
+    /** 根据新设置协调 Telegram HTTP 客户端所使用的代理。 */
+    private fun updateProxyClient(newSettings: AppSettings) {
         val desiredProxy = telegramProxyOrNull(
             proxy = newSettings.proxy,
             hasHistoricalInvalidProxy = settingsRepository.hasHistoricalInvalidProxy,
@@ -167,6 +176,7 @@ class TelegramService private constructor(
             candidate.close()
         } else {
             retiredClient?.close()
+            clientInstalledObserver(proxy)
         }
     }
 
@@ -221,7 +231,8 @@ class TelegramService private constructor(
     /**
      * 向指定聊天发送文本消息。
      *
-     * 使用当前设置中的机器人令牌发起 `sendMessage` 请求。
+     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
+     * `sendMessage` 请求；捕获后的在途请求可使用该令牌完成。
      *
      * @param chatId 目标聊天标识，不能为空。
      * @param text 要发送的文本，不能为空。
@@ -233,7 +244,7 @@ class TelegramService private constructor(
         chatId: String,
         text: String,
         replyParameters: ReplyParameters? = null,
-    ): TelegramApiResponse = sendMessageForToken(requestSettings.telegramToken, chatId, text, replyParameters)
+    ): TelegramApiResponse = sendMessageForToken(currentTelegramToken(), chatId, text, replyParameters)
 
     /** 供轮询会话使用，以会话捕获的 token 发送文本消息。 */
     internal suspend fun sendMessageForToken(
@@ -253,6 +264,22 @@ class TelegramService private constructor(
         }
     }
 
+    /**
+     * 向指定聊天发送临时聊天动作。
+     *
+     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
+     * `sendChatAction` 请求；捕获后的在途请求可使用该令牌完成。
+     *
+     * @param chatId 目标聊天标识，不能为空。
+     * @param action Telegram 支持的聊天动作名称，不能为空，例如 `typing`。
+     * @return 已完整读取、不再依赖 HTTP 客户端的 Telegram 响应快照。
+     * @throws IllegalStateException 当前机器人令牌为空时抛出。
+     */
+    suspend fun sendChatAction(
+        chatId: String,
+        action: String,
+    ): TelegramApiResponse = sendChatActionForToken(currentTelegramToken(), chatId, action)
+
     /** 供轮询会话使用，以会话捕获的 token 发送聊天动作。 */
     internal suspend fun sendChatActionForToken(
         token: String,
@@ -269,6 +296,22 @@ class TelegramService private constructor(
             }.toTelegramApiResponse()
         }
     }
+
+    /**
+     * 拉取机器人更新。
+     *
+     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
+     * `getUpdates` 请求；捕获后的在途请求可使用该令牌完成。
+     *
+     * @param offset 可选的起始更新标识；为 `null` 时不传递该请求参数。
+     * @param timeout 可选的长轮询等待秒数；为 `null` 时不传递该请求参数。
+     * @return Telegram 返回的更新结果；`result` 可能为空列表。
+     * @throws IllegalStateException 当前机器人令牌为空时抛出。
+     */
+    suspend fun getUpdates(
+        offset: Long? = null,
+        timeout: Int? = null,
+    ): GetUpdatesResponse = getUpdatesForToken(currentTelegramToken(), offset, timeout)
 
     /** 供轮询会话使用，以会话捕获的 token 拉取更新。 */
     internal suspend fun getUpdatesForToken(
@@ -287,6 +330,18 @@ class TelegramService private constructor(
         }
     }
 
+    /**
+     * 获取 Telegram 文件元数据。
+     *
+     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
+     * `getFile` 请求；捕获后的在途请求可使用该令牌完成。
+     *
+     * @param fileId Telegram 分配的文件唯一标识，不能为空。
+     * @return Telegram 返回的文件元数据；响应中的文件路径可能为 `null`。
+     * @throws IllegalStateException 当前机器人令牌为空时抛出。
+     */
+    suspend fun getFile(fileId: String): FileResponse = getFileForToken(currentTelegramToken(), fileId)
+
     /** 供轮询会话使用，以会话捕获的 token 获取文件元数据。 */
     internal suspend fun getFileForToken(token: String, fileId: String): FileResponse {
         requireTelegramToken(token)
@@ -299,6 +354,18 @@ class TelegramService private constructor(
         }
     }
 
+    /**
+     * 下载 Telegram 文件的完整字节内容。
+     *
+     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起文件下载
+     * 请求；捕获后的在途请求可使用该令牌完成。
+     *
+     * @param filePath Telegram 返回的相对文件路径，不能为空。
+     * @return 下载得到的字节数组；空文件返回空数组。
+     * @throws IllegalStateException 当前机器人令牌为空时抛出。
+     */
+    suspend fun downloadFile(filePath: String): ByteArray = downloadFileForToken(currentTelegramToken(), filePath)
+
     /** 供轮询会话使用，以会话捕获的 token 下载文件。 */
     internal suspend fun downloadFileForToken(token: String, filePath: String): ByteArray {
         requireTelegramToken(token)
@@ -310,28 +377,32 @@ class TelegramService private constructor(
     /**
      * 更新机器人的可用指令列表。
      *
-     * AI 启用时设置模型和会话相关指令；未启用时删除全部机器人指令。
+     * [aiProvider] 非空时设置与该提供方匹配的模型及会话相关指令；为 `null` 时删除全部机器人指令。
      *
      * @param token 用于本次请求的 Telegram 机器人令牌，不能为空。
-     * @param enableAI `true` 时设置 AI 指令，`false` 时删除现有指令。
+     * @param aiProvider 当前有效的 AI 服务提供方；`null` 表示未启用 AI，不发布任何指令。
      * @return 已完整读取、不再依赖 HTTP 客户端的 Telegram 响应快照。
      * @throws IllegalStateException [token] 为空时抛出。
      */
     suspend fun updateBotCommands(
         token: String,
-        enableAI: Boolean,
+        aiProvider: AIProvider?,
     ): TelegramApiResponse {
         requireTelegramToken(token)
 
         return withClientLease { client ->
-            if (enableAI) {
+            if (aiProvider != null) {
                 val url = "https://api.telegram.org/bot$token/setMyCommands"
+                val modelDescription = when (aiProvider) {
+                    AIProvider.GEMINI -> "切换 Gemini 模型"
+                    AIProvider.OPENAI -> "切换 OpenAI 模型"
+                }
                 client.post(url) {
                     contentType(ContentType.Application.Json)
                     setBody(
                         SetMyCommandsRequest(
                             commands = listOf(
-                                BotCommand("model", "切换 Gemini 模型"),
+                                BotCommand("model", modelDescription),
                                 BotCommand("reset", "重置对话上下文"),
                                 BotCommand("keep", "延长上下文自动清理时间"),
                             ),
@@ -375,6 +446,17 @@ class TelegramService private constructor(
         if (token.isBlank()) {
             throw IllegalStateException("Telegram token is not set.")
         }
+    }
+
+    /**
+     * 在 Telegram token 生命周期锁内捕获当前默认请求应使用的 token。
+     *
+     * 该方法只读取同步状态；调用方必须在锁外发起 HTTP 请求。
+     *
+     * @return 请求开始时当前设置中的 Telegram token；可能为空。
+     */
+    private fun currentTelegramToken(): String = settingsRepository.withTelegramTokenLifecycleLock {
+        settingsRepository.settingsFlow.value.telegramToken
     }
 
     private suspend fun HttpResponse.toTelegramApiResponse(): TelegramApiResponse =

@@ -748,16 +748,19 @@ class OpenAIAgentService @Inject constructor(
      * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
      */
     private fun clearPersistedSelectedModel(invalidModel: String) {
-        val settings = settingsRepository.settingsFlow.value
-        val aiSettings = settings.ai
-        if (
-            aiSettings?.provider == AIProvider.OPENAI &&
-            aiSettings.openAiApiKey == configuredApiKey &&
-            aiSettings.openAiBaseUrl == configuredBaseUrl &&
-            settings.proxy == configuredProxy &&
-            aiSettings.selectedModel == invalidModel
-        ) {
-            settingsRepository.saveSettings(settings.copy(ai = aiSettings.copy(selectedModel = "")))
+        settingsRepository.updateSettings { settings ->
+            val aiSettings = settings.ai
+            if (
+                aiSettings?.provider == AIProvider.OPENAI &&
+                aiSettings.openAiApiKey == configuredApiKey &&
+                aiSettings.openAiBaseUrl == configuredBaseUrl &&
+                settings.proxy == configuredProxy &&
+                aiSettings.selectedModel == invalidModel
+            ) {
+                settings.copy(ai = aiSettings.copy(selectedModel = ""))
+            } else {
+                settings
+            }
         }
     }
 

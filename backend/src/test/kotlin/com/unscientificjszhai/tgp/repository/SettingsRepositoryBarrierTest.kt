@@ -161,7 +161,7 @@ class SettingsRepositoryBarrierTest {
             }
             """.trimIndent(),
         )
-        val repository = SettingsRepository.forTesting(configFile)
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
 
         assertFalse(repository.settingsFlow.value.ai!!.httpToolSettings.enabled)
         assertTrue(repository.settingsFlow.value.ai!!.httpToolSettings.targets.isEmpty())

@@ -6,6 +6,7 @@ import com.unscientificjszhai.tgp.models.HttpCallTarget
 import com.unscientificjszhai.tgp.models.HttpToolMethod
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.runBlocking
 import mockwebserver3.MockResponse
@@ -218,8 +219,10 @@ class HttpCallingFunctionProviderTest {
 
         specialPurposeAddresses.forEach { address ->
             val connectionAttempts = AtomicInteger()
-            val repository =
-                SettingsRepository.forTesting(File(temporaryDirectory, "settings-${System.nanoTime()}.json"))
+            val repository = SettingsRepository.forTesting(
+                File(temporaryDirectory, "settings-${System.nanoTime()}.json"),
+                ModelSwitchBarrier(),
+            )
             repository.saveSettings(AppSettings(ai = AISettings(httpToolSettings = httpsHostnameSettings())))
             val provider = providerWith(
                 repository,
@@ -404,7 +407,10 @@ class HttpCallingFunctionProviderTest {
         httpToolSettings: HttpToolSettings,
         resolver: HttpToolDnsResolver = HttpToolDnsResolver { listOf(InetAddress.getByName("127.0.0.1")) },
     ): HttpCallingFunctionProvider {
-        val repository = SettingsRepository.forTesting(File(temporaryDirectory, "settings-${System.nanoTime()}.json"))
+        val repository = SettingsRepository.forTesting(
+            File(temporaryDirectory, "settings-${System.nanoTime()}.json"),
+            ModelSwitchBarrier(),
+        )
         repository.saveSettings(AppSettings(ai = AISettings(httpToolSettings = httpToolSettings)))
         return HttpCallingFunctionProvider(repository, resolver)
     }

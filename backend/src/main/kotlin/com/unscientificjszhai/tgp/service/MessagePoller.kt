@@ -5,11 +5,10 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
 import java.util.concurrent.locks.ReentrantLock
@@ -33,6 +32,7 @@ import kotlin.time.Duration.Companion.minutes
  * @param agentService 处理文本和媒体消息的 AI 代理服务。
  * @param settingsRepository 提供机器人与 AI 设置的仓储。
  * @param updatesRepository 持久化按机器人隔离的聊天信息和已完成更新标识的仓储。
+ * @param modelSwitchBarrier 与设置仓储及代理服务共享的启动和模型切换屏障。
  */
 @Singleton
 class MessagePoller @Inject constructor(
@@ -41,10 +41,44 @@ class MessagePoller @Inject constructor(
     private val agentService: AgentService,
     private val settingsRepository: SettingsRepository,
     private val updatesRepository: UpdatesRepository,
+    private val modelSwitchBarrier: ModelSwitchBarrier,
 ) : AutoCloseable {
+    /**
+     * 为未接入依赖注入的既有调用方创建轮询服务。
+     *
+     * 此兼容构造器复用 [settingsRepository] 持有的屏障，不会创建独立屏障。新代码应显式传入应用共享的
+     * [ModelSwitchBarrier]。
+     *
+     * @param parentScope 持有轮询服务的父协程作用域；取消该作用域会停止内部轮询任务。
+     * @param telegramService 与 Telegram Bot API 通信的服务。
+     * @param agentService 处理文本和媒体消息的 AI 代理服务。
+     * @param settingsRepository 提供机器人与 AI 设置的仓储，且必须持有应用共享的屏障。
+     * @param updatesRepository 持久化按机器人隔离的聊天信息和已完成更新标识的仓储。
+     */
+    @Deprecated("请显式传入与 SettingsRepository 共享的 ModelSwitchBarrier。")
+    constructor(
+        parentScope: CoroutineScope,
+        telegramService: TelegramService,
+        agentService: AgentService,
+        settingsRepository: SettingsRepository,
+        updatesRepository: UpdatesRepository,
+    ) : this(
+        parentScope,
+        telegramService,
+        agentService,
+        settingsRepository,
+        updatesRepository,
+        settingsRepository.modelSwitchBarrier,
+    )
+
     private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
+    private val lifecycleLock = Any()
     private val sessionLock = ReentrantLock()
+
+    @Volatile
+    private var closed = false
+
     private var settingsJob: Job? = null
     private var currentSession: PollingSession? = null
     private var processingTimeout: Duration = 10.minutes
@@ -57,6 +91,7 @@ class MessagePoller @Inject constructor(
      * @param agentService 处理文本和媒体消息的 AI 代理服务。
      * @param settingsRepository 提供机器人与 AI 设置的仓储。
      * @param updatesRepository 持久化按机器人隔离的状态的仓储。
+     * @param modelSwitchBarrier 与设置仓储及代理服务共享的启动和模型切换屏障。
      * @param processingTimeout 单条排队消息允许的最长处理时长；必须大于零。
      */
     internal constructor(
@@ -65,11 +100,42 @@ class MessagePoller @Inject constructor(
         agentService: AgentService,
         settingsRepository: SettingsRepository,
         updatesRepository: UpdatesRepository,
+        modelSwitchBarrier: ModelSwitchBarrier,
         processingTimeout: Duration,
-    ) : this(parentScope, telegramService, agentService, settingsRepository, updatesRepository) {
+    ) : this(parentScope, telegramService, agentService, settingsRepository, updatesRepository, modelSwitchBarrier) {
         require(processingTimeout.isPositive()) { "processingTimeout must be positive." }
         this.processingTimeout = processingTimeout
     }
+
+    /**
+     * 使用指定单条消息处理时限创建兼容的测试轮询服务。
+     *
+     * 此兼容构造器复用 [settingsRepository] 持有的屏障，不会创建独立屏障；新的测试应显式传入共享屏障。
+     *
+     * @param parentScope 持有轮询服务的父协程作用域。
+     * @param telegramService 与 Telegram Bot API 通信的服务。
+     * @param agentService 处理文本和媒体消息的 AI 代理服务。
+     * @param settingsRepository 提供机器人与 AI 设置的仓储，且必须持有共享屏障。
+     * @param updatesRepository 持久化按机器人隔离的状态的仓储。
+     * @param processingTimeout 单条排队消息允许的最长处理时长；必须大于零。
+     */
+    @Deprecated("新的测试应显式传入与 SettingsRepository 共享的 ModelSwitchBarrier。")
+    internal constructor(
+        parentScope: CoroutineScope,
+        telegramService: TelegramService,
+        agentService: AgentService,
+        settingsRepository: SettingsRepository,
+        updatesRepository: UpdatesRepository,
+        processingTimeout: Duration,
+    ) : this(
+        parentScope,
+        telegramService,
+        agentService,
+        settingsRepository,
+        updatesRepository,
+        settingsRepository.modelSwitchBarrier,
+        processingTimeout,
+    )
 
     private class PollingSession(
         val token: String,
@@ -91,20 +157,40 @@ class MessagePoller @Inject constructor(
     /**
      * 启动 token 生命周期监听，并按需创建唯一轮询会话。
      *
-     * 重复调用不会创建额外监听器。token 为空或格式无有效 bot 前缀时不创建会话；每次 token
-     * 实际改变后的代次都会替换会话，即使最终 token 文本恢复为原值。
+     * 此方法不会等待代理初始化或阻塞调用线程。屏障放行后才订阅 token 流并创建会话；关闭或调用协程
+     * 已取消时不创建会话。重复调用不会创建额外监听器。token 为空或格式无有效 bot 前缀时不创建会话；
+     * 每次 token 实际改变后的代次都会替换会话，即使最终 token 文本恢复为原值。
      */
     fun start() {
-        if (settingsJob != null) {
-            return
+        val started = synchronized(lifecycleLock) {
+            if (closed || settingsJob != null) {
+                false
+            } else {
+                settingsJob = scope.launch {
+                    modelSwitchBarrier.awaitReady()
+                    currentCoroutineContext().ensureActive()
+                    if (closed) {
+                        return@launch
+                    }
+                    settingsRepository.telegramTokenUpdateFlow.collect { tokenUpdate ->
+                        currentCoroutineContext().ensureActive()
+                        if (!closed) {
+                            replaceSession(tokenUpdate.token, tokenUpdate.generation)
+                        }
+                    }
+                }
+                true
+            }
         }
-        settingsJob = settingsRepository.telegramTokenUpdateFlow
-            .onEach { tokenUpdate -> replaceSession(tokenUpdate.token, tokenUpdate.generation) }
-            .launchIn(scope)
-        logger.info("Agent poller observer started.")
+        if (started) {
+            logger.info("Agent poller observer started.")
+        }
     }
 
     private suspend fun replaceSession(token: String, generation: Long) {
+        if (closed) {
+            return
+        }
         val sameSession = sessionLock.withLock {
             currentSession?.let { it.token == token && it.generation == generation } == true
         }
@@ -120,12 +206,8 @@ class MessagePoller @Inject constructor(
             previous.scope.cancel()
             previous.scope.coroutineContext[Job]?.join()
             // AgentService 的会话是全局的；token 切换时必须显式清除，避免 A 的上下文泄漏给 B。
-            try {
-                agentService.resetSession()?.join()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.warn("Failed to reset agent session while switching polling session", e)
+            if (!awaitSuccessfulAgentReset()) {
+                logger.warn("Failed to reset agent session while switching polling session; continuing with new bot session.")
             }
             logger.info("Cancelled polling session for bot {} at generation {}", previous.botId, previous.generation)
         }
@@ -142,8 +224,19 @@ class MessagePoller @Inject constructor(
             scope = sessionScope,
             updateChannel = Channel(capacity = 10),
         )
-        sessionLock.withLock {
-            currentSession = session
+        val installed = synchronized(lifecycleLock) {
+            if (closed) {
+                false
+            } else {
+                sessionLock.withLock {
+                    currentSession = session
+                }
+                true
+            }
+        }
+        if (!installed) {
+            sessionScope.cancel()
+            return
         }
         session.consumerJob = session.scope.launch { consumeQueue(session) }
         session.pollJob = session.scope.launch { runPolling(session) }
@@ -330,7 +423,7 @@ class MessagePoller @Inject constructor(
         }
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return completedSignal()
         val chatId = message.chat.id.toString()
-        if (!aiSettings.agentEnabled || chatId != aiSettings.agentChatId) {
+        if (!agentService.isAiFeatureEnabled(aiSettings) || chatId != aiSettings.agentChatId) {
             return completedSignal()
         }
 
@@ -361,8 +454,8 @@ class MessagePoller @Inject constructor(
     /**
      * 使用当前活跃会话处理 AI 聊天命令。
      *
-     * 当前没有有效会话时不会产生副作用。`/reset` 只清空当前会话的队列并保持已清空更新的确认
-     * 语义，不会影响其他机器人的队列。
+     * 当前没有有效会话时不会产生副作用。`/reset` 仅在代理重置任务正常完成且会话仍有效时，才清空当前
+     * 会话的队列并清除自动清理计时。重置失败时会保留这些状态并发送失败提示，不会影响其他机器人的队列。
      *
      * @param chatId 发送命令的聊天标识，不能为空。
      * @param text 完整命令文本；首个空白分隔字段作为命令。
@@ -383,9 +476,15 @@ class MessagePoller @Inject constructor(
             }
 
             "/reset" -> {
-                clearQueue(session)
                 ensureCurrent(session)
-                agentService.resetSession()?.join()
+                if (!awaitSuccessfulAgentReset()) {
+                    ensureCurrent(session)
+                    sendMessageForSession(session, chatId, "会话重置失败，请稍后重试。", ReplyParameters(messageId))
+                    logger.warn("Session reset failed by command in chat {}", chatId)
+                    return
+                }
+                ensureCurrent(session)
+                clearQueue(session)
                 ensureCurrent(session)
                 session.lastAiReplyAtMillis = null
                 sendMessageForSession(session, chatId, "会话已重置，待处理消息已清空。", ReplyParameters(messageId))
@@ -396,11 +495,14 @@ class MessagePoller @Inject constructor(
                 if (parts.size > 1) {
                     val requestedModel = parts[1].trim()
                     try {
+                        val settingsBeforeSelection = settingsRepository.currentSettingsSnapshot().settings
                         val selectedModel = agentService.availableModels.firstOrNull { model ->
                             model == requestedModel ||
                                     model.removePrefix("models/") == requestedModel.removePrefix("models/")
                         } ?: throw IllegalArgumentException("Unsupported model: $requestedModel")
-                        persistSelectedModel(selectedModel)
+                        if (!persistSelectedModel(selectedModel, settingsBeforeSelection)) {
+                            throw IllegalStateException("AI configuration changed while selecting a model")
+                        }
                         if (isCurrent(session)) {
                             session.lastAiReplyAtMillis = null
                         }
@@ -445,12 +547,35 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    private fun persistSelectedModel(selectedModel: String) {
-        val settings = settingsRepository.settingsFlow.value
-        val aiSettings = settings.ai ?: return
-        if (aiSettings.selectedModel != selectedModel) {
-            settingsRepository.saveSettings(settings.copy(ai = aiSettings.copy(selectedModel = selectedModel)))
+    private fun persistSelectedModel(selectedModel: String, expectedSettings: AppSettings): Boolean {
+        var persisted = false
+        settingsRepository.updateSettings { settings ->
+            val aiSettings = settings.ai ?: return@updateSettings settings
+            if (!settings.hasSameModelServiceConfiguration(expectedSettings)) {
+                settings
+            } else {
+                persisted = true
+                settings.copy(ai = aiSettings.copy(selectedModel = selectedModel))
+            }
         }
+        return persisted
+    }
+
+    private fun AppSettings.hasSameModelServiceConfiguration(expected: AppSettings): Boolean {
+        val currentAi = ai ?: return false
+        val expectedAi = expected.ai ?: return false
+        return currentAi.provider == expectedAi.provider &&
+                currentAi.agentEnabled == expectedAi.agentEnabled &&
+                currentAi.selectedModel == expectedAi.selectedModel &&
+                proxy == expected.proxy &&
+                currentAi.httpToolSettings == expectedAi.httpToolSettings &&
+                currentAi.mcpServers == expectedAi.mcpServers &&
+                when (currentAi.provider) {
+                    AIProvider.GEMINI -> currentAi.geminiApiKey == expectedAi.geminiApiKey
+                    AIProvider.OPENAI ->
+                        currentAi.openAiApiKey == expectedAi.openAiApiKey &&
+                                currentAi.openAiBaseUrl == expectedAi.openAiBaseUrl
+                }
     }
 
     private suspend fun handleAiMessage(session: PollingSession, chatId: String, text: String, messageId: Long) {
@@ -540,7 +665,14 @@ class MessagePoller @Inject constructor(
             return
         }
         ensureCurrent(session)
-        agentService.resetSession()?.join()
+        if (!awaitSuccessfulAgentReset()) {
+            ensureCurrent(session)
+            logger.warn(
+                "Failed to auto-clean AI context after {} minutes without a successful AI reply.",
+                intervalMinutes
+            )
+            return
+        }
         ensureCurrent(session)
         session.lastAiReplyAtMillis = null
         if (!aiSettings.silentContextCleanup) {
@@ -551,6 +683,26 @@ class MessagePoller @Inject constructor(
             )
         }
         logger.info("Auto-cleaned AI context after {} minutes without a successful AI reply.", intervalMinutes)
+    }
+
+    /**
+     * 等待代理重置结束，并以 [Job.isCancelled] 判定成功。
+     *
+     * [Job.join] 不会传播任务自身的失败；当前消费者或轮询会话被取消时仍会原样传播其取消，避免旧会话在
+     * token 切换后继续执行。代理返回 `null`、抛出普通异常或返回已取消任务都会返回 `false`。
+     */
+    private suspend fun awaitSuccessfulAgentReset(): Boolean {
+        val resetJob = try {
+            agentService.resetSession()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn("Failed to start agent session reset", e)
+            return false
+        } ?: return false
+
+        resetJob.join()
+        return !resetJob.isCancelled
     }
 
     private fun clearQueue(session: PollingSession) {
@@ -585,11 +737,11 @@ class MessagePoller @Inject constructor(
     }
 
     private fun activeSession(): PollingSession? = sessionLock.withLock {
-        currentSession?.takeIf(::isTokenGenerationCurrent)
+        currentSession?.takeIf { !closed && isTokenGenerationCurrent(it) }
     }
 
     private fun isCurrent(session: PollingSession): Boolean = sessionLock.withLock {
-        currentSession === session && isTokenGenerationCurrent(session)
+        !closed && currentSession === session && isTokenGenerationCurrent(session)
     }
 
     private fun ensureCurrent(session: PollingSession) {
@@ -634,8 +786,14 @@ class MessagePoller @Inject constructor(
      * 关闭会取消当前会话的在途和排队任务，但不会完成旧队列的确认信号或写入其偏移量。
      */
     override fun close() {
-        settingsJob?.cancel()
-        settingsJob = null
+        val jobToCancel = synchronized(lifecycleLock) {
+            if (closed) {
+                return
+            }
+            closed = true
+            settingsJob.also { settingsJob = null }
+        }
+        jobToCancel?.cancel()
         runBlocking { cancelCurrentSession() }
         scope.cancel()
         logger.info("Agent poller stopped.")

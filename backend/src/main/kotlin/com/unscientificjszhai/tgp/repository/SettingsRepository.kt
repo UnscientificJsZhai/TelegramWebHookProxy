@@ -15,13 +15,17 @@ import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -36,7 +40,12 @@ import kotlin.concurrent.withLock
  */
 class SettingsRepository private constructor(
     configFile: File,
-    private val modelSwitchBarrier: ModelSwitchBarrier,
+    /**
+     * 与此仓储发布的设置更新对应的共享模型切换屏障。
+     *
+     * 兼容构造器和测试装配必须复用此实例，避免将同一仓储的观察者接到不同屏障。
+     */
+    internal val modelSwitchBarrier: ModelSwitchBarrier,
     fileOperations: AtomicJsonFileOperations,
 ) {
     /**
@@ -55,7 +64,7 @@ class SettingsRepository private constructor(
     companion object {
         internal fun forTesting(
             configFile: File,
-            modelSwitchBarrier: ModelSwitchBarrier = ModelSwitchBarrier(),
+            modelSwitchBarrier: ModelSwitchBarrier,
             fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
         ): SettingsRepository = SettingsRepository(configFile, modelSwitchBarrier, fileOperations)
     }
@@ -70,6 +79,7 @@ class SettingsRepository private constructor(
     private var requiresStorageValidationBeforeWrite = loadedSettings.requiresStorageValidationBeforeWrite
 
     private val _settingsFlow = MutableStateFlow(loadedSettings.settings)
+    private var settingsRevision = loadedSettings.settings.revision()
 
     /**
      * 当前应用设置的只读状态流。
@@ -219,6 +229,7 @@ class SettingsRepository private constructor(
             }
             _settingsFlow.value = settings
             if (settings != previousSettings) {
+                settingsRevision = settings.revision()
                 _settingsUpdateFlow.value = SettingsUpdate(
                     settings = settings,
                     version = ++settingsVersion,
@@ -301,12 +312,30 @@ class SettingsRepository private constructor(
     }
 
     /**
-     * 保存应用设置，并发布发生变化的新设置。
-
-     * 此方法会同步原子提交配置文件；仅主文件替换成功后才发布设置、Token 代次和历史代理状态。
-     * 主文件替换前失败时会取消本次已登记的代理切换屏障，并将异常继续抛给调用方。
+     * 原子读取当前设置及其内容修订值。
      *
-     * @param settings 要保存的完整设置，不能为空；其内容将整体覆盖当前内存和配置文件中的设置。
+     * 返回的设置与修订值来自同一同步临界区，可将修订值用于后续 [updateSettings] 的条件写入。
+     *
+     * @return 当前不可变设置快照，以及由其规范 JSON 计算的 SHA-256 小写十六进制修订值。
+     */
+    @Synchronized
+    fun currentSettingsSnapshot(): SettingsSnapshot =
+        SettingsSnapshot(settings = _settingsFlow.value, revision = settingsRevision)
+
+    /**
+     * 在同一同步临界区内基于最新设置执行变换并持久化结果。
+     *
+     * 写入前会完成存储恢复检查及可选的修订值比较，然后调用 [transform]、校验结果并同步原子提交
+     * 配置文件。仅主文件替换成功后才发布设置、Token 代次、生命周期屏障和历史代理状态。变换结果
+     * 与当前设置相同时视为无操作，不写文件、不递增代次，也不发布设置事件。
+     *
+     * @param expectedRevision 期望的当前修订值；`null` 表示局部变换不执行 CAS，非空值必须是此前
+     * [currentSettingsSnapshot] 返回的 64 位小写十六进制 SHA-256。
+     * @param transform 接收锁内最新不可变设置并返回候选完整设置的同步变换；不得递归调用本仓储的
+     * 同步方法，也不得执行长时间阻塞操作。
+     * @return 提交前和提交后的原子快照；无操作时两个快照相等。
+     * @throws SettingsRevisionMismatchException [expectedRevision] 与锁内当前修订值不一致时抛出；
+     * 不调用 [transform]，也不改变文件、屏障或任何设置流。
      * @throws IllegalArgumentException 代理或 HTTP 工具设置不合法，或历史非法代理尚未被显式替换为
      * 合法代理时抛出；不会改变屏障、文件或任何设置流。
      * @throws Exception 配置文件无法编码或原子提交，设置文件不可读取或可恢复性未验证，设置文件及备份
@@ -314,15 +343,27 @@ class SettingsRepository private constructor(
      * [StorageRecoveredRetryException]；调用方必须基于新快照重试。
      */
     @Synchronized
-    fun saveSettings(settings: AppSettings) {
+    fun updateSettings(
+        expectedRevision: String? = null,
+        transform: (AppSettings) -> AppSettings,
+    ): SettingsUpdateResult {
         ensureStorageValidatedBeforeWrite()
+        val previousSettings = _settingsFlow.value
+        val previousSnapshot = SettingsSnapshot(previousSettings, settingsRevision)
+        if (expectedRevision != null && expectedRevision != settingsRevision) {
+            throw SettingsRevisionMismatchException()
+        }
+
+        val settings = transform(previousSettings)
         if (hasHistoricalInvalidProxy && settings.proxy == null) {
             throw IllegalArgumentException("历史代理设置不合法，必须显式提供合法代理后才能保存设置。")
         }
         validateProxySettings(settings.proxy)
         settings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
+        if (settings == previousSettings) {
+            return SettingsUpdateResult(previousSnapshot, previousSnapshot)
+        }
 
-        val previousSettings = _settingsFlow.value
         val switchGeneration = if (settings.requiresAgentLifecycleBarrier(previousSettings)) {
             modelSwitchBarrier.beginSwitch()
         } else {
@@ -330,7 +371,7 @@ class SettingsRepository private constructor(
         }
 
         try {
-            storage.commit(ConfigJson.encodeToString(settings).toByteArray(StandardCharsets.UTF_8))
+            storage.commit(settings.serializedBytes())
         } catch (e: Exception) {
             modelSwitchBarrier.cancel(switchGeneration)
             throw e
@@ -342,6 +383,21 @@ class SettingsRepository private constructor(
             hasInvalidProxy = false,
             switchGeneration = switchGeneration,
         )
+        return SettingsUpdateResult(
+            previous = previousSnapshot,
+            current = SettingsSnapshot(settings, settingsRevision),
+        )
+    }
+
+    /**
+     * 仅供模块内既有测试构造完整设置；生产写入必须使用 [updateSettings]。
+     *
+     * 此兼容入口直接委托统一的锁内变换，不提供独立写入路径。
+     *
+     * @param settings 要替换的完整测试设置。
+     */
+    internal fun saveSettings(settings: AppSettings) {
+        updateSettings { settings }
     }
 
     /**
@@ -349,7 +405,7 @@ class SettingsRepository private constructor(
      *
      * token 实际变更的保存会持有同一锁直至发布新的 [telegramTokenUpdateFlow] 值；调用方
      * 因此可在该锁内检查代次并提交与该代次关联的偏移量，避免已生效切换后的旧会话写入。
-     * [action] 不得调用 [saveSettings] 或执行会等待 token 变更完成的操作。
+     * [action] 不得调用 [updateSettings] 或执行会等待 token 变更完成的操作。
      *
      * @param action 需要与 token 生命周期串行化的短同步操作。
      * @return [action] 的返回值。
@@ -358,6 +414,35 @@ class SettingsRepository private constructor(
         telegramTokenLifecycleLock.withLock(action)
 
 }
+
+/**
+ * 设置及其内容寻址修订值组成的原子快照。
+ *
+ * @property settings 完整不可变应用设置。
+ * @property revision 由 [settings] 的规范 JSON 计算的 64 位小写十六进制 SHA-256。
+ */
+data class SettingsSnapshot(
+    val settings: AppSettings,
+    val revision: String,
+)
+
+/**
+ * 一次设置变换的提交结果。
+ *
+ * @property previous 变换执行前的锁内设置快照。
+ * @property current 实际提交并发布后的设置快照；无操作时与 [previous] 相等。
+ */
+data class SettingsUpdateResult(
+    val previous: SettingsSnapshot,
+    val current: SettingsSnapshot,
+)
+
+/**
+ * 条件设置写入使用了过期修订值。
+ *
+ * 异常表示写入未执行，调用方应重新读取设置并由用户决定如何合并。
+ */
+class SettingsRevisionMismatchException : IllegalStateException("设置修订值已变更。")
 
 private fun ProxySettings?.isInvalidProxy(): Boolean = runCatching {
     validateProxySettings(this)
@@ -370,6 +455,25 @@ private fun AppSettings.failClosedHttpToolSettings(): AppSettings {
     } else {
         copy(ai = aiSettings.copy(httpToolSettings = HttpToolSettings()))
     }
+}
+
+private fun AppSettings.serializedBytes(): ByteArray =
+    ConfigJson.encodeToString(this).toByteArray(StandardCharsets.UTF_8)
+
+private fun AppSettings.revision(): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(ConfigJson.encodeToJsonElement(this).canonicalized().toString().toByteArray(StandardCharsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+private fun JsonElement.canonicalized(): JsonElement = when (this) {
+    is JsonObject -> entries.sortedBy { (key, _) -> key }.let { sortedEntries ->
+        buildJsonObject {
+            sortedEntries.forEach { (key, value) -> put(key, value.canonicalized()) }
+        }
+    }
+
+    is JsonArray -> JsonArray(map(JsonElement::canonicalized))
+    else -> this
 }
 
 private data class LoadedSettings(

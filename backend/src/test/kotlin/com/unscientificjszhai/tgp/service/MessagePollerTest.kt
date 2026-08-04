@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.Chat
 import com.unscientificjszhai.tgp.models.FileResponse
@@ -10,9 +11,13 @@ import com.unscientificjszhai.tgp.models.TelegramFile
 import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.models.Voice
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.DelegatingAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
+import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
+import com.unscientificjszhai.tgp.di.AgentComponent
 import io.ktor.http.HttpStatusCode
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -22,9 +27,11 @@ import io.mockk.verify
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -34,6 +41,8 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -61,7 +70,7 @@ class MessagePollerTest {
         val oldPollStarted = CompletableDeferred<Unit>()
         val oldPollCancelled = CompletableDeferred<Unit>()
         val neverCompletes = CompletableDeferred<Unit>()
-        fixture.settings.saveSettings(AppSettings(telegramToken = "100:A"))
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
         fixture.updates.saveLastUpdateId("100", 7)
         coEvery { fixture.telegram.getUpdatesForToken("100:A", 8, 30) } coAnswers {
             oldPollStarted.complete(Unit)
@@ -76,8 +85,8 @@ class MessagePollerTest {
         fixture.poller.start()
         try {
             withTimeout(2.seconds) { oldPollStarted.await() }
-            fixture.settings.saveSettings(AppSettings(telegramToken = ""))
-            fixture.settings.saveSettings(AppSettings(telegramToken = "100:A"))
+            fixture.saveSettings(AppSettings(telegramToken = ""))
+            fixture.saveSettings(AppSettings(telegramToken = "100:A"))
             eventually {
                 assert(oldPollCancelled.isCompleted)
                 coVerify(atLeast = 2) { fixture.telegram.getUpdatesForToken("100:A", 8, 30) }
@@ -104,13 +113,13 @@ class MessagePollerTest {
         coEvery { fixture.telegram.getUpdatesForToken("200:B", 21, 30) } returns GetUpdatesResponse(ok = true)
         coEvery { fixture.telegram.getUpdatesForToken("100:A-rotated", 5, 30) } returns GetUpdatesResponse(ok = true)
 
-        fixture.settings.saveSettings(AppSettings(telegramToken = "100:A"))
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
         fixture.poller.start()
         try {
             eventually { coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:A", 5, 30) } }
-            fixture.settings.saveSettings(AppSettings(telegramToken = "200:B"))
+            fixture.saveSettings(AppSettings(telegramToken = "200:B"))
             eventually { coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("200:B", 21, 30) } }
-            fixture.settings.saveSettings(AppSettings(telegramToken = "100:A-rotated"))
+            fixture.saveSettings(AppSettings(telegramToken = "100:A-rotated"))
             eventually { coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:A-rotated", 5, 30) } }
         } finally {
             fixture.poller.close()
@@ -127,7 +136,7 @@ class MessagePollerTest {
         val processingStarted = CompletableDeferred<Unit>()
         val neverCompletes = CompletableDeferred<Unit>()
         fixture.updates.saveLastUpdateId("100", 10)
-        fixture.settings.saveSettings(
+        fixture.saveSettings(
             AppSettings(
                 telegramToken = "100:A",
                 ai = AISettings(agentEnabled = true, agentChatId = "123"),
@@ -151,7 +160,7 @@ class MessagePollerTest {
         fixture.poller.start()
         try {
             withTimeout(2.seconds) { processingStarted.await() }
-            fixture.settings.saveSettings(
+            fixture.saveSettings(
                 AppSettings(
                     telegramToken = "200:B",
                     ai = AISettings(agentEnabled = true, agentChatId = "123"),
@@ -170,8 +179,8 @@ class MessagePollerTest {
      */
     @Test
     fun `token change waits for an in progress offset commit`() = runBlocking {
-        val settings =
-            SettingsRepository.forTesting(tempDirectory.resolve("linear-settings.json"), ModelSwitchBarrier())
+        val barrier = ModelSwitchBarrier()
+        val settings = SettingsRepository.forTesting(tempDirectory.resolve("linear-settings.json"), barrier)
         val offsetWriteEntered = CompletableDeferred<Unit>()
         val allowOffsetWrite = CountDownLatch(1)
         val updates = UpdatesRepository(tempDirectory.resolve("linear-updates.json")) { state ->
@@ -182,7 +191,7 @@ class MessagePollerTest {
         }
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
-        val poller = MessagePoller(parentScope, telegram, agent, settings, updates)
+        val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
         updates.saveLastUpdateId("100", 10)
         settings.saveSettings(AppSettings(telegramToken = "100:A"))
         coEvery { telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
@@ -220,7 +229,7 @@ class MessagePollerTest {
         val fixture = fixture()
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         fixture.updates.saveLastUpdateId("100", 10)
-        fixture.settings.saveSettings(
+        fixture.saveSettings(
             AppSettings(
                 telegramToken = "100:captured-token",
                 ai = AISettings(agentEnabled = true, agentChatId = "123"),
@@ -275,7 +284,7 @@ class MessagePollerTest {
         val fixture = fixture()
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         fixture.updates.saveLastUpdateId("100", 10)
-        fixture.settings.saveSettings(
+        fixture.saveSettings(
             AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
         )
         coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
@@ -313,7 +322,7 @@ class MessagePollerTest {
         val fixture = fixture(processingTimeout = 50.milliseconds)
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         fixture.updates.saveLastUpdateId("100", 10)
-        fixture.settings.saveSettings(
+        fixture.saveSettings(
             AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
         )
         coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
@@ -356,7 +365,7 @@ class MessagePollerTest {
         val processingStarted = CompletableDeferred<Unit>()
         val neverCompletes = CompletableDeferred<Unit>()
         fixture.updates.saveLastUpdateId("100", 10)
-        fixture.settings.saveSettings(
+        fixture.saveSettings(
             AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
         )
         coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(ok = true)
@@ -386,7 +395,7 @@ class MessagePollerTest {
                 }
             }
 
-            fixture.settings.saveSettings(
+            fixture.saveSettings(
                 AppSettings(
                     telegramToken = "200:B",
                     ai = AISettings(agentEnabled = true, agentChatId = "123")
@@ -411,11 +420,12 @@ class MessagePollerTest {
             {"telegramToken":"100:token","proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"},"ai":{"agentEnabled":true,"selectedModel":""}}
             """.trimIndent()
         configFile.writeText(originalContent)
-        val settings = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val barrier = ModelSwitchBarrier()
+        val settings = SettingsRepository.forTesting(configFile, barrier)
         val updates = UpdatesRepository(tempDirectory.resolve("historical-proxy-model-updates.json"))
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
-        val poller = MessagePoller(parentScope, telegram, agent, settings, updates)
+        val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
         every { agent.availableModels } returns listOf("model")
         coEvery { telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
         coEvery {
@@ -440,23 +450,340 @@ class MessagePollerTest {
         }
     }
 
-    private fun fixture(processingTimeout: Duration? = null): Fixture {
-        val settings = SettingsRepository.forTesting(
-            tempDirectory.resolve("settings-${System.nanoTime()}.json"),
-            ModelSwitchBarrier()
+    /**
+     * 验证旧代理的模型列表不会在提供方并发切换后污染最新设置。
+     */
+    @Test
+    fun `model selection rechecks provider configuration inside repository lock`() = runBlocking {
+        val fixture = fixture()
+        val geminiSettings = AppSettings(
+            telegramToken = "100:token",
+            ai = AISettings(
+                provider = AIProvider.GEMINI,
+                geminiApiKey = "gemini-key",
+                agentEnabled = true,
+            ),
         )
+        fixture.saveSettings(geminiSettings)
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } returns
+                TelegramApiResponse(HttpStatusCode.OK, "")
+        every { fixture.agent.availableModels } answers {
+            fixture.settings.updateSettings { current ->
+                current.copy(
+                    ai = current.ai!!.copy(
+                        provider = AIProvider.OPENAI,
+                        openAiApiKey = "openai-key",
+                    ),
+                )
+            }
+            listOf("models/gemini-old")
+        }
+
+        fixture.poller.start()
+        try {
+            eventually {
+                coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:token", any(), any()) }
+            }
+            fixture.poller.handleCommand("123", "/model models/gemini-old", 1)
+
+            assertEquals(AIProvider.OPENAI, fixture.settings.settingsFlow.value.ai?.provider)
+            assertEquals("", fixture.settings.settingsFlow.value.ai?.selectedModel)
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证启动仅在共享初始就绪屏障放行后才订阅 token 流。
+     *
+     * 有效初始 AI 配置尚在就绪时，不会创建轮询会话或发起 Telegram 请求。
+     */
+    @Test
+    fun `start waits for the shared initial readiness barrier before polling`() = runBlocking {
+        val barrier = ModelSwitchBarrier()
+        val settings = SettingsRepository.forTesting(tempDirectory.resolve("initial-readiness-settings.json"), barrier)
+        val updates = UpdatesRepository(tempDirectory.resolve("initial-readiness-updates.json"))
+        val telegram = mockk<TelegramService>(relaxed = true)
+        val agent = mockk<AgentService>(relaxed = true)
+        every { agent.isAiFeatureEnabled(any()) } returns true
+        settings.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "valid-key",
+                    agentEnabled = true,
+                    agentChatId = "123",
+                ),
+            ),
+        )
+        barrier.complete(barrier.latestPendingGeneration())
+        val initialGeneration = barrier.beginSwitch()
+        val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
+        coEvery { telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
+
+        poller.start()
+        try {
+            delay(100)
+            coVerify(exactly = 0) { telegram.getUpdatesForToken(any(), any(), any()) }
+
+            barrier.complete(initialGeneration)
+            eventually {
+                coVerify(atLeast = 1) { telegram.getUpdatesForToken("100:token", any(), any()) }
+            }
+        } finally {
+            barrier.complete(initialGeneration)
+            poller.close()
+        }
+    }
+
+    /**
+     * 验证设置仓储、委派服务和轮询器共享的初始屏障会阻止有效配置在候选 Agent 就绪前轮询。
+     */
+    @Test
+    fun `delegating initial readiness blocks polling until the candidate agent is ready`() = runBlocking {
+        val barrier = ModelSwitchBarrier()
+        val settings = SettingsRepository.forTesting(tempDirectory.resolve("shared-readiness-settings.json"), barrier)
+        val skills = SkillRepository.forTesting(tempDirectory.resolve("shared-readiness-skills.json"))
+        val updates = UpdatesRepository(tempDirectory.resolve("shared-readiness-updates.json"))
+        val telegram = mockk<TelegramService>(relaxed = true)
+        val componentFactory = mockk<AgentComponent.Factory>()
+        val component = mockk<AgentComponent>()
+        val candidateAgent = mockk<OpenAIAgentService>()
+        val candidateCreated = CompletableDeferred<Unit>()
+        val readiness = Job()
+        val delegatingScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        updates.saveLastUpdateId("100", 10)
+        settings.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "valid-key",
+                    agentEnabled = true,
+                    agentChatId = "123",
+                ),
+            ),
+        )
+        every { componentFactory.create() } answers {
+            candidateCreated.complete(Unit)
+            component
+        }
+        every { component.openAIAgentService } returns candidateAgent
+        every { candidateAgent.initializationJob() } returns readiness
+        every { candidateAgent.close() } returns Job().apply { complete() }
+        coEvery { telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(ok = true)
+
+        val delegatingAgent = DelegatingAgentService(componentFactory, settings, skills, barrier, delegatingScope)
+        val poller = MessagePoller(parentScope, telegram, delegatingAgent, settings, updates, barrier)
+        poller.start()
+        try {
+            withTimeout(5.seconds) { candidateCreated.await() }
+            delay(100)
+            coVerify(exactly = 0) { telegram.getUpdatesForToken(any(), any(), any()) }
+            assertEquals(10, updates.getData("100").lastUpdateId)
+
+            readiness.complete()
+            eventually {
+                coVerify(atLeast = 1) { telegram.getUpdatesForToken("100:token", 11, 30) }
+            }
+        } finally {
+            readiness.complete()
+            poller.close()
+            delegatingAgent.close().join()
+            delegatingScope.cancel()
+            delegatingScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证缺少提供商密钥时不会将更新发送给不可用的代理。
+     *
+     * 屏障会正常放行，使轮询器能按禁用 AI 的语义跳过该更新而不发送错误回复。
+     */
+    @Test
+    fun `missing initial API key does not dispatch messages to an unavailable agent`() = runBlocking {
+        val barrier = ModelSwitchBarrier()
+        val settings = SettingsRepository.forTesting(tempDirectory.resolve("missing-key-settings.json"), barrier)
+        val updates = UpdatesRepository(tempDirectory.resolve("missing-key-updates.json"))
+        val telegram = mockk<TelegramService>(relaxed = true)
+        val agent = mockk<AgentService>(relaxed = true)
+        val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        updates.saveLastUpdateId("100", 10)
+        settings.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    agentEnabled = true,
+                    agentChatId = "123",
+                ),
+            ),
+        )
+        barrier.complete(barrier.latestPendingGeneration())
+        coEvery { telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(Update(11, message = Message(1, chat, text = "hello"))),
+        ) andThen GetUpdatesResponse(ok = true)
+
+        poller.start()
+        try {
+            eventually {
+                verify(atLeast = 1) { agent.isAiFeatureEnabled(any()) }
+            }
+            coVerify(exactly = 0) { agent.sendMessage("hello") }
+            coVerify(exactly = 0) { telegram.sendMessageForToken(any(), any(), any(), any()) }
+        } finally {
+            poller.close()
+        }
+    }
+
+    /**
+     * 验证等待初始就绪屏障期间关闭服务不会在随后放行时创建会话。
+     */
+    @Test
+    fun `close while waiting for readiness never creates a polling session`() = runBlocking {
+        val barrier = ModelSwitchBarrier()
+        val settings = SettingsRepository.forTesting(tempDirectory.resolve("close-race-settings.json"), barrier)
+        val updates = UpdatesRepository(tempDirectory.resolve("close-race-updates.json"))
+        val telegram = mockk<TelegramService>(relaxed = true)
+        val agent = mockk<AgentService>(relaxed = true)
+        val generation = barrier.beginSwitch()
+        settings.saveSettings(AppSettings(telegramToken = "100:token"))
+        val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
+
+        poller.start()
+        poller.close()
+        barrier.complete(generation)
+        delay(100)
+
+        coVerify(exactly = 0) { telegram.getUpdatesForToken(any(), any(), any()) }
+    }
+
+    /**
+     * 验证 `/reset` 的候选会话任务取消时只发送失败提示，不清空当前队列或自动清理计时。
+     */
+    @Test
+    fun `reset command keeps queue and timer when reset job is cancelled`() = runBlocking {
+        val fixture = fixture()
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        val processingStarted = CompletableDeferred<Unit>()
+        val keepProcessing = CompletableDeferred<Unit>()
+        val cancelledReset = Job().apply { cancel() }
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            processingStarted.complete(Unit)
+            keepProcessing.await()
+            ""
+        }
+        every { fixture.agent.resetSession() } returns cancelledReset
+        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } returns
+                TelegramApiResponse(HttpStatusCode.OK, "")
+
+        fixture.poller.start()
+        try {
+            eventually { coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } }
+            fixture.poller.handleUpdate(Update(101, message = Message(1, chat, text = "block")))
+            withTimeout(2.seconds) { processingStarted.await() }
+            fixture.poller.handleUpdate(Update(102, message = Message(2, chat, text = "queued")))
+            val session = currentSession(fixture.poller)
+            val lastReplyAt = 1234L
+            session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }
+                .set(session, lastReplyAt)
+
+            fixture.poller.handleCommand("123", "/reset", 99)
+
+            assertEquals(lastReplyAt, session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply {
+                isAccessible = true
+            }.get(session))
+            assertNotNull(sessionQueue(session).tryReceive().getOrNull())
+            coVerify {
+                fixture.telegram.sendMessageForToken("100:token", "123", "会话重置失败，请稍后重试。", any())
+            }
+            coVerify(exactly = 0) {
+                fixture.telegram.sendMessageForToken("100:token", "123", "会话已重置，待处理消息已清空。", any())
+            }
+        } finally {
+            keepProcessing.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证 `/reset` 仅在任务正常完成且会话仍有效时清空队列、清除计时并通知成功。
+     */
+    @Test
+    fun `reset command clears queue and timer only after successful reset job`() = runBlocking {
+        val fixture = fixture()
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        val processingStarted = CompletableDeferred<Unit>()
+        val keepProcessing = CompletableDeferred<Unit>()
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            processingStarted.complete(Unit)
+            keepProcessing.await()
+            ""
+        }
+        every { fixture.agent.resetSession() } returns Job().apply { complete() }
+        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } returns
+                TelegramApiResponse(HttpStatusCode.OK, "")
+
+        fixture.poller.start()
+        try {
+            eventually { coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } }
+            fixture.poller.handleUpdate(Update(101, message = Message(1, chat, text = "block")))
+            withTimeout(2.seconds) { processingStarted.await() }
+            fixture.poller.handleUpdate(Update(102, message = Message(2, chat, text = "queued")))
+            val session = currentSession(fixture.poller)
+            session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }.set(session, 1234L)
+
+            fixture.poller.handleCommand("123", "/reset", 99)
+
+            assertNull(session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }
+                .get(session))
+            assertTrue(sessionQueue(session).tryReceive().isFailure)
+            coVerify {
+                fixture.telegram.sendMessageForToken("100:token", "123", "会话已重置，待处理消息已清空。", any())
+            }
+        } finally {
+            keepProcessing.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    private fun fixture(processingTimeout: Duration? = null): Fixture {
+        val barrier = ModelSwitchBarrier()
+        val settings =
+            SettingsRepository.forTesting(tempDirectory.resolve("settings-${System.nanoTime()}.json"), barrier)
         val updates = UpdatesRepository(tempDirectory.resolve("updates-${System.nanoTime()}.json"))
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
+        every { agent.isAiFeatureEnabled(any()) } returns true
         return Fixture(
+            barrier = barrier,
             settings = settings,
             updates = updates,
             telegram = telegram,
             agent = agent,
             poller = processingTimeout?.let { timeout ->
-                MessagePoller(parentScope, telegram, agent, settings, updates, timeout)
-            } ?: MessagePoller(parentScope, telegram, agent, settings, updates),
+                MessagePoller(parentScope, telegram, agent, settings, updates, barrier, timeout)
+            } ?: MessagePoller(parentScope, telegram, agent, settings, updates, barrier),
         )
+    }
+
+    private fun Fixture.saveSettings(settings: AppSettings) {
+        this.settings.saveSettings(settings)
+        barrier.complete(barrier.latestPendingGeneration())
     }
 
     private suspend fun eventually(assertion: () -> Unit) {
@@ -472,7 +799,17 @@ class MessagePollerTest {
         }
     }
 
+    private fun currentSession(poller: MessagePoller): Any = assertNotNull(
+        MessagePoller::class.java.getDeclaredField("currentSession").apply { isAccessible = true }.get(poller),
+    )
+
+    @Suppress("UNCHECKED_CAST")
+    private fun sessionQueue(session: Any): Channel<Any> = session.javaClass.getDeclaredField("updateChannel").apply {
+        isAccessible = true
+    }.get(session) as Channel<Any>
+
     private data class Fixture(
+        val barrier: ModelSwitchBarrier,
         val settings: SettingsRepository,
         val updates: UpdatesRepository,
         val telegram: TelegramService,

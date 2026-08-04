@@ -29,6 +29,253 @@ import kotlin.time.Duration.Companion.seconds
  */
 class DelegatingAgentServiceTest {
     /**
+     * 验证有效初始配置会在候选 Agent 完成就绪后才释放启动屏障。
+     */
+    @Test
+    fun `initial readiness barrier waits for the first candidate agent`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val openAIAgentService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val agentCreated = CompletableDeferred<Unit>()
+        val readiness = Job()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } answers {
+            agentCreated.complete(Unit)
+            agentComponent
+        }
+        every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.initializationJob() } returns readiness
+        every { openAIAgentService.close() } returns Job().apply { complete() }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { agentCreated.await() }
+            assertTrue(barrier.isSwitching)
+
+            readiness.complete()
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) yield()
+            }
+        } finally {
+            readiness.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证缺少初始 API 密钥会禁用代理并释放启动屏障。
+     */
+    @Test
+    fun `missing initial API key releases readiness without creating an agent`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val initialSettings = AppSettings(
+            ai = AISettings(provider = AIProvider.OPENAI, agentEnabled = true),
+        )
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns MutableStateFlow(
+            SettingsUpdate(
+                initialSettings,
+                0,
+                null
+            )
+        )
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) yield()
+            }
+            verify(exactly = 0) { agentComponentFactory.create() }
+            assertFalse(delegatingAgentService.isAiFeatureEnabled(initialSettings.ai!!))
+        } finally {
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证关闭不等待卡住的初始候选 Agent 清理就释放启动屏障。
+     */
+    @Test
+    fun `close releases the barrier before an unready candidate finishes closing`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val openAIAgentService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val agentCreated = CompletableDeferred<Unit>()
+        val candidateCloseCalled = CompletableDeferred<Unit>()
+        val readiness = Job()
+        val candidateClose = Job()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns MutableStateFlow(
+            SettingsUpdate(
+                initialSettings,
+                0,
+                null
+            )
+        )
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+        every { agentComponentFactory.create() } answers {
+            agentCreated.complete(Unit)
+            agentComponent
+        }
+        every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.initializationJob() } returns readiness
+        every { openAIAgentService.close() } answers {
+            candidateCloseCalled.complete(Unit)
+            candidateClose
+        }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { agentCreated.await() }
+            assertTrue(barrier.isSwitching)
+
+            val closeWaitJob = delegatingAgentService.close()
+            assertFalse(barrier.isSwitching)
+            withTimeout(5.seconds) { candidateCloseCalled.await() }
+            assertFalse(closeWaitJob.isCompleted)
+
+            candidateClose.complete()
+            withTimeout(5.seconds) { closeWaitJob.join() }
+        } finally {
+            readiness.complete()
+            candidateClose.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证父作用域取消不会等待卡住的初始候选 Agent 清理才释放启动屏障。
+     */
+    @Test
+    fun `parent scope cancellation releases the barrier before an unready candidate finishes closing`() = runBlocking {
+        val settingsRepository = mockk<SettingsRepository>()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val agentComponent = mockk<AgentComponent>()
+        val openAIAgentService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "test-api-key",
+                agentEnabled = true,
+            ),
+        )
+        val agentCreated = CompletableDeferred<Unit>()
+        val candidateCloseCalled = CompletableDeferred<Unit>()
+        val readiness = Job()
+        val candidateClose = Job()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns MutableStateFlow(
+            SettingsUpdate(
+                initialSettings,
+                0,
+                null
+            )
+        )
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+        every { agentComponentFactory.create() } answers {
+            agentCreated.complete(Unit)
+            agentComponent
+        }
+        every { agentComponent.openAIAgentService } returns openAIAgentService
+        every { openAIAgentService.initializationJob() } returns readiness
+        every { openAIAgentService.close() } answers {
+            candidateCloseCalled.complete(Unit)
+            candidateClose
+        }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { agentCreated.await() }
+            assertTrue(barrier.isSwitching)
+
+            serviceScope.cancel()
+            withTimeout(5.seconds) { candidateCloseCalled.await() }
+            assertFalse(barrier.isSwitching)
+
+            candidateClose.complete()
+            withTimeout(5.seconds) { requireNotNull(serviceScope.coroutineContext[Job]).join() }
+        } finally {
+            readiness.complete()
+            candidateClose.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            requireNotNull(serviceScope.coroutineContext[Job]).join()
+        }
+    }
+
+    /**
      * 验证初始设置订阅和技能更新的处理设计。
      *
      * 验证初始订阅仅创建一次组件，技能更新会重置会话。

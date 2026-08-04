@@ -5,6 +5,7 @@ import com.google.genai.Chats
 import com.google.genai.Client
 import com.google.genai.Models
 import com.google.genai.Pager
+import com.google.common.collect.ImmutableList
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
@@ -14,6 +15,7 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
 import io.mockk.coEvery
 import io.mockk.every
@@ -46,7 +48,7 @@ class GeminiAgentServiceTest {
     fun setup() {
         tempDirectory = Files.createTempDirectory("gemini-agent-service-test").toFile()
         val testScope = CoroutineScope(EmptyCoroutineContext)
-        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"))
+        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
         skillRepository =
             com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(File(tempDirectory, "skills.json"))
         service =
@@ -191,13 +193,14 @@ class GeminiAgentServiceTest {
      * 验证服务会保留 SDK 所需的 `models/` 前缀。
      */
     @Test
-    fun testSwitchingUnprefixedModelsRetainsSdkPrefix() {
+    fun testSwitchingUnprefixedModelsRetainsSdkPrefix() = runBlocking {
+        prepareSuccessfulSwitch()
         listOf(
             "gemini-3.5-flash-lite" to "models/gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite" to "models/gemini-3.1-flash-lite",
             "gemini-2.5-flash" to "models/gemini-2.5-flash",
         ).forEach { (modelName, expectedModel) ->
-            service.switchModel(modelName)
+            service.switchModel(modelName)?.join()
 
             assertEquals(expectedModel, service.currentModel)
         }
@@ -209,9 +212,12 @@ class GeminiAgentServiceTest {
      * 验证模型名称不会被重复添加或修改前缀。
      */
     @Test
-    fun testSwitchingPrefixedModelRetainsItsName() {
-        service.switchModel("models/gemini-3.1-flash-lite")
+    fun testSwitchingPrefixedModelRetainsItsName() = runBlocking {
+        prepareSuccessfulSwitch()
+        val switchJob = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        switchJob.join()
 
+        assertFalse(switchJob.isCancelled)
         assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
     }
 
@@ -221,15 +227,229 @@ class GeminiAgentServiceTest {
      * 验证无前缀的动态模型会以 SDK 兼容名称保存。
      */
     @Test
-    fun testSwitchingUnprefixedDynamicallyAvailableModelAddsPrefix() {
+    fun testSwitchingUnprefixedDynamicallyAvailableModelAddsPrefix() = runBlocking {
         GeminiAgentService::class.java.getDeclaredField("availableModels").apply {
             isAccessible = true
             set(service, listOf("models/custom-model"))
         }
 
-        service.switchModel("custom-model")
+        prepareSuccessfulSwitch()
+        val switchJob = assertNotNull(service.switchModel("custom-model"))
+        switchJob.join()
 
         assertEquals("models/custom-model", service.currentModel)
+    }
+
+    /**
+     * 验证候选会话创建失败时保留原有会话状态，并以任务取消而非 [Job.join] 抛异常报告失败。
+     */
+    @Test
+    fun `failed Gemini reset keeps the previous chat route and pending history`() = runBlocking {
+        val oldChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val preservedHistory = listOf(Content.fromParts(Part.fromText("待恢复历史")))
+        val originalRoute = LocalFunctionRouter(emptyList()).refresh()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every {
+            chats.create(
+                any<String>(),
+                any<GenerateContentConfig>()
+            )
+        } throws IllegalStateException("create failed")
+        every { oldChat.getHistory(false) } returns ImmutableList.of()
+        every { oldChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("旧会话回复"))
+        injectClient(chats)
+        GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, oldChat)
+        GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
+            isAccessible = true
+        }.set(service, originalRoute)
+        setPrivateField("savedHistory", preservedHistory)
+
+        val resetJob = assertNotNull(service.resetSession())
+        resetJob.join()
+
+        assertTrue(resetJob.isCancelled)
+        assertSame(oldChat, privateField("chat"))
+        assertSame(originalRoute, privateField("chatFunctionRouteSnapshot"))
+        assertEquals(preservedHistory, privateField("savedHistory"))
+        assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
+        assertEquals("旧会话回复", service.sendMessage("继续使用旧会话"))
+    }
+
+    /**
+     * 验证候选创建成功时才会替换会话状态。
+     */
+    @Test
+    fun `successful Gemini reset atomically replaces the session`() = runBlocking {
+        val oldChat = mockk<Chat>()
+        val newChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val originalRoute = LocalFunctionRouter(emptyList()).refresh()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns newChat
+        every { newChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("新会话回复"))
+        injectClient(chats)
+        GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, oldChat)
+        GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
+            isAccessible = true
+        }.set(service, originalRoute)
+        setPrivateField("savedHistory", listOf(Content.fromParts(Part.fromText("旧历史"))))
+
+        val resetJob = assertNotNull(service.resetSession())
+        resetJob.join()
+
+        assertFalse(resetJob.isCancelled)
+        assertSame(newChat, privateField("chat"))
+        assertNotSame(originalRoute, privateField("chatFunctionRouteSnapshot"))
+        assertNull(privateField("savedHistory"))
+        assertEquals("新会话回复", service.sendMessage("新会话"))
+    }
+
+    /**
+     * 验证模型切换在候选创建失败时不会乐观改写模型或历史。
+     */
+    @Test
+    fun `failed model switch rolls back chat route history and model`() = runBlocking {
+        val oldChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val preservedHistory = listOf(Content.fromParts(Part.fromText("原待恢复历史")))
+        val capturedHistory = listOf(Content.fromParts(Part.fromText("当前会话历史")))
+        val originalRoute = LocalFunctionRouter(emptyList()).refresh()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { oldChat.getHistory(true) } returns ImmutableList.copyOf(capturedHistory)
+        every { oldChat.getHistory(false) } returns ImmutableList.of()
+        every { oldChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("原会话回复"))
+        every {
+            chats.create(
+                any<String>(),
+                any<GenerateContentConfig>()
+            )
+        } throws IllegalStateException("create failed")
+        injectClient(chats)
+        GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, oldChat)
+        GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
+            isAccessible = true
+        }.set(service, originalRoute)
+        setPrivateField("savedHistory", preservedHistory)
+
+        val switchJob = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
+        switchJob.join()
+
+        assertTrue(switchJob.isCancelled)
+        assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
+        assertSame(oldChat, privateField("chat"))
+        assertSame(originalRoute, privateField("chatFunctionRouteSnapshot"))
+        assertEquals(preservedHistory, privateField("savedHistory"))
+        assertEquals("原会话回复", service.sendMessage("仍走原会话"))
+    }
+
+    /**
+     * 验证并发模型切换按最后一次选择线性化，过期候选不会覆盖最新会话。
+     */
+    @Test
+    fun `concurrent model switches commit only the latest candidate`() = runBlocking {
+        val chats = mockk<Chats>()
+        val firstCandidate = mockk<Chat>()
+        val latestCandidate = mockk<Chat>()
+        val firstCreateStarted = CountDownLatch(1)
+        val releaseFirstCreate = CountDownLatch(1)
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chats.create("models/gemini-3.1-flash-lite", any<GenerateContentConfig>()) } answers {
+            firstCreateStarted.countDown()
+            check(releaseFirstCreate.await(5, TimeUnit.SECONDS))
+            firstCandidate
+        }
+        every { chats.create("models/gemini-2.5-flash", any<GenerateContentConfig>()) } returns latestCandidate
+        injectClient(chats)
+
+        val firstSwitch = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        assertTrue(firstCreateStarted.await(5, TimeUnit.SECONDS))
+        val latestSwitch = assertNotNull(service.switchModel("models/gemini-2.5-flash"))
+        releaseFirstCreate.countDown()
+        firstSwitch.join()
+        latestSwitch.join()
+
+        assertTrue(firstSwitch.isCancelled)
+        assertFalse(latestSwitch.isCancelled)
+        assertEquals("models/gemini-2.5-flash", service.currentModel)
+        assertSame(latestCandidate, privateField("chat"))
+    }
+
+    /**
+     * 验证同一目标模型的并发切换共享同一个候选任务；首个候选失败时，两个调用方都能观察到取消状态，
+     * 后续重试不会复用已结束任务。
+     */
+    @Test
+    fun `same model switches share a failed candidate job and allow retry`() = runBlocking {
+        val chats = mockk<Chats>()
+        val recoveredCandidate = mockk<Chat>()
+        val firstCreateStarted = CountDownLatch(1)
+        val releaseFirstCreate = CountDownLatch(1)
+        var createAttempts = 0
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chats.create("models/gemini-3.1-flash-lite", any<GenerateContentConfig>()) } answers {
+            if (createAttempts++ == 0) {
+                firstCreateStarted.countDown()
+                check(releaseFirstCreate.await(5, TimeUnit.SECONDS))
+                throw IllegalStateException("first candidate failed")
+            }
+            recoveredCandidate
+        }
+        injectClient(chats)
+
+        val firstSwitch = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        val secondSwitch = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        assertSame(firstSwitch, secondSwitch)
+        assertTrue(firstCreateStarted.await(5, TimeUnit.SECONDS))
+        releaseFirstCreate.countDown()
+        firstSwitch.join()
+        secondSwitch.join()
+
+        assertTrue(firstSwitch.isCancelled)
+        assertTrue(secondSwitch.isCancelled)
+        assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
+        assertNull(privateField("pendingModelSwitchJob"))
+
+        val retrySwitch = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        assertNotSame(firstSwitch, retrySwitch)
+        retrySwitch.join()
+        assertFalse(retrySwitch.isCancelled)
+        assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
+        assertSame(recoveredCandidate, privateField("chat"))
+    }
+
+    /**
+     * 验证 reset 与模型切换共享会话线性化边界：先取得会话锁的 reset 可以完成，但随后选择的模型候选
+     * 必须成为最终已发布会话。
+     */
+    @Test
+    fun `concurrent reset and model switch publish the latest selected model`() = runBlocking {
+        val chats = mockk<Chats>()
+        val resetCandidate = mockk<Chat>()
+        val switchCandidate = mockk<Chat>()
+        val resetCreateStarted = CountDownLatch(1)
+        val releaseResetCreate = CountDownLatch(1)
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chats.create("models/gemini-3.5-flash-lite", any<GenerateContentConfig>()) } answers {
+            resetCreateStarted.countDown()
+            check(releaseResetCreate.await(5, TimeUnit.SECONDS))
+            resetCandidate
+        }
+        every { chats.create("models/gemini-3.1-flash-lite", any<GenerateContentConfig>()) } returns switchCandidate
+        injectClient(chats)
+
+        val resetJob = assertNotNull(service.resetSession())
+        assertTrue(resetCreateStarted.await(5, TimeUnit.SECONDS))
+        val switchJob = assertNotNull(service.switchModel("models/gemini-3.1-flash-lite"))
+        releaseResetCreate.countDown()
+        resetJob.join()
+        switchJob.join()
+
+        assertFalse(resetJob.isCancelled)
+        assertFalse(switchJob.isCancelled)
+        assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
+        assertSame(switchCandidate, privateField("chat"))
     }
 
     /**
@@ -431,6 +651,17 @@ class GeminiAgentServiceTest {
                 Content.builder().role("model").parts(parts.toList()).build(),
             ).build(),
         ).build()
+
+    private fun prepareSuccessfulSwitch() {
+        val chats = mockk<Chats>()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns mockk()
+        injectClient(chats)
+    }
+
+    private fun privateField(name: String): Any? = GeminiAgentService::class.java.getDeclaredField(name).apply {
+        isAccessible = true
+    }.get(service)
 
     private fun injectChat(chat: Chat) {
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, chat)

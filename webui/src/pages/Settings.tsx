@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, {useState, useEffect, useRef} from 'react';
 import {
     TextField,
     Button,
@@ -21,8 +21,8 @@ import {
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
-import { useNavigate } from 'react-router-dom';
-import api from '../api';
+import {useNavigate} from 'react-router-dom';
+import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from '../settingsClient';
 
 interface ProxySettings {
     host: string;
@@ -74,37 +74,51 @@ const defaultAiSettings: AISettings = {
     mcpServers: []
 };
 
+const normalizeSettings = (settings: AppSettings): AppSettings => ({
+    ...settings,
+    ai: settings.ai ? {
+        ...defaultAiSettings,
+        ...settings.ai,
+        mcpServers: settings.ai.mcpServers || []
+    } : null
+});
+
 const Settings: React.FC = () => {
     const navigate = useNavigate();
     const [settings, setSettings] = useState<AppSettings | null>(null);
+    const [settingsRevision, setSettingsRevision] = useState<string | null>(null);
+    const [saving, setSaving] = useState(false);
+    const savingRef = useRef(false);
     const [autoCleanIntervalInput, setAutoCleanIntervalInput] = useState('0');
     const [autoCleanIntervalError, setAutoCleanIntervalError] = useState(false);
-    const [snackbar, setSnackbar] = useState<{ open: boolean, message: string, severity: 'success' | 'error' | 'info' } | null>(null);
+    const [snackbar, setSnackbar] = useState<{
+        open: boolean,
+        message: string,
+        severity: 'success' | 'error' | 'info'
+    } | null>(null);
 
     useEffect(() => {
-        api.get<AppSettings>('/settings')
+        fetchVersionedSettings<AppSettings>()
             .then(response => {
-                const normalizedSettings = {
-                    ...response.data,
-                    ai: response.data.ai ? {
-                        ...defaultAiSettings,
-                        ...response.data.ai,
-                        mcpServers: response.data.ai.mcpServers || []
-                    } : null
-                };
+                const normalizedSettings = normalizeSettings(response.settings);
+                const etag = response.etag;
                 setSettings(normalizedSettings);
+                setSettingsRevision(etag);
                 setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
                 setAutoCleanIntervalError(false);
+                if (!etag) {
+                    setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
+                }
             })
             .catch(error => {
                 console.error('Failed to fetch settings:', error);
-                setSnackbar({ open: true, message: '获取设置失败', severity: 'error' });
+                setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
             });
     }, []);
 
     const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         if (!settings) return;
-        const { name, value } = event.target;
+        const {name, value} = event.target;
         const [section, field] = name.split('.');
 
         if (section === 'proxy') {
@@ -174,7 +188,7 @@ const Settings: React.FC = () => {
 
     const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         if (!settings) return;
-        const { name, checked } = event.target;
+        const {name, checked} = event.target;
         const [section, field] = name.split('.');
 
         if (section === 'ai') {
@@ -210,10 +224,10 @@ const Settings: React.FC = () => {
             }));
         }
     };
-    
+
     const handleProxyTypeChange = (event: SelectChangeEvent) => {
         if (!settings) return;
-        const { value } = event.target;
+        const {value} = event.target;
         setSettings(prev => {
             if (!prev || !prev.proxy) return prev;
             return {
@@ -228,7 +242,7 @@ const Settings: React.FC = () => {
 
     const handleAiProviderChange = (event: SelectChangeEvent) => {
         if (!settings) return;
-        const { value } = event.target;
+        const {value} = event.target;
         setSettings(prev => {
             if (!prev) return prev;
             const ai = prev.ai || defaultAiSettings;
@@ -268,7 +282,7 @@ const Settings: React.FC = () => {
                 ...prev,
                 ai: {
                     ...ai,
-                    mcpServers: [...currentServers, { name: '', url: '', headers: {} }]
+                    mcpServers: [...currentServers, {name: '', url: '', headers: {}}]
                 }
             };
         });
@@ -297,7 +311,7 @@ const Settings: React.FC = () => {
             if (!prev) return prev;
             const ai = prev.ai || defaultAiSettings;
             const updatedServers = [...(ai.mcpServers || [])];
-            updatedServers[index] = { ...updatedServers[index], [field]: value };
+            updatedServers[index] = {...updatedServers[index], [field]: value};
             return {
                 ...prev,
                 ai: {
@@ -310,12 +324,12 @@ const Settings: React.FC = () => {
 
     const handleMCPHeaderChange = (index: number, headerString: string) => {
         if (!settings) return;
-        
+
         setSettings(prev => {
             if (!prev) return prev;
             const ai = prev.ai || defaultAiSettings;
             const updatedServers = [...(ai.mcpServers || [])];
-            
+
             let parsedHeaders = updatedServers[index].headers;
             try {
                 if (headerString.trim() !== '') {
@@ -327,10 +341,10 @@ const Settings: React.FC = () => {
                 // Ignore parsing errors, keep old headers object but update the string
             }
 
-            updatedServers[index] = { 
-                ...updatedServers[index], 
+            updatedServers[index] = {
+                ...updatedServers[index],
                 headers: parsedHeaders,
-                _headerString: headerString 
+                _headerString: headerString
             };
 
             return {
@@ -343,10 +357,14 @@ const Settings: React.FC = () => {
         });
     };
 
-    const handleSave = () => {
-        if (!settings) return;
+    const handleSave = async () => {
+        if (!settings || savingRef.current) return;
+        if (!settingsRevision) {
+            setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
+            return;
+        }
         if ((settings.ai?.autoCleanContextIntervalMinutes || 0) > 0 && autoCleanIntervalError) {
-            setSnackbar({ open: true, message: '清理间隔必须是正整数', severity: 'error' });
+            setSnackbar({open: true, message: '清理间隔必须是正整数', severity: 'error'});
             return;
         }
 
@@ -356,36 +374,56 @@ const Settings: React.FC = () => {
             ai: settings.ai ? {
                 ...settings.ai,
                 mcpServers: settings.ai.mcpServers.map((server) => {
-                    const serverToSave = { ...server };
+                    const serverToSave = {...server};
                     delete serverToSave._headerString;
                     return serverToSave;
                 })
             } : null
         };
 
-        api.post('/settings', settingsToSave)
-            .then(() => {
-                setSnackbar({ open: true, message: '设置保存成功！', severity: 'success' });
-            })
-            .catch(error => {
-                console.error('Failed to save settings:', error);
-                setSnackbar({ open: true, message: '保存设置失败', severity: 'error' });
+        savingRef.current = true;
+        setSaving(true);
+        try {
+            const response = await saveVersionedSettings<AppSettings>(settingsToSave, settingsRevision);
+            const normalizedSettings = normalizeSettings(response.settings);
+            const etag = response.etag;
+            setSettings(normalizedSettings);
+            setSettingsRevision(etag);
+            setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
+            setAutoCleanIntervalError(false);
+            setSnackbar({
+                open: true,
+                message: etag ? '设置保存成功！' : '设置已保存，但获取设置修订值失败，请刷新页面',
+                severity: etag ? 'success' : 'error'
             });
+        } catch (error: unknown) {
+            console.error('Failed to save settings:', error);
+            setSnackbar({
+                open: true,
+                message: isSettingsConflict(error)
+                    ? '配置已被其他操作修改，请刷新页面后重试'
+                    : '保存设置失败',
+                severity: 'error'
+            });
+        } finally {
+            savingRef.current = false;
+            setSaving(false);
+        }
     };
 
     const handleCloseSnackbar = () => {
         setSnackbar(null);
     };
-    
+
     if (!settings) {
-        return <CircularProgress />;
+        return <CircularProgress/>;
     }
 
     const ai = settings.ai || defaultAiSettings;
     const autoCleanEnabled = (ai.autoCleanContextIntervalMinutes || 0) > 0;
 
     return (
-        <Paper elevation={3} sx={{ p: 4 }}>
+        <Paper elevation={3} sx={{p: 4}}>
             <Typography variant="h4" gutterBottom>
                 设置
             </Typography>
@@ -407,14 +445,14 @@ const Settings: React.FC = () => {
                 </Grid>
 
                 <Grid size={{xs: 12}}>
-                    <Divider sx={{ my: 2 }} />
+                    <Divider sx={{my: 2}}/>
                     <Typography variant="h5" gutterBottom>
                         AI 代理设置
                     </Typography>
                 </Grid>
 
                 <Grid size={{xs: 12}}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Box sx={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
                         <FormControlLabel
                             control={
                                 <Checkbox
@@ -493,9 +531,9 @@ const Settings: React.FC = () => {
                                 </Grid>
                             </>
                         )}
-                        
+
                         <Grid size={{xs: 12}}>
-                            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                            <Box sx={{display: 'flex', gap: 2, alignItems: 'center'}}>
                                 <TextField
                                     fullWidth
                                     label="监听 Chat ID"
@@ -505,10 +543,10 @@ const Settings: React.FC = () => {
                                     variant="outlined"
                                     helperText="AI 将只在此 Chat ID 的会话中回复消息，且可以响应 /reset"
                                 />
-                                <Button 
-                                    variant="outlined" 
+                                <Button
+                                    variant="outlined"
                                     onClick={handleCopyChatId}
-                                    sx={{ whiteSpace: 'nowrap', height: 'fit-content', mt: -3 }}
+                                    sx={{whiteSpace: 'nowrap', height: 'fit-content', mt: -3}}
                                 >
                                     填入发送消息ID
                                 </Button>
@@ -538,7 +576,7 @@ const Settings: React.FC = () => {
                                 }}
                             >
                                 <FormControlLabel
-                                    sx={{ pb: '23px' }}
+                                    sx={{pb: '23px'}}
                                     control={
                                         <Checkbox
                                             checked={autoCleanEnabled}
@@ -556,12 +594,12 @@ const Settings: React.FC = () => {
                                     variant="outlined"
                                     disabled={!autoCleanEnabled}
                                     error={autoCleanIntervalError}
-                                    slotProps={{ htmlInput: { min: 1, step: 1 } }}
+                                    slotProps={{htmlInput: {min: 1, step: 1}}}
                                     helperText={autoCleanIntervalError ? '请输入正整数' : '关闭开关可停用自动清理'}
-                                    sx={{ width: { xs: '100%', sm: 240 } }}
+                                    sx={{width: {xs: '100%', sm: 240}}}
                                 />
                                 <FormControlLabel
-                                    sx={{ pb: '23px' }}
+                                    sx={{pb: '23px'}}
                                     control={
                                         <Checkbox
                                             checked={ai.silentContextCleanup || false}
@@ -580,7 +618,7 @@ const Settings: React.FC = () => {
                                 MCP 服务器配置
                             </Typography>
                             {ai.mcpServers?.map((server, index) => (
-                                <Paper key={index} variant="outlined" sx={{ p: 2, mb: 2 }}>
+                                <Paper key={index} variant="outlined" sx={{p: 2, mb: 2}}>
                                     <Grid container spacing={2} alignItems="center">
                                         <Grid size={{xs: 12, md: 3}}>
                                             <TextField
@@ -621,17 +659,17 @@ const Settings: React.FC = () => {
                                                 })() as unknown as boolean}
                                             />
                                         </Grid>
-                                        <Grid size={{xs: 12, md: 1}} sx={{ textAlign: 'center' }}>
+                                        <Grid size={{xs: 12, md: 1}} sx={{textAlign: 'center'}}>
                                             <IconButton color="error" onClick={() => handleRemoveMCPServer(index)}>
-                                                <DeleteIcon />
+                                                <DeleteIcon/>
                                             </IconButton>
                                         </Grid>
                                     </Grid>
                                 </Paper>
                             ))}
-                            <Button 
-                                variant="outlined" 
-                                startIcon={<AddIcon />} 
+                            <Button
+                                variant="outlined"
+                                startIcon={<AddIcon/>}
                                 onClick={handleAddMCPServer}
                             >
                                 添加 MCP 服务器
@@ -642,7 +680,7 @@ const Settings: React.FC = () => {
 
 
                 <Grid size={{xs: 12}}>
-                    <Divider sx={{ my: 2 }} />
+                    <Divider sx={{my: 2}}/>
                     <Typography variant="h5" gutterBottom>
                         代理设置
                     </Typography>
@@ -694,7 +732,7 @@ const Settings: React.FC = () => {
                                 </Select>
                             </FormControl>
                         </Grid>
-                            <Grid size={{xs: 12, sm: 6}}>
+                        <Grid size={{xs: 12, sm: 6}}>
                             <TextField
                                 fullWidth
                                 label="用户名（可选）"
@@ -721,7 +759,12 @@ const Settings: React.FC = () => {
                 )}
                 <Grid size={{xs: 12}}>
                     <Box mt={2}>
-                        <Button variant="contained" color="primary" onClick={handleSave}>
+                        <Button
+                            variant="contained"
+                            color="primary"
+                            onClick={handleSave}
+                            disabled={saving || !settingsRevision}
+                        >
                             保存设置
                         </Button>
                     </Box>
@@ -737,9 +780,9 @@ const Settings: React.FC = () => {
                     open={snackbar.open}
                     autoHideDuration={6000}
                     onClose={handleCloseSnackbar}
-                    anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+                    anchorOrigin={{vertical: 'bottom', horizontal: 'center'}}
                 >
-                    <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: '100%' }}>
+                    <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{width: '100%'}}>
                         {snackbar.message}
                     </Alert>
                 </Snackbar>

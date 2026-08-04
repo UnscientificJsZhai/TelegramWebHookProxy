@@ -8,9 +8,11 @@
 
 ## 概览
 
-TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统、脚本或自动化工具的消息发送到 Telegram。它内置 Web 管理界面，可以配置 Bot Token、默认会话、代理服务器和 AI 助手能力。
+TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统、脚本或自动化工具的消息发送到 Telegram。它内置 Web 管理界面，可以配置
+Bot Token、默认会话、代理服务器和 AI 助手能力。
 
-启用 AI 后，Telegram Bot 还能作为个人 Agent 使用：接收文本或语音消息，调用本地 HTTP API、MCP 工具、Skill 知识库和定时任务能力，用来管理家中或服务器上的服务。
+启用 AI 后，Telegram Bot 还能作为个人 Agent 使用：接收文本或语音消息，调用本地 HTTP API、MCP 工具、Skill
+知识库和定时任务能力，用来管理家中或服务器上的服务。
 
 ## 功能特性
 
@@ -26,11 +28,11 @@ TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统�
 ## 技术栈
 
 | 模块 | 技术                                                                  |
-|----|---------------------------------------------------------------------|
-| 后端 | Kotlin 2.2、Ktor 3、Dagger、kotlinx.serialization                      |
-| AI | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
-| 前端 | React 19、Vite、Material UI、React Router、Axios                        |
-| 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                          |
+|------|-----------------------------------------------------------------------|
+| 后端 | Kotlin 2.4.10、Ktor 3、Dagger、kotlinx.serialization                  |
+| AI   | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
+| 前端 | React 19、Vite、Material UI、React Router、Axios                      |
+| 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                         |
 
 ## 快速开始
 
@@ -92,9 +94,9 @@ java -jar backend/build/libs/TelegramWebHookProxy-1.1.3-all.jar
 
 支持 `application/json` 与 `application/x-www-form-urlencoded`。
 
-| 查询参数           | 默认值      | 说明                             |
-|----------------|----------|--------------------------------|
-| `messagefield` | `text`   | 请求体中表示消息内容的字段名                 |
+| 查询参数       | 默认值   | 说明                                       |
+|----------------|----------|--------------------------------------------|
+| `messagefield` | `text`   | 请求体中表示消息内容的字段名               |
 | `chatidfield`  | `chatId` | 请求体中表示目标 Telegram Chat ID 的字段名 |
 
 默认 JSON 请求：
@@ -120,27 +122,27 @@ curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chati
 
 ### 常用接口
 
-| 方法       | 路径                           | 说明                 |
-|----------|------------------------------|--------------------|
-| `GET`    | `/api/settings`              | 获取当前设置             |
-| `POST`   | `/api/settings`              | 保存全局设置             |
-| `POST`   | `/api/settings/chat`         | 更新默认 Telegram 会话   |
+| 方法     | 路径                         | 说明                       |
+|----------|------------------------------|----------------------------|
+| `GET`    | `/api/settings`              | 获取当前设置               |
+| `POST`   | `/api/settings`              | 保存全局设置               |
+| `POST`   | `/api/settings/chat`         | 更新默认 Telegram 会话     |
 | `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话 |
-| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话          |
-| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill         |
-| `POST`   | `/api/skills`                | 新增或更新 Skill        |
-| `DELETE` | `/api/skills/{id}`           | 删除 Skill           |
+| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话         |
+| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill             |
+| `POST`   | `/api/skills`                | 新增或更新 Skill           |
+| `DELETE` | `/api/skills/{id}`           | 删除 Skill                 |
 
 ## AI Agent
 
 AI Agent 只处理来自 `agentChatId` 的消息。开启后可在 Telegram 中使用以下命令：
 
-| 命令              | 说明                |
-|-----------------|-------------------|
-| `/model`        | 查看当前模型与可用模型       |
-| `/model <模型名称>` | 切换模型并重置会话         |
-| `/reset`        | 重置当前会话上下文并清空待处理消息 |
-| `/keep`         | 刷新自动清理上下文的计时      |
+| 命令                | 说明                               |
+|---------------------|------------------------------------|
+| `/model`            | 查看当前模型与可用模型             |
+| `/model <模型名称>` | 切换模型并重置会话                 |
+| `/reset`            | 重置当前会话上下文并清空待处理消息 |
+| `/keep`             | 刷新自动清理上下文的计时           |
 
 Agent 可用能力包括：
 

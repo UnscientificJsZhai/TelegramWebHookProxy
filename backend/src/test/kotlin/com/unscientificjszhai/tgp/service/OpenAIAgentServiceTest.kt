@@ -20,6 +20,7 @@ import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
@@ -56,7 +57,7 @@ class OpenAIAgentServiceTest {
     fun setup() {
         tempDirectory = Files.createTempDirectory("openai-agent-service-test").toFile()
         val testScope = CoroutineScope(EmptyCoroutineContext)
-        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"))
+        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
         skillRepository = SkillRepository.forTesting(File(tempDirectory, "skills.json"))
         service = OpenAIAgentService(
             testScope,

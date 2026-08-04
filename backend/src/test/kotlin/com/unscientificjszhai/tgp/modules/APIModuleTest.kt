@@ -58,15 +58,26 @@ class APIModuleTest {
             ),
         )
 
+        val revision = currentSettingsETag()
         client.post("/api/settings") {
+            header(HttpHeaders.IfMatch, revision)
             header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
             setBody(Json.encodeToString(testSettings))
         }.apply {
             assertEquals(HttpStatusCode.OK, status)
+            assertEquals(testSettings, Json.decodeFromString<AppSettings>(bodyAsText()))
+            assertEquals(
+                "\"${repository.currentSettingsSnapshot().revision}\"",
+                headers[HttpHeaders.ETag],
+            )
         }
 
         client.get("/api/settings").apply {
             assertEquals(HttpStatusCode.OK, status)
+            assertEquals(
+                "\"${repository.currentSettingsSnapshot().revision}\"",
+                headers[HttpHeaders.ETag],
+            )
             val receivedSettings = Json.decodeFromString<AppSettings>(bodyAsText())
 
             assertEquals("api_token", receivedSettings.telegramToken)
@@ -76,6 +87,75 @@ class APIModuleTest {
             assertEquals("system prompt", receivedSettings.ai?.globalContext)
         }
         assertEquals(testSettings, repository.settingsFlow.value)
+    }
+
+    /**
+     * 验证完整设置写入强制使用单个强 ETag，且过期请求不会提交。
+     */
+    @Test
+    fun `settings API enforces strong If-Match preconditions`() = withTestApi { repository, _, configFile ->
+        val requested = AppSettings(telegramToken = "100:requested")
+
+        client.post("/api/settings") {
+            contentType(ContentType.Application.Json)
+            setBody(Json.encodeToString(requested))
+        }.apply {
+            assertEquals(HttpStatusCode(428, "Precondition Required"), status)
+        }
+
+        listOf(
+            "W/\"${repository.currentSettingsSnapshot().revision}\"",
+            "\"${repository.currentSettingsSnapshot().revision}\", \"other\"",
+            "\"not-a-sha256\"",
+        ).forEach { invalid ->
+            client.post("/api/settings") {
+                header(HttpHeaders.IfMatch, invalid)
+                contentType(ContentType.Application.Json)
+                setBody(Json.encodeToString(requested))
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+        }
+
+        val staleETag = currentSettingsETag()
+        repository.updateSettings { it.copy(chatId = "concurrent-chat") }
+        val contentBeforeStaleWrite = configFile.readText()
+        client.post("/api/settings") {
+            header(HttpHeaders.IfMatch, staleETag)
+            contentType(ContentType.Application.Json)
+            setBody(Json.encodeToString(requested))
+        }.apply {
+            assertEquals(HttpStatusCode.PreconditionFailed, status)
+        }
+
+        assertEquals("concurrent-chat", repository.settingsFlow.value.chatId)
+        assertEquals(contentBeforeStaleWrite, configFile.readText())
+    }
+
+    /**
+     * 验证聊天局部更新会使旧的完整设置提交失败，避免静默回滚聊天标识。
+     */
+    @Test
+    fun `chat update cannot be overwritten by stale full settings save`() = withTestApi { repository, _, _ ->
+        val staleETag = currentSettingsETag()
+
+        client.post("/api/settings/chat") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"chatId":"new-chat"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+        }
+
+        client.post("/api/settings") {
+            header(HttpHeaders.IfMatch, staleETag)
+            contentType(ContentType.Application.Json)
+            setBody(Json.encodeToString(AppSettings(telegramToken = "100:new-token")))
+        }.apply {
+            assertEquals(HttpStatusCode.PreconditionFailed, status)
+        }
+
+        assertEquals("new-chat", repository.settingsFlow.value.chatId)
+        assertEquals("", repository.settingsFlow.value.telegramToken)
     }
 
     /**
@@ -99,7 +179,9 @@ class APIModuleTest {
             ),
         )
 
+        val revision = currentSettingsETag()
         client.post("/api/settings") {
+            header(HttpHeaders.IfMatch, revision)
             header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
             setBody(Json.encodeToString(unsafe))
         }.apply {
@@ -123,7 +205,9 @@ class APIModuleTest {
         )
 
         suspend fun save(settings: AppSettings): AppSettings {
+            val revision = currentSettingsETag()
             client.post("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
                 header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
                 setBody(Json.encodeToString(settings))
             }.apply {
@@ -180,6 +264,35 @@ class APIModuleTest {
     }
 
     /**
+     * 验证有效 AI 提供方切换会重新发布机器人模型命令。
+     */
+    @Test
+    fun `provider switch refreshes bot model commands`() = withTestApi { repository, telegramService, _ ->
+        val geminiSettings = AppSettings(
+            telegramToken = "100:token",
+            ai = AISettings(provider = AIProvider.GEMINI, agentEnabled = true, geminiApiKey = "gemini-key"),
+        )
+        repository.saveSettings(geminiSettings)
+        val openAiSettings = geminiSettings.copy(
+            ai = geminiSettings.ai!!.copy(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "openai-key",
+            ),
+        )
+
+        val revision = currentSettingsETag()
+        client.post("/api/settings") {
+            header(HttpHeaders.IfMatch, revision)
+            contentType(ContentType.Application.Json)
+            setBody(Json.encodeToString(openAiSettings))
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+        }
+
+        coVerify(exactly = 1) { telegramService.updateBotCommands("100:token", AIProvider.OPENAI) }
+    }
+
+    /**
      * 验证非法代理和未知协议会返回 400，且不会保存设置或更新机器人指令。
      */
     @Test
@@ -189,7 +302,9 @@ class APIModuleTest {
             repository.saveSettings(original)
             val originalContent = configFile.readText()
 
+            val revision = currentSettingsETag()
             client.post("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
                 contentType(ContentType.Application.Json)
                 setBody(
                     Json.encodeToString(
@@ -204,6 +319,7 @@ class APIModuleTest {
             }
 
             client.post("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
                 contentType(ContentType.Application.Json)
                 setBody("""{"proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"}}""")
             }.apply {
@@ -250,7 +366,9 @@ class APIModuleTest {
                     chatId = "resolved-chat",
                     proxy = ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS),
                 )
+                val revision = currentSettingsETag()
                 client.post("/api/settings") {
+                    header(HttpHeaders.IfMatch, revision)
                     contentType(ContentType.Application.Json)
                     setBody(Json.encodeToString(resolvedSettings))
                 }.apply {
@@ -357,4 +475,8 @@ class APIModuleTest {
         }
         apiModule(appComponent)
     }
+
+    private suspend fun ApplicationTestBuilder.currentSettingsETag(): String =
+        client.get("/api/settings").headers[HttpHeaders.ETag]
+            ?: error("设置读取响应缺少 ETag")
 }

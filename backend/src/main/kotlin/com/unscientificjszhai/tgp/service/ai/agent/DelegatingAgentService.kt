@@ -29,9 +29,9 @@ import javax.inject.Singleton
 /**
  * 根据应用设置创建并代理当前 AI 提供商的服务实例。
  *
- * 设置或技能发生变化时，此服务会重建或重置底层代理；发送消息会等待模型切换屏障放行，
- * 以避免请求使用已被替换的服务。该屏障仅协调此委派服务的消息和组件重建，不表示应用内所有
- * AI 相关操作都被全局串行化。
+ * 设置或技能发生变化时，此服务会重建或重置底层代理；构造时会登记一次性初始就绪代次，直到首次
+ * 设置处理及候选代理初始化完成才放行。发送消息会等待模型切换屏障放行，以避免请求使用已被替换的服务。
+ * 该屏障仅协调此委派服务的消息和组件重建，不表示应用内所有 AI 相关操作都被全局串行化。
  *
  * @param agentComponentFactory 用于创建提供商专属代理组件的工厂。
  * @param settingsRepository 提供 AI 与代理设置变更的仓库。
@@ -48,16 +48,17 @@ class DelegatingAgentService @Inject constructor(
     parentScope: CoroutineScope,
 ) : AgentService() {
     /**
-     * 为不使用依赖注入的调用方创建服务。
+     * 为未接入依赖注入的既有调用方创建服务。
      *
-     * 此构造函数会创建独立的 [ModelSwitchBarrier]。
+     * 此兼容构造器复用 [settingsRepository] 持有的屏障，不会创建独立屏障。新代码应通过依赖注入构造服务，
+     * 以显式共享应用级依赖。
      *
      * @param agentComponentFactory 用于创建提供商专属代理组件的工厂。
-     * @param settingsRepository 提供 AI 与代理设置变更的仓库。
+     * @param settingsRepository 提供 AI 与代理设置变更的仓库，且必须持有应用共享的屏障。
      * @param skillRepository 提供技能变更事件的仓库。
      * @param parentScope 用于收集设置与技能变更的协程作用域。
      */
-    @Suppress("unused")
+    @Deprecated("请通过依赖注入构造 DelegatingAgentService，以显式共享 ModelSwitchBarrier。")
     constructor(
         agentComponentFactory: AgentComponent.Factory,
         settingsRepository: SettingsRepository,
@@ -67,13 +68,17 @@ class DelegatingAgentService @Inject constructor(
         agentComponentFactory,
         settingsRepository,
         skillRepository,
-        ModelSwitchBarrier(),
+        settingsRepository.modelSwitchBarrier,
         parentScope,
     )
 
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
     private val lifecycleLock = Any()
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // 初始 SettingsUpdate 没有 switchGeneration，必须用独立代次保护 Poller 的启动。
+    private val initialReadinessGeneration = modelSwitchBarrier.beginSwitch()
+    private var initialReadinessPending = true
 
     @Volatile
     private var closed = false
@@ -117,11 +122,8 @@ class DelegatingAgentService @Inject constructor(
                 if (settingsUpdate.switchGeneration != null) {
                     modelSwitchBarrier.awaitInFlightRequests()
                 }
-                if (aiSettings != null && aiSettings.agentEnabled) {
-                    val apiKey = when (aiSettings.provider) {
-                        AIProvider.OPENAI -> aiSettings.openAiApiKey
-                        else -> aiSettings.geminiApiKey
-                    }
+                val apiKey = aiSettings?.requiredApiKey()
+                if (aiSettings?.agentEnabled == true && !apiKey.isNullOrBlank()) {
                     val baseUrl = aiSettings.openAiBaseUrl
 
                     val needsRecreate = synchronized(lifecycleLock) {
@@ -147,8 +149,33 @@ class DelegatingAgentService @Inject constructor(
             } finally {
                 lastHandledSettings = settings
                 modelSwitchBarrier.completeThrough(settingsUpdate.switchGeneration)
+                completeInitialReadiness()
             }
-        }.launchIn(parentScope)
+        }.launchIn(parentScope).also { job ->
+            job.invokeOnCompletion { completeInitialReadiness() }
+        }
+    }
+
+    /**
+     * 释放仅覆盖首次设置处理的一次性启动代次。
+     *
+     * 设置收集器在首次处理完成、取消或关闭时都会调用本方法；后续设置更新不会重复影响该代次。
+     */
+    private fun completeInitialReadiness() {
+        val shouldComplete = synchronized(lifecycleLock) {
+            initialReadinessPending.also { initialReadinessPending = false }
+        }
+        if (shouldComplete) {
+            modelSwitchBarrier.complete(initialReadinessGeneration)
+        }
+    }
+
+    /**
+     * 返回当前 AI 提供商启动所需的 API 密钥。
+     */
+    private fun AISettings.requiredApiKey(): String = when (provider) {
+        AIProvider.OPENAI -> openAiApiKey
+        AIProvider.GEMINI -> geminiApiKey
     }
 
     /**
@@ -200,6 +227,8 @@ class DelegatingAgentService @Inject constructor(
             }
         } finally {
             if (!published) {
+                // 取消或失败后的候选清理可能卡住；初始 Poller 不应因此永久等待启动屏障。
+                completeInitialReadiness()
                 withContext(NonCancellable) {
                     newService.close()?.join()
                 }
@@ -248,13 +277,17 @@ class DelegatingAgentService @Inject constructor(
         onlySelectedModelChanged: Boolean,
     ) {
         if (!selectedModelChanged) {
-            _currentService?.resetSession()?.join()
+            if (!awaitSuccessfulReset(_currentService?.resetSession())) {
+                logger.warn("Failed to reset agent session after settings changed.")
+            }
             return
         }
 
         if (aiSettings.selectedModel.isBlank()) {
             if (!onlySelectedModelChanged) {
-                _currentService?.resetSession()?.join()
+                if (!awaitSuccessfulReset(_currentService?.resetSession())) {
+                    logger.warn("Failed to reset agent session after clearing model selection.")
+                }
             }
             return
         }
@@ -268,9 +301,23 @@ class DelegatingAgentService @Inject constructor(
 
         if (modelSwitchJob != null) {
             modelSwitchJob.join()
+            if (modelSwitchJob.isCancelled) {
+                logger.warn("Failed to switch agent model to {}.", aiSettings.selectedModel)
+            }
         } else if (!onlySelectedModelChanged) {
-            _currentService?.resetSession()?.join()
+            if (!awaitSuccessfulReset(_currentService?.resetSession())) {
+                logger.warn("Failed to reset agent session after unsupported model selection.")
+            }
         }
+    }
+
+    /**
+     * 等待会话重置任务，并以任务状态而非 [Job.join] 的返回行为判定成功。
+     */
+    private suspend fun awaitSuccessfulReset(resetJob: Job?): Boolean {
+        resetJob ?: return false
+        resetJob.join()
+        return !resetJob.isCancelled
     }
 
     /**
@@ -297,10 +344,23 @@ class DelegatingAgentService @Inject constructor(
      * 判断当前底层代理能否根据给定设置启用。
      *
      * @param aiSettings 要检查的 AI 设置。
-     * @return 当前代理存在且其提供商所需设置完整时返回 `true`，否则返回 `false`。
+     * @return 服务未关闭、当前代理与设置指定的提供商及凭据一致且底层代理可用时返回 `true`，否则返回
+     * `false`。
      */
-    override fun isAiFeatureEnabled(aiSettings: AISettings): Boolean =
-        _currentService?.isAiFeatureEnabled(aiSettings) ?: false
+    override fun isAiFeatureEnabled(aiSettings: AISettings): Boolean {
+        val apiKey = aiSettings.requiredApiKey()
+        return synchronized(lifecycleLock) {
+            val service = _currentService
+            !closed &&
+                    aiSettings.agentEnabled &&
+                    apiKey.isNotBlank() &&
+                    service != null &&
+                    currentProvider == aiSettings.provider &&
+                    currentApiKey == apiKey &&
+                    currentBaseUrl == aiSettings.openAiBaseUrl &&
+                    service.isAiFeatureEnabled(aiSettings)
+        }
+    }
 
     /**
      * 将模型切换请求转发给当前底层代理。
@@ -329,6 +389,9 @@ class DelegatingAgentService @Inject constructor(
     /**
      * 转发当前底层代理的会话重置请求。
      *
+     * 本方法原样返回当前底层提供商的任务；任务的正常完成、取消和失败语义完全遵从该提供商的
+     * [AgentService.resetSession] 实现文档。委托层不将 Gemini 的候选会话原子提交语义泛化给其他提供商。
+     *
      * @return 已开始重置时返回异步任务；服务不可用或无需重置时返回 `null`。
      * @throws IllegalStateException 当服务尚未初始化或已禁用时抛出。
      */
@@ -356,15 +419,16 @@ class DelegatingAgentService @Inject constructor(
     /**
      * 终态关闭当前底层代理并清除服务引用。
      *
-     * 首次调用会停止设置订阅，并等待当前代理及任何正在进行的重建安全完成清理；重复调用返回同一个
-     * 等待任务。调用方取消等待任务不会取消清理，后续调用会提供新的等待任务。关闭后服务不再发布新的
-     * 代理。
+     * 首次调用会同步释放初始就绪屏障、停止设置订阅，并等待当前代理及任何正在进行的重建安全完成清理；
+     * 候选代理清理耗时不会阻塞已等待启动屏障的调用方。重复调用返回同一个等待任务。调用方取消等待任务
+     * 不会取消清理，后续调用会提供新的等待任务。关闭后服务不再发布新的代理。
      *
      * @return 幂等的异步清理任务；等待其完成后当前 Agent 组件持有的资源均已释放。
      */
     override fun close(): Job = synchronized(lifecycleLock) {
         val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
             closed = true
+            completeInitialReadiness()
             val settingsJobToStop = settingsJob
             settingsJob = null
             settingsJobToStop?.cancel()

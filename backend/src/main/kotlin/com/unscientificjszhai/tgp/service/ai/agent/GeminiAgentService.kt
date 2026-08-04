@@ -101,6 +101,12 @@ class GeminiAgentService @Inject constructor(
     private val modelUpdateMutex = Mutex()
     private val modelStateLock = Any()
     private var modelSelectionVersion = 0L
+
+    /** 仅在 [modelStateLock] 保护下访问；非空时表示尚未提交的最新模型选择。 */
+    private var pendingModel: String? = null
+
+    /** 仅在 [modelStateLock] 保护下访问；表示 [pendingModel] 对应的候选会话任务。 */
+    private var pendingModelSwitchJob: Job? = null
     private var initialModelUpdateJob: Job? = null
     private var configuredApiKey: String? = null
     private var configuredProxy: ProxySettings? = null
@@ -108,6 +114,7 @@ class GeminiAgentService @Inject constructor(
     /**
      * 获取当前会话实际使用的 Gemini 模型名称。
      */
+    @Volatile
     override var currentModel: String = DEFAULT_MODEL
         private set
 
@@ -189,46 +196,62 @@ class GeminiAgentService @Inject constructor(
     override fun initializationJob(): Job? = initialReadinessJob
 
     private fun createInitialReadinessJob(resetJob: Job?): Job = resetJob?.let { initialResetJob ->
-        scope.launch {
+        scope.launch(CoroutineExceptionHandler { _, error ->
+            logger.error("Gemini agent initialization did not become ready", error)
+        }) {
             initialResetJob.join()
             if (initialResetJob.isCancelled || chat == null) {
-                throw CancellationException("Gemini agent initialization failed")
+                throw IllegalStateException("Gemini agent initialization failed")
             }
         }
     } ?: failedInitializationJob()
 
-    private fun failedInitializationJob(): Job = Job().also {
-        it.cancel(CancellationException("Gemini agent initialization failed"))
+    private fun failedInitializationJob(): Job = scope.launch(
+        CoroutineExceptionHandler { _, error -> logger.error("Gemini agent initialization failed", error) },
+        start = CoroutineStart.UNDISPATCHED,
+    ) {
+        throw IllegalStateException("Gemini agent initialization failed")
     }
 
     /**
-     * 保存当前会话的历史记录。
+     * 读取候选会话应继承的历史记录。
+     *
+     * 调用方必须持有 [sessionMutex]。读取失败时保留当前待恢复历史，避免候选创建失败或历史读取失败
+     * 提前破坏既有会话状态。
      */
-    private fun captureHistoryLocked() {
+    private fun captureHistoryLocked(): List<Content>? {
         try {
-            chat?.getHistory(true)?.let { history ->
-                if (history.isNotEmpty()) {
-                    savedHistory = history
-                    logger.debug("Captured history: ${history.size} items.")
-                }
+            val history = chat?.getHistory(true)?.takeIf { it.isNotEmpty() } ?: savedHistory
+            if (history != null) {
+                logger.debug("Captured history: ${history.size} items.")
             }
+            return history
         } catch (e: Exception) {
             logger.warn("Failed to capture history", e)
+            return savedHistory
         }
     }
+
+    private data class ModelSwitchRequest(
+        val model: String,
+        val version: Long,
+    )
 
     /**
      * 切换当前会话使用的模型。
      *
-     * 模型名称可以省略 `models/` 前缀。实际切换时会保存当前历史记录并异步重建会话。
+     * 模型名称可以省略 `models/` 前缀。实际切换时会保存当前历史记录并异步重建会话；只有候选会话
+     * 创建成功且该请求仍代表最新选择时，才会同时提交模型与会话。并发切换按最新选择线性化，较旧任务会
+     * 以取消状态结束而不会覆盖新选择。
      *
      * @param modelName 要切换到的模型名称，必须存在于 [availableModels]，或在补上 `models/`
      * 前缀后存在于该列表。
-     * @return 已开始切换时返回重置会话的任务；模型未改变或服务已关闭时返回 `null`。
+     * @return 已开始切换时返回重置会话的任务；模型未改变或服务已关闭时返回 `null`。调用方等待任务后
+     * 必须检查 [Job.isCancelled]；仅正常完成表示模型和会话都已提交。
      * @throws IllegalArgumentException 当 [modelName] 不在 [availableModels] 中时抛出。
      */
     override fun switchModel(modelName: String): Job? {
-        val modelChanged = synchronized(modelStateLock) {
+        return synchronized(modelStateLock) {
             if (closed) {
                 return null
             }
@@ -240,18 +263,8 @@ class GeminiAgentService @Inject constructor(
             if (normalizedModel !in availableModels) {
                 throw IllegalArgumentException("Unsupported model: $modelName")
             }
-            if (currentModel == normalizedModel) {
-                false
-            } else {
-                currentModel = normalizedModel
-                modelSelectionVersion++
-                true
-            }
+            startModelSwitchLocked(normalizedModel)
         }
-        if (modelChanged) {
-            return resetSession(captureHistory = true)
-        }
-        return null
     }
 
     /**
@@ -278,17 +291,22 @@ class GeminiAgentService @Inject constructor(
                 availableModels = refreshedModels
                 val invalidModel = currentModel.takeUnless { it in availableModels }
                 val fallbackModel = invalidModel?.let { preferredModel(availableModels) }
-                if (fallbackModel != null) {
-                    currentModel = fallbackModel
-                    modelSelectionVersion++
+                val fallbackJob = fallbackModel?.let(::startModelSwitchLocked)
+                Triple(fallbackJob, invalidModel, ModelSnapshot(currentModel, availableModels))
+            }
+            val fallbackJob = refreshResult.first
+            if (fallbackJob != null) {
+                fallbackJob.join()
+                if (fallbackJob.isCancelled) {
+                    return@withLock null
                 }
-                Triple(ModelSnapshot(currentModel, availableModels), fallbackModel != null, invalidModel)
+                refreshResult.second?.let(::clearPersistedSelectedModel)
+            } else if (refreshResult.second != null) {
+                return@withLock null
             }
-            if (refreshResult.second) {
-                resetSession()?.join()
+            synchronized(modelStateLock) {
+                ModelSnapshot(currentModel, availableModels)
             }
-            refreshResult.third?.let(::clearPersistedSelectedModel)
-            refreshResult.first
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -300,11 +318,16 @@ class GeminiAgentService @Inject constructor(
     /**
      * 异步重置当前会话并重新应用系统提示词、技能与 MCP 工具。
      *
-     * @return 已开始重置时返回对应任务；服务已关闭或 Gemini 客户端不可用时返回 `null`。
+     * @return 已开始重置时返回对应任务；服务已关闭或 Gemini 客户端不可用时返回 `null`。调用方必须在
+     * [Job.join] 后检查 [Job.isCancelled]：只有任务正常完成时，新会话才已原子替换旧会话；候选创建
+     * 失败或任务取消都会保留旧会话状态。
      */
     override fun resetSession(): Job? = resetSession(captureHistory = false)
 
-    private fun resetSession(captureHistory: Boolean): Job? {
+    private fun resetSession(
+        captureHistory: Boolean,
+        switchRequest: ModelSwitchRequest? = null,
+    ): Job? {
         if (closed) {
             return null
         }
@@ -315,56 +338,136 @@ class GeminiAgentService @Inject constructor(
         }
 
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
-        return scope.launch {
-            sessionMutex.withLock {
-                if (closed) {
-                    return@withLock
-                }
-                if (captureHistory) {
-                    captureHistoryLocked()
-                }
-                mcpClientService.connect(aiSettings.mcpServers)
-                currentCoroutineContext().ensureActive()
-                if (closed) {
-                    return@withLock
-                }
-                val functionRouteSnapshot = localFunctionRouter.refresh()
-                val functionDeclarations = functionRouteSnapshot.providedFunctions()
-                val configBuilder = GenerateContentConfig.builder()
-                val skills = skillRepository.getSkillSummaries()
-                val skillPrompt = getSkillPrompt(skills)
+        return scope.launch(CoroutineExceptionHandler { _, error ->
+            logger.error("Gemini session reset failed", error)
+        }) {
+            try {
+                sessionMutex.withLock {
+                    ensureResetCanCommit(switchRequest)
+                    val candidateHistory = if (captureHistory) captureHistoryLocked() else null
+                    mcpClientService.connect(aiSettings.mcpServers)
+                    currentCoroutineContext().ensureActive()
+                    ensureResetCanCommit(switchRequest)
+                    val functionRouteSnapshot = localFunctionRouter.refresh()
+                    val functionDeclarations = functionRouteSnapshot.providedFunctions()
+                    val configBuilder = GenerateContentConfig.builder()
+                    val skills = skillRepository.getSkillSummaries()
+                    val skillPrompt = getSkillPrompt(skills)
 
-                val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
-                    Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
-                } else {
-                    Content.fromParts(Part.fromText(skillPrompt))
-                }
-                configBuilder.systemInstruction(systemInstruction)
-
-                if (functionDeclarations.isNotEmpty()) {
-                    configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
-                }
-
-                try {
-                    val newChat = currentClient.chats.create(currentModel, configBuilder.build())
-                    synchronized(lifecycleLock) {
-                        if (!closed) {
-                            chat = newChat
-                            chatFunctionRouteSnapshot = functionRouteSnapshot
-                            logger.info("Gemini session reset with model: $currentModel")
-                        }
+                    val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
+                        Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
+                    } else {
+                        Content.fromParts(Part.fromText(skillPrompt))
                     }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.error("Failed to create Gemini chat session", e)
-                    synchronized(lifecycleLock) {
-                        if (!closed) {
-                            chat = null
-                            chatFunctionRouteSnapshot = null
-                        }
+                    configBuilder.systemInstruction(systemInstruction)
+
+                    if (functionDeclarations.isNotEmpty()) {
+                        configBuilder.tools(listOf(Tool.builder().functionDeclarations(functionDeclarations).build()))
+                    }
+
+                    val candidateModel = switchRequest?.model ?: currentModel
+                    val newChat = try {
+                        currentClient.chats.create(candidateModel, configBuilder.build())
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error("Failed to create Gemini chat session", e)
+                        throw e
+                    }
+                    currentCoroutineContext().ensureActive()
+                    ensureResetCanCommit(switchRequest)
+
+                    // 会话锁和模型锁将会话、路由、待恢复历史和模型的发布线性化；在此之前旧状态始终可用。
+                    commitCandidateSession(newChat, functionRouteSnapshot, candidateHistory, switchRequest)
+                    logger.info("Gemini session reset with model: $candidateModel")
+                }
+            } catch (e: Throwable) {
+                switchRequest?.let(::abandonModelSwitch)
+                throw e
+            }
+        }
+    }
+
+    private suspend fun ensureResetCanCommit(switchRequest: ModelSwitchRequest?) {
+        currentCoroutineContext().ensureActive()
+        if (closed) {
+            throw CancellationException("Gemini agent is closed")
+        }
+        if (switchRequest != null && !isLatestModelSwitch(switchRequest)) {
+            throw CancellationException("Gemini model switch was superseded")
+        }
+    }
+
+    private fun isLatestModelSwitch(request: ModelSwitchRequest): Boolean = synchronized(modelStateLock) {
+        modelSelectionVersion == request.version && pendingModel == request.model
+    }
+
+    /**
+     * 在 [modelStateLock] 内启动或复用目标模型的候选会话任务。
+     */
+    private fun startModelSwitchLocked(model: String): Job? {
+        if (pendingModel == model) {
+            return pendingModelSwitchJob
+        }
+        if (pendingModel == null && currentModel == model) {
+            return null
+        }
+
+        val request = ModelSwitchRequest(model, ++modelSelectionVersion)
+        if (currentModel == model) {
+            // 取消尚未提交的其他选择；当前已发布会话正好就是最新模型。
+            pendingModel = null
+            pendingModelSwitchJob = null
+            return Job().apply { complete() }
+        }
+
+        pendingModel = model
+        val switchJob = resetSession(captureHistory = true, switchRequest = request) ?: run {
+            pendingModel = null
+            return null
+        }
+        pendingModelSwitchJob = switchJob
+        switchJob.invokeOnCompletion {
+            synchronized(modelStateLock) {
+                if (pendingModelSwitchJob === switchJob) {
+                    pendingModelSwitchJob = null
+                    if (pendingModel == request.model && modelSelectionVersion == request.version) {
+                        pendingModel = null
                     }
                 }
+            }
+        }
+        return switchJob
+    }
+
+    private fun commitCandidateSession(
+        candidateChat: Chat,
+        candidateRouteSnapshot: LocalFunctionRouteSnapshot,
+        candidateHistory: List<Content>?,
+        switchRequest: ModelSwitchRequest?,
+    ) {
+        synchronized(modelStateLock) {
+            if (switchRequest != null) {
+                check(modelSelectionVersion == switchRequest.version && pendingModel == switchRequest.model) {
+                    "Gemini model switch was superseded before commit"
+                }
+            }
+            chat = candidateChat
+            chatFunctionRouteSnapshot = candidateRouteSnapshot
+            savedHistory = candidateHistory
+            if (switchRequest != null) {
+                currentModel = switchRequest.model
+                pendingModel = null
+                pendingModelSwitchJob = null
+            }
+        }
+    }
+
+    private fun abandonModelSwitch(request: ModelSwitchRequest) {
+        synchronized(modelStateLock) {
+            if (modelSelectionVersion == request.version && pendingModel == request.model) {
+                pendingModel = null
+                pendingModelSwitchJob = null
             }
         }
     }
@@ -449,9 +552,7 @@ class GeminiAgentService @Inject constructor(
                 handleResponse(response, chatForMessage, activeChat.second)
             } catch (e: ToolCallLimitExceededException) {
                 logger.error("Tool call limit reached for Gemini session", e)
-                savedHistory = null
-                chat = null
-                chatFunctionRouteSnapshot = null
+                // 重置同样采用候选提交；创建失败时仍保留当前会话，避免在错误恢复路径破坏可用状态。
                 resetSessionJob = resetSession()
                 throw e
             } catch (e: Exception) {
@@ -536,15 +637,18 @@ class GeminiAgentService @Inject constructor(
      * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
      */
     private fun clearPersistedSelectedModel(invalidModel: String) {
-        val settings = settingsRepository.settingsFlow.value
-        val aiSettings = settings.ai
-        if (
-            aiSettings?.provider == AIProvider.GEMINI &&
-            aiSettings.geminiApiKey == configuredApiKey &&
-            settings.proxy == configuredProxy &&
-            aiSettings.selectedModel == invalidModel
-        ) {
-            settingsRepository.saveSettings(settings.copy(ai = aiSettings.copy(selectedModel = "")))
+        settingsRepository.updateSettings { settings ->
+            val aiSettings = settings.ai
+            if (
+                aiSettings?.provider == AIProvider.GEMINI &&
+                aiSettings.geminiApiKey == configuredApiKey &&
+                settings.proxy == configuredProxy &&
+                aiSettings.selectedModel == invalidModel
+            ) {
+                settings.copy(ai = aiSettings.copy(selectedModel = ""))
+            } else {
+                settings
+            }
         }
     }
 
