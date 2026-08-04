@@ -32,7 +32,9 @@ enum class LoopMode {
  * @property executionTime 下次执行的 Unix 时间戳，单位为毫秒；到期实例会在任何 Agent 或 Telegram 副作用前
  * 原子预消费，单次任务删除、循环任务推进到一个严格未来时刻。
  * @property loopMode 任务预消费后的重复调度方式；错过周期只执行一次而不逐期补跑。
- * @property agentChatId 接收任务执行结果的 Telegram 聊天标识；允许为空字符串并按原样保存。
+ * @property agentChatId 接收任务执行结果的 Telegram 聊天标识；新任务必须为非空白字符串，且按原样保存，
+ * 不去除首尾空白。旧版持久化数据可含空白值；调度器会在到期扫描中将其作为已撤销任务
+ * 原子删除，且不调用 Agent 或 Telegram。
  * @property calendarAnchorTimeMillis 日/周循环任务创建时的服务器本地时刻，自当天 `00:00` 起的毫秒数，范围为
  * `0..86399999`。调度器用它跨 DST gap 保持原始本地日历锚点：gap 当次可延后至首个有效时刻，但后续周期会
  * 恢复该锚点。`null` 兼容旧 JSON，调度器会在首次预消费时从 [executionTime] 安全推导并持久化；非空但越界的

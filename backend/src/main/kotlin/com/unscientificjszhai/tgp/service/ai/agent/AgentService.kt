@@ -47,6 +47,16 @@ class AgentTurnFailedException(
 ) : IllegalStateException(message, cause)
 
 /**
+ * 当前设置对应的代理尚未完成配置，因此拒绝开始新的代理操作。
+ *
+ * 此异常不携带提供商、凭据或网络失败详情。调用方应等待后续设置更新恢复可用性，而不是回退到已退休的
+ * 代理实例。
+ */
+internal class AgentConfigurationNotReadyException : IllegalStateException(
+    "当前 AI 配置尚未就绪。",
+)
+
+/**
  * 语音文件超过转写服务允许的本地请求大小。
  *
  * 异常在创建 multipart 请求前抛出，因此不会读取、写入或上传临时文件。调用方可提示用户发送更短的语音，

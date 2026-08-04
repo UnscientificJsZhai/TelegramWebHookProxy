@@ -8,6 +8,7 @@ import com.unscientificjszhai.tgp.repository.TelegramBotLease
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentConfigurationNotReadyException
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
@@ -66,10 +67,14 @@ import kotlin.time.Duration.Companion.minutes
  * gap 解析到首个有效本地时间，overlap 使用较早偏移量；日/周任务会持久化创建时的本地时刻锚点，所以 gap
  * 当次的延后时刻不会漂移到之后的日期或周。无法表示未来时刻或存在无效日历锚点时同样预消费删除并记录警告，
  * 避免永久重复。
- * 扫描会在 [AgentService.withReadyService] 的同一次模型切换屏障准入中捕获短暂的 Bot token 租约、预消费
- * 任务、完成 Agent 回合并投递结果。准入后的完整链路受 [AgentExecutionDeadlines.scheduledTurn] 的总体时限
- * 约束；超时任务已预消费但不会重试或投递迟到结果。因此切换已发生时旧任务不会调用旧 Agent 或旧 token；
- * 任务已准入时，对应的 Agent 切换最多等待该完整回合结束或超时，投递始终使用所捕获的旧 token。
+ * 到期任务会先在 token 生命周期锁内短暂确认 AI 已启用、当前代理会话标识非空并
+ * 精确等于任务的 [ScheduledTask.agentChatId]；不满足这些 AI 授权条件的任务会在锁外原子删除，不调用
+ * Agent 或 Telegram。无效 token 时任务会保留。通过首次确认的任务会进入
+ * [AgentService.withReadyService]，并在预消费前再次确认同一授权条件，以防等待模型就绪期间的设置变更。
+ * 最新 AI 配置尚未就绪但授权仍有效时，任务也会保留。准入后的完整预消费、Agent 与投递链路受
+ * [AgentExecutionDeadlines.scheduledTurn] 的总体时限约束；超时任务已预消费但不会重试或投递迟到结果。
+ * 因此切换已发生时旧任务不会调用旧 Agent 或旧 token；任务已准入时，对应的 Agent 切换最多等待该完整
+ * 回合结束或超时，投递始终使用第二次确认中捕获的 token。
  *
  * @param parentScope 后台扫描任务所属的协程作用域；取消该作用域会停止扫描。
  * @param telegramService 用于投递任务执行结果的 Telegram 服务。
@@ -127,7 +132,7 @@ class TaskSchedulerService private constructor(
      * @param parentScope 后台扫描任务所属的协程作用域。
      * @param telegramService 用于投递任务结果的 Telegram 服务。
      * @param agentService 用于取得 AI 代理的提供者。
-     * @param settingsRepository 用于确认任务 Bot 所有者并捕获 token 的仓储。
+     * @param settingsRepository 用于确认 AI 授权并捕获 token 的仓储。
      * @param scheduleFile 测试或本地调度文件。
      * @param fileOperations 原子 JSON 存储使用的文件操作。
      * @param startImmediately 为 `true` 时构造后立即启动每分钟扫描。
@@ -259,10 +264,12 @@ class TaskSchedulerService private constructor(
     /**
      * 扫描并依次执行所有执行时间已到的任务。
      *
-     * 候选任务会在短临界区内声明执行权；并发扫描不会重复执行同一任务。每个候选进入 Agent 就绪屏障后，
-     * 会重新确认扫描快照和到期状态，并在任何 Agent 或 Telegram 副作用前原子持久化预消费状态。
-     * 因而预提交成功后的失败、取消和进程重启都不会重放该次，提交失败则不会调用 Agent 且会在后续扫描保留
-     * 任务。代理调用与 Telegram I/O 永远不在状态锁或 token 租约内运行。
+     * 候选任务会在短临界区内声明执行权；并发扫描不会重复执行同一任务。每个候选会先确认 AI 授权；当前
+     * 会话缺失、禁用或与任务会话不一致时，调度器会在任何 Agent 或 Telegram 副作用前原子删除该任务。
+     * 无效 token 或最新 Agent 配置尚未就绪时会保留任务。通过 Agent 就绪屏障后会再次
+     * 确认授权、扫描快照和到期状态，并原子持久化预消费状态。因而预提交成功后的失败、取消和进程重启都
+     * 不会重放该次，提交失败则不会调用 Agent 且会在后续扫描保留任务。代理调用与 Telegram I/O 永远不在
+     * 状态锁或 token 生命周期租约内运行。
      *
      * @throws CancellationException 扫描被取消时原样抛出；若任务已经预提交，取消也不会恢复该次。
      */
@@ -303,9 +310,12 @@ class TaskSchedulerService private constructor(
     /**
      * 在单次 Agent 就绪屏障准入中预消费并执行一个已声明执行权的任务。
      *
-     * token 租约只用于短暂捕获投递 token；状态锁只用于重新验证扫描快照、以 fresh now 预消费并持久化。
-     * 二者都会在副作用前释放。预消费成功后，代理失败、普通异常、取消以及 Telegram 失败或取消均不会恢复
-     * 或重试任务；这在崩溃或取消落在提交和副作用之间时可能遗漏一次执行，但避免重复外部副作用。
+     * 首次租约只用于短暂确认当前 AI 授权；被撤销的任务会在租约释放后使用扫描快照原子删除。授权
+     * 有效的任务才进入 Agent 就绪屏障，并在预消费前再次获得租约确认，防止设置在等待期间改变。状态锁只
+     * 用于重新验证扫描快照、以 fresh now 预消费并持久化。所有锁和租约都会在副作用前释放。预消费成功后，
+     * 代理失败、普通异常、取消以及 Telegram 失败或取消均不会恢复或重试任务；这在崩溃或取消落在提交和
+     * 副作用之间时可能遗漏一次执行，但避免重复外部副作用。最新 AI 配置尚未就绪但授权仍有效时任务会保留
+     * 给后续已就绪配置的扫描。
      *
      * @param task 已到期且已被当前扫描声明执行权的任务。
      * [AgentExecutionDeadlines.scheduledTurn] 到期只记录稳定任务标识并停止后续投递，不重试已预消费任务；
@@ -314,53 +324,72 @@ class TaskSchedulerService private constructor(
      * @throws CancellationException 当 Agent、Telegram 调用或当前协程被普通取消时原样抛出；已预消费状态不回滚。
      */
     private suspend fun executeTask(task: ScheduledTask) {
-        agentService.get().withReadyService { readyAgent ->
-            try {
-                withTimeout(deadlines.scheduledTurn) {
-                    val preparedTask = prepareTaskForExecution(task) ?: return@withTimeout
-                    logger.info("Executing precommitted task {}", preparedTask.task.id)
-                    val result = readyAgent.sendMessage(
-                        "以下是一个定时任务指令：\n${preparedTask.task.instruction}\n\n请直接执行并返回结果。",
-                    )
-                    if (result.isNotBlank()) {
-                        deliverTaskResult(preparedTask.task, preparedTask.botLease.token, result)
-                    }
-                }
-            } catch (_: TimeoutCancellationException) {
-                logger.warn("Precommitted task {} timed out; it will not be retried or delivered", task.id)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: AgentTurnFailedException) {
-                logger.warn(
-                    "Precommitted task {} agent turn did not complete; it will not be retried; category={}",
-                    task.id,
-                    SafeLogging.failureCategory(e).wireName,
-                )
-            } catch (e: Exception) {
-                logger.error(
-                    "Precommitted task {} agent execution failed; it will not be retried; category={}",
-                    task.id,
-                    SafeLogging.failureCategory(e).wireName,
-                )
+        when (taskAuthorization(task)) {
+            TaskAuthorization.Retain -> return
+            TaskAuthorization.Revoked -> {
+                revokeTask(task)
+                return
             }
+
+            is TaskAuthorization.Authorized -> Unit
+        }
+
+        try {
+            agentService.get().withReadyService { readyAgent ->
+                try {
+                    withTimeout(deadlines.scheduledTurn) {
+                        val authorization = taskAuthorization(task)
+                        when (authorization) {
+                            TaskAuthorization.Retain -> return@withTimeout
+                            TaskAuthorization.Revoked -> {
+                                revokeTask(task)
+                                return@withTimeout
+                            }
+
+                            is TaskAuthorization.Authorized -> Unit
+                        }
+                        val preparedTask = prepareTaskForExecution(task, authorization.telegramLease)
+                            ?: return@withTimeout
+                        logger.info("Executing precommitted task {}", preparedTask.task.id)
+                        val result = readyAgent.sendMessage(
+                            "以下是一个定时任务指令：\n${preparedTask.task.instruction}\n\n请直接执行并返回结果。",
+                        )
+                        if (result.isNotBlank()) {
+                            deliverTaskResult(preparedTask.task, preparedTask.telegramLease.token, result)
+                        }
+                    }
+                } catch (_: TimeoutCancellationException) {
+                    logger.warn("Precommitted task {} timed out; it will not be retried or delivered", task.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: AgentTurnFailedException) {
+                    logger.warn(
+                        "Precommitted task {} agent turn did not complete; it will not be retried; category={}",
+                        task.id,
+                        SafeLogging.failureCategory(e).wireName,
+                    )
+                } catch (e: Exception) {
+                    logger.error(
+                        "Precommitted task {} agent execution failed; it will not be retried; category={}",
+                        task.id,
+                        SafeLogging.failureCategory(e).wireName,
+                    )
+                }
+            }
+        } catch (_: AgentConfigurationNotReadyException) {
+            logger.info("Skipping task {} because the current AI configuration is not ready", task.id)
         }
     }
 
     /**
-     * 在副作用前确认 token 和扫描快照，并原子持久化本次预消费状态。
+     * 在副作用前确认扫描快照，并原子持久化本次预消费状态。
      *
      * @param task 扫描时声明执行权的不可变任务快照。
-     * @return 已提交且可安全执行的任务与 token 快照；token、快照、到期或持久化验证不满足时返回 `null`。
+     * @param telegramLease 第二次 AI 授权确认中捕获的当前 Telegram token 快照。
+     * @return 已提交且可安全执行的任务与 token 快照；快照、到期或持久化验证不满足时返回 `null`。
      * @throws CancellationException 当调用协程在存储操作期间被取消时原样抛出。
      */
-    private fun prepareTaskForExecution(task: ScheduledTask): PreparedTask? {
-        val botLease = try {
-            settingsRepository.withActiveTelegramBotLease { it }
-        } catch (_: ActiveTelegramBotUnavailableException) {
-            logger.warn("Skipping task {} because no valid active Telegram Bot is available", task.id)
-            return null
-        }
-
+    private fun prepareTaskForExecution(task: ScheduledTask, telegramLease: TelegramBotLease): PreparedTask? {
         return try {
             stateLock.withLock {
                 ensureStorageValidatedBeforeMutation()
@@ -412,7 +441,7 @@ class TaskSchedulerService private constructor(
                 persistTasks(candidate)
                 tasks.clear()
                 tasks.addAll(candidate)
-                PreparedTask(currentTask, botLease)
+                PreparedTask(currentTask, telegramLease)
             }
         } catch (e: CancellationException) {
             throw e
@@ -423,6 +452,64 @@ class TaskSchedulerService private constructor(
                 SafeLogging.failureCategory(e).wireName,
             )
             null
+        }
+    }
+
+    /**
+     * 在 token 生命周期锁内短暂确认当前 AI 会话授权。
+     *
+     * 此方法不获取状态锁，也不执行 I/O、挂起或等待；调用方必须在返回后才进行任务删除、持久化或 Agent
+     * 调用。token 不可用时保留任务；AI 未启用、会话标识空白或与任务不精确相等时撤销任务。
+     */
+    private fun taskAuthorization(task: ScheduledTask): TaskAuthorization {
+        return try {
+            settingsRepository.withActiveTelegramBotSettingsLease { telegramLease, settings ->
+                val currentAgentChatId = settings.ai
+                    ?.takeIf { it.agentEnabled }
+                    ?.agentChatId
+                when {
+                    currentAgentChatId.isNullOrBlank() -> TaskAuthorization.Revoked
+                    currentAgentChatId != task.agentChatId -> TaskAuthorization.Revoked
+                    else -> TaskAuthorization.Authorized(telegramLease)
+                }
+            }
+        } catch (_: ActiveTelegramBotUnavailableException) {
+            TaskAuthorization.Retain
+        }
+    }
+
+    /**
+     * 删除已确认撤销、且仍与扫描快照完全一致的任务。
+     *
+     * 此方法只在 token 生命周期租约释放后调用。持久化失败时不会变更内存任务列表，也不会触发 Agent 或
+     * Telegram 副作用；任务会保留供后续扫描重试删除。
+     */
+    private fun revokeTask(task: ScheduledTask) {
+        try {
+            stateLock.withLock {
+                ensureStorageValidatedBeforeMutation()
+                val index = tasks.indexOfFirst { current ->
+                    current.id == task.id && current == task
+                }
+                if (index == -1) {
+                    logger.info("Skipping revoked task {} because it was cancelled or replaced before removal", task.id)
+                    return@withLock
+                }
+
+                val candidate = tasks.toMutableList().apply { removeAt(index) }
+                persistTasks(candidate)
+                tasks.clear()
+                tasks.addAll(candidate)
+                logger.info("Removed revoked task {}", task.id)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error(
+                "Failed to remove revoked task {}; it will remain eligible for a later scan; category={}",
+                task.id,
+                SafeLogging.failureCategory(e).wireName,
+            )
         }
     }
 
@@ -479,12 +566,14 @@ class TaskSchedulerService private constructor(
      * @param executionTime 首次执行的 Unix 时间戳，单位为毫秒；可为过去时间，此时会在下一次
      * 扫描时执行。
      * @param loopMode 任务到期后的循环方式；[LoopMode.ONCE] 表示仅执行一次。
-     * @param agentChatId 接收执行结果的 Telegram 会话标识；允许为空字符串，将按原样保存。
+     * @param agentChatId 接收执行结果的 Telegram 会话标识；不得为空白，非空值按原样保存，不去除首尾空白。
      * @return 已成功持久化的新任务八位标识符。
+     * @throws IllegalArgumentException [agentChatId] 为空白时抛出；不会添加内存任务。
      * @throws IllegalStateException 文件已损坏或暂不可读取时抛出；不会添加内存任务。
      * @throws Exception 编码或原子持久化失败时抛出；不会添加内存任务。
      */
     fun createTask(instruction: String, executionTime: Long, loopMode: LoopMode, agentChatId: String): String {
+        require(agentChatId.isNotBlank()) { "定时任务必须绑定非空代理会话标识。" }
         val id = UUID.randomUUID().toString().substring(0, 8)
         val newTask = ScheduledTask(
             id,
@@ -558,8 +647,14 @@ class TaskSchedulerService private constructor(
 
     private data class PreparedTask(
         val task: ScheduledTask,
-        val botLease: TelegramBotLease,
+        val telegramLease: TelegramBotLease,
     )
+
+    private sealed interface TaskAuthorization {
+        data class Authorized(val telegramLease: TelegramBotLease) : TaskAuthorization
+        data object Revoked : TaskAuthorization
+        data object Retain : TaskAuthorization
+    }
 }
 
 /**

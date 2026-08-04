@@ -1022,11 +1022,7 @@ class GeminiAgentServiceTest {
 
         assertEquals("工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。", exception.message)
         verify(exactly = MAX_TOOL_CALL_ROUNDS + 1) { candidateChat.sendMessage(any<List<Content>>()) }
-        val recoveryJob = assertNotNull(
-            GeminiAgentService::class.java.getDeclaredField("resetSessionJob").apply {
-                isAccessible = true
-            }.get(service) as? Job,
-        )
+        val recoveryJob = assertNotNull(privateField("resetSessionJob") as? Job)
         withTimeout(5.seconds) { recoveryJob.join() }
         assertFalse(recoveryJob.isCancelled)
         assertEquals(candidateChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
@@ -1035,6 +1031,144 @@ class GeminiAgentServiceTest {
         recover = true
         assertEquals("新会话", service.sendMessage("继续对话"))
         verify(exactly = MAX_TOOL_CALL_ROUNDS + 2) { candidateChat.sendMessage(any<List<Content>>()) }
+    }
+
+    /**
+     * 验证 SDK 工具超限后的恢复会阻塞后续发送；取消等待者不会取消恢复，恢复完成后新回合只读取新会话。
+     */
+    @Test
+    fun `SDK tool-limit recovery is a fail-closed send barrier`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val recoveryStarted = CompletableDeferred<Unit>()
+        val releaseRecovery = CompletableDeferred<Unit>()
+        val chats = mockk<Chats>()
+        val exhaustedCandidate = mockk<Chat>()
+        val recoveredSession = mockk<Chat>()
+        val postRecoveryCandidate = mockk<Chat>()
+        val recoveredHistory = Content.fromParts(Part.fromText("恢复后的会话历史"))
+        val postRecoveryRequest = slot<List<Content>>()
+        val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
+        val connectionCount = AtomicInteger()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        coEvery { mcpClientService.connect(any()) } coAnswers {
+            if (connectionCount.incrementAndGet() == 1) {
+                recoveryStarted.complete(Unit)
+                releaseRecovery.await()
+            }
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        service = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany
+                (List(MAX_TOOL_CALL_ROUNDS + 1) { exhaustedCandidate } + listOf(
+                    recoveredSession,
+                    postRecoveryCandidate
+                ))
+        every { exhaustedCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.builder().functionCall(functionCall).build(),
+        )
+        every { recoveredSession.getHistory(true) } returns ImmutableList.of(recoveredHistory)
+        every { postRecoveryCandidate.sendMessage(capture(postRecoveryRequest)) } returns responseWithParts(
+            Part.fromText("恢复后回复"),
+        )
+        injectClient(chats)
+        injectChat(mockk())
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
+
+        assertFailsWith<IllegalStateException> { service.sendMessage("触发工具超限") }
+        withTimeout(5.seconds) { recoveryStarted.await() }
+        val recoveryJob = assertNotNull(privateField("resetSessionJob") as? Job)
+        val waitingSend = async(start = CoroutineStart.UNDISPATCHED) { service.sendMessage("不得提前发送") }
+
+        assertFalse(waitingSend.isCompleted)
+        verify(exactly = 0) { postRecoveryCandidate.sendMessage(any<List<Content>>()) }
+        waitingSend.cancelAndJoin()
+        assertTrue(waitingSend.isCancelled)
+        assertFalse(recoveryJob.isCancelled)
+
+        releaseRecovery.complete(Unit)
+        withTimeout(5.seconds) { recoveryJob.join() }
+        assertFalse(recoveryJob.isCancelled)
+        assertEquals("恢复后回复", service.sendMessage("读取恢复会话"))
+        assertEquals("恢复后的会话历史", postRecoveryRequest.captured.first().parts().get().single().text().get())
+    }
+
+    /** 验证 SDK 工具超限后的候选重置失败时，旧 Chat 不会重新接收后续请求。 */
+    @Test
+    fun `failed SDK tool-limit recovery rejects subsequent sends`() = runBlocking {
+        val chats = mockk<Chats>()
+        val exhaustedCandidate = mockk<Chat>()
+        val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
+        val creationCount = AtomicInteger()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } answers {
+            if (creationCount.incrementAndGet() > MAX_TOOL_CALL_ROUNDS + 1) {
+                throw IllegalStateException("recovery creation failed")
+            }
+            exhaustedCandidate
+        }
+        every { exhaustedCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.builder().functionCall(functionCall).build(),
+        )
+        injectClient(chats)
+        injectChat(mockk())
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
+
+        assertFailsWith<IllegalStateException> { service.sendMessage("触发工具超限") }
+        val recoveryJob = assertNotNull(privateField("resetSessionJob") as? Job)
+        withTimeout(5.seconds) { recoveryJob.join() }
+
+        assertTrue(recoveryJob.isCancelled)
+        assertFailsWith<IllegalStateException> { service.sendMessage("不能回退到旧会话") }
+        verify(exactly = MAX_TOOL_CALL_ROUNDS + 1) { exhaustedCandidate.sendMessage(any<List<Content>>()) }
+    }
+
+    /** 验证被取消的 SDK 工具超限恢复同样封闭旧会话。 */
+    @Test
+    fun `cancelled SDK tool-limit recovery rejects subsequent sends`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val recoveryStarted = CompletableDeferred<Unit>()
+        val neverReleaseRecovery = CompletableDeferred<Unit>()
+        val chats = mockk<Chats>()
+        val exhaustedCandidate = mockk<Chat>()
+        val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
+        coEvery { mcpClientService.connect(any()) } coAnswers {
+            recoveryStarted.complete(Unit)
+            neverReleaseRecovery.await()
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        service = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns exhaustedCandidate
+        every { exhaustedCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.builder().functionCall(functionCall).build(),
+        )
+        injectClient(chats)
+        injectChat(mockk())
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
+
+        assertFailsWith<IllegalStateException> { service.sendMessage("触发工具超限") }
+        withTimeout(5.seconds) { recoveryStarted.await() }
+        val recoveryJob = assertNotNull(privateField("resetSessionJob") as? Job)
+        recoveryJob.cancelAndJoin()
+
+        assertTrue(recoveryJob.isCancelled)
+        assertFailsWith<IllegalStateException> { service.sendMessage("不能回退到旧会话") }
+        verify(exactly = MAX_TOOL_CALL_ROUNDS + 1) { exhaustedCandidate.sendMessage(any<List<Content>>()) }
     }
 
     /**

@@ -12,6 +12,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionTooLargeExc
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_INLINE_MEDIA_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AUDIO_TRANSCRIPTION_BYTES
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import io.mockk.coEvery
@@ -20,10 +21,13 @@ import io.mockk.mockk
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
@@ -33,6 +37,7 @@ import mockwebserver3.MockWebServer
 import okhttp3.OkHttpClient
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -111,6 +116,168 @@ class RawAgentTransportTest {
             assertTrue(toolPayload.contains("\"id\":\"call-1\""))
         }
         service.close().join()
+    }
+
+    /** 验证原生 Gemini 路径在工具超限恢复完成前不会读取旧会话，并在恢复后只使用新会话。 */
+    @Test
+    fun `Gemini raw pending recovery blocks the old session and resumes with the new session`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val service =
+            GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+        val oldSession = assertNotNull(privateField(service, "rawSession"))
+        setPrivateField(service, "currentModel", "models/recovered-session")
+        assertNotNull(service.resetSession()).join()
+        val recoveredSession = assertNotNull(privateField(service, "rawSession"))
+        setPrivateField(service, "rawSession", oldSession)
+        val recoveryJob = kotlinx.coroutines.Job()
+        installPendingToolLimitRecovery(service, recoveryJob)
+        server.enqueue(MockResponse.Builder().body(geminiTextResponse("恢复后回复")).build())
+        val waitingSend = async(start = CoroutineStart.UNDISPATCHED) { service.sendMessage("不得提前请求") }
+
+        assertFalse(waitingSend.isCompleted)
+        assertEquals(0, server.requestCount)
+        setPrivateField(service, "rawSession", recoveredSession)
+        recoveryJob.complete()
+
+        assertEquals("恢复后回复", withTimeout(5.seconds) { waitingSend.await() })
+        val recoveredRequest = assertNotNull(server.takeRequest())
+        assertTrue(recoveredRequest.target.contains("/models/recovered-session:generateContent"))
+        assertEquals(1, geminiContents(recoveredRequest.body!!.utf8()).size)
+        service.close().join()
+    }
+
+    /**
+     * 验证原生 Gemini 工具轮次实际耗尽后，会在 [GeminiAgentService] 启动的恢复完成前封闭后续 HTTP 请求。
+     */
+    @Test
+    fun `Gemini raw tool-limit recovery blocks a new request until reset completes`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val recoveryStarted = CompletableDeferred<Unit>()
+        val releaseRecovery = CompletableDeferred<Unit>()
+        val connectionCount = AtomicInteger()
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        coEvery { mcpClientService.connect(any()) } coAnswers {
+            if (connectionCount.incrementAndGet() == 2) {
+                recoveryStarted.complete(Unit)
+                releaseRecovery.await()
+            }
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns kotlinx.coroutines.Job().apply { complete() }
+        val service = GeminiAgentService(scope, settingsRepository, skillRepository, mcpClientService) { mockk() }
+
+        try {
+            installRawGeminiTransport(service)
+            assertNotNull(service.resetSession()).join()
+            repeat(MAX_TOOL_CALL_ROUNDS + 1) {
+                server.enqueue(MockResponse.Builder().body(geminiFunctionCallResponse()).build())
+            }
+
+            assertFailsWith<IllegalStateException> { service.sendMessage("触发工具超限") }
+            withTimeout(5.seconds) { recoveryStarted.await() }
+            val waitingSend = async(start = CoroutineStart.UNDISPATCHED) { service.sendMessage("必须等待恢复") }
+
+            assertFalse(waitingSend.isCompleted)
+            assertEquals(MAX_TOOL_CALL_ROUNDS + 1, server.requestCount)
+            server.enqueue(MockResponse.Builder().body(geminiTextResponse("恢复后回复")).build())
+            releaseRecovery.complete(Unit)
+
+            assertEquals("恢复后回复", withTimeout(5.seconds) { waitingSend.await() })
+            assertEquals(MAX_TOOL_CALL_ROUNDS + 2, server.requestCount)
+        } finally {
+            releaseRecovery.complete(Unit)
+            service.close().join()
+        }
+    }
+
+    /** 验证原生 Gemini 的实际工具超限恢复失败后，后续发送不会回退到仍保留的旧会话。 */
+    @Test
+    fun `failed Gemini raw tool-limit recovery rejects later sends without an old request`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionCount = AtomicInteger()
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        coEvery { mcpClientService.connect(any()) } coAnswers {
+            if (connectionCount.incrementAndGet() == 2) {
+                throw IllegalStateException("recovery connection failed")
+            }
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns kotlinx.coroutines.Job().apply { complete() }
+        val service = GeminiAgentService(scope, settingsRepository, skillRepository, mcpClientService) { mockk() }
+
+        try {
+            installRawGeminiTransport(service)
+            assertNotNull(service.resetSession()).join()
+            repeat(MAX_TOOL_CALL_ROUNDS + 1) {
+                server.enqueue(MockResponse.Builder().body(geminiFunctionCallResponse()).build())
+            }
+
+            assertFailsWith<IllegalStateException> { service.sendMessage("触发工具超限") }
+            val recoveryJob = assertNotNull(privateField(service, "resetSessionJob") as? kotlinx.coroutines.Job)
+            withTimeout(5.seconds) { recoveryJob.join() }
+
+            assertTrue(recoveryJob.isCancelled)
+            assertEquals(MAX_TOOL_CALL_ROUNDS + 1, server.requestCount)
+            assertFailsWith<IllegalStateException> { service.sendMessage("不得使用旧会话") }
+            assertEquals(MAX_TOOL_CALL_ROUNDS + 1, server.requestCount)
+        } finally {
+            service.close().join()
+        }
+    }
+
+    /** 验证关闭服务会取消等待中的原生 Gemini 恢复，发送者和关闭任务均不会被会话锁互相阻塞。 */
+    @Test
+    fun `closing Gemini while a raw send awaits recovery releases both operations`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val recoveryStarted = CompletableDeferred<Unit>()
+        val neverReleaseRecovery = CompletableDeferred<Unit>()
+        val connectionCount = AtomicInteger()
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        coEvery { mcpClientService.connect(any()) } coAnswers {
+            if (connectionCount.incrementAndGet() == 2) {
+                recoveryStarted.complete(Unit)
+                neverReleaseRecovery.await()
+            }
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns kotlinx.coroutines.Job().apply { complete() }
+        val service = GeminiAgentService(scope, settingsRepository, skillRepository, mcpClientService) { mockk() }
+
+        try {
+            installRawGeminiTransport(service)
+            assertNotNull(service.resetSession()).join()
+            repeat(MAX_TOOL_CALL_ROUNDS + 1) {
+                server.enqueue(MockResponse.Builder().body(geminiFunctionCallResponse()).build())
+            }
+
+            assertFailsWith<IllegalStateException> { service.sendMessage("触发工具超限") }
+            withTimeout(5.seconds) { recoveryStarted.await() }
+            supervisorScope {
+                val waitingSend = async(start = CoroutineStart.UNDISPATCHED) { service.sendMessage("等待恢复") }
+                assertFalse(waitingSend.isCompleted)
+
+                val closeJob = service.close()
+                withTimeout(5.seconds) { closeJob.join() }
+                assertTrue(closeJob.isCompleted)
+                assertFailsWith<IllegalStateException> {
+                    withTimeout(5.seconds) { waitingSend.await() }
+                }
+            }
+            assertEquals(MAX_TOOL_CALL_ROUNDS + 1, server.requestCount)
+        } finally {
+            neverReleaseRecovery.complete(Unit)
+            service.close().join()
+        }
     }
 
     /** 验证 REST 历史达到 64 条短内容后会整体滑动最早完整回合并继续完成。 */
@@ -469,6 +636,9 @@ class RawAgentTransportTest {
     private fun geminiTextResponse(text: String): String =
         """{"candidates":[{"content":{"role":"model","parts":[{"text":"$text"}]}}]}"""
 
+    private fun geminiFunctionCallResponse(): String =
+        """{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"missing","args":{}}}]}}]}"""
+
     private fun geminiContents(payload: String) = Json.parseToJsonElement(payload)
         .jsonObject["contents"]
         ?.jsonArray
@@ -476,6 +646,16 @@ class RawAgentTransportTest {
 
     private fun setPrivateField(target: Any, fieldName: String, value: Any?) {
         target.javaClass.getDeclaredField(fieldName).apply { isAccessible = true }.set(target, value)
+    }
+
+    private fun installPendingToolLimitRecovery(service: GeminiAgentService, job: kotlinx.coroutines.Job) {
+        val recoveryType = GeminiAgentService::class.java.declaredClasses.single {
+            it.simpleName == "ToolLimitRecovery"
+        }
+        val recovery = recoveryType.declaredConstructors.single().apply {
+            isAccessible = true
+        }.newInstance(job)
+        setPrivateField(service, "pendingToolLimitRecovery", recovery)
     }
 
     private fun privateField(target: Any, fieldName: String): Any? =

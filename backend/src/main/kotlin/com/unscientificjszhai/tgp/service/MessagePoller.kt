@@ -1,12 +1,3 @@
-@file:Suppress(
-    "LiftReturnOrAssignment",
-    "LoggingSimilarMessage",
-    "RedundantIf",
-    "RedundantNullableReturnType",
-    "RedundantSuspendModifier",
-    "UnclearPrecedenceOfBinaryExpression",
-)
-
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
@@ -109,7 +100,7 @@ class MessagePoller @Inject constructor(
 
     private var settingsJob: Job? = null
     private var currentSession: PollingSession? = null
-    private var pendingAuthenticationReset: PendingAuthenticationReset? = null
+    private var pendingAgentReset: PendingAgentReset? = null
     private var processingTimeout: Duration = 10.minutes
     private var retryDelay: suspend (Duration) -> Unit = { delay(it) }
     private var retryJitter: (Duration) -> Duration = { backoff ->
@@ -203,16 +194,49 @@ class MessagePoller @Inject constructor(
     )
 
     /**
-     * 认证失败后必须成功清除的 Agent 上下文状态。
+     * 尚未完成的全局 Agent 上下文清除状态。
      *
-     * 实例仅在 [sessionLock] 保护下读写。初次重置失败时保留外部屏障代次；下一次 token 会话安装会复用
-     * 该实例并在安装前重试，防止新 bot 继承旧 bot 的上下文。
+     * 实例仅在 [sessionLock] 保护下读写。普通 token 轮换会保留该状态直至当前代次的新会话已原子安装，
+     * 防止屏障在新 bot 可轮询前提前放行；认证失败会在成功清除后终止当前会话并放行。初次重置失败时保留
+     * 外部屏障代次，下一次实际 token 生命周期事件会复用该实例并串行重试。
      */
-    private class PendingAuthenticationReset(
-        val generation: Long,
+    private class PendingAgentReset(
+        val barrierGeneration: Long,
+        val source: AgentResetSource,
         val initialResetCompletion: CompletableDeferred<Boolean> = CompletableDeferred(),
         var retryCompletion: CompletableDeferred<Boolean>? = null,
     )
+
+    /** 待处理 Agent 重置的起因；两种起因共享失败重试和关闭释放语义。 */
+    private enum class AgentResetSource {
+        TOKEN_ROTATION,
+        AUTHENTICATION_FAILURE,
+    }
+
+    /** token 生命周期事件对当前会话和待处理 Agent 重置状态的原子判定。 */
+    private sealed interface SessionReplacement {
+        /** 当前 token 代次已经拥有对应会话，或事件已经过期。 */
+        data object NoOp : SessionReplacement
+
+        /** 没有旧会话或待处理重置，可直接尝试安装当前 token 的会话。 */
+        data object Install : SessionReplacement
+
+        /** 已摘除旧会话，必须先完成新建的全局 Agent 重置。 */
+        data class ResetPrevious(
+            val previous: PollingSession,
+            val pendingReset: PendingAgentReset,
+        ) : SessionReplacement
+
+        /** 另一条路径已经摘除了旧会话；当前事件只能等待或重试其 Agent 重置。 */
+        data class AwaitPending(val pendingReset: PendingAgentReset) : SessionReplacement
+    }
+
+    /** 尝试安装当前 token 会话后的结果。 */
+    private enum class SessionInstallation {
+        INSTALLED,
+        INVALID_TOKEN,
+        NOT_CURRENT,
+    }
 
     private data class QueuedUpdate(
         val update: Update,
@@ -317,39 +341,89 @@ class MessagePoller @Inject constructor(
         if (closed) {
             return
         }
-        val sameSession = sessionLock.withLock {
-            currentSession?.let { it.token == token && it.generation == generation } == true
-        }
-        if (sameSession) {
-            return
-        }
-
-        if (!awaitAuthenticationResetBeforeSession()) {
-            logger.warn(
-                "Refusing to start polling session at token generation {} until authentication reset succeeds.",
-                generation
-            )
-            return
-        }
-
-        val previous = sessionLock.withLock {
-            currentSession.also { currentSession = null }
-        }
-        if (previous != null) {
-            previous.updateChannel.close()
-            previous.scope.cancel()
-            previous.scope.coroutineContext[Job]?.join()
-            // AgentService 的会话是全局的；token 切换时必须显式清除，避免 A 的上下文泄漏给 B。
-            if (!awaitSuccessfulAgentReset()) {
-                logger.warn("Failed to reset agent session while switching polling session; continuing with new bot session.")
+        val replacement = settingsRepository.withTelegramTokenLifecycleLock {
+            sessionLock.withLock {
+                when {
+                    closed || !isTokenGenerationCurrent(token, generation) -> SessionReplacement.NoOp
+                    currentSession?.let { it.token == token && it.generation == generation } == true -> SessionReplacement.NoOp
+                    pendingAgentReset != null -> SessionReplacement.AwaitPending(checkNotNull(pendingAgentReset))
+                    currentSession == null -> SessionReplacement.Install
+                    else -> {
+                        // 必须在摘除旧会话之前创建屏障：否则新 Bot 的 Agent 请求可能在旧上下文被清除前准入。
+                        val pendingReset = PendingAgentReset(
+                            barrierGeneration = modelSwitchBarrier.beginExternalSwitch(),
+                            source = AgentResetSource.TOKEN_ROTATION,
+                        )
+                        val previous = checkNotNull(currentSession)
+                        currentSession = null
+                        previous.updateChannel.close()
+                        pendingAgentReset = pendingReset
+                        SessionReplacement.ResetPrevious(previous, pendingReset)
+                    }
+                }
             }
-            logger.info("Cancelled polling session for bot {} at generation {}", previous.botId, previous.generation)
+        }
+        val pendingReset = when (replacement) {
+            SessionReplacement.NoOp -> return
+            SessionReplacement.Install -> null
+            is SessionReplacement.ResetPrevious -> {
+                replacement.previous.scope.cancel(CancellationException("Telegram token changed"))
+                withContext(NonCancellable) {
+                    replacement.previous.scope.coroutineContext[Job]?.join()
+                }
+                if (!completeInitialAgentReset(replacement.pendingReset)) {
+                    logger.warn(
+                        "Refusing to start polling session at token generation {} until the token-rotation Agent reset succeeds.",
+                        generation,
+                    )
+                    return
+                }
+                logger.info(
+                    "Cancelled polling session for bot {} at generation {}",
+                    replacement.previous.botId,
+                    replacement.previous.generation,
+                )
+                replacement.pendingReset
+            }
+
+            is SessionReplacement.AwaitPending -> {
+                if (!awaitPendingAgentResetBeforeSession(replacement.pendingReset)) {
+                    logger.warn(
+                        "Refusing to start polling session at token generation {} until the pending Agent reset succeeds.",
+                        generation,
+                    )
+                    return
+                }
+                replacement.pendingReset.takeIf { it.source == AgentResetSource.TOKEN_ROTATION }
+            }
         }
 
-        val botId = token.botIdFromTelegramToken() ?: run {
-            logger.info("Agent poller paused due to empty or invalid token.")
-            return
+        when (installCurrentTokenSession(token, generation, pendingReset)) {
+            SessionInstallation.INSTALLED -> Unit
+            SessionInstallation.INVALID_TOKEN -> {
+                if (pendingReset != null) {
+                    completePendingResetForInvalidToken(pendingReset, token, generation)
+                }
+                logger.info("Agent poller paused due to empty or invalid token.")
+            }
+
+            SessionInstallation.NOT_CURRENT -> Unit
         }
+    }
+
+    /**
+     * 在 token 生命周期锁和会话锁内安装尚未启动的轮询会话。
+     *
+     * 对普通 token 轮换，只有安装与清除 [PendingAgentReset] 同处一个临界区时才返回
+     * [SessionInstallation.INSTALLED]；调用方随后才可释放外部屏障。若 token 已再次变化则保留待处理重置，
+     * 交由最新 token 代次收敛，绝不安装过期会话。
+     */
+    private fun installCurrentTokenSession(
+        token: String,
+        generation: Long,
+        pendingReset: PendingAgentReset?,
+    ): SessionInstallation {
+        val botId = token.botIdFromTelegramToken() ?: return SessionInstallation.INVALID_TOKEN
         val sessionScope = scope + SupervisorJob(scope.coroutineContext[Job])
         val session = PollingSession(
             token = token,
@@ -360,19 +434,28 @@ class MessagePoller @Inject constructor(
             consumerResume = Channel(capacity = Channel.CONFLATED),
             outboxSignal = Channel(capacity = Channel.CONFLATED),
         )
-        val installed = synchronized(lifecycleLock) {
-            if (closed) {
-                false
-            } else {
-                sessionLock.withLock {
+        val barrierGenerationToRelease = settingsRepository.withTelegramTokenLifecycleLock {
+            sessionLock.withLock {
+                if (
+                    closed ||
+                    !isTokenGenerationCurrent(token, generation) ||
+                    (pendingReset != null && pendingAgentReset !== pendingReset)
+                ) {
+                    null
+                } else {
                     currentSession = session
+                    pendingReset?.let { pendingAgentReset = null }
+                    pendingReset?.barrierGeneration ?: Long.MIN_VALUE
                 }
-                true
             }
         }
-        if (!installed) {
+        if (barrierGenerationToRelease == null) {
             sessionScope.cancel()
-            return
+            return SessionInstallation.NOT_CURRENT
+        }
+        if (barrierGenerationToRelease != Long.MIN_VALUE) {
+            // 会话身份已在两个生命周期锁内提交；现在才允许新 Agent 请求越过本次外部屏障。
+            modelSwitchBarrier.complete(barrierGenerationToRelease)
         }
         try {
             // `completeAgentUpdate` 已经提交而账本删除失败时，下一次同 bot 会话会在任何 Agent claim 前回收
@@ -389,6 +472,7 @@ class MessagePoller @Inject constructor(
         session.outboxJob = session.scope.launch { consumeOutbox(session) }
         session.pollJob = session.scope.launch { runPolling(session) }
         logger.info("Started polling session for bot {} at generation {}", botId, generation)
+        return SessionInstallation.INSTALLED
     }
 
     private suspend fun runPolling(session: PollingSession) {
@@ -476,7 +560,7 @@ class MessagePoller @Inject constructor(
 
         val response = telegramService.getUpdatesForToken(
             session.token,
-            offset = retryOffset ?: lastStoredId + 1,
+            offset = retryOffset ?: (lastStoredId + 1),
             timeout = 30,
         )
         if (!isCurrent(session)) {
@@ -642,78 +726,56 @@ class MessagePoller @Inject constructor(
     /**
      * 原子摘除仍为当前代次的认证失败会话，并在外部屏障代次内清除 Agent 上下文。
      *
-     * 认证失败不能由当前已经持久化的设置快照覆盖，因此登记为外部代次。初次重置失败时保留代次和
-     * [PendingAuthenticationReset]；后续 token 会话只能在重试成功后安装。会话 scope 的取消会取消调用
-     * 本方法的轮询协程，故清理必须置于 [NonCancellable] 中；不会等待该 scope，以免等待自身造成死锁。
+     * 认证失败不能由当前已经持久化的设置快照覆盖，因此登记为外部代次。初次重置失败时保留
+     * [PendingAgentReset]；后续 token 会话只能在重试成功后安装。会话 scope 的取消会取消调用本方法的
+     * 轮询协程，故清理必须置于 [NonCancellable] 中；不会等待该 scope，以免等待自身造成死锁。
      */
     private suspend fun terminateAuthenticationFailedSession(session: PollingSession) {
-        val authenticationGeneration = modelSwitchBarrier.beginExternalSwitch()
-        val pendingReset = PendingAuthenticationReset(authenticationGeneration)
-        val shouldReset = settingsRepository.withTelegramTokenLifecycleLock {
+        val pendingReset = settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (!closed && currentSession === session && isTokenGenerationCurrent(session)) {
+                    // 认证失败也必须在摘除会话前关闭 Agent 准入，避免并发请求使用即将清除的上下文。
+                    val pending = PendingAgentReset(
+                        barrierGeneration = modelSwitchBarrier.beginExternalSwitch(),
+                        source = AgentResetSource.AUTHENTICATION_FAILURE,
+                    )
                     currentSession = null
                     session.updateChannel.close()
-                    pendingAuthenticationReset = pendingReset
-                    true
+                    pendingAgentReset = pending
+                    pending
                 } else {
-                    false
+                    null
                 }
             }
         }
-        if (!shouldReset) {
-            modelSwitchBarrier.cancel(authenticationGeneration)
-            return
-        }
+        pendingReset ?: return
 
         withContext(NonCancellable) {
-            try {
-                session.scope.cancel(CancellationException("Telegram authentication failed"))
-                modelSwitchBarrier.awaitInFlightRequests()
-                val resetSucceeded = attemptAuthenticationAgentReset()
-                val shouldReleaseBarrier = sessionLock.withLock {
-                    if (pendingAuthenticationReset !== pendingReset) {
-                        false
-                    } else if (resetSucceeded) {
-                        pendingAuthenticationReset = null
-                        true
-                    } else {
-                        false
-                    }
-                }
-                pendingReset.initialResetCompletion.complete(resetSucceeded)
-                if (shouldReleaseBarrier) {
-                    modelSwitchBarrier.complete(authenticationGeneration)
-                } else if (!resetSucceeded) {
-                    logger.warn(
-                        "Agent session reset failed after Telegram authentication failure; blocking new polling sessions until a retry succeeds.",
-                    )
-                }
-            } catch (e: Exception) {
-                // NonCancellable 区域中的意外失败也必须通知等待的新 token 会话，并保持 fail-closed 屏障。
-                pendingReset.initialResetCompletion.complete(false)
+            session.scope.cancel(CancellationException("Telegram authentication failed"))
+            if (!completeInitialAgentReset(pendingReset)) {
                 logger.warn(
-                    "Authentication reset cleanup failed before completion; new polling sessions remain blocked; category={}",
-                    SafeLogging.failureCategory(e).wireName,
+                    "Agent session reset failed after Telegram authentication failure; blocking new polling sessions until a retry succeeds.",
                 )
             }
         }
     }
 
     /**
-     * 等待认证失败的初次重置完成，并在失败时由即将安装的新 token 会话执行一次串行重试。
+     * 等待待处理 Agent 重置的初次执行完成，并在失败时由即将安装的新 token 会话执行一次串行重试。
      *
-     * 返回 `false` 时保留认证外部代次；调用方不得安装会话。每次失败重试都会清除其等待器，以便后续 token
-     * 生命周期事件可以再次尝试恢复。服务关闭时会结束所有等待器并释放代次，因为之后不会再处理消息。
+     * 返回 `false` 时保留外部代次；调用方不得安装会话。每次失败重试都会清除其等待器，以便后续实际 token
+     * 生命周期事件可以再次尝试恢复。普通 token 轮换成功后仍保留待处理状态，直到调用方在 token 生命周期锁内
+     * 安装当前会话；认证失败成功后则立即结束已失效会话对应的屏障。服务关闭时会结束所有等待器并释放代次。
      */
-    private suspend fun awaitAuthenticationResetBeforeSession(): Boolean {
-        val pendingReset = sessionLock.withLock { pendingAuthenticationReset } ?: return true
+    private suspend fun awaitPendingAgentResetBeforeSession(pendingReset: PendingAgentReset): Boolean {
         if (pendingReset.initialResetCompletion.await()) {
-            return true
+            return pendingReset.source == AgentResetSource.AUTHENTICATION_FAILURE || isPendingAgentResetCurrent(
+                pendingReset
+            )
         }
 
         val retry = sessionLock.withLock {
-            if (closed || pendingAuthenticationReset !== pendingReset) {
+            if (closed || pendingAgentReset !== pendingReset) {
                 return !closed
             }
             pendingReset.retryCompletion?.let { existing -> AuthenticationRetry(existing, isOwner = false) }
@@ -726,47 +788,124 @@ class MessagePoller @Inject constructor(
             return retry.completion.await()
         }
 
-        val resetSucceeded = withContext(NonCancellable) {
-            modelSwitchBarrier.awaitInFlightRequests()
-            attemptAuthenticationAgentReset()
-        }
+        val resetSucceeded = performAgentReset()
         val shouldReleaseBarrier = sessionLock.withLock {
-            if (pendingAuthenticationReset !== pendingReset) {
-                false
-            } else if (resetSucceeded) {
-                pendingAuthenticationReset = null
-                true
-            } else {
-                pendingReset.retryCompletion = null
-                false
+            when {
+                pendingAgentReset !== pendingReset -> false
+                !resetSucceeded -> {
+                    pendingReset.retryCompletion = null
+                    false
+                }
+
+                pendingReset.source != AgentResetSource.AUTHENTICATION_FAILURE -> false
+                else -> {
+                    pendingAgentReset = null
+                    true
+                }
             }
         }
-        retry.completion.complete(resetSucceeded && shouldReleaseBarrier)
+        val retrySucceeded = resetSucceeded && (
+                pendingReset.source == AgentResetSource.AUTHENTICATION_FAILURE || isPendingAgentResetCurrent(
+                    pendingReset
+                )
+                )
+        retry.completion.complete(retrySucceeded)
         if (shouldReleaseBarrier) {
-            modelSwitchBarrier.complete(pendingReset.generation)
-        } else {
-            logger.warn("Authentication reset retry failed; polling session remains blocked.")
+            modelSwitchBarrier.complete(pendingReset.barrierGeneration)
+        } else if (!retrySucceeded) {
+            logger.warn("Pending Agent reset retry failed; polling session remains blocked.")
         }
         return retry.completion.await()
     }
 
-    /** 执行一次认证失败后的 Agent 重置，并将所有失败语义降级为可重试结果。 */
-    private suspend fun attemptAuthenticationAgentReset(): Boolean = try {
-        awaitSuccessfulAgentReset()
-    } catch (e: CancellationException) {
-        logger.warn(
-            "Agent session reset was cancelled after Telegram authentication failure; category={}",
-            SafeLogging.failureCategory(e).wireName,
-        )
-        false
-    } catch (e: Exception) {
-        logger.warn(
-            "Failed to reset agent session after Telegram authentication failure; category={}",
-            SafeLogging.failureCategory(e).wireName,
-        )
-        false
+    /**
+     * 完成已登记的首次 Agent 重置，并按其来源决定屏障释放时机。
+     *
+     * 普通 token 轮换成功后仍必须等待新会话原子安装；认证失败没有可安装的当前会话，成功清除上下文后即可
+     * 释放其外部代次。失败、取消和同步异常均完成等待器为 `false` 并保留状态。
+     */
+    private suspend fun completeInitialAgentReset(pendingReset: PendingAgentReset): Boolean {
+        val resetSucceeded = performAgentReset()
+        val shouldReleaseBarrier = sessionLock.withLock {
+            if (pendingAgentReset !== pendingReset) {
+                false
+            } else {
+                pendingReset.initialResetCompletion.complete(resetSucceeded)
+                if (resetSucceeded && pendingReset.source == AgentResetSource.AUTHENTICATION_FAILURE) {
+                    pendingAgentReset = null
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        if (shouldReleaseBarrier) {
+            modelSwitchBarrier.complete(pendingReset.barrierGeneration)
+        }
+        return resetSucceeded && (
+                pendingReset.source == AgentResetSource.AUTHENTICATION_FAILURE || isPendingAgentResetCurrent(
+                    pendingReset
+                )
+                )
     }
 
+    /** 在外部屏障已关闭时执行一次 Agent 重置，并把所有失败语义转换为可重试的 `false`。 */
+    private suspend fun performAgentReset(): Boolean = withContext(NonCancellable) {
+        try {
+            modelSwitchBarrier.awaitInFlightRequests()
+            awaitSuccessfulAgentReset()
+        } catch (e: CancellationException) {
+            logger.warn(
+                "Agent session reset was cancelled; keeping polling fail-closed; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
+            false
+        } catch (e: Exception) {
+            logger.warn(
+                "Failed to reset agent session; keeping polling fail-closed; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
+            false
+        }
+    }
+
+    /** 判断待处理 Agent 重置仍归当前未关闭服务所有。 */
+    private fun isPendingAgentResetCurrent(pendingReset: PendingAgentReset): Boolean = sessionLock.withLock {
+        !closed && pendingAgentReset === pendingReset
+    }
+
+    /**
+     * 当前 token 不可建立轮询会话时结束已成功的普通轮换重置。
+     *
+     * 空或非法 token 本身不会让新 Bot 接收工作；此处只在它仍是当前代次时释放已经完成的上下文清除屏障，
+     * 避免永久阻塞应用中与 Telegram 无关的 Agent 请求。
+     */
+    private fun completePendingResetForInvalidToken(
+        pendingReset: PendingAgentReset,
+        token: String,
+        generation: Long,
+    ) {
+        val shouldReleaseBarrier = settingsRepository.withTelegramTokenLifecycleLock {
+            sessionLock.withLock {
+                if (
+                    !closed &&
+                    currentSession == null &&
+                    pendingAgentReset === pendingReset &&
+                    isTokenGenerationCurrent(token, generation)
+                ) {
+                    pendingAgentReset = null
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        if (shouldReleaseBarrier) {
+            modelSwitchBarrier.complete(pendingReset.barrierGeneration)
+        }
+    }
+
+    /** 待处理 Agent 重置的串行重试等待器。 */
     private data class AuthenticationRetry(
         val completion: CompletableDeferred<Boolean>,
         val isOwner: Boolean,
@@ -984,7 +1123,7 @@ class MessagePoller @Inject constructor(
                 }
             } else {
                 logger.warn(
-                    "Telegram did not accept outbox reply for update {} of bot {}; retrying later.",
+                    "Telegram did not accept fallback outbox reply for update {} of bot {}; retrying later.",
                     reply.updateId,
                     session.botId,
                 )
@@ -1205,13 +1344,16 @@ class MessagePoller @Inject constructor(
                 QueueOfferResult.NOT_CURRENT -> BarrierAdmission.Confirmed
             }
         }
-        when (admission) {
-            BarrierAdmission.Confirmed -> return UpdateAdmission.Confirmed
-            BarrierAdmission.Retry -> return UpdateAdmission.Retry
-            is BarrierAdmission.Enqueued -> return UpdateAdmission.Enqueued(admission.completion)
-            is BarrierAdmission.QueueFull -> {
-                return notifyQueueFull(session, update.updateId, admission.chatId, admission.messageId)
-            }
+        return when (admission) {
+            BarrierAdmission.Confirmed -> UpdateAdmission.Confirmed
+            BarrierAdmission.Retry -> UpdateAdmission.Retry
+            is BarrierAdmission.Enqueued -> UpdateAdmission.Enqueued(admission.completion)
+            is BarrierAdmission.QueueFull -> notifyQueueFull(
+                session,
+                update.updateId,
+                admission.chatId,
+                admission.messageId
+            )
         }
     }
 
@@ -1508,7 +1650,7 @@ class MessagePoller @Inject constructor(
                 chatId,
                 "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
                 ReplyParameters(messageId = messageId),
-            )?.isTelegramAccepted() == true
+            ).isTelegramAccepted()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1560,10 +1702,7 @@ class MessagePoller @Inject constructor(
 
     /** 判断 Telegram 响应是否同时具有成功 HTTP 状态和 API `ok: true` 标记。 */
     private fun TelegramApiResponse.isTelegramAccepted(): Boolean {
-        if (!status.isSuccess()) {
-            return false
-        }
-        return try {
+        return status.isSuccess() && try {
             Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
         } catch (_: Exception) {
             false
@@ -1572,10 +1711,7 @@ class MessagePoller @Inject constructor(
 
     /** 返回该响应是否明确表明 Telegram 以非限流的永久 `4xx` 拒绝了请求。 */
     private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean {
-        if (status.value in 400..499 && status.value != 429) {
-            return true
-        }
-        return try {
+        return status.value in 400..499 && status.value != 429 || try {
             Json.parseToJsonElement(body)
                 .jsonObject["error_code"]
                 ?.jsonPrimitive
@@ -1727,17 +1863,12 @@ class MessagePoller @Inject constructor(
     private fun AppSettings.hasSameModelServiceConfiguration(expected: AppSettings): Boolean {
         val currentAi = ai ?: return false
         val expectedAi = expected.ai ?: return false
-        if (
-            currentAi.provider != expectedAi.provider ||
-            currentAi.agentEnabled != expectedAi.agentEnabled ||
-            currentAi.selectedModel != expectedAi.selectedModel ||
-            proxy != expected.proxy ||
-            currentAi.httpToolSettings != expectedAi.httpToolSettings ||
-            currentAi.mcpServers != expectedAi.mcpServers
-        ) {
-            return false
-        }
-        return when (currentAi.provider) {
+        return currentAi.provider == expectedAi.provider &&
+                currentAi.agentEnabled == expectedAi.agentEnabled &&
+                currentAi.selectedModel == expectedAi.selectedModel &&
+                proxy == expected.proxy &&
+                currentAi.httpToolSettings == expectedAi.httpToolSettings &&
+                currentAi.mcpServers == expectedAi.mcpServers && when (currentAi.provider) {
             AIProvider.GEMINI -> currentAi.geminiApiKey == expectedAi.geminiApiKey
             AIProvider.OPENAI ->
                 currentAi.openAiApiKey == expectedAi.openAiApiKey &&
@@ -1829,7 +1960,7 @@ class MessagePoller @Inject constructor(
         chatId: String,
         text: String,
         replyParameters: ReplyParameters? = null,
-    ): TelegramApiResponse? {
+    ): TelegramApiResponse {
         ensureCurrent(session)
         return telegramService.sendMessageForToken(session.token, chatId, text, replyParameters)
     }
@@ -1838,26 +1969,26 @@ class MessagePoller @Inject constructor(
         session: PollingSession,
         chatId: String,
         action: String,
-    ): TelegramApiResponse? {
+    ): TelegramApiResponse {
         ensureCurrent(session)
         return telegramService.sendChatActionForToken(session.token, chatId, action)
     }
 
-    private suspend fun activeSession(): PollingSession? = sessionLock.withLock {
+    private fun activeSession(): PollingSession? = sessionLock.withLock {
         currentSession?.takeIf { !closed && isTokenGenerationCurrent(it) }
     }
 
-    private suspend fun isCurrent(session: PollingSession): Boolean = sessionLock.withLock {
+    private fun isCurrent(session: PollingSession): Boolean = sessionLock.withLock {
         !closed && currentSession === session && isTokenGenerationCurrent(session)
     }
 
-    private suspend fun ensureCurrent(session: PollingSession) {
+    private fun ensureCurrent(session: PollingSession) {
         if (!isCurrent(session)) {
             throw CancellationException("Polling session is no longer current.")
         }
     }
 
-    private suspend fun saveForCurrent(session: PollingSession, save: () -> Unit): Boolean =
+    private fun saveForCurrent(session: PollingSession, save: () -> Unit): Boolean =
         settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession !== session || !isTokenGenerationCurrent(session)) {
@@ -1869,7 +2000,7 @@ class MessagePoller @Inject constructor(
             }
         }
 
-    private suspend fun <T> readForCurrent(session: PollingSession, read: () -> T): T? =
+    private fun <T> readForCurrent(session: PollingSession, read: () -> T): T? =
         settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession === session && isTokenGenerationCurrent(session)) read() else null
@@ -1877,11 +2008,15 @@ class MessagePoller @Inject constructor(
         }
 
     private fun isTokenGenerationCurrent(session: PollingSession): Boolean =
+        isTokenGenerationCurrent(session.token, session.generation)
+
+    /** 判断指定 token 文本及代次仍是设置仓储当前发布的不可合并生命周期。 */
+    private fun isTokenGenerationCurrent(token: String, generation: Long): Boolean =
         settingsRepository.telegramTokenUpdateFlow.value.let { tokenUpdate ->
-            tokenUpdate.token == session.token && tokenUpdate.generation == session.generation
+            tokenUpdate.token == token && tokenUpdate.generation == generation
         }
 
-    private suspend fun cancelCurrentSession() {
+    private fun cancelCurrentSession() {
         val session = sessionLock.withLock { currentSession.also { currentSession = null } } ?: return
         session.updateChannel.close()
         session.scope.cancel()
@@ -1902,11 +2037,11 @@ class MessagePoller @Inject constructor(
         }
         jobToCancel?.cancel()
         val pendingReset = sessionLock.withLock {
-            pendingAuthenticationReset.also { pendingAuthenticationReset = null }
+            pendingAgentReset.also { pendingAgentReset = null }
         }
         pendingReset?.initialResetCompletion?.complete(false)
         pendingReset?.retryCompletion?.complete(false)
-        pendingReset?.let { modelSwitchBarrier.complete(it.generation) }
+        pendingReset?.let { modelSwitchBarrier.complete(it.barrierGeneration) }
         runBlocking { cancelCurrentSession() }
         scope.cancel()
         logger.info("Agent poller stopped.")

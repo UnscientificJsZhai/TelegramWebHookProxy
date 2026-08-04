@@ -1,5 +1,3 @@
-@file:Suppress("KotlinUnreachableCode", "LoggingSimilarMessage")
-
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.google.genai.Chat
@@ -134,6 +132,17 @@ class GeminiAgentService @Inject internal constructor(
 
     @Volatile
     private var initialReadinessJob: Job? = null
+
+    /**
+     * 工具调用超限后创建的恢复身份。
+     *
+     * 该身份只在 [sessionMutex] 保护下发布和清除。即使候选重置无法启动，仍会发布 `job == null` 的
+     * 身份，使后续发送拒绝使用旧会话而不是降级放行。
+     */
+    private data class ToolLimitRecovery(val job: Job?)
+
+    /** 仅在 [sessionMutex] 保护下访问；非空时后续发送必须等待或拒绝。 */
+    private var pendingToolLimitRecovery: ToolLimitRecovery? = null
 
     private val modelUpdateMutex = Mutex()
     private val modelStateLock = Any()
@@ -464,6 +473,9 @@ class GeminiAgentService @Inject internal constructor(
     /**
      * 异步重置当前会话并重新应用系统提示词、技能与 MCP 工具。
      *
+     * 工具调用达到上限时，服务会使用同一候选重置机制建立发送恢复屏障；恢复任务未正常完成、被取消或
+     * 无法启动时，后续 [sendMessage] 会拒绝发送，不会复用此前会话。
+     *
      * @return 已开始重置时返回对应任务；服务已关闭或 Gemini HTTP 传输不可用时返回 `null`。调用方必须在
      * [Job.join] 后检查 [Job.isCancelled]：只有任务正常完成时，新会话才已原子替换旧会话；候选创建
      * 失败或任务取消都会保留旧会话状态。
@@ -686,7 +698,9 @@ class GeminiAgentService @Inject internal constructor(
     /**
      * 发送文本消息并获取回复。
      *
-     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。
+     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。若前一回合因工具调用超限而正在
+     * 恢复，本调用会在不持有会话锁的情况下等待；只有恢复正常提交新会话后才发送。恢复失败、取消或无法
+     * 启动时会拒绝发送；取消本调用不会取消恢复任务。
      *
      * @param text 要发送的文本消息；空字符串会作为空文本部分发送。
      * @return Gemini 的回复文本；模型未提供文本时返回空字符串。
@@ -699,7 +713,9 @@ class GeminiAgentService @Inject internal constructor(
     /**
      * 发送包含媒体数据的消息并获取回复。
      *
-     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。
+     * 此挂起函数会与会话重置串行执行，取消时会取消正在进行的模型调用。若前一回合因工具调用超限而正在
+     * 恢复，本调用会在不持有会话锁的情况下等待；只有恢复正常提交新会话后才发送。恢复失败、取消或无法
+     * 启动时会拒绝发送；取消本调用不会取消恢复任务。
      *
      * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
      * @param mediaData 要发送的媒体数据列表；可为空，元素会作为 Gemini 内联数据发送。
@@ -724,75 +740,157 @@ class GeminiAgentService @Inject internal constructor(
         return sendMessageWithParts(text, audioParts)
     }
 
+    /** 发送准入结果；恢复等待必须发生在 [sessionMutex] 之外。 */
+    private sealed interface SendAdmission {
+        data object Ready : SendAdmission
+
+        data object Unavailable : SendAdmission
+
+        data class AwaitReset(val job: Job) : SendAdmission
+
+        data class AwaitRecovery(val recovery: ToolLimitRecovery) : SendAdmission
+    }
+
+    /**
+     * 等待工具超限恢复或首轮会话创建，并在返回前确认当前路径存在可用会话。
+     *
+     * 每次等待结束后都会重新取得 [sessionMutex] 并按恢复身份复核，避免旧恢复任务清除或替代更新的恢复。
+     */
+    private suspend fun awaitSendAdmission(sessionAvailable: () -> Boolean) {
+        while (true) {
+            when (val admission = sessionMutex.withLock {
+                check(!closed) { "Gemini client is closed." }
+                pendingToolLimitRecovery?.let(SendAdmission::AwaitRecovery)
+                    ?: if (sessionAvailable()) {
+                        SendAdmission.Ready
+                    } else {
+                        resetSessionJob?.let(SendAdmission::AwaitReset) ?: SendAdmission.Unavailable
+                    }
+            }) {
+                SendAdmission.Ready -> return
+                SendAdmission.Unavailable -> throw IllegalStateException("Gemini chat session is not initialized.")
+                is SendAdmission.AwaitReset -> {
+                    admission.job.join()
+                    if (admission.job.isCancelled) {
+                        throw IllegalStateException("Gemini chat session is not initialized.")
+                    }
+                    val sessionEstablished = sessionMutex.withLock {
+                        check(!closed) { "Gemini client is closed." }
+                        sessionAvailable()
+                    }
+                    if (!sessionEstablished) {
+                        throw IllegalStateException("Gemini chat session is not initialized.")
+                    }
+                }
+
+                is SendAdmission.AwaitRecovery -> awaitToolLimitRecovery(admission.recovery)
+            }
+        }
+    }
+
+    /**
+     * 在不持有 [sessionMutex] 的情况下等待指定恢复身份，并只清除仍为当前身份的成功恢复。
+     */
+    private suspend fun awaitToolLimitRecovery(recovery: ToolLimitRecovery) {
+        val recoveryJob = recovery.job
+            ?: throw IllegalStateException("Gemini tool-limit recovery could not be started.")
+        recoveryJob.join()
+        sessionMutex.withLock {
+            check(!closed) { "Gemini client is closed." }
+            if (pendingToolLimitRecovery !== recovery) {
+                return
+            }
+            if (recoveryJob.isCancelled) {
+                throw IllegalStateException("Gemini tool-limit recovery did not complete.")
+            }
+            pendingToolLimitRecovery = null
+        }
+    }
+
+    /**
+     * 在会话锁内发布工具调用超限的恢复身份。
+     *
+     * 候选重置会在锁释放后取得 [sessionMutex]；这里绝不等待它，避免恢复路径与发送路径互锁。
+     */
+    private fun startToolLimitRecoveryLocked() {
+        val recovery = ToolLimitRecovery(resetSession())
+        pendingToolLimitRecovery = recovery
+        resetSessionJob = recovery.job
+    }
+
     /** 使用原生 REST 传输完成一个 Gemini 回合，并只在最终回答成功时提交历史。 */
     private suspend fun sendRawMessage(text: String?, mediaData: List<MediaData>): String {
-        val initialSession = sessionMutex.withLock {
-            check(!closed) { "Gemini client is closed." }
-            rawSession
-        }
-        val session = initialSession ?: resetSessionJob?.let { job ->
-            job.join()
-            sessionMutex.withLock {
+        while (true) {
+            awaitSendAdmission { rawSession != null }
+            val result = sessionMutex.withLock {
                 check(!closed) { "Gemini client is closed." }
-                rawSession
-            }
-        } ?: throw IllegalStateException("Gemini chat session is not initialized.")
-        return sessionMutex.withLock {
-            check(!closed) { "Gemini client is closed." }
-            val currentTransport =
-                rawTransport ?: throw IllegalStateException("Gemini HTTP transport is not initialized.")
-            validateGeminiInput(text, mediaData)
-            val tentativeHistory = prepareRawGeminiCandidate(session.history)
-            tentativeHistory += createGeminiUserContent(text, mediaData)
-            normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
-
-            try {
-                var toolCallRounds = 0
-                var toolCallsExecuted = 0
-                while (true) {
-                    val candidate = requestGeminiContent(currentTransport, session, tentativeHistory)
-                    tentativeHistory += candidate
+                if (pendingToolLimitRecovery != null || rawSession == null) {
+                    null
+                } else {
+                    val session = checkNotNull(rawSession)
+                    val currentTransport = rawTransport
+                        ?: throw IllegalStateException("Gemini HTTP transport is not initialized.")
+                    val tentativeHistory = prepareRawGeminiCandidate(session.history)
+                    tentativeHistory += createGeminiUserContent(text, mediaData)
                     normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
-                    val functionCalls = geminiFunctionCalls(candidate)
-                    if (functionCalls.isEmpty()) {
-                        val reply = candidate["parts"]?.jsonArray
-                            ?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull }
-                            ?.joinToString("")
-                            .orEmpty()
-                        currentCoroutineContext().ensureActive()
-                        check(!closed && rawSession === session) { "Gemini session was replaced before commit" }
-                        rawSession = session.copy(history = tentativeHistory)
-                        return@withLock reply
-                    }
 
-                    ensureToolCallRoundIsAllowed(toolCallRounds++)
-                    ensureToolCallCountIsAllowed(functionCalls.size, toolCallsExecuted)
-                    toolCallsExecuted += functionCalls.size
-                    val responses = buildJsonArray {
-                        functionCalls.forEach { functionCall ->
-                            add(createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot))
+                    try {
+                        var toolCallRounds = 0
+                        var toolCallsExecuted = 0
+                        var reply: String? = null
+                        while (reply == null) {
+                            val candidate = requestGeminiContent(currentTransport, session, tentativeHistory)
+                            tentativeHistory += candidate
+                            normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
+                            val functionCalls = geminiFunctionCalls(candidate)
+                            if (functionCalls.isEmpty()) {
+                                val completedReply = candidate["parts"]?.jsonArray
+                                    ?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull }
+                                    ?.joinToString("")
+                                    .orEmpty()
+                                currentCoroutineContext().ensureActive()
+                                check(!closed && rawSession === session) { "Gemini session was replaced before commit" }
+                                rawSession = session.copy(history = tentativeHistory)
+                                reply = completedReply
+                                continue
+                            }
+
+                            ensureToolCallRoundIsAllowed(toolCallRounds++)
+                            ensureToolCallCountIsAllowed(functionCalls.size, toolCallsExecuted)
+                            toolCallsExecuted += functionCalls.size
+                            val responses = buildJsonArray {
+                                functionCalls.forEach { functionCall ->
+                                    add(createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot))
+                                }
+                            }
+                            tentativeHistory += buildJsonObject {
+                                put("role", "user")
+                                put("parts", responses)
+                            }
+                            normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
                         }
+                        reply
+                    } catch (e: ToolCallLimitExceededException) {
+                        logger.error(
+                            "Gemini raw session reached the tool call limit; category={}",
+                            SafeLogging.failureCategory(e).wireName,
+                        )
+                        startToolLimitRecoveryLocked()
+                        throw e
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error(
+                            "Gemini raw message processing failed; category={}",
+                            SafeLogging.failureCategory(e).wireName
+                        )
+                        throw e
                     }
-                    tentativeHistory += buildJsonObject {
-                        put("role", "user")
-                        put("parts", responses)
-                    }
-                    normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
                 }
-            } catch (e: ToolCallLimitExceededException) {
-                logger.error(
-                    "Tool call limit reached for Gemini session; category={}",
-                    SafeLogging.failureCategory(e).wireName,
-                )
-                resetSessionJob = resetSession()
-                throw e
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.error("Gemini message processing failed; category={}", SafeLogging.failureCategory(e).wireName)
-                throw e
             }
-            error("Gemini tool loop exited unexpectedly")
+            if (result != null) {
+                return result
+            }
         }
     }
 
@@ -1130,56 +1228,57 @@ class GeminiAgentService @Inject internal constructor(
         text: String?,
         audioParts: List<Part>,
     ): String {
-        val initialChat = sessionMutex.withLock {
-            check(!closed) { "Gemini client is closed." }
-            chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) }
-        }
-        val currentChat = initialChat ?: resetSessionJob?.run {
-            join()
-            sessionMutex.withLock {
+        while (true) {
+            awaitSendAdmission { chat != null }
+            val result = sessionMutex.withLock {
                 check(!closed) { "Gemini client is closed." }
-                chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) }
-            }
-        } ?: throw IllegalStateException("Gemini chat session is not initialized.")
-        return sessionMutex.withLock {
-            check(!closed) { "Gemini client is closed." }
-            try {
-                val activeChat = chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) } ?: currentChat
-                val parts = mutableListOf<Part>()
-                text?.let { parts.add(Part.fromText(it)) }
-                parts.addAll(audioParts)
+                if (pendingToolLimitRecovery != null || chat == null) {
+                    null
+                } else {
+                    try {
+                        val activeChat = checkNotNull(chat) to checkNotNull(chatFunctionRouteSnapshot)
+                        val parts = mutableListOf<Part>()
+                        text?.let { parts.add(Part.fromText(it)) }
+                        parts.addAll(audioParts)
 
-                val userContent = Content.builder().role("user").parts(parts).build()
-                val config = sdkSessionConfig ?: run {
-                    val aiSettings = settingsRepository.settingsFlow.value.ai
-                        ?: throw AgentTurnFailedException("Gemini SDK 会话缺少可重建的配置。")
-                    createSdkSessionConfig(aiSettings, activeChat.second)
+                        val userContent = Content.builder().role("user").parts(parts).build()
+                        val config = sdkSessionConfig ?: run {
+                            val aiSettings = settingsRepository.settingsFlow.value.ai
+                                ?: throw AgentTurnFailedException("Gemini SDK 会话缺少可重建的配置。")
+                            createSdkSessionConfig(aiSettings, activeChat.second)
+                        }
+                        val currentClient = checkNotNull(client) { "Gemini client is not initialized." }
+                        val persistedHistory = savedHistory ?: activeChat.first.getHistory(true)
+                        val candidate = completeSdkCandidateTurn(
+                            currentClient,
+                            config,
+                            prepareSdkGeminiHistory(persistedHistory),
+                            userContent,
+                            activeChat.second,
+                        )
+                        check(chat === activeChat.first) { "Gemini session was replaced before commit" }
+                        chat = candidate.chat
+                        savedHistory = candidate.history
+                        sdkSessionConfig = config
+                        candidate.reply
+                    } catch (e: ToolCallLimitExceededException) {
+                        logger.error(
+                            "Gemini SDK session reached the tool call limit; category={}",
+                            SafeLogging.failureCategory(e).wireName,
+                        )
+                        startToolLimitRecoveryLocked()
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error(
+                            "Gemini SDK message processing failed; category={}",
+                            SafeLogging.failureCategory(e).wireName
+                        )
+                        throw e
+                    }
                 }
-                val currentClient = checkNotNull(client) { "Gemini client is not initialized." }
-                val persistedHistory = savedHistory ?: activeChat.first.getHistory(true)
-                val result = completeSdkCandidateTurn(
-                    currentClient,
-                    config,
-                    prepareSdkGeminiHistory(persistedHistory),
-                    userContent,
-                    activeChat.second,
-                )
-                check(chat === activeChat.first) { "Gemini session was replaced before commit" }
-                chat = result.chat
-                savedHistory = result.history
-                sdkSessionConfig = config
-                result.reply
-            } catch (e: ToolCallLimitExceededException) {
-                logger.error(
-                    "Tool call limit reached for Gemini session; category={}",
-                    SafeLogging.failureCategory(e).wireName,
-                )
-                // 重置同样采用候选提交；创建失败时仍保留当前会话，避免在错误恢复路径破坏可用状态。
-                resetSessionJob = resetSession()
-                throw e
-            } catch (e: Exception) {
-                logger.error("Gemini message processing failed; category={}", SafeLogging.failureCategory(e).wireName)
-                throw e
+            }
+            if (result != null) {
+                return result
             }
         }
     }
@@ -1276,7 +1375,7 @@ class GeminiAgentService @Inject internal constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Gemini SDK function call failed with a safe local error category.")
+            logger.warn("Gemini SDK candidate function call failed with a safe local error category.")
             buildJsonObject { put("error", "tool_execution_failed") }
         }
         return createFunctionResponsePart(functionCall, result)

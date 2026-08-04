@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service
 import ch.qos.logback.classic.Logger
 import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.core.read.ListAppender
+import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
@@ -58,7 +59,7 @@ class TaskSchedulerServiceTest {
         val agentProvider = Provider { agentService }
         val testScope = CoroutineScope(EmptyCoroutineContext)
         settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
-        settingsRepository.saveSettings(AppSettings(telegramToken = BOT_A_TOKEN))
+        settingsRepository.saveSettings(enabledSettings())
 
         service = TaskSchedulerService(testScope, telegramService, agentProvider, settingsRepository, scheduleFile)
     }
@@ -95,6 +96,26 @@ class TaskSchedulerServiceTest {
         val id = service.createTask("Test instruction", System.currentTimeMillis() + 10000, LoopMode.ONCE, "12345")
         assertTrue(service.cancelTask(id))
         assertEquals(0, service.listTasks().size)
+    }
+
+    /**
+     * 验证新建任务拒绝空白会话标识，且非空白标识不会在持久化前被修改。
+     */
+    @Test
+    fun `create task rejects blank chat ids and preserves nonblank chat ids exactly`() {
+        assertFailsWith<IllegalArgumentException> {
+            service.createTask("blank", Long.MAX_VALUE, LoopMode.ONCE, "")
+        }
+        assertFailsWith<IllegalArgumentException> {
+            service.createTask("whitespace", Long.MAX_VALUE, LoopMode.ONCE, " \t ")
+        }
+
+        val taskId = service.createTask("preserve", Long.MAX_VALUE, LoopMode.ONCE, " chat with spaces ")
+
+        assertEquals(
+            " chat with spaces ",
+            service.listTasks().single { it.id == taskId }.agentChatId,
+        )
     }
 
     /**
@@ -660,6 +681,7 @@ class TaskSchedulerServiceTest {
      */
     @Test
     fun `in flight task delivery uses the token captured by its execution lease`() = runTest {
+        settingsRepository.saveSettings(enabledSettings(BOT_A_TOKEN, "chat-a"))
         service.createTask("task", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "chat-a")
         val agentStarted = CompletableDeferred<Unit>()
         val allowAgentToFinish = CompletableDeferred<Unit>()
@@ -672,7 +694,7 @@ class TaskSchedulerServiceTest {
 
         val execution = async { service.scanAndExecute() }
         agentStarted.await()
-        settingsRepository.saveSettings(AppSettings(telegramToken = BOT_B_TOKEN))
+        settingsRepository.saveSettings(enabledSettings(BOT_B_TOKEN, "chat-b"))
         allowAgentToFinish.complete(Unit)
         execution.await()
 
@@ -685,14 +707,109 @@ class TaskSchedulerServiceTest {
      */
     @Test
     fun `invalid token leaves scheduled tasks untouched`() = runTest {
+        settingsRepository.saveSettings(enabledSettings(BOT_A_TOKEN, "chat-a"))
         val taskId = service.createTask("task", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "chat-a")
-        settingsRepository.saveSettings(AppSettings(telegramToken = "invalid-token"))
+        settingsRepository.saveSettings(enabledSettings("invalid-token", "chat-a"))
 
         service.scanAndExecute()
 
         coVerify(exactly = 0) { agentService.sendMessage(any()) }
         coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
         assertEquals(listOf(taskId), service.listTasks().map { it.id })
+    }
+
+    /**
+     * 验证当前 AI 授权撤销时，到期任务会在任何模型或 Telegram 副作用前删除；循环任务不会被推进。
+     */
+    @Test
+    fun `revoked task authorization deletes once hourly and legacy tasks without side effects`() = runTest {
+        val dueTime = System.currentTimeMillis() - 1_000
+
+        service.createTask("mismatched owner", dueTime, LoopMode.ONCE, "task-owner")
+        settingsRepository.saveSettings(enabledSettings(agentChatId = "other-owner"))
+        service.scanAndExecute()
+        assertTrue(service.listTasks().isEmpty())
+
+        service.createTask("disabled hourly", dueTime, LoopMode.HOURLY, "12345")
+        settingsRepository.saveSettings(
+            AppSettings(
+                telegramToken = BOT_A_TOKEN,
+                ai = AISettings(agentEnabled = false, agentChatId = "12345"),
+            ),
+        )
+        service.scanAndExecute()
+        assertTrue(service.listTasks().isEmpty())
+
+        service.createTask("missing AI", dueTime, LoopMode.ONCE, "12345")
+        settingsRepository.saveSettings(AppSettings(telegramToken = BOT_A_TOKEN))
+        service.scanAndExecute()
+        assertTrue(service.listTasks().isEmpty())
+
+        service.createTask("blank current chat", dueTime, LoopMode.HOURLY, "12345")
+        settingsRepository.saveSettings(enabledSettings(agentChatId = " \t "))
+        service.scanAndExecute()
+        assertTrue(service.listTasks().isEmpty())
+
+        service.close()
+        scheduleFile.writeText(
+            ConfigJson.encodeToString(
+                listOf(ScheduledTask("legacy-blank-chat", "legacy", dueTime, LoopMode.HOURLY, "")),
+            ),
+        )
+        service = newService(scheduleFile)
+        settingsRepository.saveSettings(enabledSettings())
+        service.scanAndExecute()
+
+        assertTrue(service.listTasks().isEmpty())
+        assertTrue(ConfigJson.decodeFromString<List<ScheduledTask>>(scheduleFile.readText()).isEmpty())
+        coVerify(exactly = 0) { agentService.withReadyService<Any?>(any()) }
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+    }
+
+    /**
+     * 验证首次授权检查通过后，模型就绪屏障等待期间被撤销的任务会在第二次检查中删除。
+     */
+    @Test
+    fun `authorization revoked after ready barrier is deleted before precommit`() = runTest {
+        val taskId =
+            service.createTask("revoked while waiting", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.withReadyService<Any?>(any()) } coAnswers {
+            settingsRepository.saveSettings(
+                AppSettings(
+                    telegramToken = BOT_A_TOKEN,
+                    ai = AISettings(agentEnabled = false, agentChatId = "12345"),
+                ),
+            )
+            firstArg<suspend (AgentService) -> Any?>().invoke(agentService)
+        }
+
+        service.scanAndExecute()
+
+        coVerify(exactly = 1) { agentService.withReadyService<Any?>(any()) }
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        assertTrue(service.listTasks().isEmpty())
+        assertTrue(ConfigJson.decodeFromString<List<ScheduledTask>>(scheduleFile.readText()).none { it.id == taskId })
+    }
+
+    /**
+     * 验证撤销任务的持久化删除失败时，内存和文件都保留扫描前快照且不产生副作用。
+     */
+    @Test
+    fun `revoked task deletion persistence failure retains the task without side effects`() = runTest {
+        val taskId = service.createTask("cannot remove", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val primaryBefore = scheduleFile.readText()
+        service.close()
+        service = newService(scheduleFile, primaryReplaceFailingOperations())
+        settingsRepository.saveSettings(enabledSettings(agentChatId = "different-owner"))
+
+        service.scanAndExecute()
+
+        assertEquals(primaryBefore, scheduleFile.readText())
+        assertEquals(listOf(taskId), service.listTasks().map { it.id })
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
     }
 
     /**
@@ -769,3 +886,11 @@ class TaskSchedulerServiceTest {
 
 private const val BOT_A_TOKEN = "100:token-a"
 private const val BOT_B_TOKEN = "200:token-b"
+
+private fun enabledSettings(
+    token: String = BOT_A_TOKEN,
+    agentChatId: String = "12345",
+): AppSettings = AppSettings(
+    telegramToken = token,
+    ai = AISettings(agentEnabled = true, agentChatId = agentChatId),
+)

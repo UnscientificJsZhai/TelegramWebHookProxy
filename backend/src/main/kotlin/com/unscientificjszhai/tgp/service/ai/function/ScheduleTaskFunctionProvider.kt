@@ -5,6 +5,8 @@ import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.serialization.json.*
 import java.time.Clock
 import java.time.Instant
@@ -18,13 +20,14 @@ import javax.inject.Provider
 /**
  * 提供创建、查询和取消 AI 定时任务的模型函数。
  *
- * 所有任务操作均委托给 [TaskSchedulerService]。创建任务时使用当前 AI 设置中的代理会话标识。到期实例由调度器在
+ * 所有任务操作均委托给 [TaskSchedulerService]。Agent 回合中创建任务时使用准入时固定的代理会话；
+ * 直接调用创建任务时使用当前 AI 设置中的代理会话标识。到期实例由调度器在
  * Agent 与 Telegram 副作用前原子预消费：单次任务删除，循环任务推进到一个未来时刻；因此崩溃、失败或取消
  * 不会重放该次，但提交与副作用之间中断可能遗漏一次执行。绝对时间和日/周循环均解释为服务器时区，错过的
  * 循环周期不会逐期追赶。
  *
  * @param taskSchedulerService 延迟提供定时任务调度服务，以避免初始化循环依赖。
- * @param settingsRepository 提供创建任务所需代理会话标识的设置仓库。
+ * @param settingsRepository 为没有 Agent 回合上下文的直接调用提供代理会话标识的设置仓库。
  * @param clock 提供当前时间及默认时区的时钟；默认使用系统时钟。
  * @param zoneId 解释和展示绝对执行时间的时区；必须与 [clock] 的时区相同，默认使用该时区。
  */
@@ -123,17 +126,24 @@ class ScheduleTaskFunctionProvider(
      * 当前服务器时区中严格的 `yyyy-MM-dd HH:mm:ss`，夏令时不存在的本地时间会被拒绝，重叠时间采用较早
      * 偏移量；相对时间必须是 `+<1..2147483647><s|m|h|d>`。可选 `loopMode` 必须为 `ONCE`、`HOURLY`、
      * `DAILY` 或 `WEEKLY`；取消任务要求字符串 `taskId`，列出任务时忽略该映射。
+     * Agent 回合上下文存在时，创建操作只使用其中固定的代理会话，不会重新读取当前设置。
+     *
      * @return 操作结果的 JSON 对象；参数缺失、格式错误、未配置会话或不支持的函数名称时包含 `error` 字段。
      */
-    override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject =
-        when (functionName) {
-            "create_scheduled_task" -> createScheduledTask(args)
+    override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
+        val executionContext = currentCoroutineContext()[AgentToolExecutionContext]
+        return when (functionName) {
+            "create_scheduled_task" -> createScheduledTask(args, agentChatIdForCreate(executionContext))
             "list_scheduled_tasks" -> listScheduledTasks()
             "cancel_scheduled_task" -> cancelScheduledTask(args)
             else -> buildJsonObject { put("error", "Unsupported function: $functionName") }
         }
+    }
 
-    private fun createScheduledTask(args: Map<String, Any?>): JsonObject {
+    private fun createScheduledTask(
+        args: Map<String, Any?>,
+        configuredAgentChatId: String?,
+    ): JsonObject {
         val instruction =
             args["instruction"] as? String ?: return buildJsonObject { put("error", "Missing instruction") }
         val executionTimeStr =
@@ -158,7 +168,7 @@ class ScheduleTaskFunctionProvider(
             }
         }
 
-        val agentChatId = settingsRepository.settingsFlow.value.ai?.agentChatId
+        val agentChatId = configuredAgentChatId?.takeIf { it.isNotBlank() }
             ?: return buildJsonObject {
                 put(
                     "error",
@@ -199,7 +209,9 @@ class ScheduleTaskFunctionProvider(
         }
     }
 
-    private fun cancelScheduledTask(args: Map<String, Any?>): JsonObject {
+    private fun cancelScheduledTask(
+        args: Map<String, Any?>,
+    ): JsonObject {
         val taskId = args["taskId"] as? String ?: return buildJsonObject { put("error", "Missing taskId") }
         val success = try {
             taskSchedulerService.get().cancelTask(taskId)
@@ -246,4 +258,11 @@ class ScheduleTaskFunctionProvider(
             .toEpochMilli()
     }
 
+    private fun agentChatIdForCreate(
+        executionContext: AgentToolExecutionContext?,
+    ): String? =
+        when (executionContext) {
+            null -> settingsRepository.settingsFlow.value.ai?.agentChatId
+            else -> executionContext.taskAgentChatId
+        }
 }

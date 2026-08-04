@@ -11,6 +11,7 @@ import com.unscientificjszhai.tgp.models.MAX_HTTP_TOOL_TARGET_ID_LENGTH
 import com.unscientificjszhai.tgp.models.parseExactHttpToolCidr
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
@@ -24,6 +25,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.Json
@@ -80,9 +82,9 @@ object SystemHttpToolDnsResolver : HttpToolDnsResolver {
 /**
  * 提供由固定目标配置约束的模型 HTTP 函数调用能力。
  *
- * 模型只能选择 [HttpCallTarget.id] 并为 POST 提供小型 JSON 文本。每次执行都重新读取并校验
- * 当前设置快照、使用独立 HTTP/1.1 客户端及经校验的 DNS，且不会把 URL、请求头、异常详情或
- * 非文本响应交给模型。
+ * 模型只能选择 [HttpCallTarget.id] 并为 POST 提供小型 JSON 文本。Agent 回合会固定准入时的设置
+ * 快照；没有回合上下文的直接调用才会重新读取和校验当前设置。所有调用均使用独立 HTTP/1.1 客户端及
+ * 经校验的 DNS，且不会把 URL、请求头、异常详情或非文本响应交给模型。
  *
  */
 class HttpCallingFunctionProvider private constructor(
@@ -122,8 +124,9 @@ class HttpCallingFunctionProvider private constructor(
     /**
      * 执行受限 HTTP 函数调用。
      *
-     * 调用前会重新读取和校验当前配置快照。调用方取消时会停止请求并继续抛出取消异常；其余错误
-     * 始终返回稳定、无敏感信息的错误代码。
+     * 在 Agent 回合上下文中调用时，调用只使用该回合固定的配置而不会读取当前设置；直接调用时仍会
+     * 重新读取和校验当前配置快照。调用方取消时会停止请求并继续抛出取消异常；其余错误始终返回稳定、
+     * 无敏感信息的错误代码。
      *
      * @param functionName 要执行的函数名称；仅 `call_http_api` 有效。
      * @param args 模型函数参数；只能包含非空字符串 `targetId`，以及 POST 的可选、最大 64 KiB 的
@@ -135,7 +138,11 @@ class HttpCallingFunctionProvider private constructor(
         if (functionName != HTTP_FUNCTION_NAME) return error(ERROR_UNSUPPORTED_FUNCTION)
         if (closed.get()) return error(ERROR_DISABLED)
 
-        val settings = currentSettingsOrNull() ?: return error(ERROR_DISABLED)
+        val executionContext = currentCoroutineContext()[AgentToolExecutionContext]
+        val settings = when (executionContext) {
+            null -> currentSettingsOrNull()
+            else -> executionContext.httpToolSettings
+        } ?: return error(ERROR_DISABLED)
         if (!settings.enabled || settings.targets.isEmpty()) return error(ERROR_DISABLED)
         val arguments = parseArguments(args) ?: return error(ERROR_INVALID_ARGUMENTS)
         val target =
@@ -153,7 +160,7 @@ class HttpCallingFunctionProvider private constructor(
         val semaphore = semaphores.computeIfAbsent(settings.maxConcurrentRequests, ::Semaphore)
         return hardRequestLimit.withPermit {
             semaphore.withPermit {
-                executeTarget(settings, target, arguments.body)
+                executeTarget(settings, target, arguments.body, verifyCurrentSettings = executionContext == null)
             }
         }
     }
@@ -162,16 +169,19 @@ class HttpCallingFunctionProvider private constructor(
         settings: HttpToolSettings,
         target: HttpCallTarget,
         body: String?,
+        verifyCurrentSettings: Boolean,
     ): JsonObject {
         if (closed.get()) return error(ERROR_DISABLED)
 
-        // The lifecycle barrier prevents a persisted settings transition from racing a model turn.
-        // Re-read the snapshot nevertheless so direct callers cannot use a stale target.
-        val currentSettings = currentSettingsOrNull() ?: return error(ERROR_DISABLED)
-        if (!currentSettings.enabled || currentSettings != settings ||
-            currentSettings.targets.singleOrNull { it.id == target.id } != target
-        ) {
-            return error(ERROR_TARGET_NOT_ALLOWED)
+        if (verifyCurrentSettings) {
+            // The lifecycle barrier prevents a persisted settings transition from racing a model turn.
+            // Re-read the snapshot nevertheless so direct callers cannot use a stale target.
+            val currentSettings = currentSettingsOrNull() ?: return error(ERROR_DISABLED)
+            if (!currentSettings.enabled || currentSettings != settings ||
+                currentSettings.targets.singleOrNull { it.id == target.id } != target
+            ) {
+                return error(ERROR_TARGET_NOT_ALLOWED)
+            }
         }
 
         val client = createClient(settings, target)

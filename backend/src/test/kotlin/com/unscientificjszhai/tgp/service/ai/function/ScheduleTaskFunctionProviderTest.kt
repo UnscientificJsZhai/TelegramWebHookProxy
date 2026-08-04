@@ -4,13 +4,16 @@ import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SettingsUpdate
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.time.Clock
 import java.time.Instant
@@ -176,17 +179,87 @@ class ScheduleTaskFunctionProviderTest {
         }
     }
 
+    /**
+     * 验证 Agent 回合中创建任务使用固定会话，直接调用则使用当前设置。
+     */
+    @Test
+    fun `Agent tool context keeps scheduled task chat fixed across settings changes`() = runTest {
+        val scheduler = mockk<TaskSchedulerService>()
+        val createdChatIds = mutableListOf<String>()
+        every { scheduler.createTask(any(), any(), any(), any()) } answers {
+            createdChatIds += invocation.args[3] as String
+            "task-${createdChatIds.size}"
+        }
+        val settingsRepository = settingsRepository("chat-b")
+        val executionContext = AgentToolExecutionContext.from(
+            SettingsUpdate(
+                AppSettings(ai = AISettings(agentChatId = "chat-a")),
+                version = 1,
+                switchGeneration = null,
+            ),
+        )
+        val provider = ScheduleTaskFunctionProvider(schedulerProvider(scheduler), settingsRepository)
+
+        withContext(executionContext) {
+            provider.execute("create_scheduled_task", createArgs("+1h"))
+        }
+        provider.execute("create_scheduled_task", createArgs("+1h"))
+
+        assertEquals(listOf("chat-a", "chat-b"), createdChatIds)
+    }
+
+    /**
+     * 验证 Agent 回合上下文缺失定时任务会话时，不回退读取切换后的当前设置。
+     */
+    @Test
+    fun `Agent tool context with missing task chat does not fall back to current settings`() = runTest {
+        val scheduler = mockk<TaskSchedulerService>()
+        val settingsRepository = settingsRepository("chat-b")
+        val missingChatContext = AgentToolExecutionContext.from(
+            SettingsUpdate(AppSettings(ai = null), 1, null),
+        )
+        val provider = ScheduleTaskFunctionProvider(schedulerProvider(scheduler), settingsRepository)
+
+        val create = withContext(missingChatContext) {
+            provider.execute("create_scheduled_task", createArgs("+1h"))
+        }
+
+        assertNotNull(create["error"])
+        verify(exactly = 0) { scheduler.createTask(any(), any(), any(), any()) }
+    }
+
+    /**
+     * 验证创建任务时，缺失、空白或仅含空白字符的代理会话标识都会在调用调度器前被拒绝。
+     */
+    @Test
+    fun `blank agent chat id does not create a scheduled task`() = runTest {
+        val scheduler = mockk<TaskSchedulerService>()
+
+        listOf<String?>(null, "", " \t ").forEach { agentChatId ->
+            val settingsRepository = settingsRepository(agentChatId)
+            val provider = ScheduleTaskFunctionProvider(schedulerProvider(scheduler), settingsRepository)
+
+            val result = provider.execute("create_scheduled_task", createArgs("+1h"))
+
+            assertNotNull(result["error"], "agentChatId=$agentChatId")
+            assertNull(result["status"])
+        }
+
+        verify(exactly = 0) { scheduler.createTask(any(), any(), any(), any()) }
+    }
+
     private fun provider(scheduler: TaskSchedulerService, clock: Clock): ScheduleTaskFunctionProvider =
         ScheduleTaskFunctionProvider(schedulerProvider(scheduler), settingsRepository(), clock)
 
     private fun schedulerProvider(scheduler: TaskSchedulerService): Provider<TaskSchedulerService> =
         Provider { scheduler }
 
-    private fun settingsRepository(): SettingsRepository = mockk<SettingsRepository>().also { repository ->
-        every {
-            repository.settingsFlow
-        } returns MutableStateFlow(AppSettings(ai = AISettings(agentChatId = "12345")))
-    }
+    private fun settingsRepository(agentChatId: String? = "12345"): SettingsRepository =
+        mockk<SettingsRepository>().also { repository ->
+            every {
+                repository.settingsFlow
+            } returns MutableStateFlow(AppSettings(ai = agentChatId?.let { AISettings(agentChatId = it) }))
+        }
 
     private fun createArgs(executionTime: String): Map<String, Any?> = mapOf(
         "instruction" to "test",

@@ -684,6 +684,7 @@ internal data class SettingsUpdate(
 )
 
 private fun AppSettings.requiresAgentLifecycleBarrier(previous: AppSettings): Boolean {
+    val telegramTokenChanged = telegramToken != previous.telegramToken
     val previousAi = previous.ai
     val aiSettings = ai
 
@@ -697,7 +698,8 @@ private fun AppSettings.requiresAgentLifecycleBarrier(previous: AppSettings): Bo
     val httpToolSettingsChanged = previousAi?.httpToolSettings != aiSettings?.httpToolSettings
     val mcpServersChanged = previousAi?.mcpServers != aiSettings?.mcpServers
 
-    return providerChanged ||
+    return telegramTokenChanged ||
+            providerChanged ||
             selectedModelChanged ||
             effectiveApiKeyChanged ||
             openAiBaseUrlChanged ||

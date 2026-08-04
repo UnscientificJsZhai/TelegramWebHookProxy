@@ -6,9 +6,11 @@ import com.unscientificjszhai.tgp.models.HttpCallTarget
 import com.unscientificjszhai.tgp.models.HttpToolMethod
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import java.io.File
@@ -106,6 +108,53 @@ class HttpCallingFunctionProviderTest {
         }
         assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
         provider.close()
+    }
+
+    /**
+     * 验证已有 Agent 回合在设置切换后只使用准入时固定的 HTTP 目标，且上下文离开后不会影响直接调用。
+     */
+    @Test
+    fun `Agent tool context keeps HTTP target fixed across settings changes`() = runBlocking {
+        val repository = SettingsRepository.forTesting(
+            File(temporaryDirectory, "settings-${System.nanoTime()}.json"),
+            ModelSwitchBarrier(),
+        )
+        val settingsA = enabledSettings(HttpToolMethod.GET, path = "/a")
+        val settingsB = enabledSettings(HttpToolMethod.GET, path = "/b")
+        repository.saveSettings(
+            AppSettings(
+                telegramToken = "100:token-a",
+                ai = AISettings(httpToolSettings = settingsA)
+            )
+        )
+        val executionContext = AgentToolExecutionContext.from(repository.settingsUpdateFlow.value)
+        val provider = HttpCallingFunctionProvider(repository)
+        repository.saveSettings(
+            AppSettings(
+                telegramToken = "200:token-b",
+                ai = AISettings(httpToolSettings = settingsB)
+            )
+        )
+        server.enqueue(response("from-a", "text/plain"))
+        server.enqueue(response("from-b", "text/plain"))
+        server.enqueue(response("from-b-again", "text/plain"))
+
+        try {
+            val fixedResult = withContext(executionContext) {
+                provider.execute("call_http_api", mapOf("targetId" to "fixed"))
+            }
+            val directResult = provider.execute("call_http_api", mapOf("targetId" to "fixed"))
+            val afterContextResult = provider.execute("call_http_api", mapOf("targetId" to "fixed"))
+
+            assertEquals("200", fixedResult["status"]?.toString())
+            assertEquals("200", directResult["status"]?.toString())
+            assertEquals("200", afterContextResult["status"]?.toString())
+            assertEquals("/a", server.takeRequest().target)
+            assertEquals("/b", server.takeRequest().target)
+            assertEquals("/b", server.takeRequest().target)
+        } finally {
+            provider.close()
+        }
     }
 
     /**
@@ -426,6 +475,7 @@ class HttpCallingFunctionProviderTest {
         method: HttpToolMethod,
         requestTimeoutMillis: Long = 10_000,
         port: Int = server.port,
+        path: String = "/fixed",
     ): HttpToolSettings = HttpToolSettings(
         enabled = true,
         requestTimeoutMillis = requestTimeoutMillis,
@@ -435,7 +485,7 @@ class HttpCallingFunctionProviderTest {
                 scheme = "http",
                 host = "127.0.0.1",
                 port = port,
-                path = "/fixed",
+                path = path,
                 method = method,
                 allowedCidrs = listOf("127.0.0.1/32"),
             ),

@@ -137,7 +137,9 @@ class MessagePollerTest {
         fixture.poller.start()
         try {
             eventually {
-                assertTrue(appender.list.any { it.formattedMessage.contains("API error 500") })
+                assertTrue(synchronized(appender) {
+                    appender.list.any { it.formattedMessage.contains("API error 500") }
+                })
             }
         } finally {
             retryWait.complete(Unit)
@@ -146,10 +148,11 @@ class MessagePollerTest {
             appender.stop()
         }
 
-        val messages = appender.list.map { it.formattedMessage }
+        val loggedEvents = synchronized(appender) { appender.list.toList() }
+        val messages = loggedEvents.map { it.formattedMessage }
         assertTrue(messages.none { it.contains(descriptionCanary) })
         assertTrue(messages.none { it.contains(tokenCanary) })
-        assertTrue(appender.list.none { it.throwableProxy != null })
+        assertTrue(loggedEvents.none { it.throwableProxy != null })
     }
 
     /**
@@ -248,6 +251,8 @@ class MessagePollerTest {
         val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
         updates.saveLastUpdateId("100", 10)
         settings.saveSettings(AppSettings(telegramToken = "100:A"))
+        // 该装配不包含 DelegatingAgentService，显式模拟其完成已发布设置代次的生命周期处理。
+        barrier.completeSettingsThrough(settings.settingsUpdateFlow.value.switchGeneration)
         coEvery { telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
             ok = true,
             result = listOf(Update(11)),
@@ -266,6 +271,8 @@ class MessagePollerTest {
 
             allowOffsetWrite.countDown()
             withTimeout(2.seconds) { switch.await() }
+            // B 的设置代次同样由测试装配显式完成；不会影响 token 轮换或认证失败创建的外部代次。
+            barrier.completeSettingsThrough(settings.settingsUpdateFlow.value.switchGeneration)
 
             assertEquals(11, updates.getData("100").lastUpdateId)
             assertEquals("200:B", settings.telegramTokenUpdateFlow.value.token)
@@ -1383,6 +1390,141 @@ class MessagePollerTest {
     }
 
     /**
+     * 验证替换候选初始化取消后，屏障释放不会让轮询器回退到旧 Agent 确认授权更新；后续配置恢复时同一
+     * 更新只会被处理一次。
+     */
+    @Test
+    fun `cancelled delegating replacement keeps authorized update uncommitted until recovery`() = runBlocking {
+        val barrier = ModelSwitchBarrier()
+        val settings =
+            SettingsRepository.forTesting(tempDirectory.resolve("delegating-cancelled-settings.json"), barrier)
+        val skills = SkillRepository.forTesting(tempDirectory.resolve("delegating-cancelled-skills.json"))
+        val updates = UpdatesRepository(tempDirectory.resolve("delegating-cancelled-updates.json"))
+        val telegram = mockk<TelegramService>(relaxed = true)
+        val componentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val failedComponent = mockk<AgentComponent>()
+        val recoveredComponent = mockk<AgentComponent>()
+        val oldAgent = mockk<OpenAIAgentService>()
+        val failedAgent = mockk<OpenAIAgentService>()
+        val recoveredAgent = mockk<OpenAIAgentService>()
+        val firstPollStarted = CompletableDeferred<Unit>()
+        val allowUpdate = CompletableDeferred<Unit>()
+        val retryPollStarted = CompletableDeferred<Unit>()
+        val allowRecoveredPoll = CompletableDeferred<Unit>()
+        val failedCreated = CompletableDeferred<Unit>()
+        val recoveredCreated = CompletableDeferred<Unit>()
+        val delegatingScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val oldAi = AISettings(
+            provider = AIProvider.OPENAI,
+            openAiApiKey = "old-key",
+            openAiBaseUrl = "https://old.example/v1",
+            agentEnabled = true,
+            agentChatId = "123",
+        )
+        val failedAi = oldAi.copy(
+            openAiApiKey = "failed-key",
+            openAiBaseUrl = "https://failed.example/v1",
+        )
+        val recoveredAi = oldAi.copy(
+            openAiApiKey = "recovered-key",
+            openAiBaseUrl = "https://recovered.example/v1",
+        )
+        val chat = Chat(id = 123L, type = "private", firstName = "Authorized")
+        val update = Update(
+            11,
+            message = authorizedMessage(messageId = 1, chat = chat, text = "retry-after-recovery"),
+        )
+        updates.saveLastUpdateId("100", 10)
+        settings.saveSettings(AppSettings(telegramToken = "100:token", ai = oldAi))
+        var componentCreationCount = 0
+        every { componentFactory.create() } answers {
+            when (componentCreationCount++) {
+                0 -> oldComponent
+                1 -> {
+                    failedCreated.complete(Unit)
+                    failedComponent
+                }
+
+                else -> {
+                    recoveredCreated.complete(Unit)
+                    recoveredComponent
+                }
+            }
+        }
+        every { oldComponent.openAIAgentService } returns oldAgent
+        every { failedComponent.openAIAgentService } returns failedAgent
+        every { recoveredComponent.openAIAgentService } returns recoveredAgent
+        every { oldAgent.initializationJob() } returns null
+        every { failedAgent.initializationJob() } returns Job().apply { cancel() }
+        every { recoveredAgent.initializationJob() } returns null
+        every { oldAgent.close() } returns Job().apply { complete() }
+        every { failedAgent.close() } returns Job().apply { complete() }
+        every { recoveredAgent.close() } returns Job().apply { complete() }
+        every { oldAgent.isAiFeatureEnabled(any()) } returns true
+        every { recoveredAgent.isAiFeatureEnabled(any()) } returns true
+        coEvery { recoveredAgent.sendMessage("retry-after-recovery", any()) } returns ""
+        var pollCount = 0
+        coEvery { telegram.getUpdatesForToken("100:token", 11, 30) } coAnswers {
+            if (pollCount++ == 0) {
+                firstPollStarted.complete(Unit)
+                allowUpdate.await()
+            } else {
+                retryPollStarted.complete(Unit)
+                allowRecoveredPoll.await()
+            }
+            GetUpdatesResponse(ok = true, result = listOf(update))
+        }
+        coEvery { telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
+
+        val delegatingAgent = DelegatingAgentService(componentFactory, settings, skills, barrier, delegatingScope)
+        val poller = MessagePoller(
+            parentScope,
+            telegram,
+            delegatingAgent,
+            settings,
+            updates,
+            barrier,
+            processingTimeout = 10.minutes,
+            retryDelay = {},
+        )
+        poller.start()
+        try {
+            eventually { assertTrue(delegatingAgent.isAiFeatureEnabled(oldAi)) }
+            withTimeout(2.seconds) { firstPollStarted.await() }
+            settings.updateSettings { current -> current.copy(ai = failedAi) }
+            withTimeout(2.seconds) { failedCreated.await() }
+            withTimeout(2.seconds) { while (barrier.isSwitching) delay(10) }
+
+            allowUpdate.complete(Unit)
+            withTimeout(2.seconds) { retryPollStarted.await() }
+            assertEquals(10, updates.getData("100").lastUpdateId)
+            assertTrue(updates.getData("100").agentTurnJournal.isEmpty())
+            coVerify(exactly = 0) { oldAgent.sendMessage(any(), any()) }
+            coVerify(exactly = 0) { failedAgent.sendMessage(any(), any()) }
+
+            settings.updateSettings { current -> current.copy(ai = recoveredAi) }
+            withTimeout(2.seconds) { recoveredCreated.await() }
+            withTimeout(2.seconds) { while (barrier.isSwitching) delay(10) }
+            allowRecoveredPoll.complete(Unit)
+
+            eventually {
+                assertEquals(11, updates.getData("100").lastUpdateId)
+                coVerify(exactly = 1) { recoveredAgent.sendMessage("retry-after-recovery", any()) }
+                coVerify(exactly = 0) { oldAgent.sendMessage(any(), any()) }
+                coVerify(exactly = 0) { failedAgent.sendMessage(any(), any()) }
+            }
+        } finally {
+            allowUpdate.complete(Unit)
+            allowRecoveredPoll.complete(Unit)
+            poller.close()
+            delegatingAgent.close().join()
+            delegatingScope.cancel()
+            delegatingScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
      * 验证缺少提供商密钥时不会将更新发送给不可用的代理。
      *
      * 屏障会正常放行，使轮询器能按禁用 AI 的语义跳过该更新而不发送错误回复。
@@ -2273,8 +2415,9 @@ class MessagePollerTest {
                     assertTrue(fixture.barrier.isSwitching)
                 }
 
-                // 不使用 fixture.saveSettings：它为旧测试便利会完成最新任意代次，不能触碰认证外部代次。
+                // 不使用 fixture.saveSettings：B 的 settings 代次在此处单独完成，认证外部代次必须保持封闭。
                 fixture.settings.saveSettings(AppSettings(telegramToken = "200:B"))
+                fixture.barrier.completeSettingsThrough(fixture.settings.settingsUpdateFlow.value.switchGeneration)
                 withTimeout(2.seconds) { retryResetStarted.await() }
                 assertTrue(fixture.barrier.isSwitching)
                 assertNull(currentSessionOrNull(fixture.poller))
@@ -2295,6 +2438,152 @@ class MessagePollerTest {
                 allowRetryReset.complete()
                 fixture.poller.close()
             }
+        }
+    }
+
+    /**
+     * 验证普通 token 轮换的 Agent 重置失败时，新 Bot 不会开始轮询或处理其授权用户消息；后续实际 token
+     * 代次可重试并恢复。空任务、已取消任务和同步异常必须采用同一 fail-closed 语义。
+     */
+    @Test
+    fun `failed token rotation reset blocks the new bot until a later token generation recovers`() = runBlocking {
+        data class ResetFailure(
+            val name: String,
+            val createResetJob: () -> Job?,
+        )
+
+        listOf(
+            ResetFailure("null") { null },
+            ResetFailure("cancelled") { Job().apply { cancel() } },
+            ResetFailure("synchronous exception") { throw IllegalStateException("injected reset failure") },
+        ).forEach { failure ->
+            val fixture = fixture()
+            val chatA = Chat(id = 111L, type = "private", firstName = "A")
+            val chatB = Chat(id = 222L, type = "private", firstName = "B")
+            val resetAttempted = CompletableDeferred<Unit>()
+            var resetCount = 0
+            every { fixture.agent.resetSession() } answers {
+                if (resetCount++ == 0) {
+                    resetAttempted.complete(Unit)
+                    failure.createResetJob()
+                } else {
+                    Job().apply { complete() }
+                }
+            }
+            coEvery { fixture.telegram.getUpdatesForToken("100:A", any(), any()) } returns GetUpdatesResponse(ok = true)
+            coEvery { fixture.telegram.getUpdatesForToken("200:B", any(), any()) } returns GetUpdatesResponse(ok = true)
+            coEvery { fixture.telegram.getUpdatesForToken("300:C", any(), any()) } returns GetUpdatesResponse(ok = true)
+            fixture.saveSettings(
+                AppSettings(
+                    telegramToken = "100:A",
+                    ai = AISettings(agentEnabled = true, agentChatId = chatA.id.toString()),
+                ),
+            )
+
+            fixture.poller.start()
+            try {
+                eventually {
+                    assertEquals("100:A", sessionToken(currentSession(fixture.poller)))
+                    coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:A", any(), any()) }
+                }
+
+                fixture.saveSettings(
+                    AppSettings(
+                        telegramToken = "200:B",
+                        ai = AISettings(agentEnabled = true, agentChatId = chatB.id.toString()),
+                    ),
+                )
+                withTimeout(2.seconds) { resetAttempted.await() }
+                eventually {
+                    assertNull(currentSessionOrNull(fixture.poller), failure.name)
+                    assertTrue(fixture.barrier.isSwitching, failure.name)
+                    coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("200:B", any(), any()) }
+                }
+                val blockedRequest = async { fixture.barrier.runWhenReady { "admitted" } }
+                delay(100)
+                assertFalse(blockedRequest.isCompleted, failure.name)
+
+                fixture.poller.handleUpdate(
+                    Update(11, message = authorizedMessage(11, chatB, text = "B must stay blocked")),
+                )
+                coVerify(exactly = 0) { fixture.agent.sendMessage("B must stay blocked") }
+
+                fixture.saveSettings(
+                    AppSettings(
+                        telegramToken = "300:C",
+                        ai = AISettings(agentEnabled = true, agentChatId = "333"),
+                    ),
+                )
+                eventually {
+                    assertEquals("300:C", sessionToken(currentSession(fixture.poller)))
+                    coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("300:C", any(), any()) }
+                    assertFalse(fixture.barrier.isSwitching)
+                }
+                assertEquals("admitted", withTimeout(2.seconds) { blockedRequest.await() }, failure.name)
+                verify(exactly = 2) { fixture.agent.resetSession() }
+            } finally {
+                fixture.poller.close()
+            }
+        }
+    }
+
+    /**
+     * 验证 B 的 Agent 重置期间发布 C 时，不会短暂安装或轮询已经过期的 B 代次。
+     */
+    @Test
+    fun `token rotation converges directly to C when B becomes stale during its reset`() = runBlocking {
+        val fixture = fixture()
+        val resetStarted = CompletableDeferred<Unit>()
+        val resetJob = Job()
+        val chatA = Chat(id = 111L, type = "private", firstName = "A")
+        val chatB = Chat(id = 222L, type = "private", firstName = "B")
+        every { fixture.agent.resetSession() } answers {
+            resetStarted.complete(Unit)
+            resetJob
+        }
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.getUpdatesForToken("200:B", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.getUpdatesForToken("300:C", any(), any()) } returns GetUpdatesResponse(ok = true)
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:A",
+                ai = AISettings(agentEnabled = true, agentChatId = chatA.id.toString()),
+            ),
+        )
+
+        fixture.poller.start()
+        try {
+            eventually { assertEquals("100:A", sessionToken(currentSession(fixture.poller))) }
+            fixture.saveSettings(
+                AppSettings(
+                    telegramToken = "200:B",
+                    ai = AISettings(agentEnabled = true, agentChatId = chatB.id.toString()),
+                ),
+            )
+            withTimeout(2.seconds) { resetStarted.await() }
+            eventually {
+                assertNull(currentSessionOrNull(fixture.poller))
+                assertTrue(fixture.barrier.isSwitching)
+            }
+
+            fixture.saveSettings(
+                AppSettings(
+                    telegramToken = "300:C",
+                    ai = AISettings(agentEnabled = true, agentChatId = "333"),
+                ),
+            )
+            resetJob.complete()
+
+            eventually {
+                assertEquals("300:C", sessionToken(currentSession(fixture.poller)))
+                coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("300:C", any(), any()) }
+                coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("200:B", any(), any()) }
+                assertFalse(fixture.barrier.isSwitching)
+            }
+            verify(exactly = 1) { fixture.agent.resetSession() }
+        } finally {
+            resetJob.complete()
+            fixture.poller.close()
         }
     }
 
@@ -2818,6 +3107,7 @@ class MessagePollerTest {
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
         every { agent.isAiFeatureEnabled(any()) } returns true
+        every { agent.resetSession() } returns Job().apply { complete() }
         return Fixture(
             barrier = barrier,
             settings = settings,
@@ -2855,7 +3145,8 @@ class MessagePollerTest {
             },
         )
         this.settings.saveSettings(enabledTestSettings)
-        barrier.complete(barrier.latestPendingGeneration())
+        // 只能完成本次设置写入创建的屏障；认证或 token 轮换中的外部代次必须继续保持封闭。
+        barrier.completeSettingsThrough(this.settings.settingsUpdateFlow.value.switchGeneration)
     }
 
     private suspend fun eventually(timeout: Duration = 3.seconds, assertion: () -> Unit) {

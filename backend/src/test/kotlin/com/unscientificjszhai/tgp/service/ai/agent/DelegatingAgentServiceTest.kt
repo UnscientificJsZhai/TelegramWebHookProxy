@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.currentCoroutineContext
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicInteger
@@ -34,6 +35,95 @@ import kotlin.time.Duration.Companion.seconds
 class DelegatingAgentServiceTest {
     /** 返回默认历史 URL 标记为 `false` 的设置仓储替身，供不涉及磁盘恢复的委派测试复用。 */
     private fun mockedSettingsRepository(): SettingsRepository = mockk(relaxed = true)
+
+    /**
+     * 验证就绪准入只读取一次设置快照、传播相同版本的工具上下文，并在已发布新版与旧服务不匹配时拒绝。
+     */
+    @Test
+    fun `ready service installs one captured tool context and rejects a newer settings version`() = runBlocking {
+        val settingsRepository = mockedSettingsRepository()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val initialComponent = mockk<AgentComponent>()
+        val replacementComponent = mockk<AgentComponent>()
+        val initialAgent = mockk<OpenAIAgentService>()
+        val replacementAgent = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            telegramToken = "100:token-a",
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "initial-key",
+                agentEnabled = true,
+                agentChatId = "chat-a",
+            ),
+        )
+        val replacementSettings = initialSettings.copy(
+            telegramToken = "200:token-b",
+            ai = initialSettings.ai!!.copy(openAiApiKey = "replacement-key", agentChatId = "chat-b"),
+        )
+        val settingsFlow = MutableStateFlow(initialSettings)
+        val settingsUpdateDelegate = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val settingsUpdateFlow = ValueReadTrackingStateFlow(settingsUpdateDelegate)
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val initialCreated = CompletableDeferred<Unit>()
+        val replacementReadiness = Job()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        var createdCount = 0
+
+        every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } answers {
+            if (createdCount++ == 0) {
+                initialCreated.complete(Unit)
+                initialComponent
+            } else {
+                replacementComponent
+            }
+        }
+        every { initialComponent.openAIAgentService } returns initialAgent
+        every { replacementComponent.openAIAgentService } returns replacementAgent
+        every { initialAgent.initializationJob() } returns Job().apply { complete() }
+        every { replacementAgent.initializationJob() } returns replacementReadiness
+        every { initialAgent.close() } returns Job().apply { complete() }
+        every { replacementAgent.close() } returns Job().apply { complete() }
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { initialCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+            val readsBeforeAdmission = settingsUpdateFlow.valueReadCount.get()
+
+            val capturedContext = requireNotNull(delegatingAgentService.withReadyService {
+                currentCoroutineContext()[AgentToolExecutionContext]
+            })
+
+            assertEquals(0, capturedContext.settingsVersion)
+            assertEquals("chat-a", capturedContext.taskAgentChatId)
+            assertEquals(readsBeforeAdmission + 1, settingsUpdateFlow.valueReadCount.get())
+
+            settingsFlow.value = replacementSettings
+            settingsUpdateDelegate.value = SettingsUpdate(replacementSettings, 1, null)
+            val rejected = runCatching {
+                delegatingAgentService.withReadyService { true }
+            }
+
+            assertTrue(rejected.exceptionOrNull() is AgentConfigurationNotReadyException)
+        } finally {
+            replacementReadiness.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
 
     /**
      * 验证有效初始配置会在候选 Agent 完成就绪后才释放启动屏障。
@@ -374,7 +464,7 @@ class DelegatingAgentServiceTest {
     }
 
     /**
-     * 验证候选初始化超过短总时限后，即使候选关闭也挂起，设置切换屏障仍会释放并保留旧服务。
+     * 验证候选初始化超过短总时限后，即使候选关闭也挂起，设置切换屏障仍会释放，但旧服务不能代表新设置。
      */
     @Test
     fun `candidate deadline releases switch barrier while readiness and close are both hanging`() = runBlocking {
@@ -457,12 +547,13 @@ class DelegatingAgentServiceTest {
             }
 
             assertEquals("old-model", delegatingAgentService.currentModel)
-            assertTrue(
+            assertFalse(delegatingAgentService.isAiFeatureEnabled(replacementSettings.ai!!))
+            val rejected = runCatching {
                 withTimeout(1.seconds) {
                     delegatingAgentService.withReadyService { readyService -> readyService === oldService }
-                },
-                "released barrier must admit operations on the retained old service",
-            )
+                }
+            }
+            assertTrue(rejected.exceptionOrNull() is AgentConfigurationNotReadyException)
         } finally {
             hangingMcpReadiness.complete()
             hangingCandidateClose.complete()
@@ -473,9 +564,182 @@ class DelegatingAgentServiceTest {
     }
 
     /**
+     * 验证取消的凭据替换候选在屏障释放后仍保持拒绝状态，且后续版本只能由新的候选恢复服务。
+     */
+    @Test
+    fun `cancelled API key replacement remains fail closed until a later candidate succeeds`() = runBlocking {
+        val settingsRepository = mockedSettingsRepository()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val initialComponent = mockk<AgentComponent>()
+        val failedComponent = mockk<AgentComponent>()
+        val recoveredComponent = mockk<AgentComponent>()
+        val oldService = mockk<OpenAIAgentService>()
+        val failedService = mockk<OpenAIAgentService>()
+        val recoveredService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "old-key", agentEnabled = true),
+        )
+        val failedSettings = initialSettings.copy(ai = initialSettings.ai!!.copy(openAiApiKey = "failed-key"))
+        val recoveredSettings = initialSettings.copy(ai = initialSettings.ai.copy(openAiApiKey = "recovered-key"))
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val initialCreated = CompletableDeferred<Unit>()
+        val failedCreated = CompletableDeferred<Unit>()
+        val recoveredCreated = CompletableDeferred<Unit>()
+        val cancelledReadiness = Job().apply { cancel() }
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+        every { agentComponentFactory.create() } returnsMany listOf(
+            initialComponent,
+            failedComponent,
+            recoveredComponent
+        )
+        every { initialComponent.openAIAgentService } answers { initialCreated.complete(Unit); oldService }
+        every { failedComponent.openAIAgentService } answers { failedCreated.complete(Unit); failedService }
+        every { recoveredComponent.openAIAgentService } answers { recoveredCreated.complete(Unit); recoveredService }
+        every { oldService.initializationJob() } returns null
+        every { failedService.initializationJob() } returns cancelledReadiness
+        every { recoveredService.initializationJob() } returns null
+        every { oldService.close() } returns Job().apply { complete() }
+        every { failedService.close() } returns Job().apply { complete() }
+        every { recoveredService.close() } returns Job().apply { complete() }
+        every { oldService.isAiFeatureEnabled(any()) } returns true
+        every { recoveredService.isAiFeatureEnabled(any()) } returns true
+        coEvery { oldService.sendMessage(any(), any()) } returns "old reply"
+        coEvery { recoveredService.sendMessage("recovered", emptyList()) } returns "recovered reply"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { initialCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+
+            settingsUpdateFlow.value = SettingsUpdate(failedSettings, 1, barrier.beginSwitch())
+            withTimeout(5.seconds) { failedCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+
+            assertFalse(delegatingAgentService.isAiFeatureEnabled(failedSettings.ai!!))
+            assertTrue(
+                runCatching { delegatingAgentService.withReadyService { true } }.exceptionOrNull()
+                        is AgentConfigurationNotReadyException,
+            )
+            assertTrue(
+                runCatching { delegatingAgentService.sendMessage("must not use old service") }.exceptionOrNull()
+                        is AgentConfigurationNotReadyException,
+            )
+            coVerify(exactly = 0) { oldService.sendMessage("must not use old service", emptyList()) }
+
+            settingsUpdateFlow.value = SettingsUpdate(recoveredSettings, 2, barrier.beginSwitch())
+            withTimeout(5.seconds) { recoveredCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+
+            assertTrue(delegatingAgentService.isAiFeatureEnabled(recoveredSettings.ai!!))
+            assertEquals("recovered reply", delegatingAgentService.sendMessage("recovered"))
+            coVerify(exactly = 1) { recoveredService.sendMessage("recovered", emptyList()) }
+        } finally {
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证收集器仍在等待 v1 候选时，已发布的 v2 会使迟到的 v1 只能关闭，绝不能覆盖或重新放行服务。
+     */
+    @Test
+    fun `late v1 candidate completion is discarded after StateFlow publishes v2`() = runBlocking {
+        val settingsRepository = mockedSettingsRepository()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val initialComponent = mockk<AgentComponent>()
+        val v1Component = mockk<AgentComponent>()
+        val v2Component = mockk<AgentComponent>()
+        val initialService = mockk<OpenAIAgentService>()
+        val v1Service = mockk<OpenAIAgentService>()
+        val v2Service = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "initial-key", agentEnabled = true),
+        )
+        val v1Settings = initialSettings.copy(ai = initialSettings.ai!!.copy(openAiApiKey = "v1-key"))
+        val v2Settings = initialSettings.copy(ai = initialSettings.ai.copy(openAiApiKey = "v2-key"))
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val v1Created = CompletableDeferred<Unit>()
+        val v2Created = CompletableDeferred<Unit>()
+        val v1CloseCalled = CompletableDeferred<Unit>()
+        val v1ClosedBeforeV2Created = CompletableDeferred<Boolean>()
+        val v1Readiness = Job()
+
+        every { settingsRepository.settingsFlow } returns MutableStateFlow(initialSettings)
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+        every { agentComponentFactory.create() } returnsMany listOf(initialComponent, v1Component, v2Component)
+        every { initialComponent.openAIAgentService } returns initialService
+        every { v1Component.openAIAgentService } answers { v1Created.complete(Unit); v1Service }
+        every { v2Component.openAIAgentService } answers { v2Created.complete(Unit); v2Service }
+        every { initialService.initializationJob() } returns null
+        every { v1Service.initializationJob() } returns v1Readiness
+        every { v2Service.initializationJob() } returns null
+        every { initialService.close() } returns Job().apply { complete() }
+        every { v1Service.close() } answers {
+            v1ClosedBeforeV2Created.complete(!v2Created.isCompleted)
+            v1CloseCalled.complete(Unit)
+            Job().apply { complete() }
+        }
+        every { v2Service.close() } returns Job().apply { complete() }
+        every { v2Service.isAiFeatureEnabled(any()) } returns true
+        coEvery { v2Service.sendMessage("v2 only", emptyList()) } returns "v2 reply"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+
+            settingsUpdateFlow.value = SettingsUpdate(v1Settings, 1, barrier.beginSwitch())
+            withTimeout(5.seconds) { v1Created.await() }
+            settingsUpdateFlow.value = SettingsUpdate(v2Settings, 2, barrier.beginSwitch())
+
+            v1Readiness.complete()
+            withTimeout(5.seconds) { v1CloseCalled.await() }
+            assertTrue(v1ClosedBeforeV2Created.await())
+            withTimeout(5.seconds) { v2Created.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+
+            assertFalse(delegatingAgentService.isAiFeatureEnabled(v1Settings.ai!!))
+            assertTrue(delegatingAgentService.isAiFeatureEnabled(v2Settings.ai!!))
+            assertTrue(delegatingAgentService.withReadyService { it === v2Service })
+            assertEquals("v2 reply", delegatingAgentService.sendMessage("v2 only"))
+            coVerify(exactly = 0) { v1Service.sendMessage(any(), any()) }
+            coVerify(exactly = 1) { v2Service.sendMessage("v2 only", emptyList()) }
+        } finally {
+            v1Readiness.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
      * 验证初始设置订阅和技能更新的处理设计。
      *
-     * 验证初始订阅仅创建一次组件，技能更新会重置会话。
+     * 验证初始订阅仅创建一次组件；技能触发的空重置任务会保持 fail-closed，后续同实例重置成功才恢复。
      */
     @Test
     fun `StateFlow 初始订阅只创建一次组件且技能更新会重置会话`() = runBlocking {
@@ -496,7 +760,9 @@ class DelegatingAgentServiceTest {
         val skillsUpdateEvent = MutableSharedFlow<Unit>()
         val componentCreated = CompletableDeferred<Unit>()
         val sessionReset = CompletableDeferred<Unit>()
+        val barrier = ModelSwitchBarrier()
         val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        var resetAttempt = 0
 
         every { settingsRepository.settingsFlow } returns settingsFlow
         every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
@@ -508,15 +774,16 @@ class DelegatingAgentServiceTest {
         every { agentComponent.openAIAgentService } returns openAIAgentService
         every { openAIAgentService.resetSession() } answers {
             sessionReset.complete(Unit)
-            null
+            if (resetAttempt++ == 0) null else Job().apply { complete() }
         }
         every { openAIAgentService.close() } returns Job().apply { complete() }
+        every { openAIAgentService.isAiFeatureEnabled(any()) } returns true
 
         val delegatingAgentService = DelegatingAgentService(
             agentComponentFactory,
             settingsRepository,
             skillRepository,
-            ModelSwitchBarrier(),
+            barrier,
             serviceScope,
         )
 
@@ -538,6 +805,15 @@ class DelegatingAgentServiceTest {
                 sessionReset.await()
             }
             verify(exactly = 1) { openAIAgentService.resetSession() }
+            assertFalse(delegatingAgentService.isAiFeatureEnabled(initialSettings.ai!!))
+
+            val recoveredSettings = initialSettings.copy(
+                ai = initialSettings.ai.copy(globalContext = "recovered context"),
+            )
+            settingsUpdateFlow.value = SettingsUpdate(recoveredSettings, 1, barrier.beginSwitch())
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+            assertTrue(delegatingAgentService.isAiFeatureEnabled(recoveredSettings.ai!!))
+            verify(exactly = 2) { openAIAgentService.resetSession() }
         } finally {
             delegatingAgentService.close().join()
             serviceScope.cancel()
@@ -598,6 +874,9 @@ class DelegatingAgentServiceTest {
         try {
             withTimeout(5.seconds) {
                 componentCreated.await()
+            }
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) yield()
             }
             val switchedSettings = initialSettings.copy(
                 ai = initialSettings.ai!!.copy(selectedModel = "models/gemini-next"),
@@ -957,6 +1236,7 @@ class DelegatingAgentServiceTest {
 
         try {
             withTimeout(5.seconds) { firstComponentCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
             settingsFlow.value = replacementSettings
             settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, barrier.beginSwitch())
 
@@ -972,6 +1252,105 @@ class DelegatingAgentServiceTest {
             releaseOldClose.complete()
             verify(exactly = 1) { oldService.close() }
         } finally {
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证关闭会等待已退休代理的后台清理，且取消某个等待者不会取消真实关闭流程。
+     */
+    @Test
+    fun `Delegating close waits for retired cleanup after replacement publication`() = runBlocking {
+        val settingsRepository = mockedSettingsRepository()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val newComponent = mockk<AgentComponent>()
+        val oldService = mockk<OpenAIAgentService>()
+        val newService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(
+                provider = AIProvider.OPENAI,
+                openAiApiKey = "old-key",
+                agentEnabled = true,
+            ),
+        )
+        val replacementSettings = initialSettings.copy(
+            ai = initialSettings.ai!!.copy(openAiApiKey = "new-key"),
+        )
+        val settingsFlow = MutableStateFlow(initialSettings)
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val skillsUpdateEvent = MutableSharedFlow<Unit>()
+        val firstComponentCreated = CompletableDeferred<Unit>()
+        val oldCloseStarted = CompletableDeferred<Unit>()
+        val newCloseStarted = CompletableDeferred<Unit>()
+        val releaseOldClose = Job()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val barrier = ModelSwitchBarrier()
+
+        every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns skillsUpdateEvent
+        every { agentComponentFactory.create() } returnsMany listOf(oldComponent, newComponent)
+        every { oldComponent.openAIAgentService } answers {
+            firstComponentCreated.complete(Unit)
+            oldService
+        }
+        every { newComponent.openAIAgentService } returns newService
+        every { oldService.initializationJob() } returns null
+        every { newService.initializationJob() } returns null
+        every { oldService.close() } answers {
+            oldCloseStarted.complete(Unit)
+            releaseOldClose
+        }
+        every { newService.close() } answers {
+            newCloseStarted.complete(Unit)
+            Job().apply { complete() }
+        }
+        every { oldService.currentModel } returns "old-model"
+        every { newService.currentModel } returns "new-model"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+        )
+
+        try {
+            withTimeout(5.seconds) { firstComponentCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
+            settingsFlow.value = replacementSettings
+            settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, null)
+
+            withTimeout(5.seconds) { oldCloseStarted.await() }
+            withTimeout(5.seconds) {
+                while (delegatingAgentService.currentModel != "new-model") yield()
+            }
+            assertFalse(releaseOldClose.isCompleted, "old cleanup must not delay replacement publication")
+
+            val cancelledWaitJob = delegatingAgentService.close()
+            withTimeout(5.seconds) { newCloseStarted.await() }
+            assertFalse(
+                cancelledWaitJob.isCompleted,
+                "close must wait for retired cleanup after current service closes"
+            )
+
+            cancelledWaitJob.cancel()
+            assertTrue(cancelledWaitJob.isCancelled)
+            val retryWaitJob = delegatingAgentService.close()
+            assertTrue(retryWaitJob !== cancelledWaitJob)
+            assertFalse(retryWaitJob.isCompleted, "a retried close must keep waiting for retired cleanup")
+
+            releaseOldClose.complete()
+            withTimeout(5.seconds) { retryWaitJob.join() }
+            verify(exactly = 1) { oldService.close() }
+            verify(exactly = 1) { newService.close() }
+        } finally {
+            releaseOldClose.complete()
             delegatingAgentService.close().join()
             serviceScope.cancel()
             serviceScope.coroutineContext[Job]?.join()
@@ -1039,6 +1418,7 @@ class DelegatingAgentServiceTest {
 
         try {
             withTimeout(5.seconds) { firstComponentCreated.await() }
+            withTimeout(5.seconds) { while (barrier.isSwitching) yield() }
             settingsFlow.value = replacementSettings
             settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, null)
 

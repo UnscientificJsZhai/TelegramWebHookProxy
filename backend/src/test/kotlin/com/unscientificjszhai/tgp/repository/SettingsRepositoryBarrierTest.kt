@@ -22,6 +22,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -89,6 +90,27 @@ class SettingsRepositoryBarrierTest {
         settings = settings.copy(ai = settings.ai!!.copy(agentEnabled = false))
         repository.saveSettings(settings)
         assertTrue(barrier.isSwitching)
+    }
+
+    /**
+     * 验证仅变更 Telegram token 也会在新设置发布前开启代理生命周期屏障。
+     */
+    @Test
+    fun `Telegram token changes open a model switch barrier before settings publication`() {
+        val barrier = ModelSwitchBarrier()
+        val repository = SettingsRepository.forTesting(File(tempDirectory, "telegram-token-barrier.json"), barrier)
+        val initial = AppSettings(
+            telegramToken = "100:token-a",
+            ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key", agentEnabled = true),
+        )
+        repository.saveSettings(initial)
+        barrier.complete(barrier.latestPendingGeneration())
+
+        repository.saveSettings(initial.copy(telegramToken = "200:token-b"))
+
+        assertTrue(barrier.isSwitching)
+        assertNotNull(repository.settingsUpdateFlow.value.switchGeneration)
+        assertEquals(barrier.latestPendingGeneration(), repository.settingsUpdateFlow.value.switchGeneration)
     }
 
     /**
@@ -430,6 +452,7 @@ class SettingsRepositoryBarrierTest {
         val repository = SettingsRepository.forTesting(configFile, barrier)
         val initialSettings = AppSettings(telegramToken = "100:original", chatId = "original-chat")
         repository.saveSettings(initialSettings)
+        barrier.complete(barrier.latestPendingGeneration())
         val originalContent = configFile.readText()
         val originalSettingsUpdate = repository.settingsUpdateFlow.value
         val originalTokenUpdate = repository.telegramTokenUpdateFlow.value

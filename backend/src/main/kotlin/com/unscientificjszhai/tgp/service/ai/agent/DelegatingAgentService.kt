@@ -1,5 +1,3 @@
-@file:Suppress("RedundantSuspendModifier")
-
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.di.AgentComponent
@@ -10,6 +8,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SettingsUpdate
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import kotlinx.coroutines.CancellationException
@@ -22,6 +21,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
@@ -48,7 +48,7 @@ import javax.inject.Singleton
 @Singleton
 class DelegatingAgentService @Inject internal constructor(
     private val agentComponentFactory: AgentComponent.Factory,
-    settingsRepository: SettingsRepository,
+    private val settingsRepository: SettingsRepository,
     skillRepository: SkillRepository,
     private val modelSwitchBarrier: ModelSwitchBarrier,
     parentScope: CoroutineScope,
@@ -96,6 +96,13 @@ class DelegatingAgentService @Inject internal constructor(
     private var closeCompletion: CompletableDeferred<Unit>? = null
     private var settingsJob: Job? = null
 
+    /** 关闭开始时从生命周期锁中摘除、并在锁外完成的资源。 */
+    private data class ClosingResources(
+        val completion: CompletableDeferred<Unit>,
+        val settingsJob: Job?,
+        val currentService: AgentService?,
+    )
+
     private var currentAgentComponent: AgentComponent? = null
 
     @Volatile
@@ -108,72 +115,118 @@ class DelegatingAgentService @Inject internal constructor(
     private var currentApiKey: String? = null
     private var currentBaseUrl: String? = null
     private var currentProxy: ProxySettings? = null
-    private var lastHandledSettings: AppSettings? = null
+
+    /** 仅在当前服务完整应用设置后更新；失败操作不能覆盖此快照。 */
+    private var appliedSettings: AppSettings? = null
+
+    /**
+     * 一个已发布或正在处理的代理配置快照。
+     *
+     * 设置版本是配置身份的一部分：即使两次保存恰好包含相同字段，也必须完成各自的生命周期操作后才能
+     * 重新接受请求。
+     */
+    private data class AgentConfiguration(
+        val settingsVersion: Long,
+        val provider: AIProvider,
+        val apiKey: String,
+        val baseUrl: String,
+        val proxySettings: ProxySettings?,
+    )
+
+    /** 单次设置或技能生命周期操作的身份，用于拒绝迟到完成。 */
+    private data class LifecycleOperation(
+        val settingsUpdate: SettingsUpdate,
+        val epoch: Long,
+        val configuration: AgentConfiguration?,
+    )
+
+    private var desiredSettingsVersion: Long = -1L
+    private var desiredConfiguration: AgentConfiguration? = null
+    private var readyConfiguration: AgentConfiguration? = null
+    private var lifecycleOperationEpoch: Long = 0L
 
     init {
         settingsJob = combine(
             settingsRepository.settingsUpdateFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) }
-        ) { settingsUpdate, _ -> settingsUpdate }.onEach { settingsUpdate ->
-            val settings = settingsUpdate.settings
-            val previousAiSettings = lastHandledSettings?.ai
-            val aiSettings = settings.ai
-            val proxySettings = settings.proxy
-            val selectedModelChanged = previousAiSettings != null &&
-                    previousAiSettings.selectedModel != aiSettings?.selectedModel
-            val onlySelectedModelChanged = selectedModelChanged &&
-                    previousAiSettings.copy(selectedModel = "") == aiSettings?.copy(selectedModel = "")
-
-            try {
-                if (closed) {
-                    return@onEach
-                }
-                if (settingsUpdate.switchGeneration != null) {
-                    modelSwitchBarrier.awaitInFlightRequests()
-                }
-                val apiKey = aiSettings?.requiredApiKey()
-                if (
-                    aiSettings?.provider == AIProvider.OPENAI &&
-                    aiSettings.agentEnabled &&
-                    settingsRepository.hasHistoricalInvalidOpenAiBaseUrl
-                ) {
-                    logger.warn("OpenAI agent remains disabled until the historical invalid base URL is explicitly replaced.")
-                    disableAgent()
-                } else if (aiSettings?.agentEnabled == true && !apiKey.isNullOrBlank()) {
-                    val baseUrl = aiSettings.openAiBaseUrl
-
-                    val needsRecreate = synchronized(lifecycleLock) {
-                        _currentService == null ||
-                                currentProvider != aiSettings.provider ||
-                                currentApiKey != apiKey ||
-                                currentBaseUrl != baseUrl ||
-                                currentProxy != proxySettings
-                    }
-
-                    if (needsRecreate) {
-                        recreateAgent(aiSettings, apiKey, baseUrl, proxySettings)
-                    } else {
-                        applySettingsChange(aiSettings, selectedModelChanged, onlySelectedModelChanged)
-                    }
-                } else {
-                    disableAgent()
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.error(
-                    "Failed to apply AI settings; keeping the current agent when available; category={}",
-                    SafeLogging.failureCategory(e).wireName,
-                )
-            } finally {
-                lastHandledSettings = settings
-                modelSwitchBarrier.completeSettingsThrough(settingsUpdate.switchGeneration)
-                completeInitialReadiness()
-            }
-        }.launchIn(parentScope).also { job ->
+        ) { settingsUpdate, _ -> settingsUpdate }.onEach(::applyLifecycleUpdate).launchIn(parentScope).also { job ->
             job.invokeOnCompletion { completeInitialReadiness() }
         }
     }
+
+    /**
+     * 处理一次设置快照或技能事件。
+     *
+     * 每个事件先在 [lifecycleLock] 中废止先前就绪状态，再在锁外等待已准入请求、初始化候选或重置会话。
+     * 因此迟到完成无法把旧设置重新标为就绪。
+     */
+    private suspend fun applyLifecycleUpdate(settingsUpdate: SettingsUpdate) {
+        val operation = beginLifecycleOperation(settingsUpdate) ?: return
+        val settings = settingsUpdate.settings
+        val previousSettings = synchronized(lifecycleLock) { appliedSettings }
+        val previousAiSettings = previousSettings?.ai
+        val aiSettings = settings.ai
+        val selectedModelChanged = previousAiSettings != null &&
+                previousAiSettings.selectedModel != aiSettings?.selectedModel
+
+        try {
+            if (settingsUpdate.switchGeneration != null) {
+                modelSwitchBarrier.awaitInFlightRequests()
+            }
+            if (!isOperationCurrent(operation)) {
+                return
+            }
+
+            val configuration = operation.configuration
+            if (
+                aiSettings?.provider == AIProvider.OPENAI &&
+                aiSettings.agentEnabled &&
+                settingsRepository.hasHistoricalInvalidOpenAiBaseUrl
+            ) {
+                logger.warn("OpenAI agent remains disabled until the historical invalid base URL is explicitly replaced.")
+                disableAgent(operation)
+            } else if (configuration != null && aiSettings != null) {
+                val needsRecreate = synchronized(lifecycleLock) {
+                    !currentServiceMatchesConfigurationLocked(configuration) ||
+                            (selectedModelChanged && aiSettings.selectedModel.isBlank())
+                }
+                if (needsRecreate) {
+                    recreateAgent(operation, aiSettings, configuration)
+                } else if (applySettingsChange(operation, aiSettings, selectedModelChanged)) {
+                    markReady(operation, configuration)
+                }
+            } else {
+                disableAgent(operation)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error(
+                "Failed to apply AI settings; current configuration remains unavailable; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
+        } finally {
+            modelSwitchBarrier.completeSettingsThrough(settingsUpdate.switchGeneration)
+            completeInitialReadiness()
+        }
+    }
+
+    /**
+     * 在锁内登记新的期望配置，并立即废止此前的就绪标记。
+     */
+    private fun beginLifecycleOperation(settingsUpdate: SettingsUpdate): LifecycleOperation? =
+        synchronized(lifecycleLock) {
+            if (closed) {
+                return@synchronized null
+            }
+            val configuration = settingsUpdate.toAgentConfigurationOrNull()
+            if (settingsUpdate.version >= desiredSettingsVersion) {
+                desiredSettingsVersion = settingsUpdate.version
+                desiredConfiguration = configuration
+            }
+            readyConfiguration = null
+            LifecycleOperation(settingsUpdate, ++lifecycleOperationEpoch, configuration)
+        }
 
     /**
      * 释放仅覆盖首次设置处理的一次性启动代次。
@@ -197,16 +250,31 @@ class DelegatingAgentService @Inject internal constructor(
         AIProvider.GEMINI -> geminiApiKey
     }
 
+    /** 返回可创建代理时的完整配置身份；禁用或缺少凭据时返回 `null`。 */
+    private fun SettingsUpdate.toAgentConfigurationOrNull(): AgentConfiguration? {
+        val aiSettings = settings.ai ?: return null
+        val apiKey = aiSettings.requiredApiKey()
+        if (!aiSettings.agentEnabled || apiKey.isBlank()) {
+            return null
+        }
+        return AgentConfiguration(
+            settingsVersion = version,
+            provider = aiSettings.provider,
+            apiKey = apiKey,
+            baseUrl = aiSettings.openAiBaseUrl,
+            proxySettings = settings.proxy,
+        )
+    }
+
     /**
-     * 在销毁活跃组件前先创建替代组件。这样即使创建本身失败，仍可保留可用的代理。替代组件完成就绪后
-     * 会原子发布；旧代理关闭转入后台追踪，不能占用模型切换屏障。不同组件的 MCP 资源相互隔离，因此
-     * 旧代理的慢速关闭不会影响已发布候选。
+     * 在销毁活跃组件前先创建替代组件。候选失败时旧组件仅保留到后续替换或关闭，不能代表新的期望配置。
+     * 替代组件完成就绪后会原子发布；旧代理关闭转入后台追踪，不能占用模型切换屏障。不同组件的 MCP
+     * 资源相互隔离，因此旧代理的慢速关闭不会影响已发布候选。
      */
     private suspend fun recreateAgent(
+        operation: LifecycleOperation,
         aiSettings: AISettings,
-        apiKey: String,
-        baseUrl: String,
-        proxySettings: ProxySettings?,
+        configuration: AgentConfiguration,
     ) {
         val newComponent = agentComponentFactory.create()
         val newService = when (aiSettings.provider) {
@@ -220,33 +288,33 @@ class DelegatingAgentService @Inject internal constructor(
                 newService.awaitReady()
             } ?: false
             if (!ready) {
-                logger.warn("Replacement agent did not complete initialization before its deadline; retaining the current agent.")
+                logger.warn("Replacement agent did not complete initialization before its deadline; current configuration remains unavailable.")
                 return
             }
             val previousService = synchronized(lifecycleLock) {
-                if (closed) null else _currentService
-            }
-            if (closed) {
-                return
-            }
-
-            published = synchronized(lifecycleLock) {
-                if (closed || _currentService !== previousService) {
-                    false
-                } else {
+                if (isOperationCurrentLocked(operation) &&
+                    operation.configuration == configuration &&
+                    isSettingsVersionCurrent(operation.settingsUpdate.version)
+                ) {
+                    val previous = _currentService
                     currentAgentComponent = newComponent
                     _currentService = newService
-                    currentProvider = aiSettings.provider
-                    currentApiKey = apiKey
-                    currentBaseUrl = baseUrl
-                    currentProxy = proxySettings
-                    true
+                    currentProvider = configuration.provider
+                    currentApiKey = configuration.apiKey
+                    currentBaseUrl = configuration.baseUrl
+                    currentProxy = configuration.proxySettings
+                    readyConfiguration = configuration
+                    appliedSettings = operation.settingsUpdate.settings
+                    published = true
+                    previous
+                } else {
+                    null
                 }
             }
             if (published) {
                 // 所有旧请求已经在切换屏障外排空；旧资源关闭可能忽略取消，不能继续占用设置切换路径。
                 scheduleBackgroundCleanup(previousService?.close())
-                logger.info("Agent component recreated for provider: ${aiSettings.provider}")
+                logger.info("Agent component recreated for provider: ${configuration.provider}")
             }
         } finally {
             if (!published) {
@@ -278,10 +346,36 @@ class DelegatingAgentService @Inject internal constructor(
     }
 
     /**
+     * 等待所有已登记的后台清理完成。
+     *
+     * 关闭流程先等待设置收集协程结束，因此本方法开始后不会再有生命周期操作登记新的清理任务。每轮
+     * 都在等待外清理已结束任务，并在等待当前快照后再次清理，避免完成观察者与关闭流程交错时留下过期条目。
+     */
+    private suspend fun drainBackgroundCleanup() {
+        while (true) {
+            val cleanupJobs = synchronized(cleanupLock) {
+                backgroundCleanupJobs.removeAll { it.isCompleted }
+                backgroundCleanupJobs.toList()
+            }
+            if (cleanupJobs.isEmpty()) {
+                return
+            }
+
+            cleanupJobs.joinAll()
+            synchronized(cleanupLock) {
+                backgroundCleanupJobs.removeAll { it.isCompleted }
+            }
+        }
+    }
+
+    /**
      * 关闭当前已发布的代理并清除其配置记录。
      */
-    private suspend fun disableAgent() {
+    private fun disableAgent(operation: LifecycleOperation) {
         val disabled = synchronized(lifecycleLock) {
+            if (!isOperationCurrentLocked(operation) || !isSettingsVersionCurrent(operation.settingsUpdate.version)) {
+                return@synchronized null
+            }
             val serviceToClose = _currentService
             clearCurrentAgentLocked()
             serviceToClose
@@ -302,6 +396,8 @@ class DelegatingAgentService @Inject internal constructor(
         currentApiKey = null
         currentBaseUrl = null
         currentProxy = null
+        readyConfiguration = null
+        appliedSettings = null
     }
 
     /**
@@ -309,46 +405,34 @@ class DelegatingAgentService @Inject internal constructor(
      * 重置，因此之后不能再执行通用重置。
      */
     private suspend fun applySettingsChange(
+        operation: LifecycleOperation,
         aiSettings: AISettings,
         selectedModelChanged: Boolean,
-        onlySelectedModelChanged: Boolean,
-    ) {
-        if (!selectedModelChanged) {
-            if (!awaitSuccessfulReset(_currentService?.resetSession())) {
-                logger.warn("Failed to reset agent session after settings changed.")
+    ): Boolean {
+        val service = synchronized(lifecycleLock) {
+            _currentService.takeIf { isOperationCurrentLocked(operation) }
+        } ?: return false
+        val completed = if (selectedModelChanged && aiSettings.selectedModel.isNotBlank()) {
+            try {
+                awaitSuccessfulReset(service.switchModel(aiSettings.selectedModel))
+            } catch (e: IllegalArgumentException) {
+                logger.warn(
+                    "Unsupported model from settings; current configuration remains unavailable; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
+                false
             }
-            return
+        } else {
+            // 清除模型选择和任意非模型设置都必须重新建立会话；`null` 任务同样是失败，不能重新放行旧会话。
+            awaitSuccessfulReset(service.resetSession())
         }
-
-        if (aiSettings.selectedModel.isBlank()) {
-            if (!onlySelectedModelChanged) {
-                if (!awaitSuccessfulReset(_currentService?.resetSession())) {
-                    logger.warn("Failed to reset agent session after clearing model selection.")
-                }
-            }
-            return
+        if (!completed) {
+            val action =
+                if (selectedModelChanged && aiSettings.selectedModel.isNotBlank()) "switch agent model" else "reset agent session"
+            logger.warn("Failed to {} for the current settings.", action)
+            return false
         }
-
-        val modelSwitchJob = try {
-            _currentService?.switchModel(aiSettings.selectedModel)
-        } catch (e: IllegalArgumentException) {
-            logger.warn(
-                "Ignoring unsupported model from settings; category={}",
-                SafeLogging.failureCategory(e).wireName,
-            )
-            null
-        }
-
-        if (modelSwitchJob != null) {
-            modelSwitchJob.join()
-            if (modelSwitchJob.isCancelled) {
-                logger.warn("Failed to switch agent model to {}.", aiSettings.selectedModel)
-            }
-        } else if (!onlySelectedModelChanged) {
-            if (!awaitSuccessfulReset(_currentService?.resetSession())) {
-                logger.warn("Failed to reset agent session after unsupported model selection.")
-            }
-        }
+        return isOperationCurrent(operation)
     }
 
     /**
@@ -359,6 +443,43 @@ class DelegatingAgentService @Inject internal constructor(
         resetJob.join()
         return !resetJob.isCancelled
     }
+
+    /** 标记已完成本次生命周期操作的当前配置可用。 */
+    private fun markReady(operation: LifecycleOperation, configuration: AgentConfiguration) {
+        synchronized(lifecycleLock) {
+            if (isOperationCurrentLocked(operation) &&
+                currentServiceMatchesConfigurationLocked(configuration) &&
+                isSettingsVersionCurrent(operation.settingsUpdate.version)
+            ) {
+                readyConfiguration = configuration
+                appliedSettings = operation.settingsUpdate.settings
+            }
+        }
+    }
+
+    /** 在不持有 [lifecycleLock] 时检查迟到操作是否仍代表最新设置。 */
+    private fun isOperationCurrent(operation: LifecycleOperation): Boolean = synchronized(lifecycleLock) {
+        isOperationCurrentLocked(operation) && isSettingsVersionCurrent(operation.settingsUpdate.version)
+    }
+
+    /** 调用方必须持有 [lifecycleLock]。 */
+    private fun isOperationCurrentLocked(operation: LifecycleOperation): Boolean =
+        !closed &&
+                lifecycleOperationEpoch == operation.epoch &&
+                desiredSettingsVersion == operation.settingsUpdate.version &&
+                desiredConfiguration == operation.configuration
+
+    /** 当前 [SettingsRepository] 已发布相同版本时返回 `true`。 */
+    private fun isSettingsVersionCurrent(settingsVersion: Long): Boolean =
+        settingsRepository.settingsUpdateFlow.value.version == settingsVersion
+
+    /** 调用方必须持有 [lifecycleLock]。 */
+    private fun currentServiceMatchesConfigurationLocked(configuration: AgentConfiguration): Boolean =
+        _currentService != null &&
+                currentProvider == configuration.provider &&
+                currentApiKey == configuration.apiKey &&
+                currentBaseUrl == configuration.baseUrl &&
+                currentProxy == configuration.proxySettings
 
     /**
      * 获取当前底层代理实际使用的模型名称。
@@ -383,23 +504,28 @@ class DelegatingAgentService @Inject internal constructor(
     /**
      * 判断当前底层代理能否根据给定设置启用。
      *
-     * @param aiSettings 要检查的 AI 设置。
-     * @return 服务未关闭、当前代理与设置指定的提供商及凭据一致且底层代理可用时返回 `true`，否则返回
-     * `false`。
+     * 输入必须与仓储最新设置中的 AI 配置完全一致；委派服务仅在该版本已由当前代理完整应用且未关闭时
+     * 返回可用。候选初始化、会话重置或模型切换尚未完成时，即使旧代理仍在内存中也返回 `false`。
+     *
+     * @param aiSettings 要检查的 AI 设置；必须等于仓储最新设置中的非空 AI 配置。
+     * @return 服务未关闭、当前代理完整应用了最新配置且底层代理可用时返回 `true`，否则返回 `false`。
      */
     override fun isAiFeatureEnabled(aiSettings: AISettings): Boolean {
-        val apiKey = aiSettings.requiredApiKey()
-        return synchronized(lifecycleLock) {
-            val service = _currentService
-            !closed &&
-                    aiSettings.agentEnabled &&
-                    apiKey.isNotBlank() &&
-                    service != null &&
-                    currentProvider == aiSettings.provider &&
-                    currentApiKey == apiKey &&
-                    currentBaseUrl == aiSettings.openAiBaseUrl &&
-                    service.isAiFeatureEnabled(aiSettings)
+        val settingsUpdate = settingsRepository.settingsUpdateFlow.value
+        val configuration = settingsUpdate.toAgentConfigurationOrNull() ?: return false
+        if (settingsUpdate.settings.ai != aiSettings) {
+            return false
         }
+        val service = synchronized(lifecycleLock) {
+            _currentService.takeIf {
+                !closed &&
+                        desiredSettingsVersion == configuration.settingsVersion &&
+                        desiredConfiguration == configuration &&
+                        readyConfiguration == configuration &&
+                        currentServiceMatchesConfigurationLocked(configuration)
+            }
+        } ?: return false
+        return service.isAiFeatureEnabled(aiSettings) && isReadyForCurrentSettings(configuration, service)
     }
 
     /**
@@ -443,15 +569,59 @@ class DelegatingAgentService @Inject internal constructor(
      * 在唯一一次模型切换屏障准入中，将当前底层服务交给调用方完成完整操作。
      *
      * [block] 只能在本次同步作用域内使用传入服务，不得将服务逸出到后台任务、返回值或字段，也不得再次
-     * 对该服务调用 [withReadyService]。这样切换会一直等待 [block] 完成，且不会因嵌套屏障而死锁。
+     * 对该服务调用 [withReadyService]。这样切换会一直等待 [block] 完成，且不会因嵌套屏障而死锁。该次
+     * 准入只读取一次设置快照，并将同一版本的工具配置安装到协程上下文；配置暂时未就绪时不会回退到
+     * 已退休服务，而是拒绝本次操作。
      *
      * @param T [block] 的返回类型。
      * @param block 在屏障已准入时使用当前底层服务的挂起代码块。
      * @return [block] 的返回值。
+     * @throws AgentConfigurationNotReadyException 当前设置尚未由已完成初始化或会话操作的代理完整应用时抛出。
      */
     override suspend fun <T> withReadyService(block: suspend (AgentService) -> T): T {
-        return modelSwitchBarrier.runWhenReady { block(currentService) }
+        return modelSwitchBarrier.runWhenReady {
+            val settingsUpdate = settingsRepository.settingsUpdateFlow.value
+            val configuration = settingsUpdate.toAgentConfigurationOrNull()
+                ?: throw AgentConfigurationNotReadyException()
+            val service = synchronized(lifecycleLock) {
+                val currentService = _currentService
+                currentService?.takeIf { isReadyForCapturedSettingsLocked(configuration, it) }
+            } ?: throw AgentConfigurationNotReadyException()
+            withContext(AgentToolExecutionContext.from(settingsUpdate)) {
+                block(service)
+            }
+        }
     }
+
+    /**
+     * 在不持有 [lifecycleLock] 时确认服务仍属于当前已完整应用的设置。
+     */
+    private fun isReadyForCurrentSettings(configuration: AgentConfiguration, service: AgentService): Boolean =
+        settingsRepository.settingsUpdateFlow.value.let { current ->
+            current.version == configuration.settingsVersion &&
+                    synchronized(lifecycleLock) {
+                        isReadyForCurrentSettingsLocked(configuration, service)
+                    }
+        }
+
+    /** 调用方必须持有 [lifecycleLock]。 */
+    private fun isReadyForCurrentSettingsLocked(
+        configuration: AgentConfiguration,
+        service: AgentService,
+    ): Boolean = isReadyForCapturedSettingsLocked(configuration, service) &&
+            isSettingsVersionCurrent(configuration.settingsVersion)
+
+    /** 调用方必须持有 [lifecycleLock]，且调用方已捕获并固定设置快照。 */
+    private fun isReadyForCapturedSettingsLocked(
+        configuration: AgentConfiguration,
+        service: AgentService,
+    ): Boolean =
+        !closed &&
+                desiredSettingsVersion == configuration.settingsVersion &&
+                desiredConfiguration == configuration &&
+                readyConfiguration == configuration &&
+                _currentService === service &&
+                currentServiceMatchesConfigurationLocked(configuration)
 
     /**
      * 等待模型切换完成后，将消息转发给当前底层代理。
@@ -463,6 +633,8 @@ class DelegatingAgentService @Inject internal constructor(
      * [MAX_AUDIO_TRANSCRIPTION_BYTES] 的 OGG 语音时，在上传前抛出。
      * @throws AudioTranscriptionFailedException 当当前 OpenAI 代理的 OGG 语音转写失败或返回空文本时抛出。
      * @throws AgentTurnFailedException 当当前 OpenAI 代理未完成回合且未提交其会话历史时抛出。
+     * @throws AgentConfigurationNotReadyException 当最新配置正在初始化、重置或切换，或其先前操作失败时抛出；
+     * 不会回退到旧代理。
      * @throws IllegalStateException 当服务尚未初始化、已禁用或已关闭时抛出。
      * @throws Exception 当当前非 OpenAI 代理以其原有语义报告失败时抛出。
      * @throws CancellationException 当模型切换屏障、当前代理或调用协程被取消时原样抛出。
@@ -472,47 +644,79 @@ class DelegatingAgentService @Inject internal constructor(
     }
 
     /**
-     * 终态关闭当前底层代理并清除服务引用。
+     * 终态关闭底层代理并清除服务引用。
      *
-     * 首次调用会同步释放初始就绪屏障、停止设置订阅，并等待当前代理及任何正在进行的重建安全完成清理；
-     * 候选代理清理耗时不会阻塞已等待启动屏障的调用方。重复调用返回同一个等待任务。调用方取消等待任务
-     * 不会取消清理，后续调用会提供新的等待任务。关闭后服务不再发布新的代理。
+     * 首次调用会释放初始就绪屏障并停止设置订阅。返回任务完成前，当前已发布代理、已退休代理以及未发布候选
+     * 代理的资源清理均已结束；替换流程本身仍会异步清理退休代理，不会等待其完成才发布新代理。重复调用复用
+     * 同一关闭过程；取消某次返回的等待任务不会取消真实清理，后续调用会返回可继续等待的任务。关闭后不再发布
+     * 新的代理。
      *
-     * @return 幂等的异步清理任务；等待其完成后当前 Agent 组件持有的资源均已释放。
+     * @return 幂等的异步清理任务；等待其完成后当前、已退休和未发布候选 Agent 组件持有的资源均已释放。
      */
-    override fun close(): Job = synchronized(lifecycleLock) {
-        val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
-            closed = true
-            completeInitialReadiness()
-            val settingsJobToStop = settingsJob
-            settingsJob = null
-            settingsJobToStop?.cancel()
-            val serviceToClose = _currentService
-            clearCurrentAgentLocked()
-            closeCompletion = newCompletion
-            closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+    override fun close(): Job {
+        val (completion, resourcesToClose) = synchronized(lifecycleLock) {
+            val existingCompletion = closeCompletion
+            if (existingCompletion != null) {
+                existingCompletion to null
+            } else {
+                val newCompletion = CompletableDeferred<Unit>()
+                closed = true
+                completeInitialReadiness()
+                val settingsJobToStop = settingsJob
+                settingsJob = null
+                settingsJobToStop?.cancel()
+                val serviceToClose = _currentService
+                clearCurrentAgentLocked()
+                closeCompletion = newCompletion
+                newCompletion to ClosingResources(newCompletion, settingsJobToStop, serviceToClose)
+            }
+        }
+
+        resourcesToClose?.let { resources ->
+            closingScope.launch {
                 withContext(NonCancellable) {
                     try {
-                        settingsJobToStop?.join()
-                        serviceToClose?.close()?.join()
-                    } catch (e: Exception) {
-                        logger.error(
-                            "Failed to close delegating agent resources; category={}",
-                            SafeLogging.failureCategory(e).wireName,
-                        )
+                        try {
+                            resources.settingsJob?.join()
+                        } catch (e: Exception) {
+                            logger.error(
+                                "Failed to stop delegating agent settings subscription; category={}",
+                                SafeLogging.failureCategory(e).wireName,
+                            )
+                        }
+                        try {
+                            resources.currentService?.close()?.join()
+                        } catch (e: Exception) {
+                            logger.error(
+                                "Failed to close current delegating agent resources; category={}",
+                                SafeLogging.failureCategory(e).wireName,
+                            )
+                        }
                     } finally {
-                        newCompletion.complete(Unit)
+                        try {
+                            drainBackgroundCleanup()
+                        } catch (e: Exception) {
+                            logger.error(
+                                "Failed to drain retired delegating agent resources; category={}",
+                                SafeLogging.failureCategory(e).wireName,
+                            )
+                        } finally {
+                            resources.completion.complete(Unit)
+                        }
                     }
                 }
             }
         }
-        if (closeJob == null || closeJob?.isCancelled == true) {
-            closeJob = closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
-                withContext(NonCancellable) {
-                    completion.await()
+
+        return synchronized(lifecycleLock) {
+            if (closeJob == null || closeJob?.isCancelled == true) {
+                closeJob = closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    withContext(NonCancellable) {
+                        completion.await()
+                    }
                 }
             }
+            closeJob!!
         }
-        closeJob!!
     }
 }

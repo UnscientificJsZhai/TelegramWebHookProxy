@@ -34,6 +34,7 @@ import javax.inject.Provider
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
@@ -151,8 +152,56 @@ class TaskSchedulerBarrierIntegrationTest {
         }
     }
 
+    /**
+     * 验证候选代理无法就绪时，调度器会在预消费前跳过任务；后续有效配置恢复后任务仅执行一次。
+     */
+    @Test
+    fun `unready replacement skips task before precommit and later recovery executes it once`() = runBlocking {
+        val failedReadiness = Job().apply { cancel() }
+        val fixture = newFixture(
+            replacementReadiness = failedReadiness,
+            recoveryReadiness = null,
+        )
+        try {
+            fixture.initialize()
+            val taskId = fixture.scheduler.createTask(
+                "must wait for a ready replacement",
+                System.currentTimeMillis() - 1_000,
+                LoopMode.ONCE,
+                "chat-b",
+            )
+
+            fixture.settingsRepository.saveSettings(settingsFor(BOT_B_TOKEN, "key-b"))
+            withTimeout(TEST_TIMEOUT_MILLIS) { fixture.replacementCreated.await() }
+            awaitBarrierReady(fixture.barrier)
+
+            fixture.scheduler.scanAndExecute()
+
+            coVerify(exactly = 0) { fixture.oldAgent.sendMessage(any()) }
+            coVerify(exactly = 0) { fixture.newAgent.sendMessage(any()) }
+            coVerify(exactly = 0) { fixture.recoveryAgent.sendMessage(any()) }
+            coVerify(exactly = 0) { fixture.telegramService.sendMessageForToken(any(), any(), any(), any()) }
+            assertEquals(listOf(taskId), fixture.scheduler.listTasks().map { it.id })
+
+            coEvery { fixture.recoveryAgent.sendMessage(any()) } returns ""
+            fixture.settingsRepository.saveSettings(settingsFor(BOT_B_TOKEN, "key-c"))
+            withTimeout(TEST_TIMEOUT_MILLIS) { fixture.recoveryCreated.await() }
+            awaitBarrierReady(fixture.barrier)
+
+            fixture.scheduler.scanAndExecute()
+
+            coVerify(exactly = 1) {
+                fixture.recoveryAgent.sendMessage(match { it.contains("must wait for a ready replacement") })
+            }
+            assertTrue(fixture.scheduler.listTasks().isEmpty())
+        } finally {
+            fixture.close()
+        }
+    }
+
     private fun newFixture(
         replacementReadiness: Job?,
+        recoveryReadiness: Job? = null,
         deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     ): SchedulerBarrierFixture {
         val tempDirectory = createTempDirectory("task-scheduler-barrier").toFile().also(temporaryDirectories::add)
@@ -163,28 +212,43 @@ class TaskSchedulerBarrierIntegrationTest {
         val agentComponentFactory = mockk<AgentComponent.Factory>()
         val firstComponent = mockk<AgentComponent>()
         val secondComponent = mockk<AgentComponent>()
+        val thirdComponent = mockk<AgentComponent>()
         val oldAgent = mockk<OpenAIAgentService>()
         val newAgent = mockk<OpenAIAgentService>()
+        val recoveryAgent = mockk<OpenAIAgentService>()
         val telegramService = mockk<TelegramService>()
         val firstCreated = CompletableDeferred<Unit>()
         val replacementCreated = CompletableDeferred<Unit>()
+        val recoveryCreated = CompletableDeferred<Unit>()
         var componentCount = 0
 
         every { agentComponentFactory.create() } answers {
-            if (componentCount++ == 0) {
-                firstCreated.complete(Unit)
-                firstComponent
-            } else {
-                replacementCreated.complete(Unit)
-                secondComponent
+            when (componentCount++) {
+                0 -> {
+                    firstCreated.complete(Unit)
+                    firstComponent
+                }
+
+                1 -> {
+                    replacementCreated.complete(Unit)
+                    secondComponent
+                }
+
+                else -> {
+                    recoveryCreated.complete(Unit)
+                    thirdComponent
+                }
             }
         }
         every { firstComponent.openAIAgentService } returns oldAgent
         every { secondComponent.openAIAgentService } returns newAgent
+        every { thirdComponent.openAIAgentService } returns recoveryAgent
         every { oldAgent.initializationJob() } returns null
         every { newAgent.initializationJob() } returns replacementReadiness
+        every { recoveryAgent.initializationJob() } returns recoveryReadiness
         every { oldAgent.close() } returns Job().apply { complete() }
         every { newAgent.close() } returns Job().apply { complete() }
+        every { recoveryAgent.close() } returns Job().apply { complete() }
 
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val delegatingAgent = DelegatingAgentService(
@@ -208,11 +272,13 @@ class TaskSchedulerBarrierIntegrationTest {
             telegramService,
             oldAgent,
             newAgent,
+            recoveryAgent,
             delegatingAgent,
             scheduler,
             scope,
             firstCreated,
             replacementCreated,
+            recoveryCreated,
         )
     }
 
@@ -235,6 +301,7 @@ class TaskSchedulerBarrierIntegrationTest {
             provider = AIProvider.OPENAI,
             openAiApiKey = apiKey,
             agentEnabled = true,
+            agentChatId = if (token == BOT_A_TOKEN) "chat-a" else "chat-b",
         ),
     )
 
@@ -244,11 +311,13 @@ class TaskSchedulerBarrierIntegrationTest {
         val telegramService: TelegramService,
         val oldAgent: AgentService,
         val newAgent: AgentService,
+        val recoveryAgent: AgentService,
         val delegatingAgent: DelegatingAgentService,
         val scheduler: TaskSchedulerService,
         val scope: CoroutineScope,
         val firstCreated: CompletableDeferred<Unit>,
         val replacementCreated: CompletableDeferred<Unit>,
+        val recoveryCreated: CompletableDeferred<Unit>,
     ) {
         fun close() {
             scheduler.close()
