@@ -142,7 +142,8 @@ curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chati
 
 ## AI Agent
 
-AI Agent 只处理来自 `agentChatId` 的消息。开启后可在 Telegram 中使用以下命令：
+AI Agent 仅处理授权用户的私聊消息：消息必须来自私聊，且发送者 ID 与聊天 ID 都要等于 `agentChatId`。开启后可在 Telegram
+中使用以下命令：
 
 | 命令                | 说明                               |
 |---------------------|------------------------------------|

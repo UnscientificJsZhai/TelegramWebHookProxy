@@ -15,6 +15,7 @@ import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MCPServerConfig
+import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
@@ -34,6 +35,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -439,6 +442,8 @@ class OpenAIAgentServiceTest {
     @Test
     fun `initial OpenAI readiness waits for the MCP connection`() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
+        val server = MockWebServer()
+        server.start()
         val connectionStarted = CompletableDeferred<Unit>()
         val releaseConnection = CompletableDeferred<Unit>()
         val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
@@ -447,6 +452,7 @@ class OpenAIAgentServiceTest {
                 ai = AISettings(
                     provider = AIProvider.OPENAI,
                     openAiApiKey = "test-key",
+                    openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
                     agentEnabled = true,
                     mcpServers = mcpServers,
                 ),
@@ -470,6 +476,11 @@ class OpenAIAgentServiceTest {
             val readiness = assertNotNull(initializedService.initializationJob())
             assertFalse(readiness.isCompleted)
 
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"object":"list","data":[{"id":"gpt-5.6-luna","object":"model","created":0,"owned_by":"test"}]}""",
+                ).build(),
+            )
             releaseConnection.complete(Unit)
             readiness.join()
 
@@ -477,6 +488,102 @@ class OpenAIAgentServiceTest {
         } finally {
             releaseConnection.complete(Unit)
             initializedService.close().join()
+            server.close()
+        }
+    }
+
+    /**
+     * 验证首轮模型发现的 HTTP 失败或空列表会取消 OpenAI 候选的组合就绪任务。
+     */
+    @Test
+    fun `initial OpenAI readiness rejects failed and empty model discovery`() = runBlocking {
+        listOf(
+            MockResponse.Builder().code(500).body("upstream failure").build(),
+            MockResponse.Builder().body("""{"object":"list","data":[]}""").build(),
+        ).forEach { response ->
+            val server = MockWebServer()
+            server.start()
+            settingsRepository.saveSettings(
+                AppSettings(
+                    ai = AISettings(
+                        provider = AIProvider.OPENAI,
+                        openAiApiKey = "test-key",
+                        openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
+                        agentEnabled = true,
+                    ),
+                ),
+            )
+            server.enqueue(response)
+            val candidate = newService()
+
+            try {
+                val readiness = assertNotNull(candidate.initializationJob())
+                withTimeout(5.seconds) { readiness.join() }
+                assertTrue(readiness.isCancelled)
+            } finally {
+                candidate.close().join()
+                server.close()
+            }
+        }
+    }
+
+    /**
+     * 验证首轮模型列表不含当前模型时，回退会话的 MCP 取消会使 OpenAI 组合就绪任务失败。
+     */
+    @Test
+    fun `initial OpenAI readiness rejects a cancelled fallback reset after model mismatch`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val server = MockWebServer()
+        server.start()
+        val initialConnectionStarted = CompletableDeferred<Unit>()
+        val releaseInitialConnection = CompletableDeferred<Unit>()
+        val connectionCalls = AtomicInteger()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
+                    selectedModel = "retired-model",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            if (connectionCalls.incrementAndGet() == 1) {
+                initialConnectionStarted.complete(Unit)
+                releaseInitialConnection.await()
+            } else {
+                throw CancellationException("fallback MCP connection cancelled")
+            }
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val candidate = OpenAIAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        try {
+            initialConnectionStarted.await()
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"object":"list","data":[{"id":"gpt-5.6-luna","object":"model","created":0,"owned_by":"test"}]}""",
+                ).build(),
+            )
+            releaseInitialConnection.complete(Unit)
+
+            val readiness = assertNotNull(candidate.initializationJob())
+            withTimeout(5.seconds) { readiness.join() }
+            assertTrue(readiness.isCancelled)
+        } finally {
+            releaseInitialConnection.complete(Unit)
+            candidate.close().join()
+            server.close()
         }
     }
 
@@ -1207,6 +1314,176 @@ class OpenAIAgentServiceTest {
         assertEquals(1, requests.first().messages().size)
         assertEquals(3, requests.last().messages().size)
         assertTrue(requests.last().messages()[1].isAssistant())
+    }
+
+    /**
+     * 验证达到 64 条短历史后仍能连续完成新回合。
+     *
+     * 旧实现只做字节判断，恰好达到条数上限后会永久失败；现在应整体删除最早完整回合并继续提交。
+     */
+    @Test
+    fun `short history slides by complete turns after 64 entries`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val completionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns completionService
+        every { completionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            textResponse("完成")
+        }
+        injectClient(client)
+
+        repeat(34) { index ->
+            assertEquals("完成", service.sendMessage("短消息$index"))
+        }
+
+        assertEquals(34, requests.size)
+        assertEquals(63, requests[32].messages().size)
+        assertEquals(63, requests[33].messages().size)
+        assertTrue(requests.all { it.messages().size <= 64 })
+        assertEquals(64, service.createChatCompletionParams(emptyList()).messages().size)
+    }
+
+    /**
+     * 验证历史超过字节预留时会删除最早的完整回合，而不是清空所有已提交上下文。
+     *
+     * 两个 1.6 MiB 图片在 OpenAI 的 Base64 请求表示中超过 4 MiB 的下一回合预留；第三个请求必须
+     * 保留第二个完整回合，同时移除第一个完整回合。
+     */
+    @Test
+    fun `byte budget trims only the oldest complete OpenAI turn`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val completionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns completionService
+        every { completionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            textResponse("完成")
+        }
+        injectClient(client)
+
+        val largeImage = ByteArray(1_600 * 1024) { 7 }
+        assertEquals("完成", service.sendMessage("最旧完整回合", listOf(MediaData(largeImage, "image/png"))))
+        assertEquals("完成", service.sendMessage("较新完整回合", listOf(MediaData(largeImage, "image/png"))))
+        assertEquals("完成", service.sendMessage("当前回合", listOf(MediaData(largeImage, "image/png"))))
+
+        val userTexts = requests.last().messages()
+            .filter { it.isUser() }
+            .flatMap { message ->
+                message.asUser().content().asArrayOfContentParts()
+                    .filter { it.isText() }
+                    .map { it.asText().text() }
+            }
+        assertEquals(listOf("较新完整回合", "当前回合"), userTexts)
+        assertEquals(3, requests.last().messages().size)
+    }
+
+    /**
+     * 验证当前回合本身超过 8 MiB 时不会提交，并且会话仍可由后续小回合继续使用。
+     */
+    @Test
+    fun `oversized current OpenAI turn rolls back and later small turn succeeds`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val completionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns completionService
+        every { completionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            if (requests.size == 1) textResponse("x".repeat(8 * 1024 * 1024)) else textResponse("已恢复")
+        }
+        injectClient(client)
+
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("会超限") }
+        assertTrue(service.createChatCompletionParams(emptyList()).messages().isEmpty())
+
+        assertEquals("已恢复", service.sendMessage("小消息"))
+        assertEquals(2, requests.size)
+        assertEquals(1, requests.last().messages().size)
+        assertEquals(
+            "小消息", requests.last().messages().single().asUser().content().asArrayOfContentParts()
+                .single().asText().text()
+        )
+    }
+
+    /**
+     * 验证系统前缀仅由真实 system 消息决定，文本与仅媒体输入都不会改写其边界。
+     */
+    @Test
+    fun `system prefix is stable for text and media only turns`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val completionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        settingsRepository.saveSettings(AppSettings(ai = AISettings(globalContext = "系统提示词")))
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns completionService
+        every { completionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            textResponse("完成")
+        }
+        injectClient(client)
+        assertNotNull(service.resetSession()).join()
+
+        assertEquals("完成", service.sendMessage("文本"))
+        assertEquals("完成", service.sendMessage(null, listOf(MediaData(byteArrayOf(1), "image/png"))))
+
+        assertTrue(requests.all { it.messages().first().isSystem() })
+        assertTrue(requests[0].messages()[1].isUser())
+        assertTrue(requests[1].messages()[1].isUser())
+
+        val noSystemService = newService()
+        val noSystemClient = mockk<OpenAIClient>()
+        val noSystemChatService = mockk<ChatService>()
+        val noSystemCompletionService = mockk<ChatCompletionService>()
+        val noSystemRequests = mutableListOf<ChatCompletionCreateParams>()
+        every { noSystemClient.chat() } returns noSystemChatService
+        every { noSystemChatService.completions() } returns noSystemCompletionService
+        every { noSystemCompletionService.create(any<ChatCompletionCreateParams>()) } answers {
+            noSystemRequests += invocation.args[0] as ChatCompletionCreateParams
+            textResponse("完成")
+        }
+        injectClient(noSystemService, noSystemClient)
+
+        assertEquals("完成", noSystemService.sendMessage("无系统提示词"))
+        assertTrue(noSystemRequests.single().messages().single().isUser())
+    }
+
+    /**
+     * 验证裁剪带工具调用的最早回合时，工具调用与全部工具结果会一起消失。
+     */
+    @Test
+    fun `trimming an old tool turn leaves no orphan tool messages`() = runBlocking {
+        val client = mockk<OpenAIClient>()
+        val chatService = mockk<ChatService>()
+        val completionService = mockk<ChatCompletionService>()
+        val requests = mutableListOf<ChatCompletionCreateParams>()
+        every { client.chat() } returns chatService
+        every { chatService.completions() } returns completionService
+        every { completionService.create(any<ChatCompletionCreateParams>()) } answers {
+            requests += invocation.args[0] as ChatCompletionCreateParams
+            if (requests.size == 1) {
+                toolCallResponse(functionToolCall("old-tool", "missing", "{}"))
+            } else {
+                textResponse("完成")
+            }
+        }
+        injectClient(client)
+
+        assertEquals("完成", service.sendMessage("工具回合"))
+        repeat(30) { index -> assertEquals("完成", service.sendMessage("普通回合$index")) }
+        assertEquals("完成", service.sendMessage("触发裁剪"))
+
+        val trimmedRequest = requests.last().messages()
+        assertFalse(trimmedRequest.any { it.isTool() })
+        assertFalse(trimmedRequest.any { message ->
+            message.isAssistant() && message.asAssistant().toolCalls().isPresent
+        })
     }
 
     /**

@@ -58,7 +58,13 @@ class SettingsRepositoryBarrierTest {
 
         settings = settings.copy(ai = settings.ai!!.copy(globalContext = "new context"))
         repository.saveSettings(settings)
-        assertFalse(barrier.isSwitching)
+        assertTrue(barrier.isSwitching)
+        barrier.complete(barrier.latestPendingGeneration())
+
+        settings = settings.copy(ai = settings.ai!!.copy(agentChatId = "new-agent-chat"))
+        repository.saveSettings(settings)
+        assertTrue(barrier.isSwitching)
+        barrier.complete(barrier.latestPendingGeneration())
 
         settings = settings.copy(ai = settings.ai!!.copy(selectedModel = "gpt-next"))
         repository.saveSettings(settings)
@@ -243,6 +249,102 @@ class SettingsRepositoryBarrierTest {
         // 最新快照的情况。
         barrier.completeThrough(latestUpdate.switchGeneration)
 
+        assertFalse(barrier.isSwitching)
+    }
+
+    /**
+     * 验证历史非法 OpenAI 地址保留原始值，且只有显式地址替换可以解除写入保护。
+     */
+    @Test
+    fun `historical invalid OpenAI base URL is preserved until explicitly replaced`() {
+        val configFile = File(tempDirectory, "historical-invalid-openai-url.json")
+        val originalContent =
+            """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","agentEnabled":true}}"""
+        configFile.writeText(originalContent)
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+        assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertEquals("https://gateway.example.com/v1/%6dodels", repository.settingsFlow.value.ai?.openAiBaseUrl)
+        assertEquals(originalContent, configFile.readText())
+
+        assertFailsWith<HistoricalInvalidOpenAiBaseUrlConfigurationException> {
+            repository.updateSettings { current -> current.copy(chatId = "unrelated-change") }
+        }
+        assertEquals(originalContent, configFile.readText())
+
+        repository.updateSettings(replacesHistoricalInvalidOpenAiBaseUrl = true) { current ->
+            current.copy(ai = current.ai!!.copy(openAiBaseUrl = "https://gateway.example.com/v1"))
+        }
+
+        assertFalse(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertEquals("https://gateway.example.com/v1", repository.settingsFlow.value.ai?.openAiBaseUrl)
+        assertFalse(configFile.readText() == originalContent)
+    }
+
+    /**
+     * 验证 Gemini 可以保留休眠的历史 OpenAI 地址；保护标记不清空该原始字段。
+     */
+    @Test
+    fun `dormant historical invalid OpenAI base URL is retained for Gemini settings`() {
+        val configFile = File(tempDirectory, "dormant-invalid-openai-url.json")
+        val originalContent =
+            """{"ai":{"provider":"GEMINI","geminiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/chat/%63ompletions","agentEnabled":true}}"""
+        configFile.writeText(originalContent)
+
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+        assertEquals(AIProvider.GEMINI, repository.settingsFlow.value.ai?.provider)
+        assertEquals("key", repository.settingsFlow.value.ai?.geminiApiKey)
+        assertEquals(
+            "https://gateway.example.com/v1/chat/%63ompletions",
+            repository.settingsFlow.value.ai?.openAiBaseUrl
+        )
+        assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertEquals(originalContent, configFile.readText())
+    }
+
+    /**
+     * 验证从备份恢复历史非法 OpenAI 地址时使用原始字节，不会将其规范化或清空为默认地址。
+     */
+    @Test
+    fun `backup recovery preserves historical invalid OpenAI base URL bytes`() {
+        val configFile = File(tempDirectory, "recovered-invalid-openai-url.json")
+        val backupFile = File(tempDirectory, "recovered-invalid-openai-url.json.bak")
+        val historicalContent =
+            """{"ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/audio/%74ranscriptions","agentEnabled":true}}"""
+        configFile.writeText("{ damaged")
+        backupFile.writeText(historicalContent)
+
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+        assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertEquals(
+            "https://gateway.example.com/v1/audio/%74ranscriptions",
+            repository.settingsFlow.value.ai?.openAiBaseUrl
+        )
+        assertEquals(historicalContent, configFile.readText())
+        assertEquals(historicalContent, backupFile.readText())
+    }
+
+    /**
+     * 验证设置快照只覆盖设置代次，不能让设置处理器完成独立的认证清理代次。
+     */
+    @Test
+    fun `settings snapshot excludes an earlier external barrier generation`() {
+        val barrier = ModelSwitchBarrier()
+        val repository = SettingsRepository.forTesting(File(tempDirectory, "external-generation.json"), barrier)
+        val authenticationGeneration = barrier.beginExternalSwitch()
+
+        repository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "key", agentEnabled = true)),
+        )
+        val settingsGeneration = repository.settingsUpdateFlow.value.switchGeneration
+
+        assertEquals(barrier.latestPendingSettingsGeneration(), settingsGeneration)
+        barrier.completeSettingsThrough(settingsGeneration)
+        assertTrue(barrier.isSwitching)
+
+        barrier.complete(authenticationGeneration)
         assertFalse(barrier.isSwitching)
     }
 

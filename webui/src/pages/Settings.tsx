@@ -554,20 +554,20 @@ const Settings: React.FC = () => {
                             <Box sx={{display: 'flex', gap: 2, alignItems: 'center'}}>
                                 <TextField
                                     fullWidth
-                                    label="监听 Chat ID"
+                                    label="授权用户私聊 ID"
                                     name="ai.agentChatId"
                                     value={ai.agentChatId}
                                     onChange={handleChange}
                                     inputProps={{maxLength: 64}}
                                     variant="outlined"
-                                    helperText="AI 将只在此 Chat ID 的会话中回复消息，且可以响应 /reset"
+                                    helperText="AI 仅处理私聊，且发送者 ID 与 Chat ID 都必须匹配此 ID。默认 Chat ID 仅在它是同一用户的私聊 ID 时可填入。"
                                 />
                                 <Button
                                     variant="outlined"
                                     onClick={handleCopyChatId}
                                     sx={{whiteSpace: 'nowrap', height: 'fit-content', mt: -3}}
                                 >
-                                    填入发送消息ID
+                                    填入默认 Chat ID（仅私聊）
                                 </Button>
                             </Box>
                         </Grid>

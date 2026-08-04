@@ -15,7 +15,7 @@ import javax.inject.Singleton
 class ModelSwitchBarrier @Inject constructor() {
     private val lock = Any()
     private var nextGeneration = 0L
-    private val pendingGenerations = LinkedHashMap<Long, CompletableDeferred<Unit>>()
+    private val pendingGenerations = LinkedHashMap<Long, PendingGeneration>()
     private var activeRequests = 0
     private var activeRequestsDrained = CompletableDeferred<Unit>().also { it.complete(Unit) }
 
@@ -25,9 +25,20 @@ class ModelSwitchBarrier @Inject constructor() {
      * @return 新代次的递增版本号；在该代次完成或取消前，请求会等待屏障放行。
      */
     fun beginSwitch(): Long = synchronized(lock) {
-        val generation = ++nextGeneration
-        pendingGenerations[generation] = CompletableDeferred()
-        generation
+        beginGeneration(GenerationOrigin.SETTINGS)
+    }
+
+    /**
+     * 开启不由设置流收集器完成的外部生命周期代次。
+     *
+     * 外部代次同样阻塞 [awaitReady] 和 [runWhenReady]，但不会被
+     * [completeSettingsThrough] 或设置快照的合并完成。调用方必须在自己的清理成功、取消或终态关闭时通过
+     * [complete] 或 [cancel] 结束该代次。
+     *
+     * @return 新外部代次的递增版本号；在该代次完成或取消前，请求会等待屏障放行。
+     */
+    internal fun beginExternalSwitch(): Long = synchronized(lock) {
+        beginGeneration(GenerationOrigin.EXTERNAL)
     }
 
     /**
@@ -37,6 +48,17 @@ class ModelSwitchBarrier @Inject constructor() {
      */
     fun latestPendingGeneration(): Long? = synchronized(lock) {
         pendingGenerations.keys.lastOrNull()
+    }
+
+    /**
+     * 获取最新的未完成设置生命周期代次。
+     *
+     * 外部生命周期代次不会作为设置流快照的覆盖范围，避免设置处理器提前完成认证等独立清理。
+     *
+     * @return 最新未完成设置代次的版本号；不存在待处理设置代次时返回 `null`。
+     */
+    internal fun latestPendingSettingsGeneration(): Long? = synchronized(lock) {
+        pendingGenerations.entries.lastOrNull { it.value.origin == GenerationOrigin.SETTINGS }?.key
     }
 
     /**
@@ -57,7 +79,7 @@ class ModelSwitchBarrier @Inject constructor() {
     suspend fun awaitReady() {
         while (true) {
             val completion = synchronized(lock) {
-                pendingGenerations.entries.lastOrNull()?.value
+                pendingGenerations.entries.lastOrNull()?.value?.completion
             } ?: return
             completion.await()
         }
@@ -128,7 +150,33 @@ class ModelSwitchBarrier @Inject constructor() {
                 val entry = iterator.next()
                 if (entry.key > generation) break
                 iterator.remove()
-                completedGenerations += entry.value
+                completedGenerations += entry.value.completion
+            }
+            completedGenerations
+        }
+        completions.forEach { it.complete(Unit) }
+    }
+
+    /**
+     * 仅完成指定设置快照覆盖的设置代次。
+     *
+     * 该方法保留较早或较晚的外部代次，防止认证失败等独立清理被后续设置流的合并快照提前放行。
+     *
+     * @param generation 已完成设置快照携带的代次；为 `null` 时不执行任何操作。
+     */
+    internal fun completeSettingsThrough(generation: Long?) {
+        if (generation == null) return
+
+        val completions = synchronized(lock) {
+            val completedGenerations = mutableListOf<CompletableDeferred<Unit>>()
+            val iterator = pendingGenerations.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key > generation) break
+                if (entry.value.origin == GenerationOrigin.SETTINGS) {
+                    iterator.remove()
+                    completedGenerations += entry.value.completion
+                }
             }
             completedGenerations
         }
@@ -152,7 +200,23 @@ class ModelSwitchBarrier @Inject constructor() {
 
     private fun finish(generation: Long?) {
         if (generation == null) return
-        val completion = synchronized(lock) { pendingGenerations.remove(generation) }
+        val completion = synchronized(lock) { pendingGenerations.remove(generation)?.completion }
         completion?.complete(Unit)
+    }
+
+    private fun beginGeneration(origin: GenerationOrigin): Long {
+        val generation = ++nextGeneration
+        pendingGenerations[generation] = PendingGeneration(origin, CompletableDeferred())
+        return generation
+    }
+
+    private data class PendingGeneration(
+        val origin: GenerationOrigin,
+        val completion: CompletableDeferred<Unit>,
+    )
+
+    private enum class GenerationOrigin {
+        SETTINGS,
+        EXTERNAL,
     }
 }

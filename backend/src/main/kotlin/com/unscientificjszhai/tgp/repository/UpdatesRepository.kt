@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.ChatInfo
+import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
@@ -23,13 +24,35 @@ import javax.inject.Singleton
  * 聊天列表与最后已处理更新标识来自同一机器人快照；`lastUpdateId` 为 `0` 表示尚未
  * 初始化该机器人的轮询偏移量。
  *
- * 聊天信息列表字段保存已发现的聊天；没有已保存聊天时为空列表。
- * 最后已处理更新标识字段为 `0` 时，表示尚未初始化。
+ * @property chats 已发现的聊天信息列表；没有已保存聊天时为空列表。
+ * @property lastUpdateId 最后已处理的更新标识；`0` 表示尚未初始化。
+ * @property pendingTelegramReplies 已持久化但尚未被 Telegram 确认接受的回复，按 [PendingTelegramReply.updateId]
+ * 升序且在同一更新标识下唯一；旧文件缺少该字段时默认为空列表。
  */
 @Serializable
 data class UpdatesData(
     val chats: List<ChatInfo> = emptyList(),
     val lastUpdateId: Long = 0,
+    val pendingTelegramReplies: List<PendingTelegramReply> = emptyList(),
+)
+
+/**
+ * 已由 Agent 生成、等待 Telegram 接受的回复。
+ *
+ * 每个机器人内同一 [updateId] 最多保留一项。回复以至少一次语义投递：网络结果不确定或 Telegram
+ * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。
+ *
+ * @property updateId 生成该回复的 Telegram 更新标识；必须为非负数，且在同一机器人 outbox 中唯一。
+ * @property chatId 回复目标聊天标识；不能为空。
+ * @property text 要投递的非空回复文本。
+ * @property replyParameters 可选的原消息回复参数；为 `null` 时发送独立消息。
+ */
+@Serializable
+data class PendingTelegramReply(
+    val updateId: Long,
+    val chatId: String,
+    val text: String,
+    val replyParameters: ReplyParameters? = null,
 )
 
 /**
@@ -205,6 +228,84 @@ class UpdatesRepository private constructor(
         require(lastUpdateId >= 0) { "lastUpdateId must not be negative." }
         return updateData(botId) { current ->
             current.copy(lastUpdateId = maxOf(current.lastUpdateId, lastUpdateId))
+        }
+    }
+
+    /**
+     * 原子记录一轮已成功完成的 Agent 处理，并推进该机器人的更新偏移量。
+     *
+     * 非空 [reply] 会和 [updateId] 的偏移量在同一次文件提交中写入 outbox，先后重试不会覆盖已有
+     * 同标识回复。空回复仍会在同一次提交中确认偏移量，表示该 Agent 回合已经完成且无需投递。文件
+     * 提交失败时内存状态保持不变，调用方必须保留该更新并停止继续确认后续更新。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 已成功完成的 Telegram 更新标识；必须为非负数。
+     * @param reply 要投递的 Agent 回复；为 `null` 表示成功但无回复。
+     * @return 写入后的完整机器人状态；[botId] 无效时返回空状态。
+     * @throws IllegalArgumentException 当 [updateId] 为负数，或 [reply] 与 [updateId]、文本约束不一致时抛出。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
+     */
+    fun completeAgentUpdate(
+        botId: String,
+        updateId: Long,
+        reply: PendingTelegramReply? = null,
+    ): UpdatesData {
+        require(updateId >= 0) { "updateId must not be negative." }
+        reply?.let {
+            require(it.updateId == updateId) { "reply updateId must match updateId." }
+            require(it.chatId.isNotBlank()) { "reply chatId must not be blank." }
+            require(it.text.isNotBlank()) { "reply text must not be blank." }
+        }
+        return updateData(botId) { current ->
+            val replies = when {
+                reply == null -> current.pendingTelegramReplies
+                current.pendingTelegramReplies.any { it.updateId == updateId } -> current.pendingTelegramReplies
+                else -> (current.pendingTelegramReplies + reply).sortedBy { it.updateId }
+            }
+            current.copy(
+                lastUpdateId = maxOf(current.lastUpdateId, updateId),
+                pendingTelegramReplies = replies,
+            )
+        }
+    }
+
+    /**
+     * 读取指定机器人的待投递 Telegram 回复快照。
+     *
+     * 只返回其源更新已经被持久化确认的记录，结果始终按更新标识升序，便于单消费者按顺序投递。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @return 可投递回复的升序快照；[botId] 无效或没有待投递回复时返回空列表。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取，因旧格式迁移不能安全提交时抛出。
+     * @throws Exception 旧格式迁移的编码或原子提交失败时抛出；内存状态不变。
+     */
+    fun getPendingTelegramReplies(botId: String): List<PendingTelegramReply> {
+        val data = getData(botId)
+        return data.pendingTelegramReplies
+            .asSequence()
+            .filter { it.updateId <= data.lastUpdateId }
+            .sortedBy { it.updateId }
+            .toList()
+    }
+
+    /**
+     * 删除指定机器人 outbox 中源自一项更新的回复。
+     *
+     * 调用方只能在 Telegram 同时返回 HTTP `2xx` 与 API `ok: true` 后调用。不存在匹配项时仍会安全保留
+     * 其他回复和聊天、偏移量。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要删除的回复所属更新标识；必须为非负数。
+     * @return 写入后的完整机器人状态；[botId] 无效时返回空状态。
+     * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
+     */
+    fun deletePendingTelegramReply(botId: String, updateId: Long): UpdatesData {
+        require(updateId >= 0) { "updateId must not be negative." }
+        return updateData(botId) { current ->
+            current.copy(pendingTelegramReplies = current.pendingTelegramReplies.filterNot { it.updateId == updateId })
         }
     }
 

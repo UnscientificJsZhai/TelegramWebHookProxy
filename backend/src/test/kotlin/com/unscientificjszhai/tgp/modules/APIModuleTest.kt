@@ -540,6 +540,57 @@ class APIModuleTest {
     }
 
     /**
+     * 验证历史非法 OpenAI 地址不能由无关 PATCH 覆盖，显式地址替换或清空 AI 设置可解除保护。
+     */
+    @Test
+    fun `settings routes require an explicit OpenAI base URL replacement for historical configuration`() {
+        listOf(
+            """{"ai":{"openAiBaseUrl":"https://gateway.example.com/v1"}}""" to "https://gateway.example.com/v1",
+            """{"ai":null}""" to null,
+        ).forEachIndexed { index, (repairPatch, expectedBaseUrl) ->
+            val temporaryDirectory = createTempDirectory("api-invalid-openai-url-history-$index").toFile()
+            try {
+                val configFile = temporaryDirectory.resolve("settings.json")
+                val historicalContent =
+                    """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","agentEnabled":true}}"""
+                configFile.writeText(historicalContent)
+                val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                val telegramService = mockk<TelegramService>(relaxed = true)
+                val appComponent = mockk<AppComponent>()
+                every { appComponent.settingsRepository } returns repository
+                every { appComponent.telegramService } returns telegramService
+
+                testApplication {
+                    application { configureTestApi(appComponent) }
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody("""{"chatId":"unrelated-change"}""")
+                    }.apply {
+                        assertEquals(HttpStatusCode.Conflict, status)
+                    }
+                    assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
+                    assertEquals(historicalContent, configFile.readText())
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody(repairPatch)
+                    }.apply {
+                        assertEquals(HttpStatusCode.OK, status)
+                    }
+                    assertFalse(repository.hasHistoricalInvalidOpenAiBaseUrl)
+                    assertEquals(expectedBaseUrl, repository.settingsFlow.value.ai?.openAiBaseUrl)
+                    assertFalse(configFile.readText() == historicalContent)
+                }
+            } finally {
+                temporaryDirectory.deleteRecursively()
+            }
+        }
+    }
+
+    /**
      * 验证完整写入拒绝顶层和嵌套未知字段、缺失嵌套字段及宽松 JSON，且错误不回显敏感请求内容。
      */
     @Test

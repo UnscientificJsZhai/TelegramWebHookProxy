@@ -183,6 +183,50 @@ class SettingsTest {
         }
     }
 
+    /**
+     * 验证 OpenAI 基础地址会保留网关前缀与 IPv6，同时拒绝会与固定请求路径重复的操作端点。
+     */
+    @Test
+    fun `OpenAI base URL validation is semantic and preserves gateway prefixes`() {
+        listOf(
+            "",
+            "https://api.example.com/v1",
+            "https://api.example.com/gateway/v1/",
+            "http://[2001:db8::1]:8080/tenant/v1",
+        ).forEach(::validateOpenAiBaseUrl)
+
+        assertEquals(
+            "https://api.example.com/gateway/v1",
+            openAiBaseUrlForRequests("https://api.example.com/gateway/v1/")
+        )
+        assertEquals("https://api.openai.com/v1", openAiBaseUrlForRequests(""))
+
+        listOf(
+            " https://api.example.com/v1",
+            "ftp://api.example.com/v1",
+            "https://user@api.example.com/v1",
+            "https://api.example.com/v1?tenant=test",
+            "https://api.example.com/v1#fragment",
+            "https://api.example.com:0/v1",
+            "https://api.example.com/v1/models",
+            "https://api.example.com/v1/models/",
+            "https://api.example.com/v1/%6dodels",
+            "https://api.example.com/v1/chat/%63ompletions/",
+            "https://api.example.com/v1/audio/%74ranscriptions",
+            "https://api.example.com/v1/%2e%2e/models",
+            "https://api.example.com/v1/chat%2fcompletions",
+        ).forEach { invalid ->
+            assertFailsWith<IllegalArgumentException> { validateOpenAiBaseUrl(invalid) }
+        }
+
+        val deeplyEncodedSlash = generateSequence("%2f") { previous -> "%25${previous.drop(1)}" }
+            .drop(12)
+            .first()
+        val nestedEndpoint = "https://api.example.com/v1${deeplyEncodedSlash}models"
+        assertFailsWith<IllegalArgumentException> { validateOpenAiBaseUrl(nestedEndpoint) }
+        assertFailsWith<IllegalArgumentException> { openAiBaseUrlForRequests(nestedEndpoint) }
+    }
+
     /** 验证认证凭据必须成对提供，且仅允许 HTTP 代理使用。 */
     @Test
     fun `proxy validation accepts paired HTTP credentials only`() {

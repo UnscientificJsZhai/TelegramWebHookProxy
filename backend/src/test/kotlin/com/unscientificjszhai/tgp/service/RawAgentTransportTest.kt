@@ -10,6 +10,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.CancellableOkHttpTransport
 import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionTooLargeException
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_INLINE_MEDIA_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AUDIO_TRANSCRIPTION_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
@@ -24,6 +25,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import okhttp3.OkHttpClient
@@ -106,6 +110,93 @@ class RawAgentTransportTest {
             assertTrue(toolPayload.contains("\"functionResponse\""))
             assertTrue(toolPayload.contains("\"id\":\"call-1\""))
         }
+        service.close().join()
+    }
+
+    /** 验证 REST 历史达到 64 条短内容后会整体滑动最早完整回合并继续完成。 */
+    @Test
+    fun `Gemini raw history slides after 64 short entries`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val service =
+            GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+        repeat(34) {
+            server.enqueue(MockResponse.Builder().body(geminiTextResponse("完成")).build())
+        }
+
+        val requests = buildList {
+            repeat(34) { index ->
+                assertEquals("完成", service.sendMessage("短消息$index"))
+                add(assertNotNull(server.takeRequest()))
+            }
+        }
+
+        assertEquals(63, geminiContents(requests[32].body!!.utf8()).size)
+        assertEquals(63, geminiContents(requests[33].body!!.utf8()).size)
+        service.close().join()
+    }
+
+    /** 验证 REST 裁剪带函数调用的旧回合时，不会把 functionResponse 当作下一个回合的开头。 */
+    @Test
+    fun `Gemini raw trimming removes function calls and responses together`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val service =
+            GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(
+            MockResponse.Builder().body(
+                """{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"old-call","name":"missing","args":{}}}]}}]}""",
+            ).build(),
+        )
+        repeat(32) {
+            server.enqueue(MockResponse.Builder().body(geminiTextResponse("完成")).build())
+        }
+
+        assertEquals("完成", service.sendMessage("工具回合"))
+        repeat(30) { index -> assertEquals("完成", service.sendMessage("普通回合$index")) }
+        assertEquals("完成", service.sendMessage("触发裁剪"))
+
+        val requests = buildList {
+            repeat(33) { add(assertNotNull(server.takeRequest())) }
+        }
+        val trimmedPayload = requests.last().body!!.utf8()
+        assertFalse(trimmedPayload.contains("functionCall"))
+        assertFalse(trimmedPayload.contains("functionResponse"))
+        service.close().join()
+    }
+
+    /** 验证 REST 字节预留超限时只删除最早完整回合，而不清空全部历史。 */
+    @Test
+    fun `Gemini raw byte reservation removes only the oldest complete turn`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val service =
+            GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+        repeat(3) {
+            server.enqueue(MockResponse.Builder().body(geminiTextResponse("完成")).build())
+        }
+        val firstImage = MediaData(ByteArray(MAX_AGENT_INLINE_MEDIA_BYTES) { 1 }, "image/png")
+        val secondImage = MediaData(ByteArray(MAX_AGENT_INLINE_MEDIA_BYTES) { 2 }, "image/png")
+
+        assertEquals("完成", service.sendMessage(null, listOf(firstImage)))
+        assertNotNull(server.takeRequest())
+        assertEquals("完成", service.sendMessage(null, listOf(secondImage)))
+        assertNotNull(server.takeRequest())
+        assertEquals("完成", service.sendMessage("小消息"))
+        val trimmedRequest = assertNotNull(server.takeRequest())
+
+        val contents = geminiContents(trimmedRequest.body!!.utf8())
+        assertEquals(3, contents.size)
+        assertTrue(contents.first().toString().contains("AgICAg"))
         service.close().join()
     }
 
@@ -374,6 +465,14 @@ class RawAgentTransportTest {
         setPrivateField(service, "rawBaseUrl", server.url("/gateway/v1").toString().trimEnd('/'))
         setPrivateField(service, "rawApiKey", "openai-key")
     }
+
+    private fun geminiTextResponse(text: String): String =
+        """{"candidates":[{"content":{"role":"model","parts":[{"text":"$text"}]}}]}"""
+
+    private fun geminiContents(payload: String) = Json.parseToJsonElement(payload)
+        .jsonObject["contents"]
+        ?.jsonArray
+        ?: error("Gemini 请求未包含 contents。")
 
     private fun setPrivateField(target: Any, fieldName: String, value: Any?) {
         target.javaClass.getDeclaredField(fieldName).apply { isAccessible = true }.set(target, value)

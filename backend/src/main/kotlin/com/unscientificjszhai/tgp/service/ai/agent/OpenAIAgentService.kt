@@ -106,7 +106,6 @@ class OpenAIAgentService @Inject constructor(
     private var rawBaseUrl: String? = null
     private var rawApiKey: String? = null
     private val history = mutableListOf<ChatCompletionMessageParam>()
-    private var systemMessageCount = 0
 
     /** 串行化完整对话与会话重置，避免历史记录交错。 */
     private val sessionMutex = Mutex()
@@ -174,17 +173,13 @@ class OpenAIAgentService @Inject constructor(
                 configuredBaseUrl = aiSettings.openAiBaseUrl
                 configuredProxy = proxySettings
                 rawApiKey = aiSettings.openAiApiKey
-                rawBaseUrl = aiSettings.openAiBaseUrl.trim().trimEnd('/').ifBlank { "https://api.openai.com/v1" }
+                rawBaseUrl = openAiBaseUrlForRequests(aiSettings.openAiBaseUrl)
                 rawTransport = CancellableOkHttpTransport(createOpenAIHttpClient(proxySettings))
 
-                initialMcpConnectionJob = resetSession()
-                    ?: failedInitializationJob()
-                initialModelUpdateJob = scope.launch {
-                    initialMcpConnectionJob?.join()
-                    if (initialMcpConnectionJob?.isCancelled == false) {
-                        updateModel()
-                    }
-                }
+                val initialResetJob = resetSession() ?: failedInitializationJob()
+                initialModelUpdateJob = createInitialModelUpdateJob(initialResetJob)
+                initialMcpConnectionJob =
+                    createInitialReadinessJob(initialResetJob, checkNotNull(initialModelUpdateJob))
                 logger.info("OpenAI client initialized.")
             } catch (e: Exception) {
                 logger.error("Failed to initialize OpenAI client", e)
@@ -211,15 +206,48 @@ class OpenAIAgentService @Inject constructor(
     }
 
     /**
-     * 获取创建时首轮 MCP 连接的完成任务。
+     * 获取创建时首轮 OpenAI 会话、MCP 连接与模型发现的组合就绪任务。
      *
-     * 有效 OpenAI 配置会在构造时启动该任务；任务正常完成表示初始 MCP 连接和工具快照已完成，取消
-     * 表示初始化任务本身未就绪。[MCPClientService] 会将单个服务器连接错误降级处理，因此此类错误不会
-     * 单独使任务取消。未启用 OpenAI 时返回 `null`。
+     * 有效 OpenAI 配置会在构造时启动该任务；任务正常完成表示初始会话、MCP 工具快照与模型发现均已
+     * 完成，且模型快照非空、模型列表非空并包含当前模型。任一阶段失败或取消都会取消该任务。
+     * [MCPClientService] 会将单个服务器连接错误降级处理，因此此类错误不会单独使任务取消。未启用
+     * OpenAI 时返回 `null`。
      *
-     * @return 初始 MCP 连接任务；没有需要连接的初始 OpenAI 实例时返回 `null`。
+     * @return 初始组合就绪任务；没有需要连接的初始 OpenAI 实例时返回 `null`。
      */
     override fun initializationJob(): Job? = initialMcpConnectionJob
+
+    /** 创建顺序执行模型发现的任务；首轮会话或模型快照无效时以取消状态结束。 */
+    private fun createInitialModelUpdateJob(initialResetJob: Job): Job = scope.launch(
+        CoroutineExceptionHandler { _, error -> logger.error("OpenAI model discovery did not become ready", error) },
+    ) {
+        initialResetJob.join()
+        if (initialResetJob.isCancelled) {
+            throw CancellationException("OpenAI initial session reset did not complete")
+        }
+        val snapshot = updateModel()
+            ?: throw IllegalStateException("OpenAI initial model discovery failed")
+        check(snapshot.availableModels.isNotEmpty()) { "OpenAI initial model list is empty" }
+        check(snapshot.currentModel in snapshot.availableModels) {
+            "OpenAI initial current model is not present in the discovered model list"
+        }
+    }
+
+    /** 组合首轮会话和模型发现，使候选仅在两个阶段均成功后才可发布。 */
+    private fun createInitialReadinessJob(initialResetJob: Job, initialModelJob: Job): Job = scope.launch(
+        CoroutineExceptionHandler { _, error ->
+            logger.error(
+                "OpenAI agent initialization did not become ready",
+                error
+            )
+        },
+    ) {
+        initialResetJob.join()
+        initialModelJob.join()
+        if (initialResetJob.isCancelled || initialModelJob.isCancelled) {
+            throw CancellationException("OpenAI agent initialization failed")
+        }
+    }
 
     /**
      * 切换当前会话使用的 OpenAI 模型。
@@ -303,6 +331,9 @@ class OpenAIAgentService @Inject constructor(
                 Triple(snapshot, if (fallbackModelChanged) resetSessionLocked() else null, invalidModel)
             } ?: return@withLock null
             awaitMcpConnectionJob(refreshResult.second)
+            if (refreshResult.second?.isCancelled == true) {
+                return@withLock null
+            }
             refreshResult.third?.let(::clearPersistedSelectedModel)
             refreshResult.first
         } catch (e: CancellationException) {
@@ -369,7 +400,6 @@ class OpenAIAgentService @Inject constructor(
             return null
         }
         history.clear()
-        systemMessageCount = 0
         val aiSettings = settingsRepository.settingsFlow.value.ai
         val mcpConnectionJob = aiSettings?.let { startMcpConnection(it.mcpServers) }
             ?: run {
@@ -485,8 +515,6 @@ class OpenAIAgentService @Inject constructor(
                     ChatCompletionContentPartText.builder().text(messageText).build()
                 )
             )
-            systemMessageCount = 1
-            ensureOpenAiHistoryBudget(history)
         }
 
         var inlineMediaBytes = 0
@@ -537,15 +565,14 @@ class OpenAIAgentService @Inject constructor(
         }
 
         try {
-            val tentativeHistory = prepareOpenAiCandidate()
-            tentativeHistory.add(
-                ChatCompletionMessageParam.ofUser(
-                    ChatCompletionUserMessageParam.builder()
-                        .contentOfArrayOfContentParts(contentParts)
-                        .build()
-                )
+            val userMessage = ChatCompletionMessageParam.ofUser(
+                ChatCompletionUserMessageParam.builder()
+                    .contentOfArrayOfContentParts(contentParts)
+                    .build()
             )
-            ensureOpenAiHistoryBudget(tentativeHistory)
+            val tentativeHistory = prepareOpenAiCandidate()
+            tentativeHistory.add(userMessage)
+            normalizeOpenAiCandidate(tentativeHistory, currentOpenAiTurnStart(tentativeHistory))
             val reply = performChatLocked(currentClient, tentativeHistory)
             history.clear()
             history.addAll(tentativeHistory)
@@ -628,20 +655,50 @@ class OpenAIAgentService @Inject constructor(
         return current + size
     }
 
-    /** 在候选副本上保留系统消息，并为完整新回合腾出确定的空间。 */
+    /** 在候选副本上保留连续系统前缀，并为新的完整回合预留空间。 */
     private fun prepareOpenAiCandidate(): MutableList<ChatCompletionMessageParam> {
         val candidate = history.toMutableList()
-        if (openAiHistoryBytes(candidate) > MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES) {
-            candidate.subList(systemMessageCount.coerceAtMost(candidate.size), candidate.size).clear()
-        }
+        normalizeOpenAiCandidate(
+            candidate,
+            currentTurnStart = null,
+            maxEntries = MAX_AGENT_HISTORY_ENTRIES - 1,
+            maxBytes = MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES,
+        )
         return candidate
     }
 
-    private fun ensureOpenAiHistoryBudget(candidate: List<ChatCompletionMessageParam>) {
-        if (candidate.size > MAX_AGENT_HISTORY_ENTRIES || openAiHistoryBytes(candidate) > MAX_AGENT_HISTORY_BYTES) {
-            throw AgentTurnFailedException("AI 会话历史超过资源上限。")
+    /** 将超出预算的最早完整回合整体删除，绝不留下工具调用或工具结果的孤立片段。 */
+    private fun normalizeOpenAiCandidate(
+        candidate: MutableList<ChatCompletionMessageParam>,
+        currentTurnStart: Int?,
+        maxEntries: Int = MAX_AGENT_HISTORY_ENTRIES,
+        maxBytes: Int = MAX_AGENT_HISTORY_BYTES,
+    ) {
+        while (candidate.size > maxEntries || openAiHistoryBytes(candidate) > maxBytes) {
+            val protectedTurnStart = currentTurnStart?.let { currentOpenAiTurnStart(candidate) }
+            val firstHistoricalTurn = candidate.indexOfFirst(ChatCompletionMessageParam::isUser)
+            if (firstHistoricalTurn < 0 ||
+                (protectedTurnStart != null && firstHistoricalTurn >= protectedTurnStart)
+            ) {
+                throw AgentTurnFailedException("AI 会话历史超过资源上限。")
+            }
+            val turnEnd = candidate.subList(firstHistoricalTurn + 1, candidate.size)
+                .indexOfFirst(ChatCompletionMessageParam::isUser)
+                .takeIf { it >= 0 }
+                ?.plus(firstHistoricalTurn + 1)
+                ?: protectedTurnStart
+                ?: candidate.size
+            if (turnEnd <= firstHistoricalTurn) {
+                throw AgentTurnFailedException("AI 会话历史无法按完整回合裁剪。")
+            }
+            candidate.subList(firstHistoricalTurn, turnEnd).clear()
         }
     }
+
+    /** 当前回合唯一以普通 user 消息开始；工具结果不是 user 消息。 */
+    private fun currentOpenAiTurnStart(candidate: List<ChatCompletionMessageParam>): Int =
+        candidate.indexOfLast(ChatCompletionMessageParam::isUser).takeIf { it >= 0 }
+            ?: throw AgentTurnFailedException("AI 会话历史缺少当前用户消息。")
 
     private fun openAiHistoryBytes(candidate: List<ChatCompletionMessageParam>): Int =
         runCatching { jsonMapper().writeValueAsBytes(candidate).size }
@@ -709,7 +766,7 @@ class OpenAIAgentService @Inject constructor(
                     throw AgentTurnFailedException("OpenAI 最终响应不应包含工具调用。")
                 }
                 tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
-                ensureOpenAiHistoryBudget(tentativeHistory)
+                normalizeOpenAiCandidate(tentativeHistory, currentOpenAiTurnStart(tentativeHistory))
                 message.content().getOrNull() ?: ""
             }
 
@@ -718,12 +775,12 @@ class OpenAIAgentService @Inject constructor(
                 val validatedToolCalls = validateToolCalls(toolCalls)
                 ensureToolCallCountIsAllowed(validatedToolCalls.size, toolCallsExecuted)
                 tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
-                ensureOpenAiHistoryBudget(tentativeHistory)
+                normalizeOpenAiCandidate(tentativeHistory, currentOpenAiTurnStart(tentativeHistory))
                 for ((toolCall, toolCallId) in validatedToolCalls) {
                     val result = executeToolCall(toolCall, functionRouteSnapshot)
                     currentCoroutineContext().ensureActive()
                     tentativeHistory.add(createToolMessage(toolCallId, result))
-                    ensureOpenAiHistoryBudget(tentativeHistory)
+                    normalizeOpenAiCandidate(tentativeHistory, currentOpenAiTurnStart(tentativeHistory))
                 }
                 performChatLocked(
                     client,
@@ -1043,7 +1100,6 @@ class OpenAIAgentService @Inject constructor(
                 client = null
                 rawTransport = null
                 history.clear()
-                systemMessageCount = 0
                 cancelCurrentMcpConnection()
                 currentClient
             }

@@ -33,7 +33,7 @@ internal class ToolCallLimitExceededException : IllegalStateException(
 )
 
 /**
- * 表示 OpenAI 代理的一次回合未能完成，因而其会话历史未被提交。
+ * 表示代理的一次回合未能完成，因而其会话历史未被提交。
  *
  * 调用方可以在之后重试相同任务；已由本次回合触发的外部工具副作用无法撤销，因此重试具有至少一次
  * 语义。
@@ -118,7 +118,7 @@ abstract class AgentService {
      * 切换当前会话使用的模型。
      *
      * 模型切换会重置会话；返回任务的正常完成、取消和失败语义完全由具体提供商定义。调用方必须阅读
-     * 当前实现类的文档后再决定是否等待 [Job.join] 或检查 [Job.isCancelled]；例如 Gemini 实现以任务
+     * 当前实现类的文档后再决定是否等待 [Job.join] 或检查 [Job.isCancelled]；具体实现可通过任务
      * 状态报告候选会话是否已原子提交。
      *
      * @param modelName 要切换到的模型名称，必须存在于 [availableModels]。
@@ -138,7 +138,7 @@ abstract class AgentService {
      * 异步重置当前会话，清空历史记录并重新应用系统提示词。
      *
      * 返回任务的正常完成、取消和失败语义完全由具体提供商定义。调用方必须阅读当前实现类的文档后再
-     * 决定是否等待 [Job.join] 或检查 [Job.isCancelled]；Gemini 实现要求将 `null` 或已取消任务视为
+     * 决定是否等待 [Job.join] 或检查 [Job.isCancelled]；具体实现可要求将 `null` 或已取消任务视为
      * 失败，并保证候选会话仅在任务正常完成时原子提交。
      *
      * @return 已开始重置时返回其异步任务；服务不可用或无需重置时返回 `null`。
@@ -160,14 +160,14 @@ abstract class AgentService {
      * 发送文本消息并获取回复。
      *
      * 正常返回表示当前实现定义的代理回合已完成；模型返回以 `Error:` 开头的文本仍是正常的模型回复，
-     * 而非失败信号。OpenAI 实现会将未完成且未提交历史的回合报告为 [AgentTurnFailedException]；其他
-     * 提供商可保留其原有异常语义。取消会原样向上传播。
+     * 而非失败信号。实现会将未完成且未提交历史的回合报告为 [AgentTurnFailedException]；取消会原样向上传播。
+     * 成功提交时，为给后续回合预留资源，实现可能压缩最早的完整历史回合。
      *
      * @param text 要发送的文本消息；允许为空字符串，具体处理方式由实现决定。
      * @return AI 的回复文本；未生成可返回内容时返回空字符串。
-     * @throws AgentTurnFailedException 当 OpenAI 实现无法完成本次回合且未提交其会话历史时抛出。
+     * @throws AgentTurnFailedException 当实现无法完成本次回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务已关闭或当前会话不可用，且具体实现选择以异常报告时抛出。
-     * @throws Exception 当非 OpenAI 提供商以其原有语义报告失败时抛出。
+     * @throws Exception 当具体实现以其自身语义报告失败时抛出。
      * @throws kotlinx.coroutines.CancellationException 当调用协程或底层 I/O 被取消时原样抛出。
      */
     open suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
@@ -176,8 +176,8 @@ abstract class AgentService {
      * 发送包含媒体数据的消息并获取回复。
      *
      * 正常返回表示当前实现定义的代理回合已完成；模型返回以 `Error:` 开头的文本仍是正常的模型回复，
-     * 而非失败信号。OpenAI 实现会将未完成且未提交历史的回合报告为 [AgentTurnFailedException]；其他
-     * 提供商可保留其原有异常语义。取消会原样向上传播。
+     * 而非失败信号。实现会将未完成且未提交历史的回合报告为 [AgentTurnFailedException]；取消会原样向上传播。
+     * 成功提交时，为给后续回合预留资源，实现可能压缩最早的完整历史回合。
      *
      * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
      * @param mediaData 要发送的媒体数据列表；可为空，元素的 MIME 类型必须与具体实现支持的格式匹配。
@@ -185,9 +185,9 @@ abstract class AgentService {
      * @throws AudioTranscriptionTooLargeException 当 OpenAI 实现收到超过 [MAX_AUDIO_TRANSCRIPTION_BYTES] 的 OGG
      * 语音时，在上传前抛出。
      * @throws AudioTranscriptionFailedException 当 OpenAI OGG 语音转写失败或返回空文本时抛出。
-     * @throws AgentTurnFailedException 当 OpenAI 实现无法完成本次回合且未提交其会话历史时抛出。
+     * @throws AgentTurnFailedException 当实现无法完成本次回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务已关闭或当前会话不可用，且具体实现选择以异常报告时抛出。
-     * @throws Exception 当非 OpenAI 提供商以其原有语义报告失败时抛出。
+     * @throws Exception 当具体实现以其自身语义报告失败时抛出。
      * @throws kotlinx.coroutines.CancellationException 当调用协程或底层 I/O 被取消时原样抛出。
      */
     abstract suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String

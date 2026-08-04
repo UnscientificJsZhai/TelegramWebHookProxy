@@ -88,7 +88,39 @@ class MCPClientService internal constructor(
     private data class ConnectionState(
         val clients: Map<String, Client> = emptyMap(),
         val serverTools: Map<String, List<Tool>> = emptyMap(),
-        val configs: Map<String, MCPServerConfig> = emptyMap(),
+        val configSnapshot: ConnectionConfigSnapshot = ConnectionConfigSnapshot(),
+    )
+
+    /**
+     * 用于比较连接配置的私有规范化快照。
+     *
+     * 服务器顺序以及每个请求头的原始名称和值均属于连接身份；请求头已按名称和值排序，因而输入映射的
+     * 迭代顺序不会导致不必要的重连。
+     */
+    private data class ConnectionConfigSnapshot(
+        val servers: List<ServerConfigSnapshot> = emptyList(),
+    ) {
+        fun withoutServer(name: String): ConnectionConfigSnapshot =
+            copy(servers = servers.filterNot { it.name == name })
+    }
+
+    /** 单个服务器的私有规范化连接身份。 */
+    private data class ServerConfigSnapshot(
+        val name: String,
+        val url: String,
+        val headers: List<HeaderSnapshot>,
+    )
+
+    /** 单个请求头的私有规范化连接身份。 */
+    private data class HeaderSnapshot(
+        val name: String,
+        val value: String,
+    )
+
+    /** 已防御复制、校验并规范化的连接请求。 */
+    private data class PreparedConnection(
+        val configs: List<MCPServerConfig>,
+        val snapshot: ConnectionConfigSnapshot,
     )
 
     /**
@@ -120,23 +152,39 @@ class MCPClientService internal constructor(
     /**
      * 将已连接的服务器同步为指定配置，并发现各服务器提供的工具。
      *
-     * 此方法先构造并验证完整候选连接快照；任何连接或发现失败都会关闭候选并保留当前快照。仅当所有
-     * 服务器成功就绪后才一次发布新快照，随后关闭旧客户端，避免工具声明与调用绑定跨快照混用。
+     * 此方法先防御复制并验证完整配置。若当前完整连接的规范化快照与请求相同，会直接复用，既不发起
+     * 网络 I/O 也不关闭客户端。其他配置变更会先原子清空工具快照并关闭旧客户端，再建立完整候选；
+     * 候选连接或发现失败时会关闭已创建的候选并保持空快照，确保旧凭据和旧地址绝不会继续被调用。
      *
-     * @param configs 目标 MCP 服务器配置列表；列表为空时断开所有当前服务器。方法会在连接互斥锁内先复制并
-     * 校验列表及请求头，服务器名称应在复制后的列表内唯一且符合 [validateMcpServerConfigs] 的连接边界。
+     * @param configs 目标 MCP 服务器配置列表；列表为空时断开所有当前服务器。方法会先复制并校验列表及
+     * 请求头，服务器名称应在复制后的列表内唯一且符合 [validateMcpServerConfigs] 的连接边界。
      * @throws IllegalStateException 当服务已经 [close] 时抛出。
      * @throws IllegalArgumentException [configs] 包含不合法 MCP 配置时抛出；不会断开已有连接或发布部分状态。
      */
     suspend fun connect(configs: List<MCPServerConfig>) {
         ensureOpen()
+        val requested = prepareConnection(configs)
         connectionMutex.withLock {
             ensureOpen()
-            val requestedConfigs = configs.map { config -> config.copy(headers = config.headers.toMap()) }
-            validateMcpServerConfigs(requestedConfigs)
+            if (isCompleteReuse(requested.snapshot)) {
+                return
+            }
+
+            val previousClients = synchronized(stateLock) {
+                if (closed) {
+                    null
+                } else {
+                    connectionState.also { connectionState = ConnectionState() }.clients
+                }
+            }
+            if (previousClients == null) {
+                throw IllegalStateException("MCP client service is closed.")
+            }
+            closeClients(previousClients)
+
             val candidates = linkedMapOf<String, Pair<Client, List<Tool>>>()
             try {
-                for (config in requestedConfigs) {
+                for (config in requested.configs) {
                     val candidate = connectCandidate(config)
                     try {
                         validateDiscoveredTools(
@@ -149,29 +197,83 @@ class MCPClientService internal constructor(
                         throw e
                     }
                 }
+                currentCoroutineContext().ensureActive()
             } catch (e: CancellationException) {
-                candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+                closeCandidates(candidates)
                 throw e
-            } catch (e: Exception) {
-                candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
-                logger.warn("Failed to prepare MCP connection candidate; keeping previous snapshot.")
+            } catch (_: Exception) {
+                closeCandidates(candidates)
+                logger.warn("Failed to prepare MCP connection candidate; leaving the connection snapshot empty.")
                 return
             }
             val candidateState = ConnectionState(
                 clients = candidates.mapValues { it.value.first },
                 serverTools = candidates.mapValues { it.value.second },
-                configs = requestedConfigs.associateBy { it.name },
+                configSnapshot = requested.snapshot,
             )
-            val previous = synchronized(stateLock) {
-                if (closed) null else connectionState.also { connectionState = candidateState }
+            val published = synchronized(stateLock) {
+                if (closed) {
+                    false
+                } else {
+                    connectionState = candidateState
+                    true
+                }
             }
-            if (previous == null) {
-                candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+            if (!published) {
+                closeCandidates(candidates)
                 throw IllegalStateException("MCP client service is closed.")
             }
-            previous.clients.forEach { (name, client) -> closeClient(name, client) }
         }
     }
+
+    private fun prepareConnection(configs: List<MCPServerConfig>): PreparedConnection {
+        val copiedConfigs = configs.map { config -> config.copy(headers = config.headers.toMap()) }
+        validateMcpServerConfigs(copiedConfigs)
+        val serverSnapshots = copiedConfigs.map { config ->
+            ServerConfigSnapshot(
+                name = config.name,
+                url = config.url,
+                headers = config.headers.entries
+                    .sortedWith(compareBy({ it.key }, { it.value }))
+                    .map { HeaderSnapshot(it.key, it.value) },
+            )
+        }
+        val normalizedConfigs = serverSnapshots.map { server ->
+            MCPServerConfig(
+                name = server.name,
+                url = server.url,
+                headers = server.headers.associate { it.name to it.value },
+            )
+        }
+        return PreparedConnection(
+            configs = normalizedConfigs,
+            snapshot = ConnectionConfigSnapshot(serverSnapshots),
+        )
+    }
+
+    private fun isCompleteReuse(requestedSnapshot: ConnectionConfigSnapshot): Boolean = synchronized(stateLock) {
+        if (closed) {
+            false
+        } else {
+            val state = connectionState
+            state.configSnapshot == requestedSnapshot &&
+                    state.clients.size == requestedSnapshot.servers.size &&
+                    state.serverTools.size == requestedSnapshot.servers.size &&
+                    requestedSnapshot.servers.all { server ->
+                        server.name in state.clients && server.name in state.serverTools
+                    }
+        }
+    }
+
+    private suspend fun closeCandidates(candidates: Map<String, Pair<Client, List<Tool>>>) =
+        withContext(NonCancellable) {
+            candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+        }
+
+    private suspend fun closeClients(clients: Map<String, Client>) =
+        withContext(NonCancellable) {
+            clients.forEach { (name, client) -> closeClient(name, client) }
+        }
 
     private suspend fun connectCandidate(config: MCPServerConfig): Pair<Client, List<Tool>> {
         val client = clientFactory()
@@ -236,7 +338,7 @@ class MCPClientService internal constructor(
             connectionState = state.copy(
                 clients = state.clients - name,
                 serverTools = state.serverTools - name,
-                configs = state.configs - name,
+                configSnapshot = state.configSnapshot.withoutServer(name),
             )
             currentClient
         }
@@ -256,7 +358,7 @@ class MCPClientService internal constructor(
     /**
      * 获取当前所有已连接服务器发现到的工具。
      *
-     * @return 服务器名称与工具组成的列表；未连接任何服务器或未发现工具时返回空列表。列表
+     * @return 服务器名称与工具组成的列表；未连接任何服务器、候选连接失败或未发现工具时返回空列表。列表
      * 顺序来自当前连接快照，不应视为稳定排序。
      */
     fun getAllTools(): List<Pair<String, Tool>> =
@@ -267,14 +369,15 @@ class MCPClientService internal constructor(
     /**
      * 调用指定 MCP 服务器上的工具。
      *
-     * 调用会与连接变更串行执行，避免在工具调用期间关闭目标客户端。服务终态关闭后，即使此前
-     * 调用已清空工具快照也不会再启动新的调用。
+     * 调用会与连接变更串行执行，避免在工具调用期间关闭目标客户端。配置变更会先清空快照，因此候选
+     * 失败、取消或服务终态关闭后，旧服务器均不会再启动新的调用。
      *
      * @param serverName 已连接 MCP 服务器的名称。
      * @param toolName 目标服务器已提供的工具名称。
      * @param args 传递给工具的参数映射；值可为 `null`，其键和值应符合工具的输入架构。
      * @return MCP 服务器返回的工具调用结果。
-     * @throws IllegalStateException 当服务已 [close]，或 [serverName] 对应的服务器尚未连接时抛出。
+     * @throws IllegalStateException 当服务已 [close]、候选连接未完成或失败，或 [serverName] 对应的服务器
+     * 尚未连接时抛出。
      */
     suspend fun callTool(
         serverName: String,

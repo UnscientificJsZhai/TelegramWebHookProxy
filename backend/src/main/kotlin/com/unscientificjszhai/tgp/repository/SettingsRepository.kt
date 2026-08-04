@@ -6,6 +6,7 @@ import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
+import com.unscientificjszhai.tgp.models.validateOpenAiBaseUrl
 import com.unscientificjszhai.tgp.models.validateProxySettings
 import com.unscientificjszhai.tgp.models.validateAppSettingsResourceLimits
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -83,6 +84,10 @@ class SettingsRepository private constructor(
     @Volatile
     internal var hasHistoricalInvalidMcp = loadedSettings.hasInvalidMcp
         private set
+
+    @Volatile
+    internal var hasHistoricalInvalidOpenAiBaseUrl = loadedSettings.hasInvalidOpenAiBaseUrl
+        private set
     private var requiresStorageValidationBeforeWrite = loadedSettings.requiresStorageValidationBeforeWrite
 
     private val _settingsFlow = MutableStateFlow(loadedSettings.settings)
@@ -96,7 +101,7 @@ class SettingsRepository private constructor(
     val settingsFlow: StateFlow<AppSettings> = _settingsFlow.asStateFlow()
 
     /**
-     * 带有单调递增版本号及其覆盖的最高屏障代次的设置。代理生命周期代码使用
+     * 带有单调递增版本号及其覆盖的最高设置屏障代次的设置。代理生命周期代码使用
      * 此流而非 [settingsFlow]，使最终快照能够释放因 StateFlow 合并而丢失的
      * 代次。
      */
@@ -215,6 +220,7 @@ class SettingsRepository private constructor(
         val publish = {
             hasHistoricalInvalidProxy = validated.hasInvalidProxy
             hasHistoricalInvalidMcp = validated.hasInvalidMcp
+            hasHistoricalInvalidOpenAiBaseUrl = validated.hasInvalidOpenAiBaseUrl
             if (tokenChanged) {
                 _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
                     token = recoveredSettings.telegramToken,
@@ -227,7 +233,7 @@ class SettingsRepository private constructor(
                 _settingsUpdateFlow.value = SettingsUpdate(
                     settings = recoveredSettings,
                     version = ++settingsVersion,
-                    switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingGeneration(),
+                    switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingSettingsGeneration(),
                 )
             }
         }
@@ -281,8 +287,8 @@ class SettingsRepository private constructor(
 
         is SettingsCandidate.Migratable -> {
             val loaded = candidate.settings.toLoadedSettings()
-            if (loaded.hasInvalidMcp) {
-                // 不能在代理迁移时顺带覆盖历史非法 MCP 配置；必须由一次显式替换解决。
+            if (loaded.hasInvalidMcp || loaded.hasInvalidOpenAiBaseUrl) {
+                // 不能在代理迁移时顺带覆盖历史非法 MCP 或 OpenAI 基础地址；必须由一次显式替换解决。
                 loaded
             } else {
                 try {
@@ -324,6 +330,9 @@ class SettingsRepository private constructor(
      * [currentSettingsSnapshot] 返回的 64 位小写十六进制 SHA-256。
      * @param replacesHistoricalInvalidMcpServers 此次变换是否明确替换历史非法 MCP 服务器列表；仅当
      * 该列表由请求或调用方显式提供时可传入 `true`，避免无关保存覆盖原始非法配置。
+     * @param replacesHistoricalInvalidOpenAiBaseUrl 此次变换是否明确替换历史非法 OpenAI 基础地址；仅当
+     * 地址字段或完整 AI 设置由请求或调用方显式提供时可传入 `true`，避免无关保存把受保护的原始值
+     * 清空为默认地址。
      * @param transform 接收锁内最新不可变设置并返回候选完整设置的同步变换；不得递归调用本仓储的
      * 同步方法，也不得执行长时间阻塞操作。
      * @return 提交前和提交后的原子快照；无操作时两个快照相等。
@@ -331,6 +340,8 @@ class SettingsRepository private constructor(
      * 不调用 [transform]，也不改变文件、屏障或任何设置流。
      * @throws HistoricalInvalidMcpConfigurationException 历史非法 MCP 列表尚未由本次变换显式替换时抛出；
      * 不会改变屏障、文件或任何设置流。
+     * @throws HistoricalInvalidOpenAiBaseUrlConfigurationException 历史非法 OpenAI 基础地址尚未由本次变换
+     * 显式替换时抛出；不会改变屏障、文件或任何设置流。
      * @throws IllegalArgumentException 代理、HTTP 工具或 MCP 设置不合法，或历史非法代理尚未被显式替换时
      * 抛出；不会改变屏障、文件或任何设置流。
      * @throws Exception 配置文件无法编码或原子提交，设置文件不可读取或可恢复性未验证，设置文件及备份
@@ -341,6 +352,7 @@ class SettingsRepository private constructor(
     fun updateSettings(
         expectedRevision: String? = null,
         replacesHistoricalInvalidMcpServers: Boolean = false,
+        replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
         transform: (AppSettings) -> AppSettings,
     ): SettingsUpdateResult {
         ensureStorageValidatedBeforeWrite()
@@ -357,12 +369,18 @@ class SettingsRepository private constructor(
         if (hasHistoricalInvalidMcp && !replacesHistoricalInvalidMcpServers) {
             throw HistoricalInvalidMcpConfigurationException()
         }
+        if (hasHistoricalInvalidOpenAiBaseUrl && !replacesHistoricalInvalidOpenAiBaseUrl) {
+            throw HistoricalInvalidOpenAiBaseUrlConfigurationException()
+        }
         validateAppSettingsResourceLimits(settings)
         validateProxySettings(settings.proxy)
         settings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
         settings.ai?.mcpServers?.let(::validateMcpServerConfigs)
+        settings.ai?.let { validateOpenAiBaseUrl(it.openAiBaseUrl) }
         val resolvesHistoricalInvalidMcp = hasHistoricalInvalidMcp && replacesHistoricalInvalidMcpServers
-        if (settings == previousSettings && !resolvesHistoricalInvalidMcp) {
+        val resolvesHistoricalInvalidOpenAiBaseUrl =
+            hasHistoricalInvalidOpenAiBaseUrl && replacesHistoricalInvalidOpenAiBaseUrl
+        if (settings == previousSettings && !resolvesHistoricalInvalidMcp && !resolvesHistoricalInvalidOpenAiBaseUrl) {
             return SettingsUpdateResult(previousSnapshot, previousSnapshot)
         }
 
@@ -384,12 +402,14 @@ class SettingsRepository private constructor(
             // 显式以 fail-closed 后的同值列表修复历史磁盘配置时，只更新保护状态；不发布虚假的设置版本或
             // Agent 生命周期切换。
             hasHistoricalInvalidMcp = false
+            hasHistoricalInvalidOpenAiBaseUrl = false
             return SettingsUpdateResult(previousSnapshot, previousSnapshot)
         }
 
         val publish = {
             hasHistoricalInvalidProxy = false
             hasHistoricalInvalidMcp = false
+            hasHistoricalInvalidOpenAiBaseUrl = false
             if (tokenChanged) {
                 _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
                     token = settings.telegramToken,
@@ -402,8 +422,8 @@ class SettingsRepository private constructor(
                 settings = settings,
                 version = ++settingsVersion,
                 // 无关的保存操作可能会在 StateFlow 中抢在模型切换之前反映。
-                // 将最高待处理代次向后传递，使最新快照覆盖此前所有待处理的切换。
-                switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingGeneration(),
+                // 将最高待处理设置代次向后传递，使最新快照覆盖此前所有待处理的设置切换。
+                switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingSettingsGeneration(),
             )
         }
         if (tokenChanged) {
@@ -429,7 +449,10 @@ class SettingsRepository private constructor(
         ReplaceWith("updateSettings { settings }"),
     )
     internal fun saveSettings(settings: AppSettings) {
-        updateSettings(replacesHistoricalInvalidMcpServers = true) { settings }
+        updateSettings(
+            replacesHistoricalInvalidMcpServers = true,
+            replacesHistoricalInvalidOpenAiBaseUrl = true,
+        ) { settings }
     }
 
     /**
@@ -519,6 +542,16 @@ class HistoricalInvalidMcpConfigurationException : IllegalArgumentException(
     "历史 MCP 配置不合法，必须显式替换 MCP 服务器后才能保存设置。",
 )
 
+/**
+ * 尝试保存设置时未显式替换历史非法 OpenAI 基础地址。
+ *
+ * 异常表示原始配置文件仍被保护，调用方必须在同一次完整写入或 PATCH 中明确提供 `ai.openAiBaseUrl`，
+ * 或设置 `ai` 为 `null` 后才能提交；异常不会泄露原始地址。
+ */
+class HistoricalInvalidOpenAiBaseUrlConfigurationException : IllegalArgumentException(
+    "历史 OpenAI 基础地址不合法，必须显式替换该地址后才能保存设置。",
+)
+
 private fun ProxySettings?.isInvalidProxy(): Boolean = runCatching {
     validateProxySettings(this)
 }.isFailure
@@ -537,6 +570,9 @@ private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInva
     val hasInvalidMcp = aiSettings?.mcpServers?.let { configs ->
         runCatching { validateMcpServerConfigs(configs) }.isFailure
     } == true
+    val hasInvalidOpenAiBaseUrl = aiSettings?.let { settings ->
+        runCatching { validateOpenAiBaseUrl(settings.openAiBaseUrl) }.isFailure
+    } == true
     val failClosedSettings = failClosedHttpToolSettings().let { settings ->
         if (hasInvalidMcp && settings.ai != null) {
             settings.copy(ai = settings.ai.copy(mcpServers = emptyList()))
@@ -550,6 +586,7 @@ private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInva
         settings = failClosedSettings,
         hasInvalidProxy = hasInvalidProxy,
         hasInvalidMcp = hasInvalidMcp,
+        hasInvalidOpenAiBaseUrl = hasInvalidOpenAiBaseUrl,
     )
 }
 
@@ -576,6 +613,7 @@ private data class LoadedSettings(
     val settings: AppSettings,
     val hasInvalidProxy: Boolean,
     val hasInvalidMcp: Boolean = false,
+    val hasInvalidOpenAiBaseUrl: Boolean = false,
     val requiresStorageValidationBeforeWrite: Boolean = false,
 )
 
@@ -628,15 +666,15 @@ internal class ActiveTelegramBotUnavailableException : IllegalStateException(
 /**
  * 代理生命周期流观察到的设置快照。
  *
- * [switchGeneration] 是该快照覆盖的最高待处理生命周期屏障代次。因此，完成该
- * 快照时必须释放截至并包含此值的所有待处理代次。
+ * [switchGeneration] 是该快照覆盖的最高待处理设置生命周期屏障代次。因此，完成该
+ * 快照时只能释放截至并包含此值的设置代次；认证清理等外部代次必须由其所有者单独完成。
  */
 internal data class SettingsUpdate(
     /** 当前完整设置快照。 */
     val settings: AppSettings,
     /** 单调递增的设置版本号，从 `0` 开始。 */
     val version: Long,
-    /** 此快照覆盖的最高待处理屏障代次；没有待处理代次时为 `null`。 */
+    /** 此快照覆盖的最高待处理设置屏障代次；没有待处理设置代次时为 `null`。 */
     val switchGeneration: Long?,
 )
 
@@ -649,6 +687,8 @@ private fun AppSettings.requiresAgentLifecycleBarrier(previous: AppSettings): Bo
     val effectiveApiKeyChanged = previous.effectiveApiKey() != effectiveApiKey()
     val openAiBaseUrlChanged = previousAi?.openAiBaseUrl != aiSettings?.openAiBaseUrl
     val agentEnabledChanged = (previousAi?.agentEnabled ?: false) != (aiSettings?.agentEnabled ?: false)
+    val agentChatIdChanged = previousAi?.agentChatId != aiSettings?.agentChatId
+    val globalContextChanged = previousAi?.globalContext != aiSettings?.globalContext
     val httpToolSettingsChanged = previousAi?.httpToolSettings != aiSettings?.httpToolSettings
     val mcpServersChanged = previousAi?.mcpServers != aiSettings?.mcpServers
 
@@ -658,6 +698,8 @@ private fun AppSettings.requiresAgentLifecycleBarrier(previous: AppSettings): Bo
             openAiBaseUrlChanged ||
             previous.proxy != proxy ||
             agentEnabledChanged ||
+            agentChatIdChanged ||
+            globalContextChanged ||
             httpToolSettingsChanged ||
             mcpServersChanged
 }

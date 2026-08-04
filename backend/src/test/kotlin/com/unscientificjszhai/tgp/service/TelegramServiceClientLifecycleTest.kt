@@ -69,6 +69,35 @@ class TelegramServiceClientLifecycleTest {
         }
     }
 
+    /** 验证默认入口和会话 token 入口均固定限制每批 `getUpdates` 为 10 项。 */
+    @Test
+    fun `get updates always includes limit ten`() = runBlocking {
+        val urls = mutableListOf<String>()
+        val settings =
+            SettingsRepository.forTesting(temporaryDirectory.resolve("get-updates-limit.json"), ModelSwitchBarrier())
+        settings.saveSettings(AppSettings(telegramToken = "100:token"))
+        val service = TelegramService(
+            scope,
+            settings,
+            UpdatesRepository(temporaryDirectory.resolve("get-updates-limit-updates.json"))
+        ) {
+            newClient { request ->
+                synchronized(urls) { urls += request.url.toString() }
+                emptyUpdatesResponse()
+            }
+        }
+
+        try {
+            service.getUpdates(offset = 12, timeout = 30)
+            service.getUpdatesForToken("200:captured", offset = 34, timeout = 0)
+
+            assertEquals(2, synchronized(urls) { urls.size })
+            assertTrue(synchronized(urls) { urls.all { "limit=10" in it } })
+        } finally {
+            service.close()
+        }
+    }
+
     /**
      * 验证候选客户端构造失败不会关闭已安装客户端，后续无关设置会重试当前代理。
      */

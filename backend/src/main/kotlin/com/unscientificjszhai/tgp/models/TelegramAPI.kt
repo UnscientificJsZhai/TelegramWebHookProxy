@@ -221,6 +221,7 @@ data class TelegramFile(
  * @property text 文本消息内容；非文本消息或未提供时为 `null`。
  * @property voice 语音消息文件信息；非语音消息时为 `null`。
  * @property caption 媒体消息的说明文字；未提供时为 `null`。
+ * @property from 消息发送者；没有个人发送者时为 `null`。
  */
 @Serializable
 data class Message(
@@ -229,6 +230,7 @@ data class Message(
     val text: String? = null,
     val voice: Voice? = null,
     val caption: String? = null,
+    @SerialName("from") val from: User? = null,
 )
 
 /**

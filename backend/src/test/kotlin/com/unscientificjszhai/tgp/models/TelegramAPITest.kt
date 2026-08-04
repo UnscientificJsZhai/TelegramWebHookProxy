@@ -23,4 +23,17 @@ class TelegramAPITest {
         assertEquals(emptyList(), response.result)
         assertNull(response.parameters)
     }
+
+    @Test
+    fun `message decodes sender and remains compatible when sender is absent`() {
+        val messageWithSender = Json.decodeFromString<Message>(
+            """{"message_id":1,"chat":{"id":123,"type":"private"},"text":"hello","from":{"id":123,"is_bot":false,"first_name":"Test"}}""",
+        )
+        val messageWithoutSender = Json.decodeFromString<Message>(
+            """{"message_id":2,"chat":{"id":123,"type":"private"},"text":"hello"}""",
+        )
+
+        assertEquals(123, messageWithSender.from?.id)
+        assertNull(messageWithoutSender.from)
+    }
 }

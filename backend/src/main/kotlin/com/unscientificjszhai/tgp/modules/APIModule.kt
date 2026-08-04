@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.HistoricalInvalidMcpConfigurationException
+import com.unscientificjszhai.tgp.repository.HistoricalInvalidOpenAiBaseUrlConfigurationException
 import com.unscientificjszhai.tgp.repository.SettingsRevisionMismatchException
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdateResult
@@ -74,6 +75,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                         telegramService,
                         expectedRevision,
                         patch.explicitlyReplacesHistoricalMcpServers(),
+                        patch.explicitlyReplacesHistoricalOpenAiBaseUrl(),
                     ) { current ->
                         current.mergeSettingsPatch(patch)
                     } ?: return@patch
@@ -308,6 +310,7 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
         telegramService,
         expectedRevision,
         replacesHistoricalInvalidMcpServers = true,
+        replacesHistoricalInvalidOpenAiBaseUrl = true,
     ) { settings } ?: return
     respondSettingsUpdate(update)
 }
@@ -320,10 +323,15 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
     telegramService: TelegramService,
     expectedRevision: String,
     replacesHistoricalInvalidMcpServers: Boolean = false,
+    replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
     transform: (AppSettings) -> AppSettings,
 ): SettingsUpdateResult? {
     val update = try {
-        settingsRepository.updateSettings(expectedRevision, replacesHistoricalInvalidMcpServers) { current ->
+        settingsRepository.updateSettings(
+            expectedRevision,
+            replacesHistoricalInvalidMcpServers,
+            replacesHistoricalInvalidOpenAiBaseUrl,
+        ) { current ->
             transform(current).clearSelectedModelWhenProviderOrApiKeyChanges(current)
         }
     } catch (_: SettingsRevisionMismatchException) {
@@ -331,6 +339,9 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
         return null
     } catch (_: HistoricalInvalidMcpConfigurationException) {
         respondSettingsError(HttpStatusCode.Conflict, "历史 MCP 配置需要在本次请求中显式替换。")
+        return null
+    } catch (_: HistoricalInvalidOpenAiBaseUrlConfigurationException) {
+        respondSettingsError(HttpStatusCode.Conflict, "历史 OpenAI 基础地址需要在本次请求中显式替换。")
         return null
     } catch (_: IllegalArgumentException) {
         respondSettingsError(HttpStatusCode.BadRequest, "设置内容不合法。")
@@ -531,5 +542,12 @@ private fun JsonObject.explicitlyReplacesHistoricalMcpServers(): Boolean =
     when (val ai = this["ai"]) {
         is JsonNull -> true
         is JsonObject -> ai.containsKey("mcpServers")
+        else -> false
+    }
+
+private fun JsonObject.explicitlyReplacesHistoricalOpenAiBaseUrl(): Boolean =
+    when (val ai = this["ai"]) {
+        is JsonNull -> true
+        is JsonObject -> ai.containsKey("openAiBaseUrl")
         else -> false
     }

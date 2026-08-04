@@ -10,6 +10,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.ListToolsResult
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.*
+import java.io.IOException
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
@@ -20,10 +21,10 @@ import kotlin.time.Duration.Companion.seconds
 class MCPClientServiceTest {
 
     /**
-     * 验证超出工具数量上限的候选连接会被关闭，且不会破坏既有快照。
+     * 验证超出工具数量上限的候选连接会关闭旧连接和候选连接，并清空工具快照。
      */
     @Test
-    fun `over limit discovery closes its candidate and retains the previous connection`() = runBlocking {
+    fun `over limit discovery closes old and candidate connections then clears the snapshot`() = runBlocking {
         val stableClient = mockk<Client>()
         val rejectedClient = mockk<Client>()
         val clients = ArrayDeque(listOf(stableClient, rejectedClient))
@@ -44,9 +45,13 @@ class MCPClientServiceTest {
         service.connect(listOf(stableConfig))
         service.connect(listOf(rejectedConfig))
 
-        assertEquals(CallToolResult(emptyList()), service.callTool("stable", "tool", emptyMap()))
+        assertEquals(emptyList(), service.getAllTools())
+        assertFailsWith<IllegalStateException> {
+            service.callTool("stable", "tool", emptyMap())
+        }
         coVerify(exactly = 1) { rejectedClient.close() }
-        coVerify(exactly = 0) { stableClient.close() }
+        coVerify(exactly = 1) { stableClient.close() }
+        coVerify(exactly = 0) { stableClient.callTool("tool", emptyMap()) }
 
         service.close().join()
         coVerify(exactly = 1) { stableClient.close() }
@@ -109,6 +114,215 @@ class MCPClientServiceTest {
         val closeJob: Job = service.close()
         withTimeout(5.seconds) { closeJob.join() }
         coVerify(exactly = 1) { secondClient.close() }
+    }
+
+    /**
+     * 验证 URL 变更后的候选连接失败会撤销旧凭据关联的连接和工具快照。
+     */
+    @Test
+    fun `URL rotation failure closes old and candidate clients without retaining old tools`() = runBlocking {
+        val oldClient = mockk<Client>()
+        val rejectedClient = mockk<Client>()
+        val clients = ArrayDeque(listOf(oldClient, rejectedClient))
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+        val oldConfig = MCPServerConfig(name = "server", url = "https://old.example.com/mcp")
+        val newConfig = MCPServerConfig(name = "server", url = "https://new.example.com/mcp")
+
+        coEvery { oldClient.connect(any()) } returns Unit
+        coEvery { oldClient.listTools() } returns ListToolsResult(emptyList())
+        coEvery { oldClient.close() } returns Unit
+        coEvery { rejectedClient.connect(any()) } throws IOException("candidate rejected")
+        coEvery { rejectedClient.close() } returns Unit
+
+        service.connect(listOf(oldConfig))
+        service.connect(listOf(newConfig))
+
+        assertEquals(emptyList(), service.getAllTools())
+        assertFailsWith<IllegalStateException> {
+            service.callTool("server", "tool", emptyMap())
+        }
+        coVerify(exactly = 1) { oldClient.close() }
+        coVerify(exactly = 1) { rejectedClient.close() }
+        coVerify(exactly = 0) { oldClient.callTool("tool", emptyMap()) }
+
+        service.close().join()
+    }
+
+    /**
+     * 验证请求头变更后的候选连接失败不会保留使用旧请求头的客户端。
+     */
+    @Test
+    fun `header rotation failure closes old and candidate clients without retaining old tools`() = runBlocking {
+        val oldClient = mockk<Client>()
+        val rejectedClient = mockk<Client>()
+        val clients = ArrayDeque(listOf(oldClient, rejectedClient))
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+        val oldConfig = MCPServerConfig(
+            name = "server",
+            url = "https://example.com/mcp",
+            headers = mapOf("Authorization" to "Bearer old"),
+        )
+        val newConfig = oldConfig.copy(headers = mapOf("Authorization" to "Bearer new"))
+
+        coEvery { oldClient.connect(any()) } returns Unit
+        coEvery { oldClient.listTools() } returns ListToolsResult(emptyList())
+        coEvery { oldClient.close() } returns Unit
+        coEvery { rejectedClient.connect(any()) } throws IOException("candidate rejected")
+        coEvery { rejectedClient.close() } returns Unit
+
+        service.connect(listOf(oldConfig))
+        service.connect(listOf(newConfig))
+
+        assertEquals(emptyList(), service.getAllTools())
+        assertFailsWith<IllegalStateException> {
+            service.callTool("server", "tool", emptyMap())
+        }
+        coVerify(exactly = 1) { oldClient.close() }
+        coVerify(exactly = 1) { rejectedClient.close() }
+        coVerify(exactly = 0) { oldClient.callTool("tool", emptyMap()) }
+
+        service.close().join()
+    }
+
+    /**
+     * 验证相同的完整配置快照会复用当前连接，且请求头映射的插入顺序不影响比较结果。
+     */
+    @Test
+    fun `equivalent distinct configurations reuse the current complete connection`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        val firstConfig = MCPServerConfig(
+            name = "server",
+            url = "https://example.com/mcp",
+            headers = linkedMapOf("X-First" to "one", "X-Second" to "two"),
+        )
+        val equivalentConfig = MCPServerConfig(
+            name = "server",
+            url = "https://example.com/mcp",
+            headers = linkedMapOf("X-Second" to "two", "X-First" to "one"),
+        )
+
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools() } returns ListToolsResult(emptyList())
+        coEvery { client.close() } returns Unit
+
+        service.connect(listOf(firstConfig))
+        service.connect(listOf(equivalentConfig))
+
+        coVerify(exactly = 1) { client.connect(any()) }
+        coVerify(exactly = 1) { client.listTools() }
+        coVerify(exactly = 0) { client.close() }
+
+        service.close().join()
+        coVerify(exactly = 1) { client.close() }
+    }
+
+    /**
+     * 验证服务器顺序属于完整配置身份，列表调换后不会复用旧连接。
+     */
+    @Test
+    fun `server list reordering closes the previous snapshot instead of reusing it`() = runBlocking {
+        val firstClient = mockk<Client>()
+        val secondClient = mockk<Client>()
+        val rejectedClient = mockk<Client>()
+        val clients = ArrayDeque(listOf(firstClient, secondClient, rejectedClient))
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+        val firstConfig = MCPServerConfig(name = "first", url = "https://first.example.com/mcp")
+        val secondConfig = MCPServerConfig(name = "second", url = "https://second.example.com/mcp")
+
+        listOf(firstClient, secondClient).forEach { client ->
+            coEvery { client.connect(any()) } returns Unit
+            coEvery { client.listTools() } returns ListToolsResult(emptyList())
+            coEvery { client.close() } returns Unit
+        }
+        coEvery { rejectedClient.connect(any()) } throws IOException("candidate rejected")
+        coEvery { rejectedClient.close() } returns Unit
+
+        service.connect(listOf(firstConfig, secondConfig))
+        service.connect(listOf(secondConfig, firstConfig))
+
+        assertEquals(emptyList(), service.getAllTools())
+        coVerify(exactly = 1) { firstClient.close() }
+        coVerify(exactly = 1) { secondClient.close() }
+        coVerify(exactly = 1) { rejectedClient.connect(any()) }
+        coVerify(exactly = 1) { rejectedClient.close() }
+
+        service.close().join()
+    }
+
+    /**
+     * 验证候选连接准备期间取消时会关闭旧客户端和已创建候选，并保持空快照。
+     */
+    @Test
+    fun `cancelling replacement while preparing a candidate closes every client and clears the snapshot`() =
+        runBlocking {
+            val oldClient = mockk<Client>()
+            val cancelledClient = mockk<Client>()
+            val clients = ArrayDeque(listOf(oldClient, cancelledClient))
+            val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+            val oldConfig = MCPServerConfig(name = "server", url = "https://old.example.com/mcp")
+            val newConfig = MCPServerConfig(name = "server", url = "https://new.example.com/mcp")
+            val candidateStarted = CompletableDeferred<Unit>()
+
+            coEvery { oldClient.connect(any()) } returns Unit
+            coEvery { oldClient.listTools() } returns ListToolsResult(emptyList())
+            coEvery { oldClient.close() } returns Unit
+            coEvery { cancelledClient.connect(any()) } coAnswers {
+                candidateStarted.complete(Unit)
+                awaitCancellation()
+            }
+            coEvery { cancelledClient.close() } returns Unit
+
+            service.connect(listOf(oldConfig))
+            val replacement = launch(Dispatchers.Default) { service.connect(listOf(newConfig)) }
+            candidateStarted.await()
+            replacement.cancelAndJoin()
+
+            assertEquals(emptyList(), service.getAllTools())
+            assertFailsWith<IllegalStateException> {
+                service.callTool("server", "tool", emptyMap())
+            }
+            coVerify(exactly = 1) { oldClient.close() }
+            coVerify(exactly = 1) { cancelledClient.close() }
+
+            service.close().join()
+        }
+
+    /**
+     * 验证后续候选失败时，会关闭此前已准备成功的候选并保持空快照。
+     */
+    @Test
+    fun `partial candidate preparation failure closes all candidates and the old connection`() = runBlocking {
+        val oldClient = mockk<Client>()
+        val firstCandidate = mockk<Client>()
+        val rejectedCandidate = mockk<Client>()
+        val clients = ArrayDeque(listOf(oldClient, firstCandidate, rejectedCandidate))
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+        val oldConfig = MCPServerConfig(name = "old", url = "https://old.example.com/mcp")
+        val firstNewConfig = MCPServerConfig(name = "first", url = "https://first.example.com/mcp")
+        val rejectedNewConfig = MCPServerConfig(name = "second", url = "https://second.example.com/mcp")
+
+        coEvery { oldClient.connect(any()) } returns Unit
+        coEvery { oldClient.listTools() } returns ListToolsResult(emptyList())
+        coEvery { oldClient.close() } returns Unit
+        coEvery { firstCandidate.connect(any()) } returns Unit
+        coEvery { firstCandidate.listTools() } returns ListToolsResult(emptyList())
+        coEvery { firstCandidate.close() } returns Unit
+        coEvery { rejectedCandidate.connect(any()) } throws IOException("candidate rejected")
+        coEvery { rejectedCandidate.close() } returns Unit
+
+        service.connect(listOf(oldConfig))
+        service.connect(listOf(firstNewConfig, rejectedNewConfig))
+
+        assertEquals(emptyList(), service.getAllTools())
+        assertFailsWith<IllegalStateException> {
+            service.callTool("old", "tool", emptyMap())
+        }
+        coVerify(exactly = 1) { oldClient.close() }
+        coVerify(exactly = 1) { firstCandidate.close() }
+        coVerify(exactly = 1) { rejectedCandidate.close() }
+
+        service.close().join()
     }
 
     /**

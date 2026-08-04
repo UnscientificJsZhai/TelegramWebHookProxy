@@ -123,7 +123,14 @@ class DelegatingAgentService @Inject constructor(
                     modelSwitchBarrier.awaitInFlightRequests()
                 }
                 val apiKey = aiSettings?.requiredApiKey()
-                if (aiSettings?.agentEnabled == true && !apiKey.isNullOrBlank()) {
+                if (
+                    aiSettings?.provider == AIProvider.OPENAI &&
+                    aiSettings.agentEnabled &&
+                    settingsRepository.hasHistoricalInvalidOpenAiBaseUrl
+                ) {
+                    logger.warn("OpenAI agent remains disabled until the historical invalid base URL is explicitly replaced.")
+                    disableAgent()
+                } else if (aiSettings?.agentEnabled == true && !apiKey.isNullOrBlank()) {
                     val baseUrl = aiSettings.openAiBaseUrl
 
                     val needsRecreate = synchronized(lifecycleLock) {
@@ -148,7 +155,7 @@ class DelegatingAgentService @Inject constructor(
                 logger.error("Failed to apply AI settings; keeping the current agent when available.", e)
             } finally {
                 lastHandledSettings = settings
-                modelSwitchBarrier.completeThrough(settingsUpdate.switchGeneration)
+                modelSwitchBarrier.completeSettingsThrough(settingsUpdate.switchGeneration)
                 completeInitialReadiness()
             }
         }.launchIn(parentScope).also { job ->

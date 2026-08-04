@@ -303,6 +303,9 @@ class TelegramService private constructor(
      * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
      * `getUpdates` 请求；捕获后的在途请求可使用该令牌完成。
      *
+     * 每次请求都会固定附带 `limit=10`，避免 Telegram 受 1 MiB 响应上限截断大型积压批次后在同一
+     * 偏移量反复失败。
+     *
      * @param offset 可选的起始更新标识；为 `null` 时不传递该请求参数。
      * @param timeout 可选的长轮询等待秒数；为 `null` 时不传递该请求参数。
      * @return Telegram 返回的更新结果；`result` 可能为空列表。
@@ -313,7 +316,15 @@ class TelegramService private constructor(
         timeout: Int? = null,
     ): GetUpdatesResponse = getUpdatesForToken(currentTelegramToken(), offset, timeout)
 
-    /** 供轮询会话使用，以会话捕获的 token 拉取更新。 */
+    /**
+     * 供轮询会话使用，以会话捕获的 token 拉取最多 10 项更新。
+     *
+     * @param token 会话开始时捕获的有效 Telegram Bot token。
+     * @param offset 可选的起始更新标识；为 `null` 时不传递该请求参数。
+     * @param timeout 可选的长轮询等待秒数；为 `null` 时不传递该请求参数。
+     * @return Telegram 返回的更新结果；`result` 可能为空列表。
+     * @throws IllegalArgumentException 当 [token] 为空或格式无效时抛出。
+     */
     internal suspend fun getUpdatesForToken(
         token: String,
         offset: Long? = null,
@@ -326,6 +337,7 @@ class TelegramService private constructor(
             val response = client.get(url) {
                 offset?.let { parameter("offset", it) }
                 timeout?.let { parameter("timeout", it) }
+                parameter("limit", 10)
             }
             telegramJson.decodeFromString(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
         }

@@ -31,10 +31,11 @@ data class AppSettings(
  * @property provider 要使用的 AI 服务提供方。
  * @property geminiApiKey Gemini 服务的 API 密钥；空字符串表示未配置。
  * @property openAiApiKey OpenAI 兼容服务的 API 密钥；空字符串表示未配置。
- * @property openAiBaseUrl OpenAI 兼容服务的基础地址；空字符串表示未配置自定义地址。
+ * @property openAiBaseUrl OpenAI 兼容服务的基础地址；空字符串表示使用官方默认地址，非空时必须是
+ * 无查询、无片段且不指向 OpenAI 操作端点的绝对 HTTP(S) URL。
  * @property selectedModel 已选择的模型名称；空字符串表示尚未选择模型。
  * @property agentEnabled 是否启用代理功能。
- * @property agentChatId 允许使用代理功能的 Telegram 聊天标识；空字符串表示未指定。
+ * @property agentChatId 允许使用代理功能的 Telegram 用户私聊标识；空字符串表示未指定。运行时仅当消息来自私聊，且发送者标识与聊天标识均等于此值时授权。
  * @property globalContext 注入每个 AI 会话的全局上下文；允许为空字符串。
  * @property autoCleanContextIntervalMinutes 自动清理会话上下文的间隔，单位为分钟；`0` 表示不自动清理。
  * @property silentContextCleanup 是否在自动清理上下文时保持静默。
@@ -298,11 +299,115 @@ internal fun validateAppSettingsResourceLimits(settings: AppSettings) {
             require(key.utf8ByteSize() <= 512) { "API 密钥不能超过 512 字节。" }
         }
         require(ai.openAiBaseUrl.utf8ByteSize() <= 2 * 1024) { "OpenAI 基础地址不能超过 2 KiB。" }
+        validateOpenAiBaseUrl(ai.openAiBaseUrl)
         require(ai.selectedModel.utf8ByteSize() <= 256) { "模型名称不能超过 256 字节。" }
         require(ai.agentChatId.utf8ByteSize() <= 64) { "代理聊天标识不能超过 64 字节。" }
         require(ai.globalContext.utf8ByteSize() <= 64 * 1024) { "全局上下文不能超过 64 KiB。" }
     }
 }
+
+/**
+ * 校验 OpenAI 兼容服务基础地址的语义边界。
+ *
+ * 空字符串表示调用方使用官方默认地址。非空地址必须是不含空白、用户信息、查询或片段的绝对
+ * `http`/`https` URL，并且不能在解析百分号编码和规范化路径后直接指向模型、聊天补全或音频转写
+ * 操作端点。这样运行时只能在该基础路径下追加固定的 OpenAI 操作路径。
+ *
+ * @param value 要校验的基础地址；可为空字符串，非空值长度不得超过 2 KiB。
+ * @throws IllegalArgumentException 地址不是受支持的绝对 HTTP(S) URL，包含不允许的 URL 组成部分，
+ * 端口不合法，或其规范化路径直接指向 OpenAI 操作端点时抛出。
+ */
+fun validateOpenAiBaseUrl(value: String) {
+    require(value.utf8ByteSize() <= MAX_OPENAI_BASE_URL_BYTES) { "OpenAI 基础地址不能超过 2 KiB。" }
+    if (value.isEmpty()) {
+        return
+    }
+    require(value.none { it.isWhitespace() || it.isISOControl() }) {
+        "OpenAI 基础地址不能包含空白或控制字符。"
+    }
+    val uri = runCatching { URI(value) }
+        .getOrElse { throw IllegalArgumentException("OpenAI 基础地址格式不合法。", it) }
+    require(uri.isAbsolute && uri.scheme in OPENAI_BASE_URL_SCHEMES && !uri.isOpaque) {
+        "OpenAI 基础地址必须是绝对 http 或 https 地址。"
+    }
+    require(!uri.host.isNullOrBlank()) { "OpenAI 基础地址必须包含主机名。" }
+    require(uri.userInfo == null) { "OpenAI 基础地址不能包含用户信息。" }
+    require(uri.rawQuery == null) { "OpenAI 基础地址不能包含查询参数。" }
+    require(uri.rawFragment == null) { "OpenAI 基础地址不能包含片段。" }
+    require(uri.port == -1 || uri.port in 1..65535) { "OpenAI 基础地址端口必须在 1..65535 范围内。" }
+    require(!normalizedOpenAiBasePath(uri.rawPath.orEmpty()).endsWithOpenAiOperationEndpoint()) {
+        "OpenAI 基础地址不能直接指向模型或生成操作端点。"
+    }
+}
+
+/**
+ * 返回经语义校验后可追加固定 OpenAI 操作路径的基础地址。
+ *
+ * 空配置会转换为官方 `v1` 根地址；非空配置仅移除末尾分隔符，不解析或丢弃用户提供的网关前缀。
+ * 调用本函数可确保运行时使用的地址与 [validateOpenAiBaseUrl] 的校验结果一致。
+ *
+ * @param value 持久化的 OpenAI 基础地址；可为空字符串。
+ * @return 非空且不以 `/` 结尾的基础地址。
+ * @throws IllegalArgumentException [value] 不满足 [validateOpenAiBaseUrl] 的约束时抛出。
+ */
+fun openAiBaseUrlForRequests(value: String): String {
+    validateOpenAiBaseUrl(value)
+    return value.ifBlank { DEFAULT_OPENAI_BASE_URL }.trimEnd('/')
+}
+
+private const val MAX_OPENAI_BASE_URL_BYTES = 2 * 1024
+private const val DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+private val OPENAI_BASE_URL_SCHEMES = setOf("http", "https")
+
+private fun normalizedOpenAiBasePath(rawPath: String): List<String> {
+    val decodedPath = decodeOpenAiPathPercentEscapes(rawPath)
+    val normalized = ArrayDeque<String>()
+    decodedPath.split('/').forEach { segment ->
+        when (segment) {
+            "", "." -> Unit
+            ".." -> if (normalized.isNotEmpty()) normalized.removeLast()
+            else -> normalized.addLast(segment)
+        }
+    }
+    return normalized.toList()
+}
+
+private fun decodeOpenAiPathPercentEscapes(rawPath: String): String {
+    var decoded = rawPath
+    // 基础地址整体受 2 KiB 上限约束。每轮至少消耗一个 `%xx`，因此解码至稳定至多执行与输入长度
+    // 同阶的轮数；绝不能留下可被下游 URI/网关继续解释的百分号编码层。
+    while (decoded.contains('%')) {
+        decoded = decodeOpenAiPathPercentEscapesOnce(decoded)
+    }
+    return decoded
+}
+
+private fun decodeOpenAiPathPercentEscapesOnce(value: String): String {
+    val result = StringBuilder(value.length)
+    var index = 0
+    while (index < value.length) {
+        if (value[index] != '%') {
+            result.append(value[index++])
+            continue
+        }
+        val encoded = ArrayList<Byte>()
+        while (index < value.length && value[index] == '%') {
+            require(index + 2 < value.length) { "OpenAI 基础地址路径中的百分号编码不完整。" }
+            val high = value[index + 1].digitToIntOrNull(16)
+            val low = value[index + 2].digitToIntOrNull(16)
+            require(high != null && low != null) { "OpenAI 基础地址路径中的百分号编码不合法。" }
+            encoded += ((high shl 4) + low).toByte()
+            index += 3
+        }
+        result.append(encoded.toByteArray().toString(StandardCharsets.UTF_8))
+    }
+    return result.toString()
+}
+
+private fun List<String>.endsWithOpenAiOperationEndpoint(): Boolean =
+    lastOrNull() == "models" ||
+            takeLast(2) == listOf("chat", "completions") ||
+            takeLast(2) == listOf("audio", "transcriptions")
 
 private fun String.utf8ByteSize(): Int = toByteArray(StandardCharsets.UTF_8).size
 

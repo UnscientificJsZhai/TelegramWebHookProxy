@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.ChatInfo
+import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
@@ -145,6 +146,65 @@ class UpdatesRepositoryTest {
         assertFalse(state.chats.any { it.id == "1" })
     }
 
+    /** 验证 Agent 完成记录、outbox 与偏移量原子写入，并按 bot 和更新标识隔离。 */
+    @Test
+    fun `agent completion atomically keeps ordered isolated outbox`() {
+        val file = tempDirectory.resolve("outbox.json")
+        val repository = UpdatesRepository(file)
+        val later = PendingTelegramReply(12, "chat-a", "later", ReplyParameters(12))
+        val first = PendingTelegramReply(11, "chat-a", "first", ReplyParameters(11))
+
+        repository.completeAgentUpdate("100", 12, later)
+        repository.completeAgentUpdate("100", 11, first)
+        repository.completeAgentUpdate("200", 21, PendingTelegramReply(21, "chat-b", "other"))
+        repository.completeAgentUpdate("100", 13)
+
+        assertEquals(13, repository.getData("100").lastUpdateId)
+        assertEquals(listOf(first, later), repository.getPendingTelegramReplies("100"))
+        assertEquals(listOf(PendingTelegramReply(21, "chat-b", "other")), repository.getPendingTelegramReplies("200"))
+
+        repository.deletePendingTelegramReply("100", 11)
+        assertEquals(listOf(later), UpdatesRepository(file).getPendingTelegramReplies("100"))
+        assertEquals(
+            listOf(PendingTelegramReply(21, "chat-b", "other")),
+            UpdatesRepository(file).getPendingTelegramReplies("200")
+        )
+    }
+
+    /** 验证旧 JSON 默认空 outbox，且不允许投递尚未持久化确认的异常遗留记录。 */
+    @Test
+    fun `outbox defaults for old schema and only exposes confirmed updates`() {
+        val oldFile = tempDirectory.resolve("old-outbox.json")
+        oldFile.writeText(ConfigJson.encodeToString(UpdatesData(lastUpdateId = 7)))
+        assertTrue(UpdatesRepository(oldFile).getPendingTelegramReplies("100").isEmpty())
+
+        val aheadFile = tempDirectory.resolve("ahead-outbox.json")
+        val ahead = PendingTelegramReply(8, "chat", "must wait")
+        aheadFile.writeText(
+            ConfigJson.encodeToString(
+                UpdatesData(
+                    lastUpdateId = 7,
+                    pendingTelegramReplies = listOf(ahead)
+                )
+            )
+        )
+        assertTrue(UpdatesRepository(aheadFile).getPendingTelegramReplies("100").isEmpty())
+    }
+
+    /** 验证 outbox 原子提交失败时不会污染内存状态或错误推进偏移量。 */
+    @Test
+    fun `failed outbox completion leaves in memory state unchanged`() {
+        val file = tempDirectory.resolve("failed-outbox.json")
+        val repository = UpdatesRepository(file) { throw IOException("injected write failure") }
+
+        assertFailsWith<IOException> {
+            repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", "reply"))
+        }
+
+        assertEquals(0, repository.getData("100").lastUpdateId)
+        assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
+    }
+
     /**
      * 验证损坏主更新状态会以经过格式验证的备份原始字节恢复。
      */
@@ -173,7 +233,8 @@ class UpdatesRepositoryTest {
         val file = tempDirectory.resolve("updates-recovery-failure.json")
         val backup = file.resolveSibling("updates-recovery-failure.json.bak")
         val damagedPrimary = "{ invalid"
-        val validBackup = ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 7))))
+        val validBackup =
+            ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 7))))
         file.writeText(damagedPrimary)
         backup.writeText(validBackup)
         val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {

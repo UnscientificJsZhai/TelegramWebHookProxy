@@ -89,6 +89,30 @@ class ModelSwitchBarrierTest {
     }
 
     /**
+     * 验证设置流完成其代次时不会提前释放认证等外部生命周期代次。
+     */
+    @Test
+    fun `completing a later settings generation keeps an earlier external generation blocked`() = runTest {
+        val barrier = ModelSwitchBarrier()
+        val authenticationGeneration = barrier.beginExternalSwitch()
+        val settingsGeneration = barrier.beginSwitch()
+        val waitingRequest = async { barrier.awaitReady() }
+
+        runCurrent()
+        assertFalse(waitingRequest.isCompleted)
+
+        barrier.completeSettingsThrough(settingsGeneration)
+        runCurrent()
+
+        assertTrue(barrier.isSwitching)
+        assertFalse(waitingRequest.isCompleted)
+
+        barrier.complete(authenticationGeneration)
+        waitingRequest.await()
+        assertFalse(barrier.isSwitching)
+    }
+
+    /**
      * 验证模型切换等待先前请求的设计。
      *
      * 验证切换会等待在其代次前已获准的请求结束。

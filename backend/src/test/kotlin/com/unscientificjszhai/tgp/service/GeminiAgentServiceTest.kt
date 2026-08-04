@@ -13,6 +13,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -26,10 +27,13 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
@@ -100,6 +104,8 @@ class GeminiAgentServiceTest {
     @Test
     fun `initial Gemini readiness waits for the MCP connection and chat`() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
+        val server = MockWebServer()
+        server.start()
         val connectionStarted = CompletableDeferred<Unit>()
         val releaseConnection = CompletableDeferred<Unit>()
         val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
@@ -131,6 +137,16 @@ class GeminiAgentServiceTest {
             val readiness = assertNotNull(initializedService.initializationJob())
             assertFalse(readiness.isCompleted)
 
+            setPrivateField(
+                initializedService,
+                "rawBaseUrl",
+                server.url("/v1beta").toString().trimEnd('/'),
+            )
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}]}""",
+                ).build(),
+            )
             releaseConnection.complete(Unit)
             readiness.join()
 
@@ -138,6 +154,118 @@ class GeminiAgentServiceTest {
         } finally {
             releaseConnection.complete(Unit)
             initializedService.close().join()
+            server.close()
+        }
+    }
+
+    /**
+     * 验证首轮模型发现的 HTTP 失败或空列表会取消 Gemini 候选的组合就绪任务。
+     */
+    @Test
+    fun `initial Gemini readiness rejects failed and empty model discovery`() = runBlocking {
+        listOf(
+            MockResponse.Builder().code(500).body("upstream failure").build(),
+            MockResponse.Builder().body("""{"models":[]}""").build(),
+        ).forEach { response ->
+            val mcpClientService = mockk<MCPClientService>()
+            val connectionStarted = CompletableDeferred<Unit>()
+            val releaseConnection = CompletableDeferred<Unit>()
+            val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+            val server = MockWebServer()
+            server.start()
+            settingsRepository.saveSettings(
+                AppSettings(
+                    ai = AISettings(
+                        provider = AIProvider.GEMINI,
+                        geminiApiKey = "test-key",
+                        agentEnabled = true,
+                        mcpServers = mcpServers,
+                    ),
+                ),
+            )
+            coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+                connectionStarted.complete(Unit)
+                releaseConnection.await()
+            }
+            every { mcpClientService.getAllTools() } returns emptyList()
+            every { mcpClientService.close() } returns Job().apply { complete() }
+            val candidate = GeminiAgentService(
+                CoroutineScope(EmptyCoroutineContext),
+                settingsRepository,
+                skillRepository,
+                mcpClientService,
+            ) { mockk() }
+
+            try {
+                connectionStarted.await()
+                setPrivateField(candidate, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
+                server.enqueue(response)
+                releaseConnection.complete(Unit)
+
+                val readiness = assertNotNull(candidate.initializationJob())
+                withTimeout(5.seconds) { readiness.join() }
+                assertTrue(readiness.isCancelled)
+            } finally {
+                releaseConnection.complete(Unit)
+                candidate.close().join()
+                server.close()
+            }
+        }
+    }
+
+    /**
+     * 验证休眠的历史非法 OpenAI 地址不会阻止 Gemini 在首轮模型发现中完成内存回退，也不会改写原始文件。
+     */
+    @Test
+    fun `Gemini initial fallback keeps dormant historical OpenAI URL protected`() = runBlocking {
+        val configFile = File(tempDirectory, "dormant-invalid-openai-url.json")
+        val originalContent =
+            """{"ai":{"provider":"GEMINI","geminiApiKey":"test-key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","selectedModel":"models/retired","agentEnabled":true,"mcpServers":[{"name":"test","url":"https://example.com/mcp","headers":{}}]}}"""
+        configFile.writeText(originalContent)
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val releaseInitialConnection = CompletableDeferred<Unit>()
+        val connectionCalls = AtomicInteger()
+        val mcpServers = checkNotNull(repository.settingsFlow.value.ai).mcpServers
+        val server = MockWebServer()
+        server.start()
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            if (connectionCalls.incrementAndGet() == 1) {
+                connectionStarted.complete(Unit)
+                releaseInitialConnection.await()
+            }
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val candidate = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            repository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        try {
+            connectionStarted.await()
+            setPrivateField(candidate, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}]}""",
+                ).build(),
+            )
+            releaseInitialConnection.complete(Unit)
+
+            val readiness = assertNotNull(candidate.initializationJob())
+            withTimeout(5.seconds) { readiness.join() }
+            assertFalse(readiness.isCancelled)
+            assertEquals("models/gemini-3.5-flash-lite", candidate.currentModel)
+            assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
+            assertEquals("models/retired", repository.settingsFlow.value.ai?.selectedModel)
+            assertEquals(originalContent, configFile.readText())
+        } finally {
+            releaseInitialConnection.complete(Unit)
+            candidate.close().join()
+            server.close()
         }
     }
 
@@ -246,18 +374,20 @@ class GeminiAgentServiceTest {
     @Test
     fun `failed Gemini reset keeps the previous chat route and pending history`() = runBlocking {
         val oldChat = mockk<Chat>()
+        val recoveredChat = mockk<Chat>()
         val chats = mockk<Chats>()
         val preservedHistory = listOf(Content.fromParts(Part.fromText("待恢复历史")))
         val originalRoute = LocalFunctionRouter(emptyList()).refresh()
         settingsRepository.saveSettings(AppSettings(ai = AISettings()))
-        every {
-            chats.create(
-                any<String>(),
-                any<GenerateContentConfig>()
-            )
-        } throws IllegalStateException("create failed")
-        every { oldChat.getHistory(false) } returns ImmutableList.of()
-        every { oldChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("旧会话回复"))
+        var failResetCandidate = true
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } answers {
+            if (failResetCandidate) {
+                failResetCandidate = false
+                throw IllegalStateException("create failed")
+            }
+            recoveredChat
+        }
+        every { recoveredChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("旧会话回复"))
         injectClient(chats)
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, oldChat)
         GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
@@ -274,6 +404,8 @@ class GeminiAgentServiceTest {
         assertEquals(preservedHistory, privateField("savedHistory"))
         assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
         assertEquals("旧会话回复", service.sendMessage("继续使用旧会话"))
+        assertSame(recoveredChat, privateField("chat"))
+        Unit
     }
 
     /**
@@ -312,20 +444,22 @@ class GeminiAgentServiceTest {
     @Test
     fun `failed model switch rolls back chat route history and model`() = runBlocking {
         val oldChat = mockk<Chat>()
+        val recoveredChat = mockk<Chat>()
         val chats = mockk<Chats>()
         val preservedHistory = listOf(Content.fromParts(Part.fromText("原待恢复历史")))
         val capturedHistory = listOf(Content.fromParts(Part.fromText("当前会话历史")))
         val originalRoute = LocalFunctionRouter(emptyList()).refresh()
         settingsRepository.saveSettings(AppSettings(ai = AISettings()))
         every { oldChat.getHistory(true) } returns ImmutableList.copyOf(capturedHistory)
-        every { oldChat.getHistory(false) } returns ImmutableList.of()
-        every { oldChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("原会话回复"))
-        every {
-            chats.create(
-                any<String>(),
-                any<GenerateContentConfig>()
-            )
-        } throws IllegalStateException("create failed")
+        var failSwitchCandidate = true
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } answers {
+            if (failSwitchCandidate) {
+                failSwitchCandidate = false
+                throw IllegalStateException("create failed")
+            }
+            recoveredChat
+        }
+        every { recoveredChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("原会话回复"))
         injectClient(chats)
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, oldChat)
         GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
@@ -343,6 +477,8 @@ class GeminiAgentServiceTest {
         assertSame(originalRoute, privateField("chatFunctionRouteSnapshot"))
         assertEquals(preservedHistory, privateField("savedHistory"))
         assertEquals("原会话回复", service.sendMessage("仍走原会话"))
+        assertSame(recoveredChat, privateField("chat"))
+        Unit
     }
 
     /**
@@ -518,7 +654,10 @@ class GeminiAgentServiceTest {
      */
     @Test
     fun testUnknownFunctionCallsProduceMatchingErrorResponses() = runTest {
-        val chat = mockk<Chat>()
+        val activeChat = mockk<Chat>()
+        val firstCandidate = mockk<Chat>()
+        val finalCandidate = mockk<Chat>()
+        val chats = mockk<Chats>()
         val firstCall = FunctionCall.builder().id("call-1").name("missing_one").args(emptyMap()).build()
         val secondCall = FunctionCall.builder().id("call-2").name("missing_two").args(emptyMap()).build()
         val toolCallResponse = responseWithParts(
@@ -526,18 +665,171 @@ class GeminiAgentServiceTest {
             Part.builder().functionCall(secondCall).build(),
         )
         val finalResponse = responseWithParts(Part.fromText("完成"))
-        val sentFunctionResults = slot<Content>()
-        every { chat.sendMessage(any<List<Content>>()) } returns toolCallResponse
-        every { chat.sendMessage(capture(sentFunctionResults)) } returns finalResponse
-        injectChat(chat)
+        val sentFunctionResults = slot<List<Content>>()
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany listOf(
+            firstCandidate,
+            finalCandidate
+        )
+        every { firstCandidate.sendMessage(any<List<Content>>()) } returns toolCallResponse
+        every { finalCandidate.sendMessage(capture(sentFunctionResults)) } returns finalResponse
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
 
         assertEquals("完成", service.sendMessage("执行未知工具"))
 
-        val functionResponses = sentFunctionResults.captured.parts().get().map { it.functionResponse().get() }
+        val functionResponses = sentFunctionResults.captured.last().parts().get().map { it.functionResponse().get() }
         assertEquals(listOf("call-1", "call-2"), functionResponses.map { it.id().get() })
         assertEquals(listOf("missing_one", "missing_two"), functionResponses.map { it.name().get() })
         assertEquals("Function missing_one not found", functionResponses[0].response().get()["error"])
         assertEquals("Function missing_two not found", functionResponses[1].response().get()["error"])
+    }
+
+    /**
+     * 验证 SDK 候选 Chat 在裁剪历史和工具响应后重建，且已提交历史可供下一回合继续使用。
+     */
+    @Test
+    fun `SDK candidate rebuilding keeps complete tool turns and a valid history prefix`() = runTest {
+        val activeChat = mockk<Chat>()
+        val firstCandidate = mockk<Chat>()
+        val toolCandidate = mockk<Chat>()
+        val nextCandidate = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val oldFunction = FunctionCall.builder().id("old-call").name("missing").args(emptyMap()).build()
+        val currentFunction = FunctionCall.builder().id("current-call").name("missing").args(emptyMap()).build()
+        val persistedHistory = buildList {
+            add(Content.builder().role("user").parts(listOf(Part.fromText("旧工具回合"))).build())
+            add(Content.builder().role("model").parts(listOf(Part.builder().functionCall(oldFunction).build())).build())
+            add(
+                Content.builder().role("user").parts(
+                    listOf(service.createFunctionResponsePart(oldFunction, buildJsonObject { put("ok", true) })),
+                ).build(),
+            )
+            add(Content.builder().role("model").parts(listOf(Part.fromText("旧工具完成"))).build())
+            repeat(30) { index ->
+                add(Content.builder().role("user").parts(listOf(Part.fromText("旧用户$index"))).build())
+                add(Content.builder().role("model").parts(listOf(Part.fromText("旧模型$index"))).build())
+            }
+        }
+        val firstRequest = slot<List<Content>>()
+        val toolRequest = slot<List<Content>>()
+        val nextRequest = slot<List<Content>>()
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany listOf(
+            firstCandidate,
+            toolCandidate,
+            nextCandidate,
+        )
+        every { firstCandidate.sendMessage(capture(firstRequest)) } returns responseWithParts(
+            Part.builder().functionCall(currentFunction).build(),
+        )
+        every { toolCandidate.sendMessage(capture(toolRequest)) } returns responseWithParts(Part.fromText("工具完成"))
+        every { nextCandidate.sendMessage(capture(nextRequest)) } returns responseWithParts(Part.fromText("下一轮完成"))
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", persistedHistory)
+
+        assertEquals("工具完成", service.sendMessage("当前工具回合"))
+
+        assertEquals("user", firstRequest.captured.first().role().get())
+        assertFalse(firstRequest.captured.first().parts().get().any { it.functionResponse().isPresent })
+        assertEquals("user", toolRequest.captured.first().role().get())
+        val functionResponseIndex = toolRequest.captured.indexOfFirst { content ->
+            content.parts().get().any { it.functionResponse().isPresent }
+        }
+        assertTrue(functionResponseIndex > 0)
+        assertEquals("model", toolRequest.captured[functionResponseIndex - 1].role().get())
+        assertTrue(toolRequest.captured[functionResponseIndex - 1].parts().get().any { it.functionCall().isPresent })
+
+        @Suppress("UNCHECKED_CAST")
+        val saved = privateField("savedHistory") as List<Content>
+        assertEquals("user", saved.first().role().get())
+        assertTrue(saved.any { content -> content.parts().get().any { it.functionResponse().isPresent } })
+        assertTrue(saved.size <= 64)
+
+        assertEquals("下一轮完成", service.sendMessage("后续回合"))
+        assertEquals("user", nextRequest.captured.first().role().get())
+        assertTrue(nextRequest.captured.size <= 64)
+    }
+
+    /**
+     * 验证 SDK 候选历史达到字节预留阈值时只删除最旧的完整回合。
+     *
+     * 每个旧回合的 user/model 内容约为 2.2 MiB；两个回合超过 4 MiB 的下一回合预留。新请求必须
+     * 从第二个普通 user 内容开始，保留第二回合而不携带最旧回合的任一侧。
+     */
+    @Test
+    fun `SDK byte budget removes only oldest complete turn before new request`() = runTest {
+        val activeChat = mockk<Chat>()
+        val candidateChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val request = slot<List<Content>>()
+        val largeText = "x".repeat(1_100 * 1024)
+        fun historicalContent(role: String, marker: String) = Content.builder()
+            .role(role)
+            .parts(listOf(Part.fromText("$marker|$largeText")))
+            .build()
+
+        val persistedHistory = listOf(
+            historicalContent("user", "最旧用户"),
+            historicalContent("model", "最旧模型"),
+            historicalContent("user", "较新用户"),
+            historicalContent("model", "较新模型"),
+        )
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns candidateChat
+        every { candidateChat.sendMessage(capture(request)) } returns responseWithParts(Part.fromText("完成"))
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", persistedHistory)
+
+        assertEquals("完成", service.sendMessage("当前回合"))
+
+        val markers = request.captured.map { content ->
+            content.parts().get().single().text().get().substringBefore('|')
+        }
+        assertEquals(listOf("较新用户", "较新模型", "当前回合"), markers)
+        assertEquals("user", request.captured.first().role().get())
+        assertFalse(request.captured.first().parts().get().any { it.functionResponse().isPresent })
+    }
+
+    /**
+     * 验证 SDK 当前回合本身超过 8 MiB 时不发布候选 Chat 或候选历史，并允许后续小回合恢复。
+     */
+    @Test
+    fun `oversized current SDK turn rolls back candidate session and later recovers`() = runTest {
+        val activeChat = mockk<Chat>()
+        val failedCandidate = mockk<Chat>()
+        val recoveredCandidate = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val committedHistory = listOf(
+            Content.builder().role("user").parts(listOf(Part.fromText("已提交用户"))).build(),
+            Content.builder().role("model").parts(listOf(Part.fromText("已提交回复"))).build(),
+        )
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany listOf(
+            failedCandidate,
+            recoveredCandidate,
+        )
+        every { failedCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.fromText("x".repeat(8 * 1024 * 1024)),
+        )
+        every { recoveredCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("已恢复"))
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", committedHistory)
+
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("会超限") }
+        assertSame(activeChat, privateField("chat"))
+        assertEquals(committedHistory, privateField("savedHistory"))
+
+        assertEquals("已恢复", service.sendMessage("小消息"))
+        assertSame(recoveredCandidate, privateField("chat"))
+        @Suppress("UNCHECKED_CAST")
+        val recoveredHistory = privateField("savedHistory") as List<Content>
+        assertEquals("小消息", recoveredHistory[2].parts().get().single().text().get())
+        assertEquals("已恢复", recoveredHistory[3].parts().get().single().text().get())
     }
 
     /**
@@ -547,27 +839,29 @@ class GeminiAgentServiceTest {
      */
     @Test
     fun testToolCallsStopAfterMaximumRounds() = runTest {
-        val chat = mockk<Chat>()
-        val newChat = mockk<Chat>()
+        val activeChat = mockk<Chat>()
+        val candidateChat = mockk<Chat>()
         val chats = mockk<Chats>()
         val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
         val toolCallResponse = responseWithParts(Part.builder().functionCall(functionCall).build())
         settingsRepository.saveSettings(AppSettings(ai = AISettings()))
-        every { chat.sendMessage(any<List<Content>>()) } returns toolCallResponse
-        every { chat.sendMessage(any<Content>()) } returns toolCallResponse
-        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns newChat
-        every { newChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("新会话"))
-        every { newChat.getHistory(true) } returns ImmutableList.of()
+        var recover = false
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns candidateChat
+        every { candidateChat.sendMessage(any<List<Content>>()) } answers {
+            if (recover) responseWithParts(Part.fromText("新会话")) else toolCallResponse
+        }
+        every { candidateChat.getHistory(true) } returns ImmutableList.of()
         injectClient(chats)
-        injectChat(chat)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
 
         val exception = assertFailsWith<IllegalStateException> {
             service.sendMessage("持续调用工具")
         }
 
         assertEquals("工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。", exception.message)
-        verify(exactly = 1) { chat.sendMessage(any<List<Content>>()) }
-        verify(exactly = MAX_TOOL_CALL_ROUNDS) { chat.sendMessage(any<Content>()) }
+        verify(exactly = MAX_TOOL_CALL_ROUNDS + 1) { candidateChat.sendMessage(any<List<Content>>()) }
         val recoveryJob = assertNotNull(
             GeminiAgentService::class.java.getDeclaredField("resetSessionJob").apply {
                 isAccessible = true
@@ -575,12 +869,12 @@ class GeminiAgentServiceTest {
         )
         withTimeout(5.seconds) { recoveryJob.join() }
         assertFalse(recoveryJob.isCancelled)
-        assertEquals(newChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
+        assertEquals(candidateChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
             isAccessible = true
         }.get(service))
+        recover = true
         assertEquals("新会话", service.sendMessage("继续对话"))
-        verify(exactly = 2) { chats.create(any<String>(), any<GenerateContentConfig>()) }
-        verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
+        verify(exactly = MAX_TOOL_CALL_ROUNDS + 2) { candidateChat.sendMessage(any<List<Content>>()) }
     }
 
     /**
@@ -590,15 +884,21 @@ class GeminiAgentServiceTest {
      */
     @Test
     fun test关闭会等待在途消息完成后再释放会话() = runBlocking {
-        val chat = mockk<Chat>()
+        val activeChat = mockk<Chat>()
+        val candidateChat = mockk<Chat>()
+        val chats = mockk<Chats>()
         val requestStarted = CountDownLatch(1)
         val releaseRequest = CountDownLatch(1)
-        every { chat.sendMessage(any<List<Content>>()) } answers {
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns candidateChat
+        every { candidateChat.sendMessage(any<List<Content>>()) } answers {
             requestStarted.countDown()
             check(releaseRequest.await(5, TimeUnit.SECONDS))
             responseWithParts(Part.fromText("完成"))
         }
-        injectChat(chat)
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
 
         val inFlightMessage = async(Dispatchers.Default) { service.sendMessage("第一条消息") }
         assertTrue(requestStarted.await(5, TimeUnit.SECONDS))
