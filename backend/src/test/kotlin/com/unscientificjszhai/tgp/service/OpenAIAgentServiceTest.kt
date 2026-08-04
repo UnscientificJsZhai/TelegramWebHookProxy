@@ -16,8 +16,10 @@ import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.MediaData
+import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
@@ -44,6 +46,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -489,6 +492,72 @@ class OpenAIAgentServiceTest {
             releaseConnection.complete(Unit)
             initializedService.close().join()
             server.close()
+        }
+    }
+
+    /** 验证 OpenAI 实际会话系统消息只包含已批准技能，绝不保留待审批草稿 canary。 */
+    @Test
+    fun `OpenAI system prompt excludes pending skills`() = runBlocking {
+        val approvedDraft = skillRepository.saveSkill(
+            Skill(
+                id = "approved",
+                description = "APPROVED_SKILL_CANARY",
+                content = "approved"
+            )
+        )
+        skillRepository.approveSkill(approvedDraft.id, approvedDraft.revision)
+        skillRepository.createPendingDraft("PENDING_SKILL_CANARY", "pending")
+        settingsRepository.saveSettings(AppSettings(ai = AISettings(globalContext = "SYSTEM_CONTEXT_CANARY")))
+
+        assertNotNull(service.resetSession()).join()
+        val renderedPrompt = service.createChatCompletionParams(emptyList()).messages().joinToString()
+
+        assertTrue(renderedPrompt.contains("APPROVED_SKILL_CANARY"))
+        assertFalse(renderedPrompt.contains("PENDING_SKILL_CANARY"))
+    }
+
+    /**
+     * 验证候选初始化总时限会取消挂起的首轮重置与模型发现，而不是让就绪任务无限等待 MCP。
+     */
+    @Test
+    fun `initial OpenAI readiness deadline cancels hanging sibling work`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            awaitCancellation()
+        }
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val initializedService = OpenAIAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+            AgentExecutionDeadlines(
+                mcpBatch = 1.seconds,
+                candidateInitialization = 100.milliseconds,
+                scheduledTurn = 1.seconds,
+            ),
+        ) { mockk() }
+
+        try {
+            withTimeout(1.seconds) { connectionStarted.await() }
+            val readiness = assertNotNull(initializedService.initializationJob())
+            withTimeout(1.seconds) { readiness.join() }
+            assertTrue(readiness.isCancelled)
+        } finally {
+            withTimeout(1.seconds) { initializedService.close().join() }
         }
     }
 

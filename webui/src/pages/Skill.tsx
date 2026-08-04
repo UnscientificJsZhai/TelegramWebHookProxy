@@ -16,6 +16,7 @@ import {
     Card,
     CardContent,
     CardActions,
+    Chip,
     Grid,
     Pagination
 } from '@mui/material';
@@ -24,8 +25,8 @@ import EditIcon from '@mui/icons-material/Edit';
 import AddIcon from '@mui/icons-material/Add';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import {useNavigate} from 'react-router-dom';
-import {getSkills, saveSkill, deleteSkill} from '../api';
-import type {Skill} from '../api';
+import {approveSkill, deleteSkill, getSkills, revokeSkill, saveSkill} from '../api';
+import type {Skill, SkillDraft} from '../api';
 
 const SkillPage: React.FC = () => {
     const navigate = useNavigate();
@@ -86,13 +87,45 @@ const SkillPage: React.FC = () => {
         }
 
         try {
-            await saveSkill(currentSkill as Skill);
-            showSnackbar('技能保存成功', 'success');
+            const saved = await saveSkill({
+                id: currentSkill.id,
+                description: currentSkill.description,
+                content: currentSkill.content,
+                revision: currentSkill.revision,
+            } as SkillDraft);
+            showSnackbar(saved.status === 'PENDING' ? '技能已保存为待审批草稿' : '技能保存成功', 'success');
             handleClose();
             fetchSkills();
         } catch (error) {
             console.error('Failed to save skill:', error);
+            void fetchSkills();
             showSnackbar('保存技能失败', 'error');
+        }
+    };
+
+    const handleApprove = async (skill: Skill) => {
+        if (!window.confirm('确认批准此技能并允许它进入 Agent 提示词吗？')) return;
+        try {
+            await approveSkill(skill.id, skill.revision);
+            showSnackbar('技能已批准并启用', 'success');
+            fetchSkills();
+        } catch (error) {
+            console.error('Failed to approve skill:', error);
+            void fetchSkills();
+            showSnackbar('批准失败，请刷新后重试', 'error');
+        }
+    };
+
+    const handleRevoke = async (skill: Skill) => {
+        if (!window.confirm('确认撤销此技能吗？它会立即退出 Agent 提示词。')) return;
+        try {
+            await revokeSkill(skill.id, skill.revision);
+            showSnackbar('技能已撤销批准', 'success');
+            fetchSkills();
+        } catch (error) {
+            console.error('Failed to revoke skill:', error);
+            void fetchSkills();
+            showSnackbar('撤销失败，请刷新后重试', 'error');
         }
     };
 
@@ -142,6 +175,12 @@ const SkillPage: React.FC = () => {
                                 <Typography variant="h6" gutterBottom noWrap>
                                     {skill.description}
                                 </Typography>
+                                <Chip
+                                    size="small"
+                                    color={skill.status === 'APPROVED' ? 'success' : 'warning'}
+                                    label={skill.status === 'APPROVED' ? '已批准' : '待审批'}
+                                    sx={{mb: 1}}
+                                />
                                 <Typography variant="body2" color="textSecondary" sx={{
                                     display: '-webkit-box',
                                     WebkitLineClamp: 3,
@@ -152,13 +191,20 @@ const SkillPage: React.FC = () => {
                                     {skill.content}
                                 </Typography>
                                 <Typography variant="caption" color="textDisabled">
-                                    ID: {skill.id}
+                                    ID: {skill.id} · 版本 {skill.revision}
                                 </Typography>
                             </CardContent>
                             <CardActions sx={{justifyContent: 'flex-end'}}>
                                 <IconButton size="small" onClick={() => handleOpen(skill)} color="primary">
                                     <EditIcon/>
                                 </IconButton>
+                                {skill.status === 'PENDING' ? (
+                                    <Button size="small" color="success"
+                                            onClick={() => handleApprove(skill)}>批准并启用</Button>
+                                ) : (
+                                    <Button size="small" color="warning"
+                                            onClick={() => handleRevoke(skill)}>撤销批准</Button>
+                                )}
                                 <IconButton size="small" onClick={() => handleDelete(skill.id)} color="error">
                                     <DeleteIcon/>
                                 </IconButton>
@@ -189,6 +235,11 @@ const SkillPage: React.FC = () => {
             <Dialog open={open} onClose={handleClose} fullWidth maxWidth="md">
                 <DialogTitle>{currentSkill.id ? '编辑技能' : '新增技能'}</DialogTitle>
                 <DialogContent>
+                    {currentSkill.id && (
+                        <Alert severity="warning" sx={{mb: 2}}>
+                            编辑现有技能会将其变为待审批草稿，需再次批准后才会进入 Agent 提示词。
+                        </Alert>
+                    )}
                     <TextField
                         autoFocus
                         margin="dense"
@@ -216,7 +267,7 @@ const SkillPage: React.FC = () => {
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={handleClose}>取消</Button>
-                    <Button onClick={handleSave} variant="contained">保存</Button>
+                    <Button onClick={handleSave} variant="contained">保存为待审批草稿</Button>
                 </DialogActions>
             </Dialog>
 

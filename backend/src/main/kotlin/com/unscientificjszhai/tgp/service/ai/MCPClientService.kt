@@ -1,8 +1,15 @@
+@file:Suppress(
+    "LoggingSimilarMessage",
+    "RedundantIf",
+    "RemoveExplicitTypeArguments",
+)
+
 package com.unscientificjszhai.tgp.service.ai
 
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.*
@@ -43,6 +50,7 @@ import javax.inject.Inject
 @AgentScope
 class MCPClientService internal constructor(
     @Suppress("UNUSED_PARAMETER") parentScope: CoroutineScope,
+    private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     private val clientFactory: () -> Client,
 ) {
     /**
@@ -52,14 +60,25 @@ class MCPClientService internal constructor(
      * 清理。
      */
     @Inject
-    constructor(parentScope: CoroutineScope) : this(
+    internal constructor(parentScope: CoroutineScope, deadlines: AgentExecutionDeadlines) : this(
         parentScope,
+        deadlines,
         {
             Client(
                 Implementation(name = "telegram-webhook-proxy", version = "1.1.3"),
             )
         },
     )
+
+    /**
+     * 使用默认时限和默认 MCP 客户端创建器创建服务。
+     *
+     * 此构造器保留给未通过依赖注入创建服务的既有调用方；生产代码应由依赖注入提供统一的
+     * [AgentExecutionDeadlines]。
+     *
+     * @param parentScope 创建此服务的父协程作用域。
+     */
+    constructor(parentScope: CoroutineScope) : this(parentScope, AgentExecutionDeadlines())
 
     private val logger = LoggerFactory.getLogger(MCPClientService::class.java)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -133,10 +152,17 @@ class MCPClientService internal constructor(
      */
     private val stateLock = Any()
 
+    /** 最新连接请求的代次；超时、关闭或更晚请求会使旧候选永久失去发布资格。 */
+    private var connectionRequestGeneration = 0L
+
     /**
      * 串行化终态关闭的创建，使重复关闭共用同一清理任务。
      */
     private val lifecycleLock = Any()
+
+    /** 跟踪已从可见状态摘除、但仍在独立作用域中关闭的客户端，避免慢速关闭占用连接锁。 */
+    private val cleanupLock = Any()
+    private val clientCleanupJobs = mutableMapOf<Client, Job>()
 
     @Volatile
     private var closed = false
@@ -152,7 +178,9 @@ class MCPClientService internal constructor(
     /**
      * 将已连接的服务器同步为指定配置，并发现各服务器提供的工具。
      *
-     * 此方法先防御复制并验证完整配置。若当前完整连接的规范化快照与请求相同，会直接复用，既不发起
+     * 此方法先防御复制并验证完整配置。完整批次受 [AgentExecutionDeadlines.mcpBatch] 限制，时限覆盖取得
+     * 连接锁、全部服务器连接和工具发现；超时会立即摘除可见状态并在独立作用域清理客户端，因而不会让
+     * 后续连接等待缓慢或不响应取消的 `close`。若当前完整连接的规范化快照与请求相同，会直接复用，既不发起
      * 网络 I/O 也不关闭客户端。其他配置变更会先原子清空工具快照并关闭旧客户端，再建立完整候选；
      * 候选连接或发现失败时会关闭已创建的候选并保持空快照，确保旧凭据和旧地址绝不会继续被调用。
      *
@@ -164,7 +192,29 @@ class MCPClientService internal constructor(
     suspend fun connect(configs: List<MCPServerConfig>) {
         ensureOpen()
         val requested = prepareConnection(configs)
+        val generation = synchronized(stateLock) {
+            check(!closed) { "MCP client service is closed." }
+            ++connectionRequestGeneration
+        }
+        try {
+            withTimeout(deadlines.mcpBatch) {
+                connectWithinDeadline(requested, generation)
+            }
+        } catch (_: TimeoutCancellationException) {
+            // 不能等待 candidate/old client 的 close：某些实现会忽略取消，若在锁内 NonCancellable 等待会
+            // 使所有未来配置永久饥饿。先摘除状态；若摘除的是已发布客户端，后台清理会先取得连接锁，确保
+            // 已经开始的 tool call 结束后才关闭它。
+            schedulePublishedClientsForCleanupAfterInFlightCalls(detachTimedOutConnectionState(generation).clients)
+            logger.warn("MCP connection batch timed out; leaving the connection snapshot empty.")
+        }
+    }
+
+    /** 在总体 deadline 内完成一次连接状态替换；调用方负责将 timeout 转为安全的空快照。 */
+    private suspend fun connectWithinDeadline(requested: PreparedConnection, generation: Long) {
         connectionMutex.withLock {
+            if (!isCurrentConnectionRequest(generation)) {
+                return
+            }
             ensureOpen()
             if (isCompleteReuse(requested.snapshot)) {
                 return
@@ -173,6 +223,8 @@ class MCPClientService internal constructor(
             val previousClients = synchronized(stateLock) {
                 if (closed) {
                     null
+                } else if (connectionRequestGeneration != generation) {
+                    emptyMap()
                 } else {
                     connectionState.also { connectionState = ConnectionState() }.clients
                 }
@@ -180,7 +232,10 @@ class MCPClientService internal constructor(
             if (previousClients == null) {
                 throw IllegalStateException("MCP client service is closed.")
             }
-            closeClients(previousClients)
+            if (!isCurrentConnectionRequest(generation)) {
+                return
+            }
+            scheduleClientsForCleanup(previousClients)
 
             val candidates = linkedMapOf<String, Pair<Client, List<Tool>>>()
             try {
@@ -193,16 +248,16 @@ class MCPClientService internal constructor(
                         )
                         candidates[config.name] = candidate
                     } catch (e: Exception) {
-                        closeClient(config.name, candidate.first)
+                        scheduleClientForCleanup(config.name, candidate.first)
                         throw e
                     }
                 }
                 currentCoroutineContext().ensureActive()
             } catch (e: CancellationException) {
-                closeCandidates(candidates)
+                scheduleCandidatesForCleanup(candidates)
                 throw e
             } catch (_: Exception) {
-                closeCandidates(candidates)
+                scheduleCandidatesForCleanup(candidates)
                 logger.warn("Failed to prepare MCP connection candidate; leaving the connection snapshot empty.")
                 return
             }
@@ -212,7 +267,7 @@ class MCPClientService internal constructor(
                 configSnapshot = requested.snapshot,
             )
             val published = synchronized(stateLock) {
-                if (closed) {
+                if (closed || connectionRequestGeneration != generation) {
                     false
                 } else {
                     connectionState = candidateState
@@ -220,8 +275,8 @@ class MCPClientService internal constructor(
                 }
             }
             if (!published) {
-                closeCandidates(candidates)
-                throw IllegalStateException("MCP client service is closed.")
+                scheduleCandidatesForCleanup(candidates)
+                return
             }
         }
     }
@@ -234,7 +289,7 @@ class MCPClientService internal constructor(
                 name = config.name,
                 url = config.url,
                 headers = config.headers.entries
-                    .sortedWith(compareBy({ it.key }, { it.value }))
+                    .sortedWith(compareBy<Map.Entry<String, String>>({ it.key }, { it.value }))
                     .map { HeaderSnapshot(it.key, it.value) },
             )
         }
@@ -265,15 +320,119 @@ class MCPClientService internal constructor(
         }
     }
 
-    private suspend fun closeCandidates(candidates: Map<String, Pair<Client, List<Tool>>>) =
-        withContext(NonCancellable) {
-            candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+    /**
+     * 在当前批次超时时原子摘除快照，并推进代次以阻止其候选或更早候选随后发布。
+     *
+     * 已有更新请求时不干扰它：只有仍为最新的超时批次可以清空快照。
+     */
+    private fun detachTimedOutConnectionState(generation: Long): ConnectionState = synchronized(stateLock) {
+        if (connectionRequestGeneration != generation) {
+            ConnectionState()
+        } else {
+            connectionRequestGeneration++
+            connectionState.also { connectionState = ConnectionState() }
         }
+    }
 
-    private suspend fun closeClients(clients: Map<String, Client>) =
-        withContext(NonCancellable) {
-            clients.forEach { (name, client) -> closeClient(name, client) }
+    /** 判断代次是否仍可修改或发布连接状态。 */
+    private fun isCurrentConnectionRequest(generation: Long): Boolean = synchronized(stateLock) {
+        !closed && connectionRequestGeneration == generation
+    }
+
+    /** 将候选客户端的关闭放到独立作用域，绝不在连接锁或不可取消区中等待。 */
+    private fun scheduleCandidatesForCleanup(candidates: Map<String, Pair<Client, List<Tool>>>) {
+        candidates.forEach { (name, candidate) -> scheduleClientForCleanup(name, candidate.first) }
+    }
+
+    /** 将多个已摘除客户端的关闭放到独立作用域，绝不在连接锁或不可取消区中等待。 */
+    private fun scheduleClientsForCleanup(clients: Map<String, Client>) {
+        clients.forEach { (name, client) -> scheduleClientForCleanup(name, client) }
+    }
+
+    /**
+     * 在超时摘除已发布快照后，等待已经开始的工具调用退出，再在锁外关闭客户端。
+     *
+     * 此方法只用于从 [connectionState] 摘除的客户端。候选客户端从未发布，不可能被 [callTool] 持有，
+     * 可直接走 [scheduleClientsForCleanup]。每个客户端从创建时起即登记为 tracked cleanup，登记任务先
+     * 等待 [connectionMutex] 再在锁外关闭，因而终态 [close] 不会遗漏这段交接期。
+     */
+    private fun schedulePublishedClientsForCleanupAfterInFlightCalls(clients: Map<String, Client>) {
+        clients.forEach { (name, client) -> schedulePublishedClientForCleanupAfterInFlightCalls(name, client) }
+    }
+
+    /**
+     * 登记已发布客户端的完整关闭交接：先等待 in-flight tool 退出，再在连接锁外关闭。
+     *
+     * 此任务和普通客户端关闭共用 [clientCleanupJobs]，所以终态 [close] 会等待它至少进入有界清理结果。
+     */
+    private fun schedulePublishedClientForCleanupAfterInFlightCalls(name: String, client: Client) {
+        lateinit var cleanupJob: Job
+        synchronized(cleanupLock) {
+            if (client in clientCleanupJobs) {
+                return
+            }
+            cleanupJob = closingScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    connectionMutex.withLock {
+                        // 仅作为 in-flight tool 调用的栅栏；真正的 client.close 必须在锁外执行。
+                    }
+                    client.close()
+                } catch (e: Exception) {
+                    logger.error(
+                        "Error closing MCP client {}; category={}",
+                        name,
+                        SafeLogging.failureCategory(e).wireName,
+                    )
+                } finally {
+                    synchronized(cleanupLock) { clientCleanupJobs.remove(client) }
+                }
+            }
+            clientCleanupJobs[client] = cleanupJob
         }
+        cleanupJob.start()
+    }
+
+    /**
+     * 跟踪并启动单个客户端的异步关闭。
+     *
+     * 同一客户端只会进入一次清理；调用者已从快照中摘除它，故慢速关闭不会阻塞新的连接或发布。终态
+     * 关闭会在有界时间内等待当前已登记的清理，超时后仍由 [closingScope] 持续跟踪。
+     */
+    private fun scheduleClientForCleanup(name: String, client: Client) {
+        lateinit var cleanupJob: Job
+        synchronized(cleanupLock) {
+            if (client in clientCleanupJobs) {
+                return
+            }
+            cleanupJob = closingScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    client.close()
+                } catch (e: Exception) {
+                    logger.error(
+                        "Error closing MCP client {}; category={}",
+                        name,
+                        SafeLogging.failureCategory(e).wireName,
+                    )
+                } finally {
+                    synchronized(cleanupLock) { clientCleanupJobs.remove(client) }
+                }
+            }
+            clientCleanupJobs[client] = cleanupJob
+        }
+        cleanupJob.start()
+    }
+
+    /** 在终态关闭中有界等待已登记的客户端清理；调用时不持有连接锁。 */
+    private suspend fun awaitTrackedClientCleanup(): Boolean {
+        val cleanupJobs = synchronized(cleanupLock) { clientCleanupJobs.values.toList() }
+        if (cleanupJobs.isEmpty()) {
+            return true
+        }
+        return withTimeoutOrNull(deadlines.mcpBatch) {
+            cleanupJobs.joinAll()
+            true
+        } ?: false
+    }
 
     private suspend fun connectCandidate(config: MCPServerConfig): Pair<Client, List<Tool>> {
         val client = clientFactory()
@@ -296,11 +455,31 @@ class MCPClientService internal constructor(
             logger.info("Connected to MCP server: ${config.name}, discovered ${tools.size} tools.")
             return client to tools
         } catch (e: CancellationException) {
-            closeClient(config.name, client)
+            scheduleClientForCleanup(config.name, client)
             throw e
         } catch (e: Exception) {
-            closeClient(config.name, client)
+            scheduleClientForCleanup(config.name, client)
             throw e
+        }
+    }
+
+    /**
+     * 异步断开所有当前 MCP 服务器。
+     *
+     * 等待返回任务完成后不再保留服务器连接或工具快照，但服务仍可再次 [connect]。关闭已开始后该方法
+     * 不再启动额外断开操作，并返回已关闭资源的完成任务。
+     *
+     * @return 执行断开操作的任务；终态关闭已开始时返回其清理任务。
+     */
+    @Suppress("unused")
+    fun disconnectAll(): Job = synchronized(lifecycleLock) {
+        closeJob ?: closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            connectionMutex.withLock {
+                if (!closed) {
+                    synchronized(stateLock) { connectionRequestGeneration++ }
+                    currentConnectionState().clients.keys.toList().forEach { disconnectLocked(it) }
+                }
+            }
         }
     }
 
@@ -309,29 +488,34 @@ class MCPClientService internal constructor(
      *
      * 首次调用会同步拒绝后续 [connect] 和 [callTool]，并立即清空可见工具快照；已开始的工具调用会先
      * 完成，随后恰好一次地关闭当时持有的 MCP 客户端与 HTTP 客户端。清理任务使用独立作用域，因此
-     * 不依赖创建服务的父作用域仍处于活动状态。重复调用返回同一个任务。
+     * 不依赖创建服务的父作用域仍处于活动状态。任务只会在 [AgentExecutionDeadlines.mcpBatch] 的有界
+     * 时间内等待已摘除客户端的后台关闭；超过时限的关闭仍会继续运行，避免终态关闭无限挂起。重复调用
+     * 返回同一个任务。
      *
-     * @return 幂等的异步清理任务；等待其完成后所有此实例拥有的网络资源均已释放。
+     * @return 幂等的异步清理任务；等待其完成后本实例拒绝新操作、清空快照并关闭 HTTP 客户端，且所有
+     * 已摘除 MCP 客户端都已启动清理。
      */
     fun close(): Job = synchronized(lifecycleLock) {
         closeJob ?: run {
             val clientsToClose = synchronized(stateLock) {
                 closed = true
+                connectionRequestGeneration++
                 connectionState.also { connectionState = ConnectionState() }.clients
             }
             closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
-                withContext(NonCancellable) {
-                    connectionMutex.withLock {
-                        clientsToClose.forEach { (name, client) -> closeClient(name, client) }
-                    }
-                    httpClient.close()
+                connectionMutex.withLock {
+                    // 等待已经开始的 tool call 离开锁，但不会在锁中等待可能永久挂起的 client.close。
                 }
+                scheduleClientsForCleanup(clientsToClose)
+                if (!awaitTrackedClientCleanup()) {
+                    logger.warn("Timed out while waiting for detached MCP client cleanup; cleanup continues in the background.")
+                }
+                httpClient.close()
             }.also { closeJob = it }
         }
     }
 
-    @Suppress("unused")
-    private suspend fun disconnectLocked(name: String) {
+    private fun disconnectLocked(name: String) {
         val client = synchronized(stateLock) {
             val state = connectionState
             val currentClient = state.clients[name] ?: return
@@ -342,17 +526,7 @@ class MCPClientService internal constructor(
             )
             currentClient
         }
-        closeClient(name, client)
-    }
-
-    private suspend fun closeClient(name: String, client: Client) {
-        withContext(NonCancellable) {
-            try {
-                client.close()
-            } catch (e: Exception) {
-                logger.error("Error closing MCP client: $name", e)
-            }
-        }
+        scheduleClientForCleanup(name, client)
     }
 
     /**

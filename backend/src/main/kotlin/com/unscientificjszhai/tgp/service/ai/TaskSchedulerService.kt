@@ -15,16 +15,19 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ResourceLimits
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
@@ -64,8 +67,9 @@ import kotlin.time.Duration.Companion.minutes
  * 当次的延后时刻不会漂移到之后的日期或周。无法表示未来时刻或存在无效日历锚点时同样预消费删除并记录警告，
  * 避免永久重复。
  * 扫描会在 [AgentService.withReadyService] 的同一次模型切换屏障准入中捕获短暂的 Bot token 租约、预消费
- * 任务、完成 Agent 回合并投递结果。因此切换已发生时旧任务不会调用旧 Agent 或旧 token；任务已准入时，
- * 对应的 Agent 切换会等待完整回合和投递结束，投递始终使用所捕获的旧 token。
+ * 任务、完成 Agent 回合并投递结果。准入后的完整链路受 [AgentExecutionDeadlines.scheduledTurn] 的总体时限
+ * 约束；超时任务已预消费但不会重试或投递迟到结果。因此切换已发生时旧任务不会调用旧 Agent 或旧 token；
+ * 任务已准入时，对应的 Agent 切换最多等待该完整回合结束或超时，投递始终使用所捕获的旧 token。
  *
  * @param parentScope 后台扫描任务所属的协程作用域；取消该作用域会停止扫描。
  * @param telegramService 用于投递任务执行结果的 Telegram 服务。
@@ -73,6 +77,7 @@ import kotlin.time.Duration.Companion.minutes
  * @param settingsRepository 用于在线性化 token 生命周期内捕获执行租约的仓储。
  * @param clock 提供服务器当前时间的时钟。
  * @param zoneId 日/周循环任务使用的服务器日历时区。
+ * @param deadlines 限制已准入定时任务的完整预消费、Agent 和投递链路。
  */
 @Singleton
 class TaskSchedulerService private constructor(
@@ -84,6 +89,7 @@ class TaskSchedulerService private constructor(
     startImmediately: Boolean,
     private val clock: Clock,
     private val zoneId: ZoneId,
+    private val deadlines: AgentExecutionDeadlines,
 ) : AutoCloseable {
 
     /**
@@ -94,13 +100,15 @@ class TaskSchedulerService private constructor(
      * @param telegramService 用于投递任务执行结果的 Telegram 服务。
      * @param agentService 用于取得 AI 代理的提供者。
      * @param settingsRepository 用于捕获执行租约的设置仓储。
+     * @param deadlines 限制完整已准入任务回合的总体时限。
      */
     @Inject
-    constructor(
+    internal constructor(
         parentScope: CoroutineScope,
         telegramService: TelegramService,
         agentService: Provider<AgentService>,
         settingsRepository: SettingsRepository,
+        deadlines: AgentExecutionDeadlines,
     ) : this(
         parentScope,
         telegramService,
@@ -110,6 +118,7 @@ class TaskSchedulerService private constructor(
         startImmediately = true,
         clock = Clock.systemDefaultZone(),
         zoneId = ZoneId.systemDefault(),
+        deadlines = deadlines,
     )
 
     /**
@@ -124,6 +133,7 @@ class TaskSchedulerService private constructor(
      * @param startImmediately 为 `true` 时构造后立即启动每分钟扫描。
      * @param clock 提供服务器当前时间的时钟。
      * @param zoneId 日/周循环任务使用的服务器日历时区。
+     * @param deadlines 限制完整已准入任务回合的总体时限。
      */
     internal constructor(
         parentScope: CoroutineScope,
@@ -135,6 +145,7 @@ class TaskSchedulerService private constructor(
         startImmediately: Boolean = false,
         clock: Clock = Clock.systemDefaultZone(),
         zoneId: ZoneId = ZoneId.systemDefault(),
+        deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     ) : this(
         parentScope,
         telegramService,
@@ -144,6 +155,7 @@ class TaskSchedulerService private constructor(
         startImmediately,
         clock,
         zoneId,
+        deadlines,
     )
 
     private val logger = LoggerFactory.getLogger(TaskSchedulerService::class.java)
@@ -172,12 +184,18 @@ class TaskSchedulerService private constructor(
 
             is AtomicJsonRead.Corrupt -> {
                 requiresStorageValidationBeforeWrite = true
-                logger.error("Schedule file is semantically invalid; preserving it", read.cause)
+                logger.error(
+                    "Schedule file is semantically invalid; preserving it; category={}",
+                    SafeLogging.failureCategory(read.cause).wireName,
+                )
             }
 
             is AtomicJsonRead.IoFailure -> {
                 requiresStorageValidationBeforeWrite = true
-                logger.error("Unable to read scheduled tasks; delaying writes until it can be revalidated", read.cause)
+                logger.error(
+                    "Unable to read scheduled tasks; delaying writes until it can be revalidated; category={}",
+                    SafeLogging.failureCategory(read.cause).wireName,
+                )
             }
 
         }
@@ -230,7 +248,7 @@ class TaskSchedulerService private constructor(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    logger.error("Error during task scanning", e)
+                    logger.error("Task scan failed; category={}", SafeLogging.failureCategory(e).wireName)
                 }
                 delay(1.minutes)
             }
@@ -252,7 +270,10 @@ class TaskSchedulerService private constructor(
         val currentTime = try {
             clock.millis()
         } catch (e: ArithmeticException) {
-            logger.warn("Scheduler clock cannot be represented as epoch milliseconds; skipping this scan", e)
+            logger.warn(
+                "Scheduler clock cannot be represented as epoch milliseconds; skipping this scan; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
             return
         }
         val tasksToExecute = stateLock.withLock {
@@ -261,7 +282,10 @@ class TaskSchedulerService private constructor(
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (e: Exception) {
-                logger.error("Failed to revalidate task storage before scanning; this scan will retry later", e)
+                logger.error(
+                    "Failed to revalidate task storage before scanning; this scan will retry later; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 return@withLock emptyList()
             }
             tasks.filter { task -> task.executionTime <= currentTime && executingTaskIds.add(task.id) }
@@ -284,25 +308,40 @@ class TaskSchedulerService private constructor(
      * 或重试任务；这在崩溃或取消落在提交和副作用之间时可能遗漏一次执行，但避免重复外部副作用。
      *
      * @param task 已到期且已被当前扫描声明执行权的任务。
-     * @throws CancellationException 当 Agent、Telegram 调用或当前协程被取消时原样抛出；已预消费状态不回滚。
+     * [AgentExecutionDeadlines.scheduledTurn] 到期只记录稳定任务标识并停止后续投递，不重试已预消费任务；
+     * 普通 [CancellationException] 仍会原样抛出，且已预消费状态不回滚。
+     *
+     * @throws CancellationException 当 Agent、Telegram 调用或当前协程被普通取消时原样抛出；已预消费状态不回滚。
      */
     private suspend fun executeTask(task: ScheduledTask) {
         agentService.get().withReadyService { readyAgent ->
-            val preparedTask = prepareTaskForExecution(task) ?: return@withReadyService
-            logger.info("Executing precommitted task {}: {}", preparedTask.task.id, preparedTask.task.instruction)
             try {
-                val result = readyAgent.sendMessage(
-                    "以下是一个定时任务指令：\n${preparedTask.task.instruction}\n\n请直接执行并返回结果。",
-                )
-                if (result.isNotBlank()) {
-                    deliverTaskResult(preparedTask.task, preparedTask.botLease.token, result)
+                withTimeout(deadlines.scheduledTurn) {
+                    val preparedTask = prepareTaskForExecution(task) ?: return@withTimeout
+                    logger.info("Executing precommitted task {}", preparedTask.task.id)
+                    val result = readyAgent.sendMessage(
+                        "以下是一个定时任务指令：\n${preparedTask.task.instruction}\n\n请直接执行并返回结果。",
+                    )
+                    if (result.isNotBlank()) {
+                        deliverTaskResult(preparedTask.task, preparedTask.botLease.token, result)
+                    }
                 }
+            } catch (_: TimeoutCancellationException) {
+                logger.warn("Precommitted task {} timed out; it will not be retried or delivered", task.id)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: AgentTurnFailedException) {
-                logger.warn("Precommitted task {} agent turn did not complete; it will not be retried", task.id, e)
+                logger.warn(
+                    "Precommitted task {} agent turn did not complete; it will not be retried; category={}",
+                    task.id,
+                    SafeLogging.failureCategory(e).wireName,
+                )
             } catch (e: Exception) {
-                logger.error("Precommitted task {} agent execution failed; it will not be retried", task.id, e)
+                logger.error(
+                    "Precommitted task {} agent execution failed; it will not be retried; category={}",
+                    task.id,
+                    SafeLogging.failureCategory(e).wireName,
+                )
             }
         }
     }
@@ -378,7 +417,11 @@ class TaskSchedulerService private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to precommit task {}; it will remain eligible for a later scan", task.id, e)
+            logger.error(
+                "Failed to precommit task {}; it will remain eligible for a later scan; category={}",
+                task.id,
+                SafeLogging.failureCategory(e).wireName,
+            )
             null
         }
     }
@@ -406,7 +449,11 @@ class TaskSchedulerService private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to send task result for {}", task.id, e)
+            logger.error(
+                "Failed to send task result for {}; category={}",
+                task.id,
+                SafeLogging.failureCategory(e).wireName,
+            )
         }
     }
 

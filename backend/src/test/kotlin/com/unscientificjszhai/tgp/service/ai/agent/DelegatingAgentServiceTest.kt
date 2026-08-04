@@ -7,6 +7,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdate
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -24,6 +25,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -368,6 +370,105 @@ class DelegatingAgentServiceTest {
             delegatingAgentService.close().join()
             serviceScope.cancel()
             requireNotNull(serviceScope.coroutineContext[Job]).join()
+        }
+    }
+
+    /**
+     * 验证候选初始化超过短总时限后，即使候选关闭也挂起，设置切换屏障仍会释放并保留旧服务。
+     */
+    @Test
+    fun `candidate deadline releases switch barrier while readiness and close are both hanging`() = runBlocking {
+        val settingsRepository = mockedSettingsRepository()
+        val skillRepository = mockk<SkillRepository>()
+        val agentComponentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val candidateComponent = mockk<AgentComponent>()
+        val oldService = mockk<OpenAIAgentService>()
+        val candidateService = mockk<OpenAIAgentService>()
+        val initialSettings = AppSettings(
+            ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "old-key", agentEnabled = true),
+        )
+        val replacementSettings = initialSettings.copy(
+            ai = initialSettings.ai!!.copy(openAiApiKey = "new-key"),
+        )
+        val settingsFlow = MutableStateFlow(initialSettings)
+        val settingsUpdateFlow = MutableStateFlow(SettingsUpdate(initialSettings, 0, null))
+        val firstCreated = CompletableDeferred<Unit>()
+        val candidateCreated = CompletableDeferred<Unit>()
+        val candidateCloseCalled = CompletableDeferred<Unit>()
+        val hangingMcpReadiness = Job()
+        val hangingCandidateClose = Job()
+        val barrier = ModelSwitchBarrier()
+        val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        every { settingsRepository.settingsFlow } returns settingsFlow
+        every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
+        every { skillRepository.skillsUpdateEvent } returns MutableSharedFlow()
+        every { agentComponentFactory.create() } returnsMany listOf(oldComponent, candidateComponent)
+        every { oldComponent.openAIAgentService } answers {
+            firstCreated.complete(Unit)
+            oldService
+        }
+        every { candidateComponent.openAIAgentService } answers {
+            candidateCreated.complete(Unit)
+            candidateService
+        }
+        every { oldService.initializationJob() } returns null
+        every { candidateService.initializationJob() } returns hangingMcpReadiness
+        every { oldService.close() } returns Job().apply { complete() }
+        every { candidateService.close() } answers {
+            candidateCloseCalled.complete(Unit)
+            hangingCandidateClose
+        }
+        every { oldService.currentModel } returns "old-model"
+
+        val delegatingAgentService = DelegatingAgentService(
+            agentComponentFactory,
+            settingsRepository,
+            skillRepository,
+            barrier,
+            serviceScope,
+            AgentExecutionDeadlines(
+                mcpBatch = 1.seconds,
+                candidateInitialization = 100.milliseconds,
+                scheduledTurn = 1.seconds,
+            ),
+        )
+
+        try {
+            withTimeout(5.seconds) { firstCreated.await() }
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) {
+                    yield()
+                }
+            }
+            assertEquals("old-model", delegatingAgentService.currentModel)
+
+            val generation = barrier.beginSwitch()
+            settingsFlow.value = replacementSettings
+            settingsUpdateFlow.value = SettingsUpdate(replacementSettings, 1, generation)
+
+            withTimeout(5.seconds) { candidateCreated.await() }
+            withTimeout(5.seconds) { candidateCloseCalled.await() }
+            withTimeout(5.seconds) {
+                while (barrier.isSwitching) {
+                    yield()
+                }
+            }
+
+            assertEquals("old-model", delegatingAgentService.currentModel)
+            assertTrue(
+                withTimeout(1.seconds) {
+                    delegatingAgentService.withReadyService { readyService -> readyService === oldService }
+                },
+                "released barrier must admit operations on the retained old service",
+            )
+        } finally {
+            hangingMcpReadiness.complete()
+            hangingCandidateClose.complete()
+            delegatingAgentService.close().join()
+            serviceScope.cancel()
+            serviceScope.coroutineContext[Job]?.join()
         }
     }
 
@@ -792,10 +893,10 @@ class DelegatingAgentServiceTest {
     /**
      * 验证代理重建时新组件的发布顺序。
      *
-     * 替代组件可先开始初始化，但委派服务会保留旧代理，直到旧代理的关闭任务结束后才发布新代理。
+     * 替代组件必须先完成初始化；之后旧组件的关闭会转入后台追踪，不能阻塞新代理发布或模型切换屏障。
      */
     @Test
-    fun `重建会等待旧代理关闭后才发布已创建的新代理`() = runBlocking {
+    fun `重建会在旧代理慢速关闭时发布已创建的新代理`() = runBlocking {
         val settingsRepository = mockedSettingsRepository()
         val skillRepository = mockk<SkillRepository>()
         val agentComponentFactory = mockk<AgentComponent.Factory>()
@@ -863,13 +964,12 @@ class DelegatingAgentServiceTest {
             assertFalse(oldCloseStarted.isCompleted)
             initialMcpConnection.complete()
             withTimeout(5.seconds) { oldCloseStarted.await() }
-            assertEquals("old-model", delegatingAgentService.currentModel)
-
-            releaseOldClose.complete()
             withTimeout(5.seconds) {
                 while (delegatingAgentService.currentModel != "new-model") yield()
             }
             assertEquals("new-model", delegatingAgentService.currentModel)
+            assertFalse(releaseOldClose.isCompleted, "old cleanup must not delay candidate publication")
+            releaseOldClose.complete()
             verify(exactly = 1) { oldService.close() }
         } finally {
             delegatingAgentService.close().join()
@@ -879,10 +979,10 @@ class DelegatingAgentServiceTest {
     }
 
     /**
-     * 验证 Gemini 替代实例会先完成首轮 MCP/会话初始化，再关闭旧代理。
+     * 验证 Gemini 替代实例完成首轮初始化后会立即发布，不等待旧代理的慢速关闭。
      */
     @Test
-    fun `Gemini replacement waits for readiness before closing the old agent`() = runBlocking {
+    fun `Gemini replacement publishes after readiness without waiting for old close`() = runBlocking {
         val settingsRepository = mockedSettingsRepository()
         val skillRepository = mockk<SkillRepository>()
         val agentComponentFactory = mockk<AgentComponent.Factory>()
@@ -905,6 +1005,7 @@ class DelegatingAgentServiceTest {
         val geminiReadiness = Job()
         val releaseOldClose = Job()
         val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val barrier = ModelSwitchBarrier()
 
         every { settingsRepository.settingsFlow } returns settingsFlow
         every { settingsRepository.settingsUpdateFlow } returns settingsUpdateFlow
@@ -932,7 +1033,7 @@ class DelegatingAgentServiceTest {
             agentComponentFactory,
             settingsRepository,
             skillRepository,
-            ModelSwitchBarrier(),
+            barrier,
             serviceScope,
         )
 
@@ -947,10 +1048,11 @@ class DelegatingAgentServiceTest {
 
             geminiReadiness.complete()
             withTimeout(5.seconds) { oldCloseStarted.await() }
-            releaseOldClose.complete()
             withTimeout(5.seconds) {
                 while (delegatingAgentService.currentModel != "gemini-model") yield()
             }
+            assertFalse(releaseOldClose.isCompleted, "old cleanup must not delay the replacement publication")
+            releaseOldClose.complete()
         } finally {
             geminiReadiness.complete()
             releaseOldClose.complete()
@@ -958,6 +1060,7 @@ class DelegatingAgentServiceTest {
             serviceScope.cancel()
             serviceScope.coroutineContext[Job]?.join()
         }
+        Unit
     }
 
     /**

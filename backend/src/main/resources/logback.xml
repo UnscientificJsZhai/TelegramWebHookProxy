@@ -1,7 +1,9 @@
 <configuration>
+    <conversionRule conversionWord="safeMsg" converterClass="com.unscientificjszhai.tgp.utils.SafeLogMessageConverter"/>
+
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %safeMsg%n%nopex</pattern>
         </encoder>
     </appender>
 

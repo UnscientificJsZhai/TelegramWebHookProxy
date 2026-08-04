@@ -1,3 +1,5 @@
+@file:Suppress("KotlinUnreachableCode", "LoggingSimilarMessage")
+
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.google.genai.Chat
@@ -13,9 +15,11 @@ import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
@@ -63,13 +67,15 @@ import kotlin.jvm.optionals.getOrNull
  * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
  * @param mcpClientService 管理会话可调用的 MCP 工具连接。
  * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ * @param deadlines 限制候选初始化与其 MCP 批次的总体执行时间。
  */
 @AgentScope
-class GeminiAgentService @Inject constructor(
+class GeminiAgentService @Inject internal constructor(
     parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
     private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
+    private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
 ) : AgentService() {
     private companion object {
@@ -84,6 +90,8 @@ class GeminiAgentService @Inject constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleLock = Any()
+    private val initializationCleanupLock = Any()
+    private val initializationCleanupJobs = mutableSetOf<Job>()
 
     @Volatile
     private var closed = false
@@ -198,7 +206,7 @@ class GeminiAgentService @Inject constructor(
                 initialReadinessJob = createInitialReadinessJob(resetSessionJob, checkNotNull(initialModelUpdateJob))
                 logger.info("Gemini client initialized.")
             } catch (e: Exception) {
-                logger.error("Failed to initialize Gemini client", e)
+                logger.error("Failed to initialize Gemini client; category={}", SafeLogging.failureCategory(e).wireName)
                 client = null
                 rawTransport?.close()
                 rawTransport = null
@@ -224,7 +232,10 @@ class GeminiAgentService @Inject constructor(
 
     private fun createInitialModelUpdateJob(initialResetJob: Job?): Job = initialResetJob?.let { resetJob ->
         scope.launch(CoroutineExceptionHandler { _, error ->
-            logger.error("Gemini model discovery did not become ready", error)
+            logger.error(
+                "Gemini model discovery did not become ready; category={}",
+                SafeLogging.failureCategory(error).wireName,
+            )
         }) {
             resetJob.join()
             if (resetJob.isCancelled) {
@@ -239,25 +250,69 @@ class GeminiAgentService @Inject constructor(
         }
     } ?: failedInitializationJob()
 
+    /**
+     * 合并首轮会话与模型发现，并以统一时限约束完整候选初始化。
+     *
+     * 时限到期时会取消两个同级任务，并在独立作用域追踪其退出，禁止其在候选已经放弃后继续提交会话或
+     * 模型状态，也避免不响应取消的 I/O 延长候选 deadline。
+     */
     private fun createInitialReadinessJob(resetJob: Job?, initialModelJob: Job): Job =
         resetJob?.let { initialResetJob ->
             scope.launch(CoroutineExceptionHandler { _, error ->
-                logger.error("Gemini agent initialization did not become ready", error)
+                logger.error(
+                    "Gemini agent initialization did not become ready; category={}",
+                    SafeLogging.failureCategory(error).wireName,
+                )
             }) {
-                initialResetJob.join()
-                initialModelJob.join()
-                if (
-                    initialResetJob.isCancelled ||
-                    initialModelJob.isCancelled ||
-                    (chat == null && rawSession == null)
-                ) {
-                    throw IllegalStateException("Gemini agent initialization failed")
+                try {
+                    withTimeout(deadlines.candidateInitialization) {
+                        initialResetJob.join()
+                        initialModelJob.join()
+                        if (
+                            initialResetJob.isCancelled ||
+                            initialModelJob.isCancelled ||
+                            (chat == null && rawSession == null)
+                        ) {
+                            throw IllegalStateException("Gemini agent initialization failed")
+                        }
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    logger.warn("Gemini candidate initialization timed out; cancelling unfinished initialization work.")
+                    scheduleInitializationSiblingCleanup(initialResetJob, initialModelJob)
+                    throw e
                 }
             }
         } ?: failedInitializationJob()
 
+    /**
+     * 取消并在独立作用域中等待超时初始化的同级任务。
+     *
+     * 取消请求必须立即发出；实际 `join` 可能被不响应取消的网络实现延迟，故不得继续占用候选就绪任务或
+     * 模型切换屏障。
+     */
+    private fun scheduleInitializationSiblingCleanup(vararg jobs: Job) {
+        jobs.forEach(Job::cancel)
+        lateinit var cleanupJob: Job
+        synchronized(initializationCleanupLock) {
+            cleanupJob = closingScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    jobs.toList().joinAll()
+                } finally {
+                    synchronized(initializationCleanupLock) { initializationCleanupJobs.remove(cleanupJob) }
+                }
+            }
+            initializationCleanupJobs.add(cleanupJob)
+        }
+        cleanupJob.start()
+    }
+
     private fun failedInitializationJob(): Job = scope.launch(
-        CoroutineExceptionHandler { _, error -> logger.error("Gemini agent initialization failed", error) },
+        CoroutineExceptionHandler { _, error ->
+            logger.error(
+                "Gemini agent initialization failed; category={}",
+                SafeLogging.failureCategory(error).wireName,
+            )
+        },
         start = CoroutineStart.UNDISPATCHED,
     ) {
         throw IllegalStateException("Gemini agent initialization failed")
@@ -277,7 +332,7 @@ class GeminiAgentService @Inject constructor(
             }
             return history
         } catch (e: Exception) {
-            logger.warn("Failed to capture history", e)
+            logger.warn("Failed to capture history; category={}", SafeLogging.failureCategory(e).wireName)
             return savedHistory
         }
     }
@@ -401,7 +456,7 @@ class GeminiAgentService @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to update Gemini models", e)
+            logger.error("Failed to update Gemini models; category={}", SafeLogging.failureCategory(e).wireName)
             null
         }
     }
@@ -433,7 +488,7 @@ class GeminiAgentService @Inject constructor(
 
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
         return scope.launch(CoroutineExceptionHandler { _, error ->
-            logger.error("Gemini session reset failed", error)
+            logger.error("Gemini session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
         }) {
             try {
                 sessionMutex.withLock {
@@ -454,7 +509,10 @@ class GeminiAgentService @Inject constructor(
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        logger.error("Failed to create Gemini chat session", e)
+                        logger.error(
+                            "Failed to create Gemini chat session; category={}",
+                            SafeLogging.failureCategory(e).wireName,
+                        )
                         throw e
                     }
                     currentCoroutineContext().ensureActive()
@@ -490,7 +548,7 @@ class GeminiAgentService @Inject constructor(
         val currentTransport = rawTransport ?: return null
         val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
         return scope.launch(CoroutineExceptionHandler { _, error ->
-            logger.error("Gemini raw session reset failed", error)
+            logger.error("Gemini raw session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
         }) {
             try {
                 sessionMutex.withLock {
@@ -691,7 +749,7 @@ class GeminiAgentService @Inject constructor(
             try {
                 var toolCallRounds = 0
                 var toolCallsExecuted = 0
-                while (!closed) {
+                while (true) {
                     val candidate = requestGeminiContent(currentTransport, session, tentativeHistory)
                     tentativeHistory += candidate
                     normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
@@ -715,7 +773,6 @@ class GeminiAgentService @Inject constructor(
                             add(createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot))
                         }
                     }
-
                     tentativeHistory += buildJsonObject {
                         put("role", "user")
                         put("parts", responses)
@@ -723,16 +780,19 @@ class GeminiAgentService @Inject constructor(
                     normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
                 }
             } catch (e: ToolCallLimitExceededException) {
-                logger.error("Tool call limit reached for Gemini session", e)
+                logger.error(
+                    "Tool call limit reached for Gemini session; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 resetSessionJob = resetSession()
                 throw e
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.error("Error while sending message to Gemini", e)
+                logger.error("Gemini message processing failed; category={}", SafeLogging.failureCategory(e).wireName)
                 throw e
             }
-            error("Gemini session was closed before a response was committed.")
+            error("Gemini tool loop exited unexpectedly")
         }
     }
 
@@ -820,7 +880,7 @@ class GeminiAgentService @Inject constructor(
         functionRouteSnapshot: LocalFunctionRouteSnapshot,
     ): GenerateContentConfig {
         val configBuilder = GenerateContentConfig.builder()
-        val skillPrompt = getSkillPrompt(skillRepository.getSkillSummaries())
+        val skillPrompt = getSkillPrompt(skillRepository.getApprovedSkillSummaries())
         val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
             Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
         } else {
@@ -950,7 +1010,7 @@ class GeminiAgentService @Inject constructor(
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             logger.warn("Gemini function call failed with a safe local error category.")
             buildJsonObject { put("error", "tool_execution_failed") }
         }
@@ -968,7 +1028,7 @@ class GeminiAgentService @Inject constructor(
         aiSettings: AISettings,
         routeSnapshot: LocalFunctionRouteSnapshot,
     ): JsonObject = buildJsonObject {
-        val skillPrompt = getSkillPrompt(skillRepository.getSkillSummaries())
+        val skillPrompt = getSkillPrompt(skillRepository.getApprovedSkillSummaries())
         val instruction = skillPrompt + aiSettings.globalContext
         if (instruction.isNotBlank()) {
             put("systemInstruction", buildJsonObject {
@@ -1110,12 +1170,15 @@ class GeminiAgentService @Inject constructor(
                 sdkSessionConfig = config
                 result.reply
             } catch (e: ToolCallLimitExceededException) {
-                logger.error("Tool call limit reached for Gemini session", e)
+                logger.error(
+                    "Tool call limit reached for Gemini session; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 // 重置同样采用候选提交；创建失败时仍保留当前会话，避免在错误恢复路径破坏可用状态。
                 resetSessionJob = resetSession()
                 throw e
             } catch (e: Exception) {
-                logger.error("Error while sending message to Gemini", e)
+                logger.error("Gemini message processing failed; category={}", SafeLogging.failureCategory(e).wireName)
                 throw e
             }
         }
@@ -1212,7 +1275,7 @@ class GeminiAgentService @Inject constructor(
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             logger.warn("Gemini SDK function call failed with a safe local error category.")
             buildJsonObject { put("error", "tool_execution_failed") }
         }
@@ -1299,7 +1362,10 @@ class GeminiAgentService @Inject constructor(
                             mcpClientService.close().join()
                         }
                     } catch (e: Exception) {
-                        logger.error("Failed to close Gemini agent resources", e)
+                        logger.error(
+                            "Failed to close Gemini agent resources; category={}",
+                            SafeLogging.failureCategory(e).wireName,
+                        )
                     } finally {
                         newCompletion.complete(Unit)
                     }

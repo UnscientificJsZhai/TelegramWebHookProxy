@@ -1,3 +1,12 @@
+@file:Suppress(
+    "LiftReturnOrAssignment",
+    "LoggingSimilarMessage",
+    "RedundantIf",
+    "RedundantNullableReturnType",
+    "RedundantSuspendModifier",
+    "UnclearPrecedenceOfBinaryExpression",
+)
+
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
@@ -13,6 +22,7 @@ import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -22,7 +32,6 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
-import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
@@ -370,7 +379,11 @@ class MessagePoller @Inject constructor(
             // FINAL 残留。失败不影响已确认偏移量；后续 claim 仍会 fail-closed。
             updatesRepository.cleanupConfirmedAgentTurns(botId)
         } catch (e: Exception) {
-            logger.warn("Deferred confirmed Agent journal cleanup for bot {} ({}).", botId, e::class.simpleName)
+            logger.warn(
+                "Deferred confirmed Agent journal cleanup for bot {}; category={}",
+                botId,
+                SafeLogging.failureCategory(e).wireName,
+            )
         }
         session.consumerJob = session.scope.launch { consumeQueue(session) }
         session.outboxJob = session.scope.launch { consumeOutbox(session) }
@@ -414,21 +427,12 @@ class MessagePoller @Inject constructor(
             } catch (_: CancellationException) {
                 return
             } catch (e: Exception) {
-                if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
-                    logger.warn(
-                        "Polling request timed out for bot {} at generation {} ({}).",
-                        session.botId,
-                        session.generation,
-                        e::class.simpleName,
-                    )
-                } else {
-                    logger.warn(
-                        "Polling request failed for bot {} at generation {} ({}).",
-                        session.botId,
-                        session.generation,
-                        e::class.simpleName,
-                    )
-                }
+                logger.warn(
+                    "Polling request failed for bot {} at generation {}; category={}",
+                    session.botId,
+                    session.generation,
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 if (!delayAfterFailure(session)) {
                     return
                 }
@@ -472,7 +476,7 @@ class MessagePoller @Inject constructor(
 
         val response = telegramService.getUpdatesForToken(
             session.token,
-            offset = retryOffset ?: (lastStoredId + 1),
+            offset = retryOffset ?: lastStoredId + 1,
             timeout = 30,
         )
         if (!isCurrent(session)) {
@@ -508,9 +512,9 @@ class MessagePoller @Inject constructor(
                 throw e
             } catch (e: Exception) {
                 logger.warn(
-                    "Failed to admit update {}; preserving its offset for retry ({}).",
+                    "Failed to admit update {}; preserving its offset for retry; category={}",
                     update.updateId,
-                    e::class.simpleName,
+                    SafeLogging.failureCategory(e).wireName,
                 )
                 mustRetry = true
                 retryUpdateId = update.updateId
@@ -565,11 +569,10 @@ class MessagePoller @Inject constructor(
             403,
                 -> {
                 logger.error(
-                    "Telegram authentication failed for bot {} at generation {} with HTTP {}: {}. Polling session will stop.",
+                    "Telegram authentication failed for bot {} at generation {} with HTTP {}. Polling session will stop.",
                     session.botId,
                     session.generation,
                     response.errorCode,
-                    response.description ?: "no description",
                 )
                 terminateAuthenticationFailedSession(session)
                 false
@@ -577,10 +580,9 @@ class MessagePoller @Inject constructor(
 
             409 -> {
                 logger.error(
-                    "Telegram getUpdates conflict for bot {} at generation {}: another getUpdates consumer exists ({}).",
+                    "Telegram getUpdates conflict for bot {} at generation {}; another getUpdates consumer exists.",
                     session.botId,
                     session.generation,
-                    response.description ?: "no description",
                 )
                 delayAfterFailure(session)
             }
@@ -588,22 +590,20 @@ class MessagePoller @Inject constructor(
             429 -> {
                 val retryAfter = response.parameters?.retryAfter?.takeIf { it > 0 }?.seconds
                 logger.warn(
-                    "Telegram rate limited bot {} at generation {} (retry_after={}): {}.",
+                    "Telegram rate limited bot {} at generation {} (retry_after={}).",
                     session.botId,
                     session.generation,
                     retryAfter?.inWholeSeconds ?: "ignored",
-                    response.description ?: "no description",
                 )
                 delayAfterFailure(session, retryAfter)
             }
 
             else -> {
                 logger.warn(
-                    "Telegram getUpdates failed for bot {} at generation {} with API error {}: {}.",
+                    "Telegram getUpdates failed for bot {} at generation {} with API error {}.",
                     session.botId,
                     session.generation,
                     response.errorCode ?: "unknown",
-                    response.description ?: "no description",
                 )
                 delayAfterFailure(session)
             }
@@ -672,7 +672,9 @@ class MessagePoller @Inject constructor(
                 modelSwitchBarrier.awaitInFlightRequests()
                 val resetSucceeded = attemptAuthenticationAgentReset()
                 val shouldReleaseBarrier = sessionLock.withLock {
-                    if (pendingAuthenticationReset === pendingReset && resetSucceeded) {
+                    if (pendingAuthenticationReset !== pendingReset) {
+                        false
+                    } else if (resetSucceeded) {
                         pendingAuthenticationReset = null
                         true
                     } else {
@@ -691,8 +693,8 @@ class MessagePoller @Inject constructor(
                 // NonCancellable 区域中的意外失败也必须通知等待的新 token 会话，并保持 fail-closed 屏障。
                 pendingReset.initialResetCompletion.complete(false)
                 logger.warn(
-                    "Authentication reset cleanup failed before completion; new polling sessions remain blocked.",
-                    e
+                    "Authentication reset cleanup failed before completion; new polling sessions remain blocked; category={}",
+                    SafeLogging.failureCategory(e).wireName,
                 )
             }
         }
@@ -729,17 +731,14 @@ class MessagePoller @Inject constructor(
             attemptAuthenticationAgentReset()
         }
         val shouldReleaseBarrier = sessionLock.withLock {
-            when {
-                pendingAuthenticationReset !== pendingReset -> false
-                resetSucceeded -> {
-                    pendingAuthenticationReset = null
-                    true
-                }
-
-                else -> {
-                    pendingReset.retryCompletion = null
-                    false
-                }
+            if (pendingAuthenticationReset !== pendingReset) {
+                false
+            } else if (resetSucceeded) {
+                pendingAuthenticationReset = null
+                true
+            } else {
+                pendingReset.retryCompletion = null
+                false
             }
         }
         retry.completion.complete(resetSucceeded && shouldReleaseBarrier)
@@ -755,10 +754,16 @@ class MessagePoller @Inject constructor(
     private suspend fun attemptAuthenticationAgentReset(): Boolean = try {
         awaitSuccessfulAgentReset()
     } catch (e: CancellationException) {
-        logger.warn("Agent session reset was cancelled after Telegram authentication failure.", e)
+        logger.warn(
+            "Agent session reset was cancelled after Telegram authentication failure; category={}",
+            SafeLogging.failureCategory(e).wireName,
+        )
         false
     } catch (e: Exception) {
-        logger.warn("Failed to reset agent session after Telegram authentication failure.", e)
+        logger.warn(
+            "Failed to reset agent session after Telegram authentication failure; category={}",
+            SafeLogging.failureCategory(e).wireName,
+        )
         false
     }
 
@@ -781,7 +786,11 @@ class MessagePoller @Inject constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.error("Error processing update ${queuedUpdate.update.updateId}", e)
+                logger.error(
+                    "Error processing update {}; category={}",
+                    queuedUpdate.update.updateId,
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 UpdateCompletion.Retry
             }
 
@@ -851,7 +860,11 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to read Telegram outbox for bot {}; retrying later.", session.botId, e)
+            logger.error(
+                "Failed to read Telegram outbox for bot {}; retrying later; category={}",
+                session.botId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             return OutboxDelivery.RETRY
         } ?: return if (isCurrent(session)) OutboxDelivery.EMPTY else OutboxDelivery.RETRY
 
@@ -865,9 +878,9 @@ class MessagePoller @Inject constructor(
             throw e
         } catch (e: Exception) {
             logger.error(
-                "Failed to persist Telegram outbox delivery attempt for update {}; not sending it.",
+                "Failed to persist Telegram outbox delivery attempt for update {}; not sending it; category={}",
                 pendingReply.updateId,
-                e,
+                SafeLogging.failureCategory(e).wireName,
             )
             return OutboxDelivery.RETRY
         }
@@ -883,10 +896,10 @@ class MessagePoller @Inject constructor(
             throw e
         } catch (e: Exception) {
             logger.warn(
-                "Telegram outbox send failed for update {} of bot {} ({}); retrying later.",
+                "Telegram outbox send failed for update {} of bot {}; retrying later; category={}",
                 reply.updateId,
                 session.botId,
-                e::class.simpleName,
+                SafeLogging.failureCategory(e).wireName,
             )
             null
         }
@@ -902,9 +915,9 @@ class MessagePoller @Inject constructor(
                     throw e
                 } catch (e: Exception) {
                     logger.error(
-                        "Failed to discard exhausted Telegram fallback reply {}; retaining it.",
+                        "Failed to discard exhausted Telegram fallback reply {}; retaining it; category={}",
                         reply.updateId,
-                        e,
+                        SafeLogging.failureCategory(e).wireName,
                     )
                     false
                 }
@@ -926,7 +939,7 @@ class MessagePoller @Inject constructor(
                 }
                 if (replacement == reply) {
                     logger.warn(
-                        "Telegram outbox reply for update {} of bot {} had no delivery-state transition; retrying later.",
+                        "Telegram did not accept outbox reply for update {} of bot {}; retrying later.",
                         reply.updateId,
                         session.botId,
                     )
@@ -941,9 +954,9 @@ class MessagePoller @Inject constructor(
                     throw e
                 } catch (e: Exception) {
                     logger.error(
-                        "Failed to persist Telegram outbox delivery state for reply {}; retrying later.",
+                        "Failed to persist Telegram outbox delivery state for reply {}; retrying later; category={}",
                         reply.updateId,
-                        e,
+                        SafeLogging.failureCategory(e).wireName,
                     )
                     false
                 }
@@ -971,7 +984,7 @@ class MessagePoller @Inject constructor(
                 }
             } else {
                 logger.warn(
-                    "Telegram fallback outbox reply for update {} of bot {} was not accepted; retrying later.",
+                    "Telegram did not accept outbox reply for update {} of bot {}; retrying later.",
                     reply.updateId,
                     session.botId,
                 )
@@ -986,7 +999,11 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to acknowledge delivered Telegram outbox reply {}; retaining it.", reply.updateId, e)
+            logger.error(
+                "Failed to acknowledge delivered Telegram outbox reply {}; retaining it; category={}",
+                reply.updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             false
         }
         return if (removed) OutboxDelivery.DELIVERED else OutboxDelivery.RETRY
@@ -1039,7 +1056,10 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Failed to send timeout notification", e)
+            logger.warn(
+                "Failed to send timeout notification; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
         }
         return UpdateCompletion.Retry
     }
@@ -1061,7 +1081,11 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Timed out Agent turn {} could not finalize safely ({}).", updateId, e::class.simpleName)
+            logger.warn(
+                "Timed out Agent turn {} could not finalize safely; category={}",
+                updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             UpdateCompletion.Retry
         }
 
@@ -1112,9 +1136,9 @@ class MessagePoller @Inject constructor(
             throw e
         } catch (e: Exception) {
             logger.warn(
-                "Unable to read durable Agent journal for update {}; preserving its offset ({}).",
+                "Unable to read durable Agent journal for update {}; preserving its offset; category={}",
                 update.updateId,
-                e::class.simpleName,
+                SafeLogging.failureCategory(e).wireName,
             )
             return UpdateAdmission.Retry
         }
@@ -1155,9 +1179,9 @@ class MessagePoller @Inject constructor(
                 throw e
             } catch (e: Exception) {
                 logger.warn(
-                    "AI availability check failed for update {}; preserving its offset for retry ({}).",
+                    "AI availability check failed for update {}; preserving its offset for retry; category={}",
                     update.updateId,
-                    e::class.simpleName,
+                    SafeLogging.failureCategory(e).wireName,
                 )
                 return@runWhenReady BarrierAdmission.Retry
             }
@@ -1181,16 +1205,13 @@ class MessagePoller @Inject constructor(
                 QueueOfferResult.NOT_CURRENT -> BarrierAdmission.Confirmed
             }
         }
-        return when (admission) {
-            BarrierAdmission.Confirmed -> UpdateAdmission.Confirmed
-            BarrierAdmission.Retry -> UpdateAdmission.Retry
-            is BarrierAdmission.Enqueued -> UpdateAdmission.Enqueued(admission.completion)
-            is BarrierAdmission.QueueFull -> notifyQueueFull(
-                session,
-                update.updateId,
-                admission.chatId,
-                admission.messageId
-            )
+        when (admission) {
+            BarrierAdmission.Confirmed -> return UpdateAdmission.Confirmed
+            BarrierAdmission.Retry -> return UpdateAdmission.Retry
+            is BarrierAdmission.Enqueued -> return UpdateAdmission.Enqueued(admission.completion)
+            is BarrierAdmission.QueueFull -> {
+                return notifyQueueFull(session, update.updateId, admission.chatId, admission.messageId)
+            }
         }
     }
 
@@ -1240,7 +1261,11 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Text update {} could not reach durable Agent claim ({}).", updateId, e::class.simpleName)
+            logger.warn(
+                "Text update {} could not reach durable Agent claim; category={}",
+                updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             UpdateCompletion.Retry
         }
     }
@@ -1277,9 +1302,9 @@ class MessagePoller @Inject constructor(
             throw e
         } catch (e: Exception) {
             logger.warn(
-                "Voice input for update {} was unavailable before Agent claim ({}).",
+                "Voice input for update {} was unavailable before Agent claim; category={}",
                 updateId,
-                e::class.simpleName
+                SafeLogging.failureCategory(e).wireName,
             )
             return UpdateCompletion.Retry
         }
@@ -1311,7 +1336,11 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Voice update {} could not reach durable Agent claim ({}).", updateId, e::class.simpleName)
+            logger.warn(
+                "Voice update {} could not reach durable Agent claim; category={}",
+                updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             UpdateCompletion.Retry
         }
     }
@@ -1346,7 +1375,11 @@ class MessagePoller @Inject constructor(
                         // 取消时结果不确定；留下 IN_PROGRESS 使下一次无 owner 重投安全降级，而不是猜测重放。
                         throw e
                     } catch (e: Exception) {
-                        logger.warn("Agent turn {} failed after durable claim ({}).", updateId, e::class.simpleName)
+                        logger.warn(
+                            "Agent turn {} failed after durable claim; category={}",
+                            updateId,
+                            SafeLogging.failureCategory(e).wireName,
+                        )
                         withContext(NonCancellable) {
                             updatesRepository.failInProgressAgentTurn(session.botId, updateId, AGENT_TURN_FAILURE_REPLY)
                         }
@@ -1367,7 +1400,11 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Durable Agent journal operation failed for update {} ({}).", updateId, e::class.simpleName)
+            logger.warn(
+                "Durable Agent journal operation failed for update {}; category={}",
+                updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             return UpdateCompletion.Retry
         } finally {
             releaseAgentTurnOwner(key, owner)
@@ -1409,16 +1446,20 @@ class MessagePoller @Inject constructor(
                 }
             } catch (e: Exception) {
                 logger.warn(
-                    "Confirmed Agent journal cleanup deferred for update {} ({}).",
+                    "Confirmed Agent journal cleanup deferred for update {}; category={}",
                     entry.updateId,
-                    e::class.simpleName
+                    SafeLogging.failureCategory(e).wireName,
                 )
             }
             UpdateCompletion.Persisted
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("FINAL Agent turn {} could not commit offset/outbox ({}).", entry.updateId, e::class.simpleName)
+            logger.warn(
+                "FINAL Agent turn {} could not commit offset/outbox; category={}",
+                entry.updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
             UpdateCompletion.Retry
         }
     }
@@ -1467,14 +1508,14 @@ class MessagePoller @Inject constructor(
                 chatId,
                 "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
                 ReplyParameters(messageId = messageId),
-            ).isTelegramAccepted()
+            )?.isTelegramAccepted() == true
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             logger.warn(
-                "Queue full notification request failed for update {} ({}).",
+                "Queue full notification request failed for update {}; category={}",
                 updateId,
-                e::class.simpleName,
+                SafeLogging.failureCategory(e).wireName,
             )
             false
         }
@@ -1519,7 +1560,10 @@ class MessagePoller @Inject constructor(
 
     /** 判断 Telegram 响应是否同时具有成功 HTTP 状态和 API `ok: true` 标记。 */
     private fun TelegramApiResponse.isTelegramAccepted(): Boolean {
-        return status.isSuccess() && try {
+        if (!status.isSuccess()) {
+            return false
+        }
+        return try {
             Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
         } catch (_: Exception) {
             false
@@ -1527,8 +1571,11 @@ class MessagePoller @Inject constructor(
     }
 
     /** 返回该响应是否明确表明 Telegram 以非限流的永久 `4xx` 拒绝了请求。 */
-    private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean =
-        status.value in 400..499 && status.value != 429 || try {
+    private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean {
+        if (status.value in 400..499 && status.value != 429) {
+            return true
+        }
+        return try {
             Json.parseToJsonElement(body)
                 .jsonObject["error_code"]
                 ?.jsonPrimitive
@@ -1538,6 +1585,7 @@ class MessagePoller @Inject constructor(
         } catch (_: Exception) {
             false
         }
+    }
 
     /** 基于一项已登记投递的原文回复，记录一次永久拒绝或切换到固定回退消息。 */
     private fun PendingTelegramReply.afterPermanentTelegramRejection(): PendingTelegramReply {
@@ -1586,7 +1634,7 @@ class MessagePoller @Inject constructor(
             "/keep" -> {
                 if (isCurrent(session)) {
                     session.lastAiReplyAtMillis = System.currentTimeMillis()
-                    logger.info("Auto-clean context timer refreshed by keep command in chat {}", chatId)
+                    logger.info("Auto-clean context timer refreshed by keep command for bot {}", session.botId)
                 }
             }
 
@@ -1595,7 +1643,7 @@ class MessagePoller @Inject constructor(
                 if (!awaitSuccessfulAgentReset()) {
                     ensureCurrent(session)
                     sendMessageForSession(session, chatId, "会话重置失败，请稍后重试。", ReplyParameters(messageId))
-                    logger.warn("Session reset failed by command in chat {}", chatId)
+                    logger.warn("Session reset failed by command for bot {}", session.botId)
                     return
                 }
                 ensureCurrent(session)
@@ -1603,7 +1651,7 @@ class MessagePoller @Inject constructor(
                 ensureCurrent(session)
                 session.lastAiReplyAtMillis = null
                 sendMessageForSession(session, chatId, "会话已重置，待处理消息已清空。", ReplyParameters(messageId))
-                logger.info("Session reset and queue cleared by command in chat {}", chatId)
+                logger.info("Session reset and queue cleared by command for bot {}", session.botId)
             }
 
             "/model" -> {
@@ -1679,14 +1727,17 @@ class MessagePoller @Inject constructor(
     private fun AppSettings.hasSameModelServiceConfiguration(expected: AppSettings): Boolean {
         val currentAi = ai ?: return false
         val expectedAi = expected.ai ?: return false
-        return !(
-                currentAi.provider != expectedAi.provider ||
-                        currentAi.agentEnabled != expectedAi.agentEnabled ||
-                        currentAi.selectedModel != expectedAi.selectedModel ||
-                        proxy != expected.proxy ||
-                        currentAi.httpToolSettings != expectedAi.httpToolSettings ||
-                        currentAi.mcpServers != expectedAi.mcpServers
-                ) && when (currentAi.provider) {
+        if (
+            currentAi.provider != expectedAi.provider ||
+            currentAi.agentEnabled != expectedAi.agentEnabled ||
+            currentAi.selectedModel != expectedAi.selectedModel ||
+            proxy != expected.proxy ||
+            currentAi.httpToolSettings != expectedAi.httpToolSettings ||
+            currentAi.mcpServers != expectedAi.mcpServers
+        ) {
+            return false
+        }
+        return when (currentAi.provider) {
             AIProvider.GEMINI -> currentAi.geminiApiKey == expectedAi.geminiApiKey
             AIProvider.OPENAI ->
                 currentAi.openAiApiKey == expectedAi.openAiApiKey &&
@@ -1702,7 +1753,10 @@ class MessagePoller @Inject constructor(
             } catch (_: CancellationException) {
                 return@launch
             } catch (e: Exception) {
-                logger.warn("Failed to send typing action", e)
+                logger.warn(
+                    "Failed to send typing action; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
             }
         }
     }
@@ -1747,7 +1801,10 @@ class MessagePoller @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Failed to start agent session reset", e)
+            logger.warn(
+                "Failed to start agent session reset; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
             return false
         } ?: return false
 
@@ -1772,7 +1829,7 @@ class MessagePoller @Inject constructor(
         chatId: String,
         text: String,
         replyParameters: ReplyParameters? = null,
-    ): TelegramApiResponse {
+    ): TelegramApiResponse? {
         ensureCurrent(session)
         return telegramService.sendMessageForToken(session.token, chatId, text, replyParameters)
     }
@@ -1781,26 +1838,26 @@ class MessagePoller @Inject constructor(
         session: PollingSession,
         chatId: String,
         action: String,
-    ): TelegramApiResponse {
+    ): TelegramApiResponse? {
         ensureCurrent(session)
         return telegramService.sendChatActionForToken(session.token, chatId, action)
     }
 
-    private fun activeSession(): PollingSession? = sessionLock.withLock {
+    private suspend fun activeSession(): PollingSession? = sessionLock.withLock {
         currentSession?.takeIf { !closed && isTokenGenerationCurrent(it) }
     }
 
-    private fun isCurrent(session: PollingSession): Boolean = sessionLock.withLock {
+    private suspend fun isCurrent(session: PollingSession): Boolean = sessionLock.withLock {
         !closed && currentSession === session && isTokenGenerationCurrent(session)
     }
 
-    private fun ensureCurrent(session: PollingSession) {
+    private suspend fun ensureCurrent(session: PollingSession) {
         if (!isCurrent(session)) {
             throw CancellationException("Polling session is no longer current.")
         }
     }
 
-    private fun saveForCurrent(session: PollingSession, save: () -> Unit): Boolean =
+    private suspend fun saveForCurrent(session: PollingSession, save: () -> Unit): Boolean =
         settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession !== session || !isTokenGenerationCurrent(session)) {
@@ -1812,7 +1869,7 @@ class MessagePoller @Inject constructor(
             }
         }
 
-    private fun <T> readForCurrent(session: PollingSession, read: () -> T): T? =
+    private suspend fun <T> readForCurrent(session: PollingSession, read: () -> T): T? =
         settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession === session && isTokenGenerationCurrent(session)) read() else null
@@ -1824,7 +1881,7 @@ class MessagePoller @Inject constructor(
             tokenUpdate.token == session.token && tokenUpdate.generation == session.generation
         }
 
-    private fun cancelCurrentSession() {
+    private suspend fun cancelCurrentSession() {
         val session = sessionLock.withLock { currentSession.also { currentSession = null } } ?: return
         session.updateChannel.close()
         session.scope.cancel()

@@ -5,6 +5,7 @@ import com.google.genai.types.Schema
 import com.google.genai.types.Type
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.McpToolResultTooLargeException
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
@@ -73,7 +74,10 @@ class McpFunctionProvider(
             val refreshedSnapshot = try {
                 createSnapshot(mcpClientService.getAllTools())
             } catch (e: Exception) {
-                logger.warn("Unable to refresh MCP tool declarations", e)
+                logger.warn(
+                    "Unable to refresh MCP tool declarations; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 ToolSnapshot(emptyList(), emptyMap())
             }
             toolSnapshot = refreshedSnapshot
@@ -160,7 +164,10 @@ class McpFunctionProvider(
             val functionName = try {
                 toolAliasGenerator.alias(serverName, mcpTool.name)
             } catch (e: Exception) {
-                logger.warn("Ignoring MCP tool whose alias could not be generated.", e)
+                logger.warn(
+                    "Ignoring MCP tool whose alias could not be generated; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 return@mapNotNull null
             }
             if (!MCP_TOOL_ALIAS_PATTERN.matches(functionName)) {

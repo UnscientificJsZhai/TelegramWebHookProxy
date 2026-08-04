@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.models.SkillStatus
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
@@ -153,9 +154,9 @@ class SkillRepositoryTest {
     }
 
     /**
-     * 验证技能变更事件的发布设计。
+     * 验证仅已批准技能集合变更时发布事件。
      *
-     * 验证保存技能后订阅者会收到变更事件。
+     * 待审批草稿的创建不会重置 Agent；批准、撤销和删除已批准技能才会发布事件。
      */
     @Test
     fun testSkillsUpdateEvent() = runTest {
@@ -167,16 +168,25 @@ class SkillRepositoryTest {
         }
         yield()
 
-        val skill = Skill(description = "Event Test", content = "Content")
-        repository.saveSkill(skill)
+        val skill = repository.saveSkill(Skill(description = "Event Test", content = "Content"))
 
-        // 等待订阅协程接收并记录变更事件。
+        delay(100.milliseconds)
+        assertTrue(events.isEmpty())
+
+        val approved = repository.approveSkill(skill.id, skill.revision)
         delay(100.milliseconds)
         assertEquals(1, events.size)
 
-        repository.deleteSkill(skill.id)
+        val revoked = repository.revokeSkill(approved.id, approved.revision)
         delay(100.milliseconds)
         assertEquals(2, events.size)
+
+        repository.approveSkill(revoked.id, revoked.revision)
+        delay(100.milliseconds)
+        assertEquals(3, events.size)
+        repository.deleteSkill(skill.id)
+        delay(100.milliseconds)
+        assertEquals(4, events.size)
 
         job.cancel()
     }
@@ -337,6 +347,41 @@ class SkillRepositoryTest {
         assertEquals(validBackup, backupFile.readText())
         assertTrue(events.isEmpty())
         job.cancel()
+    }
+
+    /** 验证模型草稿不能覆盖既有技能，且审批需要匹配管理员看到的版本。 */
+    @Test
+    fun `pending drafts are model-isolated and approval uses compare and set`() {
+        val managed = repository.saveSkill(Skill(id = "managed", description = "trusted", content = "trusted"))
+        val approved = repository.approveSkill(managed.id, managed.revision)
+        val draft = repository.createPendingDraft("untrusted", "PROMPT_INJECTION_CANARY")
+
+        assertEquals(listOf("managed"), repository.getApprovedSkillSummaries().map { it.id })
+        assertNull(repository.getApprovedSkillById(draft.id))
+        assertEquals("trusted", repository.getSkillById(approved.id)?.content)
+        assertFailsWith<SkillRevisionConflictException> {
+            repository.approveSkill(draft.id, draft.revision + 1)
+        }
+        val approvedDraft = repository.approveSkill(draft.id, draft.revision)
+        assertEquals(listOf("managed", draft.id), repository.getApprovedSkillSummaries().map { it.id })
+        assertEquals(SkillStatus.APPROVED, approvedDraft.status)
+    }
+
+    /** 验证缺少审批字段的历史数据保守降级为待审批，未知状态则隔离并拒绝覆盖。 */
+    @Test
+    fun `legacy skill status is fail closed`() {
+        skillsFile.writeText("""[{"id":"legacy","description":"legacy","content":"LEGACY_CANARY"}]""")
+
+        assertEquals(SkillStatus.PENDING, repository.getSkillById("legacy")?.status)
+        assertTrue(repository.getApprovedSkillSummaries().isEmpty())
+
+        skillsFile.writeText("""[{"id":"unknown","description":"unknown","content":"UNKNOWN_CANARY","status":"BYPASS"}]""")
+        repository = SkillRepository.forTesting(skillsFile)
+        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
+        assertFailsWith<IllegalStateException> {
+            repository.createPendingDraft("new", "new")
+        }
+        assertTrue(skillsFile.readText().contains("UNKNOWN_CANARY"))
     }
 
     /**

@@ -1,6 +1,6 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import type {Skill} from './api';
-import {deleteSkill, getSkills, saveSkill} from './api';
+import {approveSkill, deleteSkill, getSkills, revokeSkill, saveSkill} from './api';
 
 const {deleteRequest, get, post} = vi.hoisted(() => ({
     deleteRequest: vi.fn(),
@@ -23,8 +23,8 @@ describe('技能 API', () => {
         vi.clearAllMocks();
     });
 
-    it('使用默认分页参数获取技能列表', async () => {
-        const result = {
+    it('使用默认分页参数获取技能列表，并兼容缺失的审批默认字段', async () => {
+        const response = {
             total: 1,
             items: [
                 {
@@ -34,9 +34,12 @@ describe('技能 API', () => {
                 },
             ],
         };
-        get.mockResolvedValueOnce({data: result});
+        get.mockResolvedValueOnce({data: response});
 
-        await expect(getSkills()).resolves.toEqual(result);
+        await expect(getSkills()).resolves.toEqual({
+            total: 1,
+            items: [{...response.items[0], status: 'PENDING', revision: 0}],
+        });
         expect(get).toHaveBeenCalledWith('/skills', {
             params: {page: 1, size: 10},
         });
@@ -57,12 +60,24 @@ describe('技能 API', () => {
             id: 'skill-1',
             description: '测试技能',
             content: '测试内容',
+            status: 'PENDING',
+            revision: 0,
         };
-        post.mockResolvedValueOnce({});
+        post.mockResolvedValueOnce({data: skill});
 
-        await saveSkill(skill);
+        await expect(saveSkill(skill)).resolves.toEqual(skill);
 
         expect(post).toHaveBeenCalledWith('/skills', skill);
+    });
+
+    it('批准和撤销技能时携带版本号并编码路径标识', async () => {
+        post.mockResolvedValue({data: {}});
+
+        await approveSkill('safe?skill', 3);
+        await revokeSkill('safe?skill', 4);
+
+        expect(post).toHaveBeenNthCalledWith(1, '/skills/safe%3Fskill/approve', {revision: 3});
+        expect(post).toHaveBeenNthCalledWith(2, '/skills/safe%3Fskill/revoke', {revision: 4});
     });
 
     it('删除指定技能', async () => {

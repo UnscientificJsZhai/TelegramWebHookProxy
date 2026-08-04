@@ -14,7 +14,9 @@ import io.ktor.server.testing.*
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
@@ -47,27 +49,30 @@ class SkillAPIModuleTest {
                     assertEquals(0, received.items.size)
                 }
 
-                val testSkill1 = Skill(description = "Skill 1", content = "Content 1")
-                val testSkill2 = Skill(description = "Skill 2", content = "Content 2")
-
                 // 2. POST：新增两个技能
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-                    setBody(Json.encodeToString(testSkill1))
+                    setBody("""{"description":"Skill 1","content":"Content 1"}""")
                 }.apply { assertEquals(HttpStatusCode.OK, status) }
 
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-                    setBody(Json.encodeToString(testSkill2))
+                    setBody("""{"description":"Skill 2","content":"Content 2"}""")
                 }.apply { assertEquals(HttpStatusCode.OK, status) }
 
                 // 3. GET：验证列表包含两个技能
                 val skills = client.get("/api/skills").apply {
                     assertEquals(HttpStatusCode.OK, status)
-                    val received = Json.decodeFromString<PageResult<Skill>>(bodyAsText()).items
+                    val body = bodyAsText()
+                    val received = Json.decodeFromString<PageResult<Skill>>(body).items
                     assertEquals(2, received.size)
                     assertTrue(received.any { it.description == "Skill 1" })
                     assertTrue(received.any { it.description == "Skill 2" })
+                    Json.parseToJsonElement(body).jsonObject["items"]!!.jsonArray.forEach { item ->
+                        val rawSkill = item.jsonObject
+                        assertEquals("PENDING", rawSkill["status"]?.jsonPrimitive?.content)
+                        assertEquals(0L, rawSkill["revision"]?.jsonPrimitive?.content?.toLong())
+                    }
                 }.let { Json.decodeFromString<PageResult<Skill>>(it.bodyAsText()).items }
 
                 // 4. DELETE：删除第一个技能
@@ -103,15 +108,7 @@ class SkillAPIModuleTest {
 
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-                    setBody(
-                        Json.encodeToString(
-                            Skill(
-                                id = "oversized",
-                                description = "ok",
-                                content = "x".repeat(64 * 1024 + 1)
-                            )
-                        )
-                    )
+                    setBody("""{"description":"ok","content":"${"x".repeat(64 * 1024 + 1)}"}""")
                 }.apply {
                     assertEquals(HttpStatusCode.BadRequest, status)
                 }
@@ -138,15 +135,7 @@ class SkillAPIModuleTest {
 
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-                    setBody(
-                        Json.encodeToString(
-                            Skill(
-                                id = "large-request",
-                                description = "ok",
-                                content = "x".repeat(128 * 1024)
-                            )
-                        )
-                    )
+                    setBody("""{"description":"ok","content":"${"x".repeat(128 * 1024)}"}""")
                 }.apply {
                     assertEquals(HttpStatusCode.PayloadTooLarge, status)
                 }
@@ -323,6 +312,92 @@ class SkillAPIModuleTest {
                     }
                 }
             }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /** 验证管理 API 不能由请求体注入批准状态，且批准和编辑都受版本 CAS 保护。 */
+    @Test
+    fun `skill approval API ignores injected status and rejects stale edits`() {
+        val temporaryDirectory = createTempDirectory("skill-api-approval-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+                val created = client.post("/api/skills") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"description":"trusted","content":"safe","status":"APPROVED"}""")
+                }.let { response ->
+                    assertEquals(HttpStatusCode.OK, response.status)
+                    Json.decodeFromString<Skill>(response.bodyAsText())
+                }
+                assertEquals("PENDING", created.status.name)
+                assertEquals(0, created.revision)
+
+                val approved = client.post("/api/skills/${created.id}/approve") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":0}""")
+                }.let { response ->
+                    assertEquals(HttpStatusCode.OK, response.status)
+                    Json.decodeFromString<Skill>(response.bodyAsText())
+                }
+                assertEquals("APPROVED", approved.status.name)
+                assertEquals(1, approved.revision)
+
+                client.post("/api/skills") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"id":"${created.id}","description":"replaced","content":"PROMPT_INJECTION_CANARY","revision":0}""")
+                }.apply { assertEquals(HttpStatusCode.Conflict, status) }
+                assertEquals("safe", skillRepository.getSkillById(created.id)?.content)
+
+                val edited = client.post("/api/skills") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"id":"${created.id}","description":"edited","content":"changed","revision":1,"status":"APPROVED"}""")
+                }.let { response ->
+                    assertEquals(HttpStatusCode.OK, response.status)
+                    Json.decodeFromString<Skill>(response.bodyAsText())
+                }
+                assertEquals("PENDING", edited.status.name)
+                assertEquals(2, edited.revision)
+                assertTrue(skillRepository.getApprovedSkillSummaries().isEmpty())
+
+                client.delete("/api/skills/${edited.id}").apply { assertEquals(HttpStatusCode.OK, status) }
+                client.post("/api/skills") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"id":"${edited.id}","description":"resurrect","content":"resurrect","revision":2}""")
+                }.apply { assertEquals(HttpStatusCode.NotFound, status) }
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /** 验证批准与撤销端点继承技能 API 的请求体上限，且不会改变草稿状态。 */
+    @Test
+    fun `approval endpoints reject oversized bodies without changing the draft`() {
+        val temporaryDirectory = createTempDirectory("skill-api-transition-limit-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val pending = skillRepository.saveSkill(Skill(id = "pending", description = "pending", content = "pending"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+            val oversizedBody = """{"revision":0,"padding":"${"x".repeat(128 * 1024)}"}"""
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+                listOf("approve", "revoke").forEach { action ->
+                    client.post("/api/skills/${pending.id}/$action") {
+                        contentType(ContentType.Application.Json)
+                        setBody(oversizedBody)
+                    }.apply { assertEquals(HttpStatusCode.PayloadTooLarge, status) }
+                }
+            }
+
+            assertEquals(pending, skillRepository.getSkillById(pending.id))
         } finally {
             temporaryDirectory.deleteRecursively()
         }

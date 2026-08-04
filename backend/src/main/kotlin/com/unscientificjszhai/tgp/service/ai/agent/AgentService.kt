@@ -216,7 +216,7 @@ abstract class AgentService {
     /**
      * 生成注入到系统提示词中的技能说明。
      *
-     * @param skills 要说明的技能摘要列表；列表可为空。
+     * @param skills 已由调用方过滤为已批准状态的技能摘要列表；列表可为空，未批准技能不得传入。
      * @return 包含技能标识和描述的英文提示词；当 [skills] 为空时返回空字符串。
      */
     protected fun getSkillPrompt(skills: List<SkillBrief>): String {

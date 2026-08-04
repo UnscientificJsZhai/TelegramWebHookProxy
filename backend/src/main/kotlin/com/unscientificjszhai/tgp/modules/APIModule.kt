@@ -10,6 +10,7 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdateResult
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.utils.ResourceLimits
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -420,7 +421,10 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
             try {
                 telegramService.updateBotCommands(savedSettings.telegramToken, newEffectiveProvider)
             } catch (e: Exception) {
-                application.log.error("Failed to update bot commands", e)
+                application.log.error(
+                    "Failed to update bot commands; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
             }
         }
     }

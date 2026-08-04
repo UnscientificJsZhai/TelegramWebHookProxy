@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
+import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.models.validateOpenAiBaseUrl
@@ -16,12 +17,14 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.ConfigJson
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
@@ -138,7 +141,10 @@ class SettingsRepository private constructor(
             AtomicJsonRead.Missing -> LoadedSettings(AppSettings(), hasInvalidProxy = false)
             is AtomicJsonRead.Valid -> materializeSettingsCandidate(read.value)
             is AtomicJsonRead.Corrupt -> {
-                logger.error("Settings file is semantically invalid; preserving it", read.cause)
+                logger.error(
+                    "Settings file is semantically invalid; preserving it; category={}",
+                    SafeLogging.failureCategory(read.cause).wireName,
+                )
                 LoadedSettings(
                     settings = AppSettings(),
                     hasInvalidProxy = false,
@@ -147,7 +153,10 @@ class SettingsRepository private constructor(
             }
 
             is AtomicJsonRead.IoFailure -> {
-                logger.error("Unable to read settings file; delaying writes until it can be revalidated", read.cause)
+                logger.error(
+                    "Unable to read settings file; delaying writes until it can be revalidated; category={}",
+                    SafeLogging.failureCategory(read.cause).wireName,
+                )
                 LoadedSettings(
                     settings = AppSettings(),
                     hasInvalidProxy = false,
@@ -218,9 +227,11 @@ class SettingsRepository private constructor(
 
     private fun parseSettings(bytes: ByteArray): SettingsCandidate {
         val content = bytes.toString(StandardCharsets.UTF_8)
-        runCatching { ConfigJson.decodeFromString<AppSettings>(content) }
-            .getOrNull()
-            ?.let { return SettingsCandidate.Decoded(it) }
+        val decodedSettings = runCatching { ConfigJson.decodeFromString<AppSettings>(content) }.getOrNull()
+        if (decodedSettings != null) {
+            validateAppSettingsResourceLimits(decodedSettings)
+            return SettingsCandidate.Decoded(decodedSettings)
+        }
 
         val settings = ConfigJson.parseToJsonElement(content) as? JsonObject
             ?: throw IllegalArgumentException("Settings root must be a JSON object")
@@ -235,6 +246,8 @@ class SettingsRepository private constructor(
             ConfigJson.decodeFromJsonElement<AppSettings>(settingsWithoutProxy)
         }.getOrElse { throw IllegalArgumentException("Settings contain invalid non-proxy fields", it) }
         val proxy = settings["proxy"] as? JsonObject
+        validateAppSettingsResourceLimits(protectedSettings)
+        validateLegacyProxyCredentialResourceLimits(proxy)
 
         if (proxy != null && proxy.containsKey("host") && proxy.containsKey("port") && !proxy.containsKey("type")) {
             val migratedProxy = buildJsonObject {
@@ -246,10 +259,29 @@ class SettingsRepository private constructor(
                 ConfigJson.decodeFromJsonElement<AppSettings>(migratedSettings)
             }.getOrNull()
             if (decodedSettings != null && !decodedSettings.proxy.isInvalidProxy()) {
+                validateAppSettingsResourceLimits(decodedSettings)
                 return SettingsCandidate.Migratable(decodedSettings, protectedSettings)
             }
         }
         return SettingsCandidate.Protected(protectedSettings)
+    }
+
+    /** 校验历史未知代理类型中仍可识别的凭据字段，避免 fallback 路径跳过资源上限。 */
+    private fun validateLegacyProxyCredentialResourceLimits(proxy: JsonObject?) {
+        fun JsonObject.stringValue(name: String): String? =
+            (get(name) as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+
+        validateAppSettingsResourceLimits(
+            AppSettings(
+                proxy = ProxySettings(
+                    host = "",
+                    port = 1,
+                    type = ProxyType.HTTP,
+                    username = proxy?.stringValue("username"),
+                    password = proxy?.stringValue("password"),
+                ),
+            ),
+        )
     }
 
     private fun materializeSettingsCandidate(candidate: SettingsCandidate): LoadedSettings = when (candidate) {
@@ -267,7 +299,10 @@ class SettingsRepository private constructor(
                     storage.commit(ConfigJson.encodeToString(loaded.settings).toByteArray(StandardCharsets.UTF_8))
                     loaded
                 } catch (e: Exception) {
-                    logger.error("Could not persist migrated legacy proxy; keeping original file protected", e)
+                    logger.error(
+                        "Could not persist migrated legacy proxy; keeping original file protected; category={}",
+                        SafeLogging.failureCategory(e).wireName,
+                    )
                     candidate.protectedSettings.toLoadedSettings(hasInvalidProxy = true)
                 }
             }

@@ -1,13 +1,17 @@
+@file:Suppress("RedundantSuspendModifier")
+
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.di.AgentComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -18,6 +22,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -38,14 +43,16 @@ import javax.inject.Singleton
  * @param skillRepository 提供技能变更事件的仓库。
  * @param modelSwitchBarrier 协调设置切换和进行中请求的屏障。
  * @param parentScope 用于收集设置与技能变更的协程作用域。
+ * @param deadlines 限制候选代理初始化的总体时限。
  */
 @Singleton
-class DelegatingAgentService @Inject constructor(
+class DelegatingAgentService @Inject internal constructor(
     private val agentComponentFactory: AgentComponent.Factory,
     settingsRepository: SettingsRepository,
     skillRepository: SkillRepository,
     private val modelSwitchBarrier: ModelSwitchBarrier,
     parentScope: CoroutineScope,
+    private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
 ) : AgentService() {
     /**
      * 为未接入依赖注入的既有调用方创建服务。
@@ -75,6 +82,8 @@ class DelegatingAgentService @Inject constructor(
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
     private val lifecycleLock = Any()
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val cleanupLock = Any()
+    private val backgroundCleanupJobs = mutableSetOf<Job>()
 
     // 初始 SettingsUpdate 没有 switchGeneration，必须用独立代次保护 Poller 的启动。
     private val initialReadinessGeneration = modelSwitchBarrier.beginSwitch()
@@ -152,7 +161,10 @@ class DelegatingAgentService @Inject constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.error("Failed to apply AI settings; keeping the current agent when available.", e)
+                logger.error(
+                    "Failed to apply AI settings; keeping the current agent when available; category={}",
+                    SafeLogging.failureCategory(e).wireName,
+                )
             } finally {
                 lastHandledSettings = settings
                 modelSwitchBarrier.completeSettingsThrough(settingsUpdate.switchGeneration)
@@ -186,9 +198,9 @@ class DelegatingAgentService @Inject constructor(
     }
 
     /**
-     * 在销毁活跃组件前先创建替代组件。这样即使创建本身失败，仍可保留可用的代理。替代组件创建后，
-     * 必须先等待旧代理关闭，才可发布新代理；不同组件的 MCP 资源相互隔离，因此旧代理关闭不会影响
-     * 已开始连接的新代理。
+     * 在销毁活跃组件前先创建替代组件。这样即使创建本身失败，仍可保留可用的代理。替代组件完成就绪后
+     * 会原子发布；旧代理关闭转入后台追踪，不能占用模型切换屏障。不同组件的 MCP 资源相互隔离，因此
+     * 旧代理的慢速关闭不会影响已发布候选。
      */
     private suspend fun recreateAgent(
         aiSettings: AISettings,
@@ -204,8 +216,11 @@ class DelegatingAgentService @Inject constructor(
 
         var published = false
         try {
-            if (!newService.awaitReady()) {
-                logger.warn("Replacement agent did not complete initialization; retaining the current agent.")
+            val ready = withTimeoutOrNull(deadlines.candidateInitialization) {
+                newService.awaitReady()
+            } ?: false
+            if (!ready) {
+                logger.warn("Replacement agent did not complete initialization before its deadline; retaining the current agent.")
                 return
             }
             val previousService = synchronized(lifecycleLock) {
@@ -215,7 +230,6 @@ class DelegatingAgentService @Inject constructor(
                 return
             }
 
-            previousService?.close()?.join()
             published = synchronized(lifecycleLock) {
                 if (closed || _currentService !== previousService) {
                     false
@@ -230,15 +244,35 @@ class DelegatingAgentService @Inject constructor(
                 }
             }
             if (published) {
+                // 所有旧请求已经在切换屏障外排空；旧资源关闭可能忽略取消，不能继续占用设置切换路径。
+                scheduleBackgroundCleanup(previousService?.close())
                 logger.info("Agent component recreated for provider: ${aiSettings.provider}")
             }
         } finally {
             if (!published) {
-                // 取消或失败后的候选清理可能卡住；初始 Poller 不应因此永久等待启动屏障。
+                // 取消、失败或超时后的候选清理可能卡住；初始 Poller 不应因此永久等待启动屏障。
                 completeInitialReadiness()
-                withContext(NonCancellable) {
-                    newService.close()?.join()
-                }
+                scheduleBackgroundCleanup(newService.close())
+            }
+        }
+    }
+
+    /**
+     * 跟踪代理资源的后台清理，但绝不在设置切换屏障的关键路径等待它。
+     *
+     * 传入任务代表已经触发的关闭；本方法仅观察其结束，用于保留生命周期可诊断性。候选和旧组件已从
+     * 可见服务引用中摘除，因此其延迟关闭不能重新发布或阻塞后续切换。
+     */
+    private fun scheduleBackgroundCleanup(cleanupJob: Job?) {
+        cleanupJob ?: return
+        synchronized(cleanupLock) { backgroundCleanupJobs.add(cleanupJob) }
+        closingScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                cleanupJob.join()
+            } catch (e: CancellationException) {
+                // closingScope 不会主动取消此任务；若应用进程终止则无需把取消记录为代理错误。
+            } finally {
+                synchronized(cleanupLock) { backgroundCleanupJobs.remove(cleanupJob) }
             }
         }
     }
@@ -247,17 +281,13 @@ class DelegatingAgentService @Inject constructor(
      * 关闭当前已发布的代理并清除其配置记录。
      */
     private suspend fun disableAgent() {
-        val serviceToClose = synchronized(lifecycleLock) { _currentService }
-        serviceToClose?.close()?.join()
         val disabled = synchronized(lifecycleLock) {
-            if (_currentService !== serviceToClose) {
-                false
-            } else {
-                clearCurrentAgentLocked()
-                true
-            }
+            val serviceToClose = _currentService
+            clearCurrentAgentLocked()
+            serviceToClose
         }
-        if (disabled && serviceToClose != null) {
+        scheduleBackgroundCleanup(disabled?.close())
+        if (disabled != null) {
             logger.info("Agent service disabled.")
         }
     }
@@ -302,7 +332,10 @@ class DelegatingAgentService @Inject constructor(
         val modelSwitchJob = try {
             _currentService?.switchModel(aiSettings.selectedModel)
         } catch (e: IllegalArgumentException) {
-            logger.warn("Ignoring unsupported model from settings: ${aiSettings.selectedModel}", e)
+            logger.warn(
+                "Ignoring unsupported model from settings; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
             null
         }
 
@@ -463,7 +496,10 @@ class DelegatingAgentService @Inject constructor(
                         settingsJobToStop?.join()
                         serviceToClose?.close()?.join()
                     } catch (e: Exception) {
-                        logger.error("Failed to close delegating agent resources", e)
+                        logger.error(
+                            "Failed to close delegating agent resources; category={}",
+                            SafeLogging.failureCategory(e).wireName,
+                        )
                     } finally {
                         newCompletion.complete(Unit)
                     }

@@ -7,6 +7,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.DelegatingAgentService
@@ -25,6 +26,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import java.io.File
@@ -35,6 +37,7 @@ import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * 定时任务与真实委派 Agent 模型切换屏障的集成时序测试。
@@ -72,10 +75,10 @@ class TaskSchedulerBarrierIntegrationTest {
             )
 
             val execution = async { fixture.scheduler.scanAndExecute() }
-            withTimeout(TEST_TIMEOUT) { deliveryStarted.await() }
+            withTimeout(TEST_TIMEOUT_MILLIS) { deliveryStarted.await() }
 
             fixture.settingsRepository.saveSettings(settingsFor(BOT_B_TOKEN, "key-b"))
-            withTimeout(TEST_TIMEOUT) {
+            withTimeout(TEST_TIMEOUT_MILLIS) {
                 while (!fixture.barrier.isSwitching) {
                     yield()
                 }
@@ -84,8 +87,8 @@ class TaskSchedulerBarrierIntegrationTest {
             assertFalse(fixture.replacementCreated.isCompleted, "switch must wait for Telegram delivery")
 
             allowDelivery.complete(Unit)
-            withTimeout(TEST_TIMEOUT) { execution.await() }
-            withTimeout(TEST_TIMEOUT) { fixture.replacementCreated.await() }
+            withTimeout(TEST_TIMEOUT_MILLIS) { execution.await() }
+            withTimeout(TEST_TIMEOUT_MILLIS) { fixture.replacementCreated.await() }
             awaitBarrierReady(fixture.barrier)
 
             coVerify(exactly = 1) { fixture.oldAgent.sendMessage(match { it.contains("barrier protected") }) }
@@ -100,7 +103,58 @@ class TaskSchedulerBarrierIntegrationTest {
         }
     }
 
-    private fun newFixture(replacementReadiness: Job?): SchedulerBarrierFixture {
+    /**
+     * 验证已准入任务在总时限到期后停止完整回合、不投递迟到结果，并释放真实模型切换屏障。
+     */
+    @Test
+    fun `timed out admitted task releases switch barrier without delivery`() = runBlocking {
+        val fixture = newFixture(
+            replacementReadiness = null,
+            deadlines = AgentExecutionDeadlines(
+                mcpBatch = 1.seconds,
+                candidateInitialization = 1.seconds,
+                scheduledTurn = 100.milliseconds,
+            ),
+        )
+        val agentStarted = CompletableDeferred<Unit>()
+        try {
+            fixture.initialize()
+            coEvery { fixture.oldAgent.sendMessage(any()) } coAnswers {
+                agentStarted.complete(Unit)
+                awaitCancellation()
+            }
+            fixture.scheduler.createTask(
+                "must not outlive scheduled deadline",
+                System.currentTimeMillis() - 1_000,
+                LoopMode.ONCE,
+                "chat-a",
+            )
+
+            val execution = async { fixture.scheduler.scanAndExecute() }
+            withTimeout(TEST_TIMEOUT_MILLIS) { agentStarted.await() }
+
+            fixture.settingsRepository.saveSettings(settingsFor(BOT_B_TOKEN, "key-b"))
+            withTimeout(TEST_TIMEOUT_MILLIS) {
+                while (!fixture.barrier.isSwitching) {
+                    yield()
+                }
+            }
+            withTimeout(TEST_TIMEOUT_MILLIS) { execution.await() }
+            withTimeout(TEST_TIMEOUT_MILLIS) { fixture.replacementCreated.await() }
+            awaitBarrierReady(fixture.barrier)
+
+            coVerify(exactly = 1) { fixture.oldAgent.sendMessage(any()) }
+            coVerify(exactly = 0) { fixture.telegramService.sendMessageForToken(any(), any(), any(), any()) }
+            assertTrue(fixture.scheduler.listTasks().isEmpty(), "precommitted task must not be retried")
+        } finally {
+            fixture.close()
+        }
+    }
+
+    private fun newFixture(
+        replacementReadiness: Job?,
+        deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
+    ): SchedulerBarrierFixture {
         val tempDirectory = createTempDirectory("task-scheduler-barrier").toFile().also(temporaryDirectories::add)
         val barrier = ModelSwitchBarrier()
         val settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), barrier)
@@ -146,6 +200,7 @@ class TaskSchedulerBarrierIntegrationTest {
             Provider { delegatingAgent },
             settingsRepository,
             File(tempDirectory, "schedule.json"),
+            deadlines = deadlines,
         )
         return SchedulerBarrierFixture(
             barrier,
@@ -162,12 +217,12 @@ class TaskSchedulerBarrierIntegrationTest {
     }
 
     private suspend fun SchedulerBarrierFixture.initialize() {
-        withTimeout(TEST_TIMEOUT) { firstCreated.await() }
+        withTimeout(TEST_TIMEOUT_MILLIS) { firstCreated.await() }
         awaitBarrierReady(barrier)
     }
 
     private suspend fun awaitBarrierReady(barrier: ModelSwitchBarrier) {
-        withTimeout(TEST_TIMEOUT) {
+        withTimeout(TEST_TIMEOUT_MILLIS) {
             while (barrier.isSwitching) {
                 yield()
             }
@@ -205,4 +260,4 @@ class TaskSchedulerBarrierIntegrationTest {
 
 private const val BOT_A_TOKEN = "100:token-a"
 private const val BOT_B_TOKEN = "200:token-b"
-private val TEST_TIMEOUT = 5_000.milliseconds
+private const val TEST_TIMEOUT_MILLIS = 5_000L

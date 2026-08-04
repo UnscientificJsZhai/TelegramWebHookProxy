@@ -8,11 +8,9 @@
 
 ## 概览
 
-TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统、脚本或自动化工具的消息发送到 Telegram。它内置 Web 管理界面，可以配置
-Bot Token、默认会话、代理服务器和 AI 助手能力。
+TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统、脚本或自动化工具的消息发送到 Telegram。它内置 Web 管理界面，可以配置 Bot Token、默认会话、代理服务器和 AI 助手能力。
 
-启用 AI 后，Telegram Bot 还能作为个人 Agent 使用：接收文本或语音消息，调用本地 HTTP API、MCP 工具、Skill
-知识库和定时任务能力，用来管理家中或服务器上的服务。
+启用 AI 后，Telegram Bot 还能作为个人 Agent 使用：接收文本或语音消息，调用本地 HTTP API、MCP 工具、Skill 知识库和定时任务能力，用来管理家中或服务器上的服务。
 
 ## 功能特性
 
@@ -28,11 +26,11 @@ Bot Token、默认会话、代理服务器和 AI 助手能力。
 ## 技术栈
 
 | 模块 | 技术                                                                  |
-|------|-----------------------------------------------------------------------|
-| 后端 | Kotlin 2.4.10、Ktor 3、Dagger、kotlinx.serialization                  |
-| AI   | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
-| 前端 | React 19、Vite、Material UI、React Router、Axios                      |
-| 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                         |
+|----|---------------------------------------------------------------------|
+| 后端 | Kotlin 2.4.10、Ktor 3、Dagger、kotlinx.serialization                   |
+| AI | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
+| 前端 | React 19、Vite、Material UI、React Router、Axios                        |
+| 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                          |
 
 ## 快速开始
 
@@ -94,9 +92,9 @@ java -jar backend/build/libs/TelegramWebHookProxy-1.1.3-all.jar
 
 支持 `application/json` 与 `application/x-www-form-urlencoded`。
 
-| 查询参数       | 默认值   | 说明                                       |
-|----------------|----------|--------------------------------------------|
-| `messagefield` | `text`   | 请求体中表示消息内容的字段名               |
+| 查询参数           | 默认值      | 说明                             |
+|----------------|----------|--------------------------------|
+| `messagefield` | `text`   | 请求体中表示消息内容的字段名                 |
 | `chatidfield`  | `chatId` | 请求体中表示目标 Telegram Chat ID 的字段名 |
 
 默认 JSON 请求：
@@ -122,43 +120,48 @@ curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chati
 
 ### 常用接口
 
-| 方法     | 路径                         | 说明                             |
-|----------|------------------------------|----------------------------------|
-| `GET`    | `/api/settings`              | 获取当前设置                     |
-| `PUT`    | `/api/settings`              | 使用完整严格 JSON 替换全局设置   |
-| `PATCH`  | `/api/settings`              | 使用严格 JSON 局部更新全局设置   |
+| 方法       | 路径                           | 说明                 |
+|----------|------------------------------|--------------------|
+| `GET`    | `/api/settings`              | 获取当前设置             |
+| `PUT`    | `/api/settings`              | 使用完整严格 JSON 替换全局设置 |
+| `PATCH`  | `/api/settings`              | 使用严格 JSON 局部更新全局设置 |
 | `POST`   | `/api/settings`              | 兼容的完整设置替换，语义同 `PUT` |
-| `POST`   | `/api/settings/chat`         | 兼容的默认 Telegram 会话更新     |
-| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话       |
-| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话               |
-| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill                   |
-| `POST`   | `/api/skills`                | 新增或更新 Skill                 |
-| `DELETE` | `/api/skills/{id}`           | 删除 Skill                       |
+| `POST`   | `/api/settings/chat`         | 兼容的默认 Telegram 会话更新 |
+| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话 |
+| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话          |
+| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill         |
+| `POST`   | `/api/skills`                | 新增或编辑待审批 Skill 草稿 |
+| `POST`   | `/api/skills/{id}/approve`   | 以版本号批准 Skill 并启用 |
+| `POST`   | `/api/skills/{id}/revoke`    | 以版本号撤销已批准 Skill |
+| `DELETE` | `/api/skills/{id}`           | 删除 Skill           |
 
-设置写入必须携带 `GET /api/settings` 返回的单个强 `ETag` 作为 `If-Match`。`PUT` 要求 提供所有顶层与非空嵌套字段；`PATCH`
-仅修改出现的字段，`proxy` 与 `ai` 可用 `null` 删除，
+设置写入必须携带 `GET /api/settings` 返回的单个强 `ETag` 作为 `If-Match`。`PUT` 要求
+提供所有顶层与非空嵌套字段；`PATCH` 仅修改出现的字段，`proxy` 与 `ai` 可用 `null` 删除，
 `proxy.username` 与 `proxy.password` 可用 `null` 清除。嵌套对象递归合并，列表与 MCP
 `headers` 映射整体替换；除 `headers` 的动态键外，未知字段均会被拒绝。
 
 ## AI Agent
 
-AI Agent 仅处理授权用户的私聊消息：消息必须来自私聊，且发送者 ID 与聊天 ID 都要等于 `agentChatId`。开启后可在 Telegram
-中使用以下命令：
+AI Agent 仅处理授权用户的私聊消息：消息必须来自私聊，且发送者 ID 与聊天 ID 都要等于 `agentChatId`。开启后可在 Telegram 中使用以下命令：
 
-| 命令                | 说明                               |
-|---------------------|------------------------------------|
-| `/model`            | 查看当前模型与可用模型             |
-| `/model <模型名称>` | 切换模型并重置会话                 |
-| `/reset`            | 重置当前会话上下文并清空待处理消息 |
-| `/keep`             | 刷新自动清理上下文的计时           |
+| 命令              | 说明                |
+|-----------------|-------------------|
+| `/model`        | 查看当前模型与可用模型       |
+| `/model <模型名称>` | 切换模型并重置会话         |
+| `/reset`        | 重置当前会话上下文并清空待处理消息 |
+| `/keep`         | 刷新自动清理上下文的计时      |
 
 Agent 可用能力包括：
 
 - 调用配置的 MCP 服务器工具。
-- 读写 Skill 知识库，作为长期记忆或操作说明。
+- 读取已批准的 Skill，并只能创建等待管理端批准的 Skill 草稿。
 - 创建、列出、取消定时任务。
 - 访问外部或内网 HTTP API。
 - 处理 Telegram 语音消息。
+
+> [!WARNING]
+> Skill 管理 API 可以批准、撤销或删除 Agent 的长期指令。模型工具只能创建待审批草稿，不能自行批准或覆盖既有
+> Skill。
 
 ## 本地开发
 

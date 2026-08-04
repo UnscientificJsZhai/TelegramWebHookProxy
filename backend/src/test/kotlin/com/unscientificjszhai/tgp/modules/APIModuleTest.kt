@@ -145,6 +145,45 @@ class APIModuleTest {
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
     }
 
+    /** 验证所有设置写入入口均拒绝超限字段或请求体，且不改变持久化状态。 */
+    @Test
+    fun `settings write routes enforce resource limits without side effects`() =
+        withTestApi { repository, _, configFile ->
+            val original = AppSettings(telegramToken = "100:original", chatId = "old-chat", ai = AISettings())
+            repository.saveSettings(original)
+            val originalContent = configFile.readText()
+            val oversizedContext = "密".repeat(21_846)
+
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(original.copy(ai = original.ai!!.copy(globalContext = oversizedContext))))
+            }.apply { assertEquals(HttpStatusCode.BadRequest, status) }
+            client.post("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(original.copy(telegramToken = "密".repeat(86))))
+            }.apply { assertEquals(HttpStatusCode.BadRequest, status) }
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody("""{"ai":{"globalContext":"$oversizedContext"}}""")
+            }.apply { assertEquals(HttpStatusCode.BadRequest, status) }
+            client.post("/api/settings/chat") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody("""{"chatId":"${"密".repeat(22)}"}""")
+            }.apply { assertEquals(HttpStatusCode.BadRequest, status) }
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody("""{"telegramToken":"${"x".repeat(513 * 1024)}"}""")
+            }.apply { assertEquals(HttpStatusCode.PayloadTooLarge, status) }
+
+            assertEquals(original, repository.settingsFlow.value)
+            assertEquals(originalContent, configFile.readText())
+        }
+
     /**
      * 验证设置 API 的读写设计。
      *

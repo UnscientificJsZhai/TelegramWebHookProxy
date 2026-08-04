@@ -1,5 +1,8 @@
 package com.unscientificjszhai.tgp.service
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
@@ -21,6 +24,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
+import org.slf4j.LoggerFactory
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
@@ -115,6 +119,37 @@ class TaskSchedulerServiceTest {
         }
 
         assertEquals(0, service.listTasks().size, "ONCE task should be removed after execution")
+    }
+
+    /**
+     * 验证实际任务执行日志不记录 instruction，也不会通过 Telegram 网络异常保留 token 或 Throwable。
+     */
+    @Test
+    fun `task execution logs safe identifiers and failure category without instruction or token`() = runTest {
+        val instructionCanary = "TASK_INSTRUCTION_CANARY"
+        val tokenCanary = "TASK_TELEGRAM_TOKEN_CANARY"
+        val taskId = service.createTask(instructionCanary, System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } returns "result"
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } throws IOException(
+            "https://api.telegram.org/bot$tokenCanary/sendMessage",
+        )
+
+        val logger = LoggerFactory.getLogger(TaskSchedulerService::class.java) as Logger
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        logger.addAppender(appender)
+        try {
+            service.scanAndExecute()
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+
+        val messages = appender.list.map { it.formattedMessage }
+        assertTrue(messages.any { it.contains("Executing precommitted task $taskId") })
+        assertTrue(messages.any { it.contains("Failed to send task result for $taskId; category=network") })
+        assertTrue(messages.none { it.contains(instructionCanary) })
+        assertTrue(messages.none { it.contains(tokenCanary) })
+        assertTrue(appender.list.none { it.throwableProxy != null })
     }
 
     /**

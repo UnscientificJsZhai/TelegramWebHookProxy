@@ -8,7 +8,7 @@ internal object ResourceLimits {
     const val SKILLS_BYTES = 4 * 1024 * 1024
     const val UPDATES_BYTES = 4 * 1024 * 1024
     const val SCHEDULE_BYTES = 1024 * 1024
-    const val SETTINGS_REQUEST_BYTES = 512 * 1024L
+    const val SETTINGS_REQUEST_BYTES = SETTINGS_BYTES.toLong()
     const val CHAT_SETTINGS_REQUEST_BYTES = 8 * 1024L
     const val SKILL_REQUEST_BYTES = 128 * 1024L
     const val SEND_MESSAGE_REQUEST_BYTES = 64 * 1024L

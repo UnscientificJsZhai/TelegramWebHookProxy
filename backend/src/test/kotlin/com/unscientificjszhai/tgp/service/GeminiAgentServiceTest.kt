@@ -11,7 +11,9 @@ import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.MCPServerConfig
+import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
@@ -38,6 +40,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -157,6 +160,83 @@ class GeminiAgentServiceTest {
             releaseConnection.complete(Unit)
             initializedService.close().join()
             server.close()
+        }
+    }
+
+    /** 验证 Gemini SDK 与 REST 的实际系统提示词构造都只包含已批准技能。 */
+    @Test
+    fun `Gemini SDK and REST prompts exclude pending skills`() {
+        val approvedDraft = skillRepository.saveSkill(
+            Skill(
+                id = "approved",
+                description = "APPROVED_SKILL_CANARY",
+                content = "approved"
+            )
+        )
+        skillRepository.approveSkill(approvedDraft.id, approvedDraft.revision)
+        skillRepository.createPendingDraft("PENDING_SKILL_CANARY", "pending")
+        val settings = AISettings(globalContext = "SYSTEM_CONTEXT_CANARY")
+        val routeSnapshot = LocalFunctionRouter(emptyList()).refresh()
+        val sdkMethod =
+            GeminiAgentService::class.java.declaredMethods.single { it.name == "createSdkSessionConfig" }.apply {
+                isAccessible = true
+            }
+        val wireMethod =
+            GeminiAgentService::class.java.declaredMethods.single { it.name == "createGeminiWireConfig" }.apply {
+                isAccessible = true
+            }
+
+        val sdkPrompt = sdkMethod.invoke(service, settings, routeSnapshot).toString()
+        val wirePrompt = wireMethod.invoke(service, settings, routeSnapshot).toString()
+
+        listOf(sdkPrompt, wirePrompt).forEach { prompt ->
+            assertTrue(prompt.contains("APPROVED_SKILL_CANARY"))
+            assertFalse(prompt.contains("PENDING_SKILL_CANARY"))
+        }
+    }
+
+    /**
+     * 验证候选初始化总时限会取消挂起的 Gemini 首轮重置与模型发现，不让就绪任务无限等待 MCP。
+     */
+    @Test
+    fun `initial Gemini readiness deadline cancels hanging sibling work`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.GEMINI,
+                    geminiApiKey = "test-key",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            awaitCancellation()
+        }
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val initializedService = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+            AgentExecutionDeadlines(
+                mcpBatch = 1.seconds,
+                candidateInitialization = 100.milliseconds,
+                scheduledTurn = 1.seconds,
+            ),
+        ) { mockk() }
+
+        try {
+            withTimeout(1.seconds) { connectionStarted.await() }
+            val readiness = assertNotNull(initializedService.initializationJob())
+            withTimeout(1.seconds) { readiness.join() }
+            assertTrue(readiness.isCancelled)
+        } finally {
+            withTimeout(1.seconds) { initializedService.close().join() }
         }
     }
 

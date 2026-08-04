@@ -1,22 +1,29 @@
 package com.unscientificjszhai.tgp.service.ai.function
 
-import com.unscientificjszhai.tgp.models.Skill
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN
+import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.models.SkillStatus
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.repository.SkillStorageIsolationException
 import io.mockk.every
-import io.mockk.justRun
 import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonPrimitive
-import kotlin.test.*
+import org.slf4j.LoggerFactory
+import kotlin.test.BeforeTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
-/**
- * 技能函数提供者读取和写入行为的测试设计。
- */
+/** 验证模型技能函数只能读取已批准技能并创建待审批草稿。 */
 class SkillFunctionProviderTest {
-
     private lateinit var skillRepository: SkillRepository
     private lateinit var provider: SkillFunctionProvider
 
@@ -26,153 +33,130 @@ class SkillFunctionProviderTest {
         provider = SkillFunctionProvider(skillRepository)
     }
 
-    /**
-     * 验证读取已有技能的设计。
-     *
-     * 验证函数返回技能标识、描述和内容。
-     */
+    /** 验证读取函数只访问已批准查询接口。 */
     @Test
-    fun testReadSkill() = runTest {
-        val skill = Skill(id = "123", description = "Test Skill", content = "Test Content")
-        every { skillRepository.getSkillById("123") } returns skill
+    fun `read skill only uses approved repository lookup`() = runTest {
+        val skill =
+            Skill(id = "123", description = "Test Skill", content = "Test Content", status = SkillStatus.APPROVED)
+        every { skillRepository.getApprovedSkillById("123") } returns skill
 
-        val args = mapOf("id" to "123")
-        val result = provider.execute("read_skill", args)
+        val result = provider.execute("read_skill", mapOf("id" to "123"))
 
         assertEquals("123", result["id"]?.jsonPrimitive?.content)
-        assertEquals("Test Skill", result["description"]?.jsonPrimitive?.content)
         assertEquals("Test Content", result["content"]?.jsonPrimitive?.content)
-        verify { skillRepository.getSkillById("123") }
+        verify { skillRepository.getApprovedSkillById("123") }
+        verify(exactly = 0) { skillRepository.getSkillById(any()) }
     }
 
-    /**
-     * 验证读取不存在技能的错误处理设计。
-     *
-     * 验证函数返回错误结果并查询目标标识。
-     */
+    /** 验证待审批技能对模型与不存在技能的响应完全一致。 */
     @Test
-    fun testReadSkillNotFound() = runTest {
-        every { skillRepository.getSkillById(any()) } returns null
+    fun `pending skill is not readable by the model`() = runTest {
+        every { skillRepository.getApprovedSkillById("pending") } returns null
 
-        val args = mapOf("id" to "456")
-        val result = provider.execute("read_skill", args)
+        val result = provider.execute("read_skill", mapOf("id" to "pending"))
 
         assertTrue(result.containsKey("error"))
-        verify { skillRepository.getSkillById("456") }
+        assertFalse(result.containsKey("content"))
+        verify { skillRepository.getApprovedSkillById("pending") }
     }
 
-    /**
-     * 验证新增技能的函数调用设计。
-     *
-     * 验证函数保存新技能并返回成功状态和生成标识。
-     */
+    /** 验证模型写入只创建服务器标识的待审批草稿。 */
     @Test
-    fun testWriteNewSkill() = runTest {
+    fun `write skill creates a pending draft without an id`() = runTest {
         val description = "New Skill"
         val content = "New Content"
-        justRun { skillRepository.saveSkill(any()) }
+        val draft =
+            Skill(id = "server-draft", description = description, content = content, status = SkillStatus.PENDING)
+        every { skillRepository.createPendingDraft(description, content) } returns draft
 
-        val args = mapOf("description" to description, "content" to content)
-        val result = provider.execute("write_skill", args)
+        val result = provider.execute("write_skill", mapOf("description" to description, "content" to content))
 
-        assertEquals("success", result["status"]?.jsonPrimitive?.content)
-        assertNotNull(result["id"]?.jsonPrimitive?.content)
-        verify { skillRepository.saveSkill(match { it.description == description && it.content == content }) }
-    }
-
-    /**
-     * 验证更新技能的函数调用设计。
-     *
-     * 验证函数使用给定标识保存更新内容并返回该标识。
-     */
-    @Test
-    fun testWriteUpdateSkill() = runTest {
-        val id = "789"
-        val description = "Updated Skill"
-        val content = "Updated Content"
-        justRun { skillRepository.saveSkill(any()) }
-
-        val args = mapOf("id" to id, "description" to description, "content" to content)
-        val result = provider.execute("write_skill", args)
-
-        assertEquals("success", result["status"]?.jsonPrimitive?.content)
-        assertEquals(id, result["id"]?.jsonPrimitive?.content)
-        verify { skillRepository.saveSkill(match { it.id == id && it.description == description && it.content == content }) }
-    }
-
-    /**
-     * 验证函数执行边界在访问仓储前拒绝不安全的技能标识。
-     */
-    @Test
-    fun `invalid skill ids return safe errors without accessing the repository`() = runTest {
-        val readResult = provider.execute("read_skill", mapOf("id" to "safe?x=1"))
-        val writeResult = provider.execute(
-            "write_skill",
-            mapOf("id" to "safe/path", "description" to "description", "content" to "content"),
-        )
-
-        assertEquals("Invalid skill id", readResult["error"]?.jsonPrimitive?.content)
-        assertEquals("Invalid skill id", writeResult["error"]?.jsonPrimitive?.content)
-        verify(exactly = 0) { skillRepository.getSkillById(any()) }
+        assertEquals("pending_approval", result["status"]?.jsonPrimitive?.content)
+        assertEquals("server-draft", result["id"]?.jsonPrimitive?.content)
+        assertEquals("0", result["revision"]?.jsonPrimitive?.content)
+        verify { skillRepository.createPendingDraft(description, content) }
         verify(exactly = 0) { skillRepository.saveSkill(any()) }
     }
 
-    /**
-     * 验证显式提供的空值或非字符串标识不会被当作省略标识而创建新技能。
-     */
+    /** 验证模型无法通过额外字段覆盖、批准或为草稿指定管理员标识。 */
     @Test
-    fun `explicit null or non-string write id returns an error without saving`() = runTest {
-        val nullIdResult = provider.execute(
-            "write_skill",
-            mapOf<String, Any?>("id" to null, "description" to "description", "content" to "content"),
-        )
-        val nonStringIdResult = provider.execute(
-            "write_skill",
-            mapOf("id" to 1, "description" to "description", "content" to "content"),
-        )
-
-        assertEquals("Invalid skill id", nullIdResult["error"]?.jsonPrimitive?.content)
-        assertEquals("Invalid skill id", nonStringIdResult["error"]?.jsonPrimitive?.content)
-        verify(exactly = 0) { skillRepository.saveSkill(any()) }
-    }
-
-    /**
-     * 验证转换后的 OpenAI 函数声明仍保留技能标识的正则与长度约束。
-     */
-    @Test
-    fun `OpenAI skill schemas retain id pattern and length constraints`() {
-        val functions = provider.providedOpenAIFunctions.associateBy { it.name() }
-
-        listOf("read_skill", "write_skill").forEach { functionName ->
-            val parameters = checkNotNull(functions[functionName]).parameters().orElseThrow()._additionalProperties()
-
-            @Suppress("UNCHECKED_CAST")
-            val properties = parameters.getValue("properties").convert(Map::class.java) as Map<String, Any?>
-
-            @Suppress("UNCHECKED_CAST")
-            val idSchema = properties.getValue("id") as Map<String, Any?>
-
-            assertEquals(SKILL_ID_PATTERN, idSchema["pattern"])
-            assertEquals(1, (idSchema["minLength"] as Number).toInt())
-            assertEquals(64, (idSchema["maxLength"] as Number).toInt())
+    fun `write skill rejects id and approval fields before accessing the repository`() = runTest {
+        listOf(
+            mapOf("id" to "approved", "description" to "description", "content" to "content"),
+            mapOf("approved" to true, "description" to "description", "content" to "content"),
+            mapOf("revision" to 0, "description" to "description", "content" to "content"),
+        ).forEach { args ->
+            val result = provider.execute("write_skill", args)
+            assertEquals("Unexpected draft field", result["error"]?.jsonPrimitive?.content)
         }
+        verify(exactly = 0) { skillRepository.createPendingDraft(any(), any()) }
     }
 
-    /**
-     * 验证隔离的技能仓储不会使模型函数抛出异常或伪装成不存在的技能。
-     */
+    /** 验证读取参数仍在访问仓储前拒绝非法技能标识。 */
+    @Test
+    fun `invalid read id returns a safe error without repository access`() = runTest {
+        val result = provider.execute("read_skill", mapOf("id" to "safe?x=1"))
+
+        assertEquals("Invalid skill id", result["error"]?.jsonPrimitive?.content)
+        verify(exactly = 0) { skillRepository.getApprovedSkillById(any()) }
+    }
+
+    /** 验证 DEBUG 日志只保留函数名称，绝不输出技能正文或参数映射。 */
+    @Test
+    fun `debug logging omits skill function arguments`() = runTest {
+        val contentCanary = "SKILL_CONTENT_CANARY"
+        every { skillRepository.createPendingDraft(any(), any()) } returns Skill(
+            id = "draft",
+            description = "description",
+            content = contentCanary,
+        )
+        val logger = LoggerFactory.getLogger(SkillFunctionProvider::class.java) as Logger
+        val previousLevel = logger.level
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        logger.level = Level.DEBUG
+        logger.addAppender(appender)
+        try {
+            provider.execute("write_skill", mapOf("description" to "description", "content" to contentCanary))
+        } finally {
+            logger.detachAppender(appender)
+            logger.level = previousLevel
+            appender.stop()
+        }
+
+        assertTrue(appender.list.any { it.formattedMessage == "Processing skill function write_skill" })
+        assertTrue(appender.list.none { it.formattedMessage.contains(contentCanary) })
+    }
+
+    /** 验证 OpenAI 函数 schema 只允许 read_skill 带标识，write_skill 不暴露覆盖入口。 */
+    @Test
+    fun `OpenAI write schema omits id while read schema retains id constraints`() {
+        val functions = provider.providedOpenAIFunctions.associateBy { it.name() }
+        fun properties(name: String): Map<String, Any?> {
+            val parameters = checkNotNull(functions[name]).parameters().orElseThrow()._additionalProperties()
+            @Suppress("UNCHECKED_CAST")
+            return parameters.getValue("properties").convert(Map::class.java) as Map<String, Any?>
+        }
+
+        val readProperties = properties("read_skill")
+
+        @Suppress("UNCHECKED_CAST")
+        val idSchema = readProperties.getValue("id") as Map<String, Any?>
+        assertEquals(SKILL_ID_PATTERN, idSchema["pattern"])
+        assertEquals(1, (idSchema["minLength"] as Number).toInt())
+        assertFalse(properties("write_skill").containsKey("id"))
+    }
+
+    /** 验证隔离的技能仓储不会使模型函数抛出异常或伪装成可读取技能。 */
     @Test
     fun `isolated skill storage returns safe function errors`() = runTest {
-        every { skillRepository.getSkillById("safe") } throws SkillStorageIsolationException()
-        every { skillRepository.saveSkill(any()) } throws SkillStorageIsolationException()
+        every { skillRepository.getApprovedSkillById("safe") } throws SkillStorageIsolationException()
+        every { skillRepository.createPendingDraft(any(), any()) } throws SkillStorageIsolationException()
 
         val readResult = provider.execute("read_skill", mapOf("id" to "safe"))
-        val writeResult = provider.execute(
-            "write_skill",
-            mapOf("id" to "safe", "description" to "description", "content" to "content"),
-        )
+        val writeResult = provider.execute("write_skill", mapOf("description" to "description", "content" to "content"))
 
         assertEquals("Skill storage is unavailable", readResult["error"]?.jsonPrimitive?.content)
         assertEquals("Skill storage is unavailable", writeResult["error"]?.jsonPrimitive?.content)
+        assertNotNull(readResult["error"])
     }
 }

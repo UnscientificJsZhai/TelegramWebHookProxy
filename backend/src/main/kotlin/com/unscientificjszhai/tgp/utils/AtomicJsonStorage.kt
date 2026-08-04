@@ -125,7 +125,11 @@ internal object DefaultAtomicJsonFileOperations : AtomicJsonFileOperations {
 internal sealed interface AtomicJsonRawRead {
     data object Missing : AtomicJsonRawRead
 
-    class Present(val bytes: ByteArray) : AtomicJsonRawRead
+    class Present(val bytes: ByteArray) : AtomicJsonRawRead {
+        override fun equals(other: Any?): Boolean = other is Present && bytes.contentEquals(other.bytes)
+
+        override fun hashCode(): Int = bytes.contentHashCode()
+    }
 
     /** 文件超过所属存储的上限，不能安全解码。 */
     data class TooLarge(val limitBytes: Int) : AtomicJsonRawRead
@@ -206,12 +210,12 @@ internal class AtomicJsonStorage(
 
         var primaryTemporary: Path? = null
         try {
-            primaryTemporary = createTemporary(".${target.name}.new-")
+            primaryTemporary = createTemporary(".${target.name}.new-", ".tmp")
             fileOperations.writeAndForce(primaryTemporary, bytes)
 
             fileOperations.atomicReplace(primaryTemporary, target)
             primaryTemporary = null
-            forceDirectoryBestEffort()
+            forceDirectoryBestEffort("primary replacement")
         } finally {
             primaryTemporary?.let(::deleteTemporaryQuietly)
         }
@@ -235,20 +239,28 @@ internal class AtomicJsonStorage(
         AtomicJsonRawRead.IoFailure(e)
     }
 
-    private fun createTemporary(prefix: String): Path = fileOperations.createTempFile(directory, prefix, ".tmp")
+    private fun createTemporary(prefix: String, suffix: String): Path =
+        fileOperations.createTempFile(directory, prefix, suffix)
 
     private fun deleteTemporaryQuietly(path: Path) {
         runCatching { fileOperations.deleteIfExists(path) }
-            .onFailure { logger.warn("Failed to remove temporary JSON file {}", path, it) }
+            .onFailure { error ->
+                logger.warn(
+                    "Failed to remove temporary JSON file {}; category={}",
+                    path,
+                    SafeLogging.failureCategory(error).wireName,
+                )
+            }
     }
 
-    private fun forceDirectoryBestEffort() {
+    private fun forceDirectoryBestEffort(after: String) {
         runCatching { fileOperations.forceDirectory(directory) }
-            .onFailure {
+            .onFailure { error ->
                 logger.warn(
-                    "JSON storage directory sync after primary replacement failed for {}",
+                    "JSON storage directory sync after {} failed for {}; category={}",
+                    after,
                     target,
-                    it
+                    SafeLogging.failureCategory(error).wireName,
                 )
             }
     }

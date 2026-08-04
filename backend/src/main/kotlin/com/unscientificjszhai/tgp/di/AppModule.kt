@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.di
 
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.DelegatingAgentService
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import dagger.Module
 import dagger.Provides
 import io.ktor.server.application.*
@@ -27,6 +28,15 @@ class AppModule(
     @Provides
     @Singleton
     fun provideCoroutineScope(): CoroutineScope = application
+
+    /**
+     * 提供应用内统一使用的 Agent 工作流总体时限。
+     *
+     * @return MCP 批次、候选初始化和定时回合共用的有限正时限配置。
+     */
+    @Provides
+    @Singleton
+    internal fun provideAgentExecutionDeadlines(): AgentExecutionDeadlines = AgentExecutionDeadlines()
 
     /**
      * 提供统一调度不同 AI 服务实现的代理服务。

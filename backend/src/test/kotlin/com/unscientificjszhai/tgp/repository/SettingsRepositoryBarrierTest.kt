@@ -12,6 +12,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
@@ -301,6 +302,37 @@ class SettingsRepositoryBarrierTest {
         )
         assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
         assertEquals(originalContent, configFile.readText())
+    }
+
+    /** 验证主文件和解码后字段超限均 fail-closed，且不会读取遗留 `.bak`。 */
+    @Test
+    fun `oversized persisted settings fail closed without accessing legacy bak`() {
+        val oversizedCandidates = listOf(
+            "primary-bytes" to "x".repeat(ResourceLimits.SETTINGS_BYTES + 1),
+            "telegram-token" to ConfigJson.encodeToString(AppSettings(telegramToken = "密".repeat(86))),
+            "global-context" to ConfigJson.encodeToString(
+                AppSettings(ai = AISettings(globalContext = "密".repeat(21_846))),
+            ),
+            "unknown-proxy-credentials" to
+                    """{"proxy":{"host":"proxy.example.com","port":8080,"type":"UNKNOWN","username":"${"u".repeat(513)}","password":"pass"}}""",
+        )
+
+        oversizedCandidates.forEach { (name, primaryContent) ->
+            val configFile = File(tempDirectory, "$name.json")
+            val sidecarFile = File(tempDirectory, "$name.json.bak")
+            val sidecarContent = ConfigJson.encodeToString(AppSettings(telegramToken = "100:ignored"))
+            configFile.writeText(primaryContent)
+            sidecarFile.writeText(sidecarContent)
+
+            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+
+            assertEquals(AppSettings(), repository.settingsFlow.value)
+            assertFailsWith<IllegalStateException> {
+                repository.saveSettings(AppSettings(telegramToken = "200:blocked"))
+            }
+            assertEquals(primaryContent, configFile.readText())
+            assertEquals(sidecarContent, sidecarFile.readText())
+        }
     }
 
     /**

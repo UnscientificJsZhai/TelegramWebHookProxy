@@ -1,5 +1,8 @@
 package com.unscientificjszhai.tgp.service
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
@@ -45,6 +48,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.util.concurrent.CountDownLatch
@@ -109,6 +113,43 @@ class MessagePollerTest {
         } finally {
             fixture.poller.close()
         }
+    }
+
+    /**
+     * 验证 Telegram API 的服务端 description 不会进入轮询日志，即使其中包含 bot URL token canary。
+     */
+    @Test
+    fun `polling API failure logs stable fields without Telegram response description`() = runBlocking {
+        val descriptionCanary = "POLL_DESCRIPTION_CANARY"
+        val tokenCanary = "POLL_RESPONSE_TOKEN_CANARY"
+        val retryWait = CompletableDeferred<Unit>()
+        val fixture = fixture(retryDelay = { retryWait.await() })
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:poll-token", 11, 30) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+            description = "$descriptionCanary https://api.telegram.org/bot$tokenCanary/getUpdates",
+        )
+        val logger = LoggerFactory.getLogger(MessagePoller::class.java) as Logger
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        logger.addAppender(appender)
+        fixture.saveSettings(AppSettings(telegramToken = "100:poll-token"))
+        fixture.poller.start()
+        try {
+            eventually {
+                assertTrue(appender.list.any { it.formattedMessage.contains("API error 500") })
+            }
+        } finally {
+            retryWait.complete(Unit)
+            fixture.poller.close()
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+
+        val messages = appender.list.map { it.formattedMessage }
+        assertTrue(messages.none { it.contains(descriptionCanary) })
+        assertTrue(messages.none { it.contains(tokenCanary) })
+        assertTrue(appender.list.none { it.throwableProxy != null })
     }
 
     /**

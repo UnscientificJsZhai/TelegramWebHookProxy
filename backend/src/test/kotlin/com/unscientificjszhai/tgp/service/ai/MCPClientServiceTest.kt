@@ -13,6 +13,7 @@ import kotlinx.coroutines.*
 import java.io.IOException
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -323,6 +324,105 @@ class MCPClientServiceTest {
         coVerify(exactly = 1) { rejectedCandidate.close() }
 
         service.close().join()
+    }
+
+    /**
+     * 验证候选批次超时不会在连接锁中等待挂起的旧客户端关闭。
+     *
+     * 旧连接和超时候选的 `close` 都不返回时，调用方仍必须在批次时限后取得连接锁；可见快照保持为空，
+     * 因而超时候选绝不能在稍后重新发布工具。
+     */
+    @Test
+    fun `batch timeout releases connection lock despite hanging client cleanup`() = runBlocking {
+        val oldClient = mockk<Client>()
+        val stalledCandidate = mockk<Client>()
+        val clients = ArrayDeque(listOf(oldClient, stalledCandidate))
+        val oldCloseStarted = CompletableDeferred<Unit>()
+        val candidateStarted = CompletableDeferred<Unit>()
+        val service = MCPClientService(
+            CoroutineScope(EmptyCoroutineContext),
+            AgentExecutionDeadlines(
+                mcpBatch = 100.milliseconds,
+                candidateInitialization = 1.seconds,
+                scheduledTurn = 1.seconds,
+            ),
+        ) { clients.removeFirst() }
+        val oldConfig = MCPServerConfig(name = "old", url = "https://old.example.com/mcp")
+        val newConfig = MCPServerConfig(name = "new", url = "https://new.example.com/mcp")
+
+        coEvery { oldClient.connect(any()) } returns Unit
+        coEvery { oldClient.listTools() } returns ListToolsResult(listOf(Tool("old_tool", ToolSchema())))
+        coEvery { oldClient.close() } coAnswers {
+            oldCloseStarted.complete(Unit)
+            awaitCancellation()
+        }
+        coEvery { stalledCandidate.connect(any()) } coAnswers {
+            candidateStarted.complete(Unit)
+            awaitCancellation()
+        }
+        coEvery { stalledCandidate.close() } coAnswers { awaitCancellation() }
+
+        service.connect(listOf(oldConfig))
+        service.connect(listOf(newConfig))
+
+        withTimeout(1.seconds) { oldCloseStarted.await() }
+        withTimeout(1.seconds) { candidateStarted.await() }
+        withTimeout(1.seconds) { service.connect(emptyList()) }
+
+        assertEquals(emptyList(), service.getAllTools())
+        assertFailsWith<IllegalStateException> {
+            service.callTool("old", "old_tool", emptyMap())
+        }
+        coVerify(exactly = 0) { stalledCandidate.listTools() }
+
+        withTimeout(1.seconds) { service.close().join() }
+    }
+
+    /**
+     * 验证等待连接锁的批次超时只摘除快照；终态关闭会跟踪该交接，直到在途工具退出并完成客户端关闭。
+     */
+    @Test
+    fun `batch timeout waits for an in flight tool before closing detached published client`() = runBlocking {
+        val client = mockk<Client>()
+        val toolStarted = CompletableDeferred<Unit>()
+        val releaseTool = CompletableDeferred<Unit>()
+        val closeStarted = CompletableDeferred<Unit>()
+        val service = MCPClientService(
+            CoroutineScope(EmptyCoroutineContext),
+            AgentExecutionDeadlines(
+                mcpBatch = 100.milliseconds,
+                candidateInitialization = 1.seconds,
+                scheduledTurn = 1.seconds,
+            ),
+        ) { client }
+        val config = MCPServerConfig(name = "server", url = "https://example.com/mcp")
+
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools() } returns ListToolsResult(listOf(Tool("tool", ToolSchema())))
+        coEvery { client.callTool("tool", emptyMap()) } coAnswers {
+            toolStarted.complete(Unit)
+            releaseTool.await()
+            CallToolResult(emptyList())
+        }
+        coEvery { client.close() } coAnswers {
+            closeStarted.complete(Unit)
+        }
+
+        service.connect(listOf(config))
+        val inFlightTool = async(Dispatchers.Default) { service.callTool("server", "tool", emptyMap()) }
+        withTimeout(1.seconds) { toolStarted.await() }
+
+        service.connect(emptyList())
+
+        assertEquals(emptyList(), service.getAllTools())
+        assertFalse(closeStarted.isCompleted, "detached client must stay open while the tool owns the connection lock")
+        val closeJob = service.close()
+        assertFalse(closeJob.isCompleted, "terminal close must track the deferred published-client cleanup")
+
+        releaseTool.complete(Unit)
+        withTimeout(1.seconds) { inFlightTool.await() }
+        withTimeout(1.seconds) { closeStarted.await() }
+        withTimeout(1.seconds) { closeJob.join() }
     }
 
     /**

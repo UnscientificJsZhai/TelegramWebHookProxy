@@ -299,7 +299,6 @@ internal fun validateAppSettingsResourceLimits(settings: AppSettings) {
             require(key.utf8ByteSize() <= 512) { "API 密钥不能超过 512 字节。" }
         }
         require(ai.openAiBaseUrl.utf8ByteSize() <= 2 * 1024) { "OpenAI 基础地址不能超过 2 KiB。" }
-        validateOpenAiBaseUrl(ai.openAiBaseUrl)
         require(ai.selectedModel.utf8ByteSize() <= 256) { "模型名称不能超过 256 字节。" }
         require(ai.agentChatId.utf8ByteSize() <= 64) { "代理聊天标识不能超过 64 字节。" }
         require(ai.globalContext.utf8ByteSize() <= 64 * 1024) { "全局上下文不能超过 64 KiB。" }

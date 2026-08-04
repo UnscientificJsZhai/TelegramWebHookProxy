@@ -115,6 +115,47 @@ class SettingsTest {
         assertTrue(aiSettings.httpToolSettings.targets.isEmpty())
     }
 
+    /** 验证设置文本字段按 UTF-8 字节数应用资源上限。 */
+    @Test
+    fun `settings resource limits allow boundaries and reject oversized UTF-8 fields`() {
+        validateAppSettingsResourceLimits(
+            AppSettings(
+                telegramToken = "密".repeat(85) + "a",
+                chatId = "c".repeat(64),
+                proxy = ProxySettings(
+                    host = "proxy.example.com",
+                    port = 8080,
+                    type = ProxyType.HTTP,
+                    username = "u".repeat(512),
+                    password = "p".repeat(512),
+                ),
+                ai = AISettings(
+                    geminiApiKey = "g".repeat(512),
+                    openAiApiKey = "o".repeat(512),
+                    openAiBaseUrl = "https://example.com/${"a".repeat(2028)}",
+                    selectedModel = "m".repeat(256),
+                    agentChatId = "a".repeat(64),
+                    globalContext = "x".repeat(64 * 1024),
+                ),
+            ),
+        )
+
+        listOf(
+            AppSettings(telegramToken = "密".repeat(86)),
+            AppSettings(chatId = "c".repeat(65)),
+            AppSettings(proxy = ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "u".repeat(513), "pass")),
+            AppSettings(proxy = ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "p".repeat(513))),
+            AppSettings(ai = AISettings(geminiApiKey = "g".repeat(513))),
+            AppSettings(ai = AISettings(openAiApiKey = "o".repeat(513))),
+            AppSettings(ai = AISettings(openAiBaseUrl = "https://example.com/${"a".repeat(2029)}")),
+            AppSettings(ai = AISettings(selectedModel = "m".repeat(257))),
+            AppSettings(ai = AISettings(agentChatId = "a".repeat(65))),
+            AppSettings(ai = AISettings(globalContext = "密".repeat(21_846))),
+        ).forEach { settings ->
+            assertFailsWith<IllegalArgumentException> { validateAppSettingsResourceLimits(settings) }
+        }
+    }
+
     /**
      * 验证 HTTP 工具仅接受精确固定目标、受限 HTTP loopback 例外及硬配置上限。
      */

@@ -18,27 +18,46 @@ private val skillIdRegex = Regex(SKILL_ID_PATTERN)
 fun isValidSkillId(id: String): Boolean = skillIdRegex.matches(id)
 
 /**
+ * 技能进入代理提示词前所处的审批状态。
+ *
+ * 仅 [APPROVED] 技能可以被代理发现和读取；反序列化历史数据时缺失的状态会使用 [PENDING]。
+ */
+@Serializable
+enum class SkillStatus {
+    /** 等待受信管理端审核，不能提供给代理。 */
+    PENDING,
+
+    /** 已获批准，可以提供给代理。 */
+    APPROVED,
+}
+
+/**
  * 可提供给 AI 代理使用的完整技能定义。
  *
  * @property id 技能唯一标识，必须匹配 [SKILL_ID_PATTERN]；默认值为正随机长整数字符串。
  * @property description 技能用途的简短描述。
  * @property content 技能的完整指令内容。
+ * @property status 技能的审批状态；未指定时保守地视为 [SkillStatus.PENDING]。
+ * @property revision 技能的乐观并发版本号；每次管理端修改或状态转换都会递增，且不得为负数。
  */
 @Serializable
 data class Skill(
     val id: String = Random.nextLong(1, Long.MAX_VALUE).toString(),
     val description: String,
-    val content: String
+    val content: String,
+    val status: SkillStatus = SkillStatus.PENDING,
+    val revision: Long = 0,
 )
 
 /**
  * 校验技能字段能否安全持久化、发送给模型及用作 HTTP 路径标识。
  *
  * @param skill 要校验的完整技能。
- * @throws IllegalArgumentException 标识不匹配 [SKILL_ID_PATTERN]，或描述、内容超过固定资源上限时抛出。
+ * @throws IllegalArgumentException 标识不匹配 [SKILL_ID_PATTERN]、版本号为负数，或描述、内容超过固定资源上限时抛出。
  */
 fun validateSkill(skill: Skill) {
     require(isValidSkillId(skill.id)) { "技能标识必须匹配 $SKILL_ID_PATTERN。" }
+    require(skill.revision >= 0) { "技能版本号不能为负数。" }
     require(skill.description.utf8Size() <= 1024) { "技能描述不能超过 1024 字节。" }
     require(skill.content.utf8Size() <= 64 * 1024) { "技能内容不能超过 64 KiB。" }
 }

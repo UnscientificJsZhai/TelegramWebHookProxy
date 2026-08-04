@@ -11,9 +11,11 @@ import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
@@ -56,13 +58,15 @@ import kotlin.jvm.optionals.getOrNull
  * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
  * @param mcpClientService 管理会话可调用的 MCP 工具连接。
  * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ * @param deadlines 限制候选初始化与其 MCP 批次的总体执行时间。
  */
 @AgentScope
-class OpenAIAgentService @Inject constructor(
+class OpenAIAgentService @Inject internal constructor(
     parentScope: CoroutineScope,
     private val settingsRepository: SettingsRepository,
     private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
+    private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
 ) : AgentService() {
     private companion object {
@@ -77,6 +81,8 @@ class OpenAIAgentService @Inject constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleLock = Any()
+    private val initializationCleanupLock = Any()
+    private val initializationCleanupJobs = mutableSetOf<Job>()
 
     @Volatile
     private var closed = false
@@ -182,7 +188,7 @@ class OpenAIAgentService @Inject constructor(
                     createInitialReadinessJob(initialResetJob, checkNotNull(initialModelUpdateJob))
                 logger.info("OpenAI client initialized.")
             } catch (e: Exception) {
-                logger.error("Failed to initialize OpenAI client", e)
+                logger.error("Failed to initialize OpenAI client; category={}", SafeLogging.failureCategory(e).wireName)
                 client = null
                 rawTransport?.close()
                 rawTransport = null
@@ -219,7 +225,12 @@ class OpenAIAgentService @Inject constructor(
 
     /** 创建顺序执行模型发现的任务；首轮会话或模型快照无效时以取消状态结束。 */
     private fun createInitialModelUpdateJob(initialResetJob: Job): Job = scope.launch(
-        CoroutineExceptionHandler { _, error -> logger.error("OpenAI model discovery did not become ready", error) },
+        CoroutineExceptionHandler { _, error ->
+            logger.error(
+                "OpenAI model discovery did not become ready; category={}",
+                SafeLogging.failureCategory(error).wireName,
+            )
+        },
     ) {
         initialResetJob.join()
         if (initialResetJob.isCancelled) {
@@ -233,20 +244,55 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
-    /** 组合首轮会话和模型发现，使候选仅在两个阶段均成功后才可发布。 */
+    /**
+     * 组合首轮会话和模型发现，使候选仅在两个阶段均成功后才可发布。
+     *
+     * 总时限到期会取消两个同级任务，并将等待其退出的工作转到独立跟踪清理，保证候选不会在委派层已经
+     * 放开切换屏障后继续发布状态，也不会因不响应取消的 I/O 延长该时限。
+     */
     private fun createInitialReadinessJob(initialResetJob: Job, initialModelJob: Job): Job = scope.launch(
         CoroutineExceptionHandler { _, error ->
             logger.error(
-                "OpenAI agent initialization did not become ready",
-                error
+                "OpenAI agent initialization did not become ready; category={}",
+                SafeLogging.failureCategory(error).wireName,
             )
         },
     ) {
-        initialResetJob.join()
-        initialModelJob.join()
-        if (initialResetJob.isCancelled || initialModelJob.isCancelled) {
-            throw CancellationException("OpenAI agent initialization failed")
+        try {
+            withTimeout(deadlines.candidateInitialization) {
+                initialResetJob.join()
+                initialModelJob.join()
+                if (initialResetJob.isCancelled || initialModelJob.isCancelled) {
+                    throw CancellationException("OpenAI agent initialization failed")
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            logger.warn("OpenAI candidate initialization timed out; cancelling unfinished initialization work.")
+            scheduleInitializationSiblingCleanup(initialResetJob, initialModelJob)
+            throw e
         }
+    }
+
+    /**
+     * 取消并在独立作用域中等待超时初始化的同级任务。
+     *
+     * 等待不能留在候选就绪任务中：底层 I/O 可能忽略取消。这里先同步请求取消，再跟踪后台 `join`，使
+     * 委派层能按 deadline 释放屏障，同时仍保留对滞留任务的生命周期观察。
+     */
+    private fun scheduleInitializationSiblingCleanup(vararg jobs: Job) {
+        jobs.forEach(Job::cancel)
+        lateinit var cleanupJob: Job
+        synchronized(initializationCleanupLock) {
+            cleanupJob = closingScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    jobs.toList().joinAll()
+                } finally {
+                    synchronized(initializationCleanupLock) { initializationCleanupJobs.remove(cleanupJob) }
+                }
+            }
+            initializationCleanupJobs.add(cleanupJob)
+        }
+        cleanupJob.start()
     }
 
     /**
@@ -339,7 +385,7 @@ class OpenAIAgentService @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to update OpenAI models", e)
+            logger.error("Failed to update OpenAI models; category={}", SafeLogging.failureCategory(e).wireName)
             null
         }
     }
@@ -359,7 +405,9 @@ class OpenAIAgentService @Inject constructor(
             return null
         }
         return scope.launch(
-            CoroutineExceptionHandler { _, error -> logger.error("OpenAI session reset failed", error) },
+            CoroutineExceptionHandler { _, error ->
+                logger.error("OpenAI session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
+            },
             start = CoroutineStart.UNDISPATCHED,
         ) {
             var mcpConnectionJob: Job? = null
@@ -410,7 +458,7 @@ class OpenAIAgentService @Inject constructor(
                 return null
             }
 
-        val skills = skillRepository.getSkillSummaries()
+        val skills = skillRepository.getApprovedSkillSummaries()
         val skillPrompt = getSkillPrompt(skills)
 
         val systemPrompt = (aiSettings.globalContext) + "\n\n" + skillPrompt
@@ -589,7 +637,7 @@ class OpenAIAgentService @Inject constructor(
         } catch (e: AgentTurnFailedException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Error while sending message to OpenAI", e)
+            logger.error("OpenAI message processing failed; category={}", SafeLogging.failureCategory(e).wireName)
             throw AgentTurnFailedException("OpenAI 代理回合未完成。", e)
         }
     }
@@ -877,13 +925,20 @@ class OpenAIAgentService @Inject constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.error("OpenAI tool provider failed: {}", name, e)
+                logger.error(
+                    "OpenAI tool provider failed for {}; category={}",
+                    name,
+                    SafeLogging.failureCategory(e).wireName,
+                )
                 toolError("tool_execution_failed")
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("OpenAI returned an invalid function tool call", e)
+            logger.warn(
+                "OpenAI returned an invalid function tool call; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
             toolError("invalid_tool_call")
         }
     }
@@ -900,7 +955,7 @@ class OpenAIAgentService @Inject constructor(
             (json.parseToJsonElement(arguments) as? JsonObject)?.toMap()
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             null
         }
     }
@@ -927,7 +982,7 @@ class OpenAIAgentService @Inject constructor(
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             null
         }
 
@@ -1118,7 +1173,10 @@ class OpenAIAgentService @Inject constructor(
                 }
             }
         } catch (e: Exception) {
-            logger.error("Failed to close OpenAI agent resources", e)
+            logger.error(
+                "Failed to close OpenAI agent resources; category={}",
+                SafeLogging.failureCategory(e).wireName,
+            )
         } finally {
             completion.complete(Unit)
         }

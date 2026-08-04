@@ -8,6 +8,7 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ResourceLimits
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
@@ -770,16 +771,16 @@ class UpdatesRepository private constructor(
                 is AtomicJsonRead.Valid -> read.value
                 is AtomicJsonRead.Corrupt -> {
                     LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Updates file is semantically invalid; preserving it",
-                        read.cause,
+                        "Updates file is semantically invalid; preserving it; category={}",
+                        SafeLogging.failureCategory(read.cause).wireName,
                     )
                     LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
                 }
 
                 is AtomicJsonRead.IoFailure -> {
                     LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Unable to read updates data; delaying writes until it can be revalidated",
-                        read.cause,
+                        "Unable to read updates data; delaying writes until it can be revalidated; category={}",
+                        SafeLogging.failureCategory(read.cause).wireName,
                     )
                     LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
                 }
