@@ -183,6 +183,22 @@ class SettingsTest {
         }
     }
 
+    /** 验证认证凭据必须成对提供，且仅允许 HTTP 代理使用。 */
+    @Test
+    fun `proxy validation accepts paired HTTP credentials only`() {
+        validateProxySettings(ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"))
+        validateProxySettings(ProxySettings("proxy.example.com", 8080, ProxyType.HTTP))
+
+        listOf(
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = "user"),
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, password = "password"),
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = "password"),
+            ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
+        ).forEach { proxy ->
+            assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy) }
+        }
+    }
+
     /**
      * 验证 MCP 配置共用校验限制服务器身份、绝对 HTTP(S) URL 和不可注入的固定请求头。
      */

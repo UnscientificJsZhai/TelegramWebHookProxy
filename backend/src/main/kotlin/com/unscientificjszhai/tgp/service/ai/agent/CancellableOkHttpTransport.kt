@@ -6,6 +6,7 @@ import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okio.Buffer
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
@@ -63,7 +64,7 @@ internal class CancellableOkHttpTransport(
                         val result = HttpResult(
                             statusCode = it.code,
                             headers = it.headers.toMultimap(),
-                            body = it.body.string(),
+                            body = it.body.readUtf8AtMost(MAX_RAW_RESPONSE_BYTES),
                         )
                         if (continuation.isActive) {
                             continuation.resume(result)
@@ -97,6 +98,25 @@ internal class CancellableOkHttpTransport(
         client.dispatcher.cancelAll()
         client.connectionPool.evictAll()
     }
+}
+
+internal const val MAX_RAW_RESPONSE_BYTES = 1024 * 1024
+
+/** 上游原生 AI 响应在解压后的实际读取字节超过上限。 */
+internal class UpstreamResponseTooLargeException : IOException("上游响应超过 1 MiB 限制。")
+
+private fun okhttp3.ResponseBody.readUtf8AtMost(limit: Int): String {
+    if (contentLength() > limit) throw UpstreamResponseTooLargeException()
+    val source = source()
+    val buffer = Buffer()
+    var total = 0L
+    while (true) {
+        val read = source.read(buffer, 8192)
+        if (read == -1L) break
+        total += read
+        if (total > limit) throw UpstreamResponseTooLargeException()
+    }
+    return buffer.readUtf8()
 }
 
 /** 已由 [CancellableOkHttpTransport] 读取并关闭响应体的 HTTP 响应快照。 */

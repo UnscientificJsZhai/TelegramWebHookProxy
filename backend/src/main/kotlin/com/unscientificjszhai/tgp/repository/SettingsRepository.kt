@@ -7,11 +7,13 @@ import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.models.validateProxySettings
+import com.unscientificjszhai.tgp.models.validateAppSettingsResourceLimits
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -71,7 +73,7 @@ class SettingsRepository private constructor(
     }
 
     private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
-    private val storage = AtomicJsonStorage(configFile.toPath(), fileOperations)
+    private val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SETTINGS_BYTES, fileOperations)
     private val loadedSettings = loadSettings()
 
     @Volatile
@@ -355,6 +357,7 @@ class SettingsRepository private constructor(
         if (hasHistoricalInvalidMcp && !replacesHistoricalInvalidMcpServers) {
             throw HistoricalInvalidMcpConfigurationException()
         }
+        validateAppSettingsResourceLimits(settings)
         validateProxySettings(settings.proxy)
         settings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
         settings.ai?.mcpServers?.let(::validateMcpServerConfigs)
@@ -540,6 +543,8 @@ private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInva
         } else {
             settings
         }
+    }.let { settings ->
+        if (hasInvalidProxy) settings.copy(proxy = null) else settings
     }
     return LoadedSettings(
         settings = failClosedSettings,

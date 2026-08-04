@@ -337,6 +337,21 @@ class APIModuleTest {
                 assertEquals(HttpStatusCode.BadRequest, status)
             }
 
+            listOf(
+                ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = "user"),
+                ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, password = "password"),
+                ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = " "),
+                ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
+            ).forEach { invalidProxy ->
+                client.put("/api/settings") {
+                    header(HttpHeaders.IfMatch, revision)
+                    contentType(ContentType.Application.Json)
+                    setBody(completeSettingsJson.encodeToString(original.copy(proxy = invalidProxy)))
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+            }
+
             assertEquals(original, repository.settingsFlow.value)
             assertEquals(originalContent, configFile.readText())
             coVerify(exactly = 0) { telegramService.updateBotCommands(any(), any()) }
@@ -368,6 +383,16 @@ class APIModuleTest {
                     header(HttpHeaders.IfMatch, currentSettingsETag())
                     contentType(ContentType.Application.Json)
                     setBody("""{"chatId":"new-chat"}""")
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+                assertEquals(recoveredSettings, repository.settingsFlow.value)
+                assertEquals(originalContent, configFile.readText())
+
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"chatId":"patched-chat"}""")
                 }.apply {
                     assertEquals(HttpStatusCode.BadRequest, status)
                 }
@@ -412,11 +437,11 @@ class APIModuleTest {
             backupFile.writeText(ConfigJson.encodeToString(recovered))
             var blockBackupRead = true
             val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-                override fun readAllBytes(path: Path): ByteArray {
+                override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
                     if (blockBackupRead && path == backupFile.toPath()) {
                         throw IOException("injected backup read failure")
                     }
-                    return DefaultAtomicJsonFileOperations.readAllBytes(path)
+                    return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
                 }
             }
             val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
@@ -603,7 +628,7 @@ class APIModuleTest {
                 contentType(ContentType.Application.Json)
                 setBody(
                     """
-                {"proxy":{"username":null},"ai":{"mcpServers":[
+                {"ai":{"mcpServers":[
                   {"name":"replacement","url":"https://new.example.com/mcp","headers":{"Authorization":"new","X-Dynamic":"allowed"}}
                 ]}}
                 """.trimIndent(),
@@ -615,7 +640,7 @@ class APIModuleTest {
             }
             val patched = repository.settingsFlow.value
             assertEquals("proxy.example.com", patched.proxy?.host)
-            assertEquals(null, patched.proxy?.username)
+            assertEquals("user", patched.proxy?.username)
             assertEquals("password", patched.proxy?.password)
             assertEquals(
                 mapOf("Authorization" to "new", "X-Dynamic" to "allowed"),
@@ -648,6 +673,25 @@ class APIModuleTest {
 
             client.patch("/api/settings") {
                 header(HttpHeaders.IfMatch, invalidNullRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"proxy":{"username":null}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+            assertEquals(patched, repository.settingsFlow.value)
+
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, invalidNullRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"proxy":{"username":null,"password":null}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+            assertEquals(null, repository.settingsFlow.value.proxy?.username)
+            assertEquals(null, repository.settingsFlow.value.proxy?.password)
+
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
                 contentType(ContentType.Application.Json)
                 setBody("""{"proxy":null,"ai":null}""")
             }.apply {

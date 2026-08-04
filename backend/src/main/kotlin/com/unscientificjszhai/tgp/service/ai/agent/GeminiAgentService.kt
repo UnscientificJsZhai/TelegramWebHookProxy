@@ -12,7 +12,9 @@ import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
@@ -36,7 +38,6 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -45,6 +46,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.nio.charset.StandardCharsets
 import java.time.Duration
 import javax.inject.Inject
 import javax.inject.Provider
@@ -114,6 +116,7 @@ class GeminiAgentService @Inject constructor(
 
     @Volatile
     private var chatFunctionRouteSnapshot: LocalFunctionRouteSnapshot? = null
+    private var sdkSessionConfig: GenerateContentConfig? = null
 
     private var savedHistory: List<Content>? = null
     private var rawSession: RawGeminiSession? = null
@@ -255,7 +258,7 @@ class GeminiAgentService @Inject constructor(
         }
     }
 
-    /** 创建 Gemini 原生传输客户端，并保留既有 HTTP/SOCKS 代理及其认证语义。 */
+    /** 创建 Gemini 原生传输客户端，并支持 HTTP Basic 代理认证与 SOCKS 代理路由。 */
     private fun createGeminiHttpClient(proxySettings: ProxySettings?): OkHttpClient {
         val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
@@ -264,15 +267,7 @@ class GeminiAgentService @Inject constructor(
                 ProxyType.SOCKS -> Proxy.Type.SOCKS
             }
             builder.proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
-            if (proxySettings.type == ProxyType.HTTP && !proxySettings.username.isNullOrEmpty()) {
-                val username = proxySettings.username
-                val password = proxySettings.password.orEmpty()
-                builder.proxyAuthenticator { _, response ->
-                    response.request.newBuilder()
-                        .header("Proxy-Authorization", Credentials.basic(username, password))
-                        .build()
-                }
-            }
+            builder.configureHttpProxyBasicAuthentication(proxySettings)
         }
         return builder.build()
     }
@@ -435,8 +430,9 @@ class GeminiAgentService @Inject constructor(
                     }
 
                     val candidateModel = switchRequest?.model ?: currentModel
+                    val candidateConfig = configBuilder.build()
                     val newChat = try {
-                        currentClient.chats.create(candidateModel, configBuilder.build())
+                        currentClient.chats.create(candidateModel, candidateConfig)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -447,7 +443,13 @@ class GeminiAgentService @Inject constructor(
                     ensureResetCanCommit(switchRequest)
 
                     // 会话锁和模型锁将会话、路由、待恢复历史和模型的发布线性化；在此之前旧状态始终可用。
-                    commitCandidateSession(newChat, functionRouteSnapshot, candidateHistory, switchRequest)
+                    commitCandidateSession(
+                        newChat,
+                        functionRouteSnapshot,
+                        candidateHistory,
+                        candidateConfig,
+                        switchRequest
+                    )
                     logger.info("Gemini session reset with model: $candidateModel")
                 }
             } catch (e: Throwable) {
@@ -571,6 +573,7 @@ class GeminiAgentService @Inject constructor(
         candidateChat: Chat,
         candidateRouteSnapshot: LocalFunctionRouteSnapshot,
         candidateHistory: List<Content>?,
+        candidateConfig: GenerateContentConfig,
         switchRequest: ModelSwitchRequest?,
     ) {
         synchronized(modelStateLock) {
@@ -582,6 +585,7 @@ class GeminiAgentService @Inject constructor(
             chat = candidateChat
             chatFunctionRouteSnapshot = candidateRouteSnapshot
             savedHistory = candidateHistory
+            sdkSessionConfig = candidateConfig
             if (switchRequest != null) {
                 currentModel = switchRequest.model
                 pendingModel = null
@@ -626,6 +630,7 @@ class GeminiAgentService @Inject constructor(
         text: String?,
         mediaData: List<MediaData>,
     ): String {
+        validateGeminiInput(text, mediaData)
         if (rawTransport != null) {
             return sendRawMessage(text, mediaData)
         }
@@ -654,14 +659,18 @@ class GeminiAgentService @Inject constructor(
             check(!closed) { "Gemini client is closed." }
             val currentTransport =
                 rawTransport ?: throw IllegalStateException("Gemini HTTP transport is not initialized.")
-            val tentativeHistory = session.history.toMutableList()
+            validateGeminiInput(text, mediaData)
+            val tentativeHistory = prepareRawGeminiCandidate(session.history)
             tentativeHistory += createGeminiUserContent(text, mediaData)
+            ensureRawGeminiHistoryBudget(tentativeHistory)
 
             try {
                 var toolCallRounds = 0
+                var toolCallsExecuted = 0
                 while (!closed) {
                     val candidate = requestGeminiContent(currentTransport, session, tentativeHistory)
                     tentativeHistory += candidate
+                    ensureRawGeminiHistoryBudget(tentativeHistory)
                     val functionCalls = geminiFunctionCalls(candidate)
                     if (functionCalls.isEmpty()) {
                         val reply = candidate["parts"]?.jsonArray
@@ -675,13 +684,18 @@ class GeminiAgentService @Inject constructor(
                     }
 
                     ensureToolCallRoundIsAllowed(toolCallRounds++)
-                    val responses = functionCalls.map { functionCall ->
-                        createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot)
+                    ensureToolCallCountIsAllowed(functionCalls.size, toolCallsExecuted)
+                    toolCallsExecuted += functionCalls.size
+                    val responses = buildJsonArray {
+                        functionCalls.forEach { functionCall ->
+                            add(createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot))
+                        }
                     }
                     tentativeHistory += buildJsonObject {
                         put("role", "user")
-                        put("parts", JsonArray(responses))
+                        put("parts", responses)
                     }
+                    ensureRawGeminiHistoryBudget(tentativeHistory)
                 }
             } catch (e: ToolCallLimitExceededException) {
                 logger.error("Tool call limit reached for Gemini session", e)
@@ -711,6 +725,54 @@ class GeminiAgentService @Inject constructor(
                 })
             }
         })
+    }
+
+    private fun validateGeminiInput(text: String?, mediaData: List<MediaData>) {
+        require((text ?: "").toByteArray(StandardCharsets.UTF_8).size <= MAX_AGENT_TEXT_BYTES) {
+            "消息文本超过本地上下文限制。"
+        }
+        var mediaBytes = 0
+        mediaData.forEach { media ->
+            if (media.data.size > MAX_AGENT_INLINE_MEDIA_BYTES || mediaBytes > MAX_AGENT_INLINE_MEDIA_BYTES - media.data.size) {
+                throw AgentTurnFailedException("内联媒体超过本地上下文限制。")
+            }
+            mediaBytes += media.data.size
+        }
+    }
+
+    private fun prepareRawGeminiCandidate(history: List<JsonObject>): MutableList<JsonObject> {
+        val candidate = history.toMutableList()
+        if (rawGeminiHistoryBytes(candidate) > MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES) {
+            candidate.clear()
+        }
+        return candidate
+    }
+
+    private fun ensureRawGeminiHistoryBudget(history: List<JsonObject>) {
+        if (history.size > MAX_AGENT_HISTORY_ENTRIES || rawGeminiHistoryBytes(history) > MAX_AGENT_HISTORY_BYTES) {
+            throw AgentTurnFailedException("AI 会话历史超过资源上限。")
+        }
+    }
+
+    private fun rawGeminiHistoryBytes(history: List<JsonObject>): Int =
+        wireJson.encodeToString(JsonArray(history)).toByteArray(StandardCharsets.UTF_8).size
+
+    /** 仅在候选 Chat 中保留可为新回合预留固定空间的已成功 SDK 历史。 */
+    private fun prepareSdkGeminiHistory(history: List<Content>): List<Content> =
+        if (sdkGeminiHistoryBytes(history) > MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES) {
+            emptyList()
+        } else {
+            history
+        }
+
+    private fun ensureSdkGeminiHistoryBudget(history: List<Content>) {
+        if (history.size > MAX_AGENT_HISTORY_ENTRIES || sdkGeminiHistoryBytes(history) > MAX_AGENT_HISTORY_BYTES) {
+            throw AgentTurnFailedException("AI 会话历史超过资源上限。")
+        }
+    }
+
+    private fun sdkGeminiHistoryBytes(history: List<Content>): Int = history.sumOf { content ->
+        JsonSerializable.toJsonString(content).toByteArray(StandardCharsets.UTF_8).size
     }
 
     /** 发起一次 Gemini `generateContent` 调用并返回首个候选内容。 */
@@ -762,14 +824,17 @@ class GeminiAgentService @Inject constructor(
             when {
                 name.isNullOrBlank() -> buildJsonObject { put("error", "Function call name is missing") }
                 args == null -> buildJsonObject { put("error", "Function $name arguments are invalid") }
+                args.toString().toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_ARGUMENT_BYTES ->
+                    buildJsonObject { put("error", "tool_arguments_too_large") }
+
                 !routeSnapshot.canHandle(name) -> buildJsonObject { put("error", "Function $name not found") }
                 else -> routeSnapshot.execute(name, args.toMap())
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error("Failed to execute Gemini function call: {}", name, e)
-            buildJsonObject { put("error", e.message ?: "Function $name failed") }
+            logger.warn("Gemini function call failed with a safe local error category.")
+            buildJsonObject { put("error", "tool_execution_failed") }
         }
         return buildJsonObject {
             put("functionResponse", buildJsonObject {
@@ -902,27 +967,37 @@ class GeminiAgentService @Inject constructor(
             check(!closed) { "Gemini client is closed." }
             try {
                 val activeChat = chat?.let { it to checkNotNull(chatFunctionRouteSnapshot) } ?: currentChat
-                val chatForMessage = activeChat.first
                 val parts = mutableListOf<Part>()
                 text?.let { parts.add(Part.fromText(it)) }
                 parts.addAll(audioParts)
 
                 val userContent = Content.builder().role("user").parts(parts).build()
-
-                val history = savedHistory
-                val response = if (history != null && chatForMessage.getHistory(false).isEmpty()) {
-                    savedHistory = null
-                    withContext(Dispatchers.IO) {
-                        chatForMessage.sendMessage(history + userContent)
+                val config = sdkSessionConfig
+                if (config == null) {
+                    // 此状态只会出现于正在迁移的运行时会话，或测试注入的 SDK 会话。正常 reset 总会在发送前设置
+                    // config，因此生产路径仍使用下方的候选会话提交。
+                    val response = withContext(Dispatchers.IO) {
+                        activeChat.first.sendMessage(listOf(userContent))
                     }
+                    handleResponse(response, activeChat.first, activeChat.second)
                 } else {
-                    withContext(Dispatchers.IO) {
-                        chatForMessage.sendMessage(listOf(userContent))
+                    val currentClient = checkNotNull(client) { "Gemini client is not initialized." }
+                    val persistedHistory = savedHistory ?: activeChat.first.getHistory(true)
+                    val candidateHistory = prepareSdkGeminiHistory(persistedHistory)
+                    val candidateChat = currentClient.chats.create(currentModel, config)
+                    val response = withContext(Dispatchers.IO) {
+                        candidateChat.sendMessage(candidateHistory + userContent)
                     }
-                }
 
-                // 检查模型是否请求调用工具。
-                handleResponse(response, chatForMessage, activeChat.second)
+                    // 检查模型是否请求调用工具。
+                    val reply = handleResponse(response, candidateChat, activeChat.second)
+                    val committedHistory = candidateChat.getHistory(true)
+                    ensureSdkGeminiHistoryBudget(committedHistory)
+                    check(!closed && chat === activeChat.first) { "Gemini session was replaced before commit" }
+                    chat = candidateChat
+                    savedHistory = committedHistory
+                    reply
+                }
             } catch (e: ToolCallLimitExceededException) {
                 logger.error("Tool call limit reached for Gemini session", e)
                 // 重置同样采用候选提交；创建失败时仍保留当前会话，避免在错误恢复路径破坏可用状态。
@@ -940,10 +1015,12 @@ class GeminiAgentService @Inject constructor(
         currentChat: Chat,
         functionRouteSnapshot: LocalFunctionRouteSnapshot,
         toolCallRounds: Int = 0,
+        toolCallsExecuted: Int = 0,
     ): String {
         val functionCalls = response.functionCalls()
         if (!functionCalls.isNullOrEmpty()) {
             ensureToolCallRoundIsAllowed(toolCallRounds)
+            ensureToolCallCountIsAllowed(functionCalls.size, toolCallsExecuted)
             val functionResponses = mutableListOf<Part>()
 
             for (functionCall in functionCalls) {
@@ -964,10 +1041,8 @@ class GeminiAgentService @Inject constructor(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    logger.error("Failed to execute Gemini function call: $fullName", e)
-                    buildJsonObject {
-                        put("error", e.message ?: "Function $fullName failed")
-                    }
+                    logger.warn("Gemini SDK function call failed with a safe local error category.")
+                    buildJsonObject { put("error", "tool_execution_failed") }
                 }
                 functionResponses.add(createFunctionResponsePart(functionCall, result))
             }
@@ -977,7 +1052,13 @@ class GeminiAgentService @Inject constructor(
             val finalResponse = withContext(Dispatchers.IO) {
                 currentChat.sendMessage(content)
             }
-            return handleResponse(finalResponse, currentChat, functionRouteSnapshot, toolCallRounds + 1)
+            return handleResponse(
+                finalResponse,
+                currentChat,
+                functionRouteSnapshot,
+                toolCallRounds + 1,
+                toolCallsExecuted + functionCalls.size,
+            )
         } else {
             return response.text() ?: ""
         }

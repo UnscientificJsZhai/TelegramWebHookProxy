@@ -2,11 +2,14 @@ package com.unscientificjszhai.tgp.modules
 
 import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.server.plugins.bodylimit.*
+import kotlinx.coroutines.CancellationException
 
 /**
  * 注册技能的分页查询、新增和删除 HTTP API 路由。
@@ -26,10 +29,19 @@ fun Application.skillAPIModule(appComponent: AppComponent) {
                 val size = call.request.queryParameters["size"]?.toIntOrNull() ?: 10
                 call.respond(skillRepository.getAllSkills(page, size))
             }
-            post {
-                val skill = call.receive<Skill>()
-                skillRepository.saveSkill(skill)
-                call.respond(HttpStatusCode.OK)
+            route("") {
+                install(RequestBodyLimit) { bodyLimit { ResourceLimits.SKILL_REQUEST_BYTES } }
+                post {
+                    try {
+                        val skill = call.receive<Skill>()
+                        skillRepository.saveSkill(skill)
+                        call.respond(HttpStatusCode.OK)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: IllegalArgumentException) {
+                        call.respond(HttpStatusCode.BadRequest, "技能字段或数量超过限制")
+                    }
+                }
             }
             delete("/{id}") {
                 val id = call.parameters["id"]

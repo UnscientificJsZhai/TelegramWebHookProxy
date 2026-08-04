@@ -5,10 +5,16 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionFailedException
+import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionTooLargeException
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.net.SocketTimeoutException
 import java.util.concurrent.locks.ReentrantLock
@@ -178,11 +184,24 @@ class MessagePoller @Inject constructor(
         val completion: CompletableDeferred<Unit>,
     )
 
+    /** 一条更新在当前轮询批次中的接纳结果。 */
+    private sealed interface UpdateAdmission {
+        /** 更新无需排队或队满提示已被 Telegram 接受，可以推进偏移量。 */
+        data object Confirmed : UpdateAdmission
+
+        /** 更新已加入消费者队列，必须等待 [completion] 后才能推进偏移量。 */
+        data class Enqueued(val completion: CompletableDeferred<Unit>) : UpdateAdmission
+
+        /** 队满提示未被 Telegram 接受，必须保留当前及后续更新以便重试。 */
+        data object Retry : UpdateAdmission
+    }
+
     /** 单次初始化或长轮询请求的结果；失败结果绝不包含可推进偏移量的更新。 */
     private sealed interface PollingAttempt {
-        data object Succeeded : PollingAttempt
+        data class Succeeded(val retryOffsetResolved: Boolean) : PollingAttempt
         data object Stopped : PollingAttempt
         data class ApiFailure(val response: GetUpdatesResponse) : PollingAttempt
+        data class LocalRetry(val retryOffset: Long) : PollingAttempt
     }
 
     /**
@@ -275,16 +294,27 @@ class MessagePoller @Inject constructor(
     }
 
     private suspend fun runPolling(session: PollingSession) {
+        var retryOffset: Long? = null
         while (currentCoroutineContext().isActive) {
             try {
-                when (val attempt = pollOnce(session)) {
-                    PollingAttempt.Succeeded -> {
+                when (val attempt = pollOnce(session, retryOffset)) {
+                    is PollingAttempt.Succeeded -> {
+                        if (attempt.retryOffsetResolved) {
+                            retryOffset = null
+                        }
                         session.consecutivePollingFailures = 0
                         // 成功轮询沿用既有短暂让步；失败路径绝不会再叠加这段延迟。
                         delay(1000.milliseconds)
                     }
 
                     PollingAttempt.Stopped -> return
+                    is PollingAttempt.LocalRetry -> {
+                        retryOffset = attempt.retryOffset
+                        if (!delayAfterFailure(session)) {
+                            return
+                        }
+                    }
+
                     is PollingAttempt.ApiFailure -> {
                         if (!handleApiFailure(session, attempt.response)) {
                             return
@@ -316,15 +346,19 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    /** 执行一次初始化或正常长轮询；只有成功响应才会保存初始化偏移量或确认队列更新。 */
-    private suspend fun pollOnce(session: PollingSession): PollingAttempt {
+    /**
+     * 执行一次初始化或正常长轮询；只有成功响应才会保存初始化偏移量或确认队列更新。
+     *
+     * @param retryOffset 队满通知未被接受时要重拉的首条更新标识；为 `null` 时从已提交偏移量后的首条更新开始。
+     */
+    private suspend fun pollOnce(session: PollingSession, retryOffset: Long?): PollingAttempt {
         if (!isCurrent(session)) {
             return PollingAttempt.Stopped
         }
         var lastStoredId = readForCurrent(session) {
             updatesRepository.getData(session.botId).lastUpdateId
         } ?: return PollingAttempt.Stopped
-        if (lastStoredId == 0L && !session.initialOffsetResolved) {
+        if (lastStoredId == 0L && retryOffset == null && !session.initialOffsetResolved) {
             val initialResponse = telegramService.getUpdatesForToken(session.token, offset = -1, timeout = 0)
             if (!isCurrent(session)) {
                 return PollingAttempt.Stopped
@@ -343,12 +377,12 @@ class MessagePoller @Inject constructor(
                 logger.info("Initialized lastUpdateId for bot {} to {}", session.botId, lastStoredId)
             }
             session.initialOffsetResolved = true
-            return PollingAttempt.Succeeded
+            return PollingAttempt.Succeeded(retryOffsetResolved = true)
         }
 
         val response = telegramService.getUpdatesForToken(
             session.token,
-            offset = lastStoredId + 1,
+            offset = retryOffset ?: (lastStoredId + 1),
             timeout = 30,
         )
         if (!isCurrent(session)) {
@@ -359,15 +393,38 @@ class MessagePoller @Inject constructor(
         }
         val completions = mutableListOf<Pair<Long, CompletableDeferred<Unit>>>()
         val discoveredChats = LinkedHashMap<String, ChatInfo>()
+        var mustRetry = false
+        var retryUpdateId: Long? = null
         for (update in response.result) {
-            update.chatInfo()?.let { discoveredChats[it.id] = it }
             try {
-                completions += update.updateId to enqueueUpdate(session, update)
+                when (val admission = enqueueUpdate(session, update)) {
+                    UpdateAdmission.Confirmed -> {
+                        update.chatInfo()?.let { discoveredChats[it.id] = it }
+                        completions += update.updateId to completedSignal()
+                    }
+
+                    is UpdateAdmission.Enqueued -> {
+                        update.chatInfo()?.let { discoveredChats[it.id] = it }
+                        completions += update.updateId to admission.completion
+                    }
+
+                    UpdateAdmission.Retry -> {
+                        mustRetry = true
+                        retryUpdateId = update.updateId
+                        break
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.error("Error handling update ${update.updateId}", e)
-                completions += update.updateId to completedSignal()
+                logger.warn(
+                    "Failed to admit update {}; preserving its offset for retry ({}).",
+                    update.updateId,
+                    e::class.simpleName,
+                )
+                mustRetry = true
+                retryUpdateId = update.updateId
+                break
             }
         }
         if (discoveredChats.isNotEmpty() && !saveForCurrent(session) {
@@ -388,7 +445,13 @@ class MessagePoller @Inject constructor(
                 lastStoredId = updateId
             }
         }
-        return if (isCurrent(session)) PollingAttempt.Succeeded else PollingAttempt.Stopped
+        return when {
+            !isCurrent(session) -> PollingAttempt.Stopped
+            mustRetry -> PollingAttempt.LocalRetry(checkNotNull(retryUpdateId))
+            else -> PollingAttempt.Succeeded(
+                retryOffsetResolved = retryOffset == null || completions.any { (updateId, _) -> updateId == retryOffset },
+            )
+        }
     }
 
     /** 分类 Telegram API 的失败；认证失败会仅在本会话仍当前时终止整套轮询资源。 */
@@ -549,8 +612,8 @@ class MessagePoller @Inject constructor(
     /**
      * 将一条更新加入当前活跃会话的处理队列。
      *
-     * 当前没有有效会话时不会产生副作用。队列满时会使用该会话捕获的 token 回复失败提示，
-     * 并保持既有的“提示成功后确认更新”语义。
+     * 当前没有有效会话时不会产生副作用。队列满时会使用该会话捕获的 token 回复失败提示；只有
+     * Telegram 返回 HTTP `2xx` 且 API `ok` 为 `true` 时才确认该更新，否则由下一次轮询重试。
      *
      * @param update 要检查的 Telegram 更新；不含可处理消息时不会入队。
      */
@@ -558,43 +621,64 @@ class MessagePoller @Inject constructor(
         activeSession()?.let { enqueueUpdate(it, update) }
     }
 
-    private suspend fun enqueueUpdate(session: PollingSession, update: Update): CompletableDeferred<Unit> {
+    private suspend fun enqueueUpdate(session: PollingSession, update: Update): UpdateAdmission {
         if (!isCurrent(session)) {
-            return CompletableDeferred()
+            return UpdateAdmission.Confirmed
         }
-        val message = update.message ?: return completedSignal()
+        val message = update.message ?: return UpdateAdmission.Confirmed
         if (message.text == null && message.voice == null) {
-            return completedSignal()
+            return UpdateAdmission.Confirmed
         }
-        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return completedSignal()
+        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return UpdateAdmission.Confirmed
         val chatId = message.chat.id.toString()
         if (!agentService.isAiFeatureEnabled(aiSettings) || chatId != aiSettings.agentChatId) {
-            return completedSignal()
+            return UpdateAdmission.Confirmed
         }
 
         val completion = CompletableDeferred<Unit>()
-        if (session.updateChannel.trySend(QueuedUpdate(update, System.currentTimeMillis(), completion)).isFailure) {
-            logger.warn("Update ${update.updateId} rejected: Queue is full.")
-            try {
-                sendMessageForSession(
-                    session,
-                    chatId,
-                    "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
-                    ReplyParameters(messageId = message.messageId),
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.warn("Failed to send queue full notification", e)
-            }
-            if (isCurrent(session)) {
-                completion.complete(Unit)
-            }
+        if (session.updateChannel.trySend(QueuedUpdate(update, System.currentTimeMillis(), completion)).isSuccess) {
+            return UpdateAdmission.Enqueued(completion)
         }
-        return completion
+
+        logger.warn("Update {} rejected: queue is full.", update.updateId)
+        val notificationAccepted = try {
+            sendMessageForSession(
+                session,
+                chatId,
+                "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
+                ReplyParameters(messageId = message.messageId),
+            ).isTelegramAccepted()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn(
+                "Queue full notification request failed for update {} ({}).",
+                update.updateId,
+                e::class.simpleName,
+            )
+            false
+        }
+        if (notificationAccepted) {
+            logger.info("Queue full notification accepted for update {}; confirming update.", update.updateId)
+            return UpdateAdmission.Confirmed
+        }
+        logger.warn(
+            "Queue full notification was not accepted for update {}; preserving offset for retry.",
+            update.updateId
+        )
+        return UpdateAdmission.Retry
     }
 
     private fun completedSignal(): CompletableDeferred<Unit> = CompletableDeferred<Unit>().also { it.complete(Unit) }
+
+    /** 判断 Telegram 响应是否同时具有成功 HTTP 状态和 API `ok: true` 标记。 */
+    private fun TelegramApiResponse.isTelegramAccepted(): Boolean {
+        return status.isSuccess() && try {
+            Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     /**
      * 使用当前活跃会话处理 AI 聊天命令。
@@ -761,7 +845,7 @@ class MessagePoller @Inject constructor(
             throw e
         } catch (e: Exception) {
             logger.error("Failed to handle AI message", e)
-            sendMessageForSession(session, chatId, "AI 处理消息时出错：${e.message}", ReplyParameters(messageId))
+            sendMessageForSession(session, chatId, "AI 处理消息时出错，请稍后重试。", ReplyParameters(messageId))
         }
     }
 
@@ -814,9 +898,20 @@ class MessagePoller @Inject constructor(
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: AudioTranscriptionTooLargeException) {
+            logger.warn("Voice message exceeded the local transcription size limit.", e)
+            sendMessageForSession(
+                session,
+                chatId,
+                "语音文件过大，最大支持 24 MiB，请发送更短的语音消息。",
+                ReplyParameters(messageId),
+            )
+        } catch (e: AudioTranscriptionFailedException) {
+            logger.warn("Voice transcription failed.", e)
+            sendMessageForSession(session, chatId, "语音转写失败，请稍后重试。", ReplyParameters(messageId))
         } catch (e: Exception) {
             logger.error("Failed to handle voice message", e)
-            sendMessageForSession(session, chatId, "处理语音消息时出错：${e.message}", ReplyParameters(messageId))
+            sendMessageForSession(session, chatId, "处理语音消息时出错，请稍后重试。", ReplyParameters(messageId))
         }
     }
 

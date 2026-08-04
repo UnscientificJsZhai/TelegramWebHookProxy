@@ -52,6 +52,38 @@ class SkillRepositoryTest {
     }
 
     /**
+     * 验证技能字段与分页参数在仓储边界即被拒绝，避免将不受控文本写入持久化文件。
+     */
+    @Test
+    fun `resource bounds reject oversized skills and invalid page sizes`() {
+        assertFailsWith<IllegalArgumentException> {
+            repository.saveSkill(Skill(id = "x".repeat(65), description = "ok", content = "ok"))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.saveSkill(Skill(id = "ok", description = "ok", content = "x".repeat(64 * 1024 + 1)))
+        }
+        assertFailsWith<IllegalArgumentException> { repository.getAllSkills(page = 0) }
+        assertFailsWith<IllegalArgumentException> { repository.getAllSkills(size = 51) }
+        assertTrue(repository.getAllSkills(size = 50).items.isEmpty())
+    }
+
+    /**
+     * 验证集合上限在写入前生效，避免写出读取时必然会拒绝的第 65 条技能。
+     */
+    @Test
+    fun `skill collection limit preserves a readable store`() {
+        repeat(64) { index ->
+            repository.saveSkill(Skill(id = "skill-$index", description = "ok", content = "ok"))
+        }
+
+        assertFailsWith<IllegalArgumentException> {
+            repository.saveSkill(Skill(id = "skill-64", description = "ok", content = "ok"))
+        }
+        assertEquals(64, repository.getAllSkills(size = 50).total)
+        assertEquals(64, SkillRepository.forTesting(skillsFile).getAllSkills(size = 50).total)
+    }
+
+    /**
      * 验证按标识查询技能的设计。
      *
      * 验证保存的技能可由其标识准确读取。
@@ -137,7 +169,13 @@ class SkillRepositoryTest {
     fun `concurrent saves retain every skill`() = runTest {
         (1..40).map { index ->
             async {
-                repository.saveSkill(Skill(id = index.toString(), description = "skill-$index", content = "content-$index"))
+                repository.saveSkill(
+                    Skill(
+                        id = index.toString(),
+                        description = "skill-$index",
+                        content = "content-$index"
+                    )
+                )
             }
         }.forEach { it.await() }
 

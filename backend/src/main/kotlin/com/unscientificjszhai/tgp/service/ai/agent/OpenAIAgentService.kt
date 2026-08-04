@@ -10,7 +10,9 @@ import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
@@ -24,8 +26,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -34,6 +38,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.*
 import javax.inject.Inject
@@ -62,6 +67,8 @@ class OpenAIAgentService @Inject constructor(
 ) : AgentService() {
     private companion object {
         const val DEFAULT_MODEL = "gpt-5.6-luna"
+        const val TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+        const val TELEGRAM_OGG_MIME_TYPE = "audio/ogg"
         val FALLBACK_MODELS = listOf(DEFAULT_MODEL, ChatModel.GPT_4O.toString())
     }
 
@@ -99,6 +106,7 @@ class OpenAIAgentService @Inject constructor(
     private var rawBaseUrl: String? = null
     private var rawApiKey: String? = null
     private val history = mutableListOf<ChatCompletionMessageParam>()
+    private var systemMessageCount = 0
 
     /** 串行化完整对话与会话重置，避免历史记录交错。 */
     private val sessionMutex = Mutex()
@@ -188,7 +196,7 @@ class OpenAIAgentService @Inject constructor(
         }
     }
 
-    /** 创建 OpenAI 兼容服务的原生客户端，保留既有 HTTP/SOCKS 路由但不处理代理认证。 */
+    /** 创建 OpenAI 兼容服务的原生客户端，并支持 HTTP Basic 代理认证与 SOCKS 代理路由。 */
     private fun createOpenAIHttpClient(proxySettings: ProxySettings?): OkHttpClient {
         val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
@@ -197,6 +205,7 @@ class OpenAIAgentService @Inject constructor(
                 ProxyType.SOCKS -> Proxy.Type.SOCKS
             }
             builder.proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
+            builder.configureHttpProxyBasicAuthentication(proxySettings)
         }
         return builder.build()
     }
@@ -360,6 +369,7 @@ class OpenAIAgentService @Inject constructor(
             return null
         }
         history.clear()
+        systemMessageCount = 0
         val aiSettings = settingsRepository.settingsFlow.value.ai
         val mcpConnectionJob = aiSettings?.let { startMcpConnection(it.mcpServers) }
             ?: run {
@@ -434,8 +444,8 @@ class OpenAIAgentService @Inject constructor(
     /**
      * 向当前会话发送文本和媒体数据，并返回模型最终回复。
      *
-     * 图像会以内联数据发送；仅模型名称包含 `audio` 或以 `o1`、`o3` 开头时会发送音频。
-     * 不支持的媒体或空消息会被忽略。
+     * 图像会以内联数据发送。Telegram OGG 语音会先通过转写端点转换为文本，再与配文一起进入聊天回合；
+     * 仅真实 WAV/MP3 MIME 类型且模型支持音频时才作为直接音频输入。其他媒体或空消息会被忽略。
      * 此挂起函数会与会话重置串行执行。用户消息、模型工具调用和工具结果先在本地暂存，只有收到
      * 不含工具调用的最终 assistant 消息后才会一次性提交；失败或取消不会影响既有成功会话。工具已
      * 产生的外部副作用无法撤销，重试具有至少一次语义。
@@ -444,8 +454,12 @@ class OpenAIAgentService @Inject constructor(
      * @param mediaData 要发送的媒体数据列表；可为空，元素的 MIME 类型决定其处理方式。
      * @return 模型最终回复文本；没有可发送内容或模型未返回文本时返回空字符串。以 `Error:` 开头的
      * 文本是模型的正常回复。
-     * @throws AgentTurnFailedException 当 API、协议、工具调用上限或其他非取消错误导致本次回合未完成时
-     * 抛出；本次回合历史不会提交。
+     * @throws AudioTranscriptionTooLargeException OGG 语音超过 [MAX_AUDIO_TRANSCRIPTION_BYTES] 时，在构建
+     * multipart 请求前抛出；本次回合历史不会提交。
+     * @throws AudioTranscriptionFailedException OGG 转写请求失败、响应格式无效或返回空文本时抛出；本次回合
+     * 历史不会提交。
+     * @throws AgentTurnFailedException 当 API、协议、工具调用上限或其他非取消错误导致本次回合未完成时抛出；
+     * 本次回合历史不会提交。
      * @throws IllegalStateException 当服务已关闭或 OpenAI HTTP 传输尚未初始化时抛出。
      * @throws CancellationException 当调用协程、模型调用或工具调用被取消时抛出。
      */
@@ -454,53 +468,67 @@ class OpenAIAgentService @Inject constructor(
         val currentClient = client
         check(currentClient != null || rawTransport != null) { "OpenAI client is not initialized." }
 
-        val contentParts = mutableListOf<ChatCompletionContentPart>()
-
-        if (!text.isNullOrBlank()) {
-            contentParts.add(
-                ChatCompletionContentPart.ofText(
-                    ChatCompletionContentPartText.builder().text(text).build()
-                )
-            )
+        var messageText = text
+        mediaData.filter { (_, mimeType) -> mimeType.normalizedMimeType() == TELEGRAM_OGG_MIME_TYPE }
+            .forEach { (data) ->
+                messageText = appendTranscription(messageText, transcribeTelegramOggLocked(data))
+            }
+        require((messageText ?: "").toByteArray(StandardCharsets.UTF_8).size <= MAX_AGENT_TEXT_BYTES) {
+            "消息文本超过本地上下文限制。"
         }
 
+        val contentParts = mutableListOf<ChatCompletionContentPart>()
+
+        if (!messageText.isNullOrBlank()) {
+            contentParts.add(
+                ChatCompletionContentPart.ofText(
+                    ChatCompletionContentPartText.builder().text(messageText).build()
+                )
+            )
+            systemMessageCount = 1
+            ensureOpenAiHistoryBudget(history)
+        }
+
+        var inlineMediaBytes = 0
         for ((data, mimeType) in mediaData) {
-            if (mimeType.startsWith("image/")) {
+            val normalizedMimeType = mimeType.normalizedMimeType()
+            if (normalizedMimeType.startsWith("image/")) {
+                inlineMediaBytes = reserveInlineMedia(inlineMediaBytes, data.size)
                 val base64Data = Base64.getEncoder().encodeToString(data)
                 contentParts.add(
                     ChatCompletionContentPart.ofImageUrl(
                         ChatCompletionContentPartImage.builder()
                             .imageUrl(
                                 ChatCompletionContentPartImage.ImageUrl.builder()
-                                    .url("data:$mimeType;base64,$base64Data")
+                                    .url("data:$normalizedMimeType;base64,$base64Data")
                                     .build()
                             )
                             .build()
                     )
                 )
-            } else if (mimeType.startsWith("audio/")) {
+            } else if (normalizedMimeType.directAudioFormat() != null) {
                 if (currentModel.contains("audio") || currentModel.startsWith("o1") || currentModel.startsWith("o3")) {
+                    inlineMediaBytes = reserveInlineMedia(inlineMediaBytes, data.size)
                     contentParts.add(
                         ChatCompletionContentPart.ofInputAudio(
                             ChatCompletionContentPartInputAudio.builder()
                                 .inputAudio(
                                     ChatCompletionContentPartInputAudio.InputAudio.builder()
                                         .data(Base64.getEncoder().encodeToString(data))
-                                        .format(
-                                            when {
-                                                mimeType.contains("wav") -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
-                                                mimeType.contains("mp3") -> ChatCompletionContentPartInputAudio.InputAudio.Format.MP3
-                                                else -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
-                                            }
-                                        )
+                                        .format(normalizedMimeType.directAudioFormat()!!)
                                         .build()
                                 )
                                 .build()
                         )
                     )
                 } else {
-                    logger.warn("Model $currentModel might not support audio input. Skipping audio part.")
+                    logger.warn(
+                        "Model {} might not support direct WAV/MP3 audio input. Skipping audio part.",
+                        currentModel
+                    )
                 }
+            } else if (normalizedMimeType.startsWith("audio/") && normalizedMimeType != TELEGRAM_OGG_MIME_TYPE) {
+                logger.warn("Skipping unsupported direct audio MIME type.")
             }
         }
 
@@ -509,7 +537,7 @@ class OpenAIAgentService @Inject constructor(
         }
 
         try {
-            val tentativeHistory = history.toMutableList()
+            val tentativeHistory = prepareOpenAiCandidate()
             tentativeHistory.add(
                 ChatCompletionMessageParam.ofUser(
                     ChatCompletionUserMessageParam.builder()
@@ -517,10 +545,16 @@ class OpenAIAgentService @Inject constructor(
                         .build()
                 )
             )
+            ensureOpenAiHistoryBudget(tentativeHistory)
             val reply = performChatLocked(currentClient, tentativeHistory)
-            history.addAll(tentativeHistory.drop(history.size))
+            history.clear()
+            history.addAll(tentativeHistory)
             reply
         } catch (e: CancellationException) {
+            throw e
+        } catch (e: AudioTranscriptionTooLargeException) {
+            throw e
+        } catch (e: AudioTranscriptionFailedException) {
             throw e
         } catch (e: AgentTurnFailedException) {
             throw e
@@ -529,6 +563,98 @@ class OpenAIAgentService @Inject constructor(
             throw AgentTurnFailedException("OpenAI 代理回合未完成。", e)
         }
     }
+
+    /**
+     * 在内存中提交 Telegram OGG 语音到 OpenAI 转写端点，并返回非空转写文本。
+     *
+     * 大小上限在创建 multipart 请求体前校验；请求始终复用当前 [CancellableOkHttpTransport]，所以关闭或
+     * 协程取消会中断原生 OkHttp Call。此方法不读取或写入临时文件，也不执行音频转码。
+     *
+     * @param data Telegram 下载得到的原始 OGG 字节；长度不得超过 [MAX_AUDIO_TRANSCRIPTION_BYTES]。
+     * @return 去除首尾空白后的非空转写文本。
+     * @throws AudioTranscriptionTooLargeException [data] 超过本地大小上限时抛出，不会创建网络请求。
+     * @throws AudioTranscriptionFailedException 转写请求失败、响应无 `text` 字段或文本为空时抛出。
+     * @throws CancellationException 调用协程或底层 HTTP 请求被取消时原样抛出。
+     */
+    private suspend fun transcribeTelegramOggLocked(data: ByteArray): String {
+        if (data.size > MAX_AUDIO_TRANSCRIPTION_BYTES) {
+            throw AudioTranscriptionTooLargeException()
+        }
+        val transport = rawTransport ?: throw AudioTranscriptionFailedException()
+        return try {
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("model", TRANSCRIPTION_MODEL)
+                .addFormDataPart(
+                    "file",
+                    "telegram-voice.ogg",
+                    data.toRequestBody(TELEGRAM_OGG_MIME_TYPE.toMediaType()),
+                )
+                .build()
+            val response = transport.execute(
+                rawOpenAIRequestBuilder("audio/transcriptions")
+                    .post(requestBody)
+                    .build(),
+            )
+            if (response.statusCode !in 200..299) {
+                logger.warn("OpenAI transcription request failed with HTTP {}.", response.statusCode)
+                throw AudioTranscriptionFailedException()
+            }
+            val text = (json.parseToJsonElement(response.body) as? JsonObject)
+                ?.get("text")
+                ?.let { it as? JsonPrimitive }
+                ?.takeIf(JsonPrimitive::isString)
+                ?.content
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?: throw AudioTranscriptionFailedException()
+            text
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: AudioTranscriptionFailedException) {
+            throw e
+        } catch (e: Exception) {
+            throw AudioTranscriptionFailedException(e)
+        }
+    }
+
+    private fun appendTranscription(text: String?, transcription: String): String =
+        listOfNotNull(text?.takeIf(String::isNotBlank), transcription).joinToString("\n\n")
+
+    private fun reserveInlineMedia(current: Int, size: Int): Int {
+        if (size !in 0..MAX_AGENT_INLINE_MEDIA_BYTES || current > MAX_AGENT_INLINE_MEDIA_BYTES - size) {
+            throw AgentTurnFailedException("内联媒体超过本地上下文限制。")
+        }
+        return current + size
+    }
+
+    /** 在候选副本上保留系统消息，并为完整新回合腾出确定的空间。 */
+    private fun prepareOpenAiCandidate(): MutableList<ChatCompletionMessageParam> {
+        val candidate = history.toMutableList()
+        if (openAiHistoryBytes(candidate) > MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES) {
+            candidate.subList(systemMessageCount.coerceAtMost(candidate.size), candidate.size).clear()
+        }
+        return candidate
+    }
+
+    private fun ensureOpenAiHistoryBudget(candidate: List<ChatCompletionMessageParam>) {
+        if (candidate.size > MAX_AGENT_HISTORY_ENTRIES || openAiHistoryBytes(candidate) > MAX_AGENT_HISTORY_BYTES) {
+            throw AgentTurnFailedException("AI 会话历史超过资源上限。")
+        }
+    }
+
+    private fun openAiHistoryBytes(candidate: List<ChatCompletionMessageParam>): Int =
+        runCatching { jsonMapper().writeValueAsBytes(candidate).size }
+            .getOrElse { throw AgentTurnFailedException("AI 会话历史无法安全编码。", it) }
+
+    private fun String.normalizedMimeType(): String = substringBefore(';').trim().lowercase(Locale.ROOT)
+
+    private fun String.directAudioFormat(): ChatCompletionContentPartInputAudio.InputAudio.Format? =
+        when (this) {
+            "audio/wav", "audio/x-wav" -> ChatCompletionContentPartInputAudio.InputAudio.Format.WAV
+            "audio/mpeg", "audio/mp3" -> ChatCompletionContentPartInputAudio.InputAudio.Format.MP3
+            else -> null
+        }
 
     private fun functionRouter(): LocalFunctionRouter {
         val currentProviders = localFunctionProviders
@@ -550,6 +676,7 @@ class OpenAIAgentService @Inject constructor(
         tentativeHistory: MutableList<ChatCompletionMessageParam>,
         functionRouteSnapshot: LocalFunctionRouteSnapshot = functionRouter().refresh(),
         toolCallRounds: Int = 0,
+        toolCallsExecuted: Int = 0,
     ): String {
         val tools = functionRouteSnapshot.providedOpenAIFunctions().map { func ->
             ChatCompletionTool.ofFunction(
@@ -582,20 +709,29 @@ class OpenAIAgentService @Inject constructor(
                     throw AgentTurnFailedException("OpenAI 最终响应不应包含工具调用。")
                 }
                 tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
+                ensureOpenAiHistoryBudget(tentativeHistory)
                 message.content().getOrNull() ?: ""
             }
 
             ChatCompletion.Choice.FinishReason.TOOL_CALLS -> {
                 ensureToolCallRoundIsAllowed(toolCallRounds)
                 val validatedToolCalls = validateToolCalls(toolCalls)
+                ensureToolCallCountIsAllowed(validatedToolCalls.size, toolCallsExecuted)
                 tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
-                val toolMessages = validatedToolCalls.map { (toolCall, toolCallId) ->
+                ensureOpenAiHistoryBudget(tentativeHistory)
+                for ((toolCall, toolCallId) in validatedToolCalls) {
                     val result = executeToolCall(toolCall, functionRouteSnapshot)
                     currentCoroutineContext().ensureActive()
-                    createToolMessage(toolCallId, result)
+                    tentativeHistory.add(createToolMessage(toolCallId, result))
+                    ensureOpenAiHistoryBudget(tentativeHistory)
                 }
-                tentativeHistory.addAll(toolMessages)
-                performChatLocked(client, tentativeHistory, functionRouteSnapshot, toolCallRounds + 1)
+                performChatLocked(
+                    client,
+                    tentativeHistory,
+                    functionRouteSnapshot,
+                    toolCallRounds + 1,
+                    toolCallsExecuted + validatedToolCalls.size,
+                )
             }
 
             else -> throw AgentTurnFailedException("OpenAI 响应未完成本次代理回合。")
@@ -618,6 +754,9 @@ class OpenAIAgentService @Inject constructor(
         val calls = toolCalls.getOrNull()
             ?.takeIf { it.isNotEmpty() }
             ?: throw AgentTurnFailedException("OpenAI 工具调用缺失或为空。")
+        if (calls.size > MAX_TOOL_CALLS_PER_MODEL_RESPONSE) {
+            throw ToolCallLimitExceededException()
+        }
         val validatedCalls = calls.map { toolCall ->
             val toolCallId = toolCall.validToolCallId()
                 ?: throw AgentTurnFailedException("OpenAI 工具调用缺少有效标识。")
@@ -695,14 +834,16 @@ class OpenAIAgentService @Inject constructor(
      * @param arguments 模型返回的原始 JSON 参数文本。
      * @return 参数对象转换后的映射；文本非法或根元素不是对象时返回 `null`。
      */
-    private fun parseToolArguments(arguments: String): Map<String, Any?>? =
-        try {
+    private fun parseToolArguments(arguments: String): Map<String, Any?>? {
+        if (arguments.toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_ARGUMENT_BYTES) return null
+        return try {
             (json.parseToJsonElement(arguments) as? JsonObject)?.toMap()
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             null
         }
+    }
 
     /**
      * 创建不包含提供者异常详情的有限错误结果。
@@ -902,6 +1043,7 @@ class OpenAIAgentService @Inject constructor(
                 client = null
                 rawTransport = null
                 history.clear()
+                systemMessageCount = 0
                 cancelCurrentMcpConnection()
                 currentClient
             }

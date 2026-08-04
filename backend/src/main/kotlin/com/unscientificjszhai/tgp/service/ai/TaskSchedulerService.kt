@@ -14,6 +14,7 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -87,7 +88,7 @@ class TaskSchedulerService private constructor(
         telegramService,
         agentService,
         settingsRepository,
-        AtomicJsonStorage(File("config/schedule.json").toPath()),
+        AtomicJsonStorage(File("config/schedule.json").toPath(), ResourceLimits.SCHEDULE_BYTES),
         startImmediately = true,
     )
 
@@ -105,7 +106,7 @@ class TaskSchedulerService private constructor(
         telegramService,
         agentService,
         settingsRepository,
-        AtomicJsonStorage(scheduleFile.toPath(), fileOperations),
+        AtomicJsonStorage(scheduleFile.toPath(), ResourceLimits.SCHEDULE_BYTES, fileOperations),
         startImmediately,
     )
 

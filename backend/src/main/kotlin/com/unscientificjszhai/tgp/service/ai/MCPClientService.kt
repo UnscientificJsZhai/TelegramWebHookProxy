@@ -16,7 +16,21 @@ import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import org.slf4j.LoggerFactory
+import okhttp3.Interceptor
+import okhttp3.ResponseBody
+import okio.Buffer
+import okio.ForwardingSource
+import okio.buffer
+import java.io.IOException
+import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 
 /**
@@ -51,6 +65,20 @@ class MCPClientService internal constructor(
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient =
         HttpClient(OkHttp) {
+            engine {
+                config {
+                    addInterceptor(Interceptor { chain ->
+                        val response = chain.proceed(chain.request())
+                        if (response.body.contentLength() > MAX_MCP_RESPONSE_BYTES) {
+                            response.close()
+                            throw McpResponseTooLargeException()
+                        }
+                        response.newBuilder()
+                            .body(BoundedMcpResponseBody(response.body, MAX_MCP_RESPONSE_BYTES))
+                            .build()
+                    })
+                }
+            }
             install(SSE)
             install(HttpTimeout) {
                 requestTimeoutMillis = 300000
@@ -92,9 +120,8 @@ class MCPClientService internal constructor(
     /**
      * 将已连接的服务器同步为指定配置，并发现各服务器提供的工具。
      *
-     * 此方法会断开未包含在 [configs] 中或配置已变化的服务器。网络连接失败会被记录，
-     * 但不会阻止处理其余服务器；取消协程时会关闭正在建立的客户端并重新抛出取消异常。服务关闭后
-     * 调用会失败，不会重新建立连接。
+     * 此方法先构造并验证完整候选连接快照；任何连接或发现失败都会关闭候选并保留当前快照。仅当所有
+     * 服务器成功就绪后才一次发布新快照，随后关闭旧客户端，避免工具声明与调用绑定跨快照混用。
      *
      * @param configs 目标 MCP 服务器配置列表；列表为空时断开所有当前服务器。方法会在连接互斥锁内先复制并
      * 校验列表及请求头，服务器名称应在复制后的列表内唯一且符合 [validateMcpServerConfigs] 的连接边界。
@@ -107,23 +134,46 @@ class MCPClientService internal constructor(
             ensureOpen()
             val requestedConfigs = configs.map { config -> config.copy(headers = config.headers.toMap()) }
             validateMcpServerConfigs(requestedConfigs)
-            val newNames = requestedConfigs.map { it.name }.toSet()
-            val toRemove = currentConnectionState().clients.keys - newNames
-            toRemove.forEach { disconnectLocked(it) }
-
-            for (config in requestedConfigs) {
-                val previousConfig = currentConnectionState().configs[config.name]
-                if (previousConfig != null && previousConfig != config) {
-                    disconnectLocked(config.name)
+            val candidates = linkedMapOf<String, Pair<Client, List<Tool>>>()
+            try {
+                for (config in requestedConfigs) {
+                    val candidate = connectCandidate(config)
+                    try {
+                        validateDiscoveredTools(
+                            candidate.second,
+                            candidates.values.sumOf { it.second.size },
+                        )
+                        candidates[config.name] = candidate
+                    } catch (e: Exception) {
+                        closeClient(config.name, candidate.first)
+                        throw e
+                    }
                 }
-                if (config.name !in currentConnectionState().clients) {
-                    connectToServerLocked(config)
-                }
+            } catch (e: CancellationException) {
+                candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+                throw e
+            } catch (e: Exception) {
+                candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+                logger.warn("Failed to prepare MCP connection candidate; keeping previous snapshot.")
+                return
             }
+            val candidateState = ConnectionState(
+                clients = candidates.mapValues { it.value.first },
+                serverTools = candidates.mapValues { it.value.second },
+                configs = requestedConfigs.associateBy { it.name },
+            )
+            val previous = synchronized(stateLock) {
+                if (closed) null else connectionState.also { connectionState = candidateState }
+            }
+            if (previous == null) {
+                candidates.forEach { (name, candidate) -> closeClient(name, candidate.first) }
+                throw IllegalStateException("MCP client service is closed.")
+            }
+            previous.clients.forEach { (name, client) -> closeClient(name, client) }
         }
     }
 
-    private suspend fun connectToServerLocked(config: MCPServerConfig) {
+    private suspend fun connectCandidate(config: MCPServerConfig): Pair<Client, List<Tool>> {
         val client = clientFactory()
 
         val url = config.url
@@ -141,28 +191,14 @@ class MCPClientService internal constructor(
             client.connect(transport)
             val tools = client.listTools().tools.toList()
             currentCoroutineContext().ensureActive()
-            val published = synchronized(stateLock) {
-                if (closed) {
-                    false
-                } else {
-                    connectionState = connectionState.copy(
-                        clients = connectionState.clients + (config.name to client),
-                        serverTools = connectionState.serverTools + (config.name to tools),
-                        configs = connectionState.configs + (config.name to config),
-                    )
-                    true
-                }
-            }
-            if (!published) {
-                throw IllegalStateException("MCP client service is closed.")
-            }
             logger.info("Connected to MCP server: ${config.name}, discovered ${tools.size} tools.")
+            return client to tools
         } catch (e: CancellationException) {
             closeClient(config.name, client)
             throw e
         } catch (e: Exception) {
             closeClient(config.name, client)
-            logger.error("Failed to connect to MCP server: ${config.name}", e)
+            throw e
         }
     }
 
@@ -192,6 +228,7 @@ class MCPClientService internal constructor(
         }
     }
 
+    @Suppress("unused")
     private suspend fun disconnectLocked(name: String) {
         val client = synchronized(stateLock) {
             val state = connectionState
@@ -245,13 +282,14 @@ class MCPClientService internal constructor(
         args: Map<String, Any?>,
     ): CallToolResult {
         ensureOpen()
+        validateMcpArguments(args)
         return connectionMutex.withLock {
             val client = synchronized(stateLock) {
                 check(!closed) { "MCP client service is closed." }
                 connectionState.clients[serverName]
                     ?: throw IllegalStateException("MCP server $serverName not connected")
             }
-            client.callTool(toolName, args)
+            client.callTool(toolName, args).also(::validateMcpToolResult)
         }
     }
 
@@ -260,4 +298,108 @@ class MCPClientService internal constructor(
     }
 
     private fun currentConnectionState(): ConnectionState = synchronized(stateLock) { connectionState }
+}
+
+internal const val MAX_MCP_RESPONSE_BYTES = 1024L * 1024L
+internal const val MAX_MCP_TOOLS_PER_SERVER = 32
+internal const val MAX_MCP_TOOLS_TOTAL = 128
+internal const val MAX_MCP_TOOL_NAME_BYTES = 128
+internal const val MAX_MCP_TOOL_DESCRIPTION_BYTES = 4 * 1024
+internal const val MAX_MCP_TOOL_SCHEMA_BYTES = 64 * 1024
+internal const val MAX_MCP_TOOL_ARGUMENT_BYTES = 64 * 1024
+internal const val MAX_MCP_TOOL_RESULT_BYTES = 256 * 1024
+
+/** MCP 上游响应在解压后的实际读取字节超过上限。 */
+internal class McpResponseTooLargeException : IOException("MCP 响应超过 1 MiB 限制。")
+
+/** MCP 工具调用参数超过可安全传递给服务器的上限。 */
+internal class McpToolArgumentsTooLargeException : IllegalArgumentException("MCP 工具调用参数超过限制。")
+
+/** MCP 工具结果超过可安全放入模型上下文的上限。 */
+internal class McpToolResultTooLargeException : IllegalStateException("MCP 工具结果超过限制。")
+
+private class BoundedMcpResponseBody(
+    private val delegate: ResponseBody,
+    private val limit: Long,
+) : ResponseBody() {
+    private val boundedSource = object : ForwardingSource(delegate.source()) {
+        private var total = 0L
+
+        override fun read(sink: Buffer, byteCount: Long): Long {
+            val read = super.read(sink, byteCount)
+            if (read > 0) {
+                total += read
+                if (total > limit) {
+                    close()
+                    throw McpResponseTooLargeException()
+                }
+            }
+            return read
+        }
+    }.buffer()
+
+    override fun contentType() = delegate.contentType()
+
+    override fun contentLength(): Long = delegate.contentLength()
+
+    override fun source() = boundedSource
+
+    override fun close() = delegate.close()
+}
+
+private fun validateDiscoveredTools(tools: List<Tool>, existingCount: Int) {
+    require(tools.size <= MAX_MCP_TOOLS_PER_SERVER) {
+        "单个 MCP 服务器工具不能超过 $MAX_MCP_TOOLS_PER_SERVER 个。"
+    }
+    require(existingCount + tools.size <= MAX_MCP_TOOLS_TOTAL) {
+        "MCP 工具总数不能超过 $MAX_MCP_TOOLS_TOTAL 个。"
+    }
+    tools.forEach { tool ->
+        require(tool.name.toByteArray(StandardCharsets.UTF_8).size in 1..MAX_MCP_TOOL_NAME_BYTES) {
+            "MCP 工具名称长度不合法。"
+        }
+        require((tool.description ?: "").toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_DESCRIPTION_BYTES) {
+            "MCP 工具描述超过限制。"
+        }
+        require(tool.inputSchema.toString().toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_SCHEMA_BYTES) {
+            "MCP 工具输入架构超过限制。"
+        }
+    }
+}
+
+private fun validateMcpArguments(args: Map<String, Any?>) {
+    val encoded = runCatching {
+        Json.encodeToString(JsonObject.serializer(), buildJsonObject {
+            args.forEach { (name, value) -> put(name, value.toMcpJsonElement()) }
+        })
+    }
+        .getOrElse { throw McpToolArgumentsTooLargeException() }
+    if (encoded.toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_ARGUMENT_BYTES) {
+        throw McpToolArgumentsTooLargeException()
+    }
+}
+
+private fun Any?.toMcpJsonElement(): JsonElement = when (this) {
+    null -> JsonNull
+    is JsonElement -> this
+    is String -> JsonPrimitive(this)
+    is Boolean -> JsonPrimitive(this)
+    is Byte, is Short, is Int, is Long, is Float, is Double -> JsonPrimitive(this as Number)
+    is Map<*, *> -> buildJsonObject {
+        this@toMcpJsonElement.forEach { (key, value) ->
+            val name = key as? String ?: throw IllegalArgumentException("MCP 参数对象键必须是字符串。")
+            put(name, value.toMcpJsonElement())
+        }
+    }
+
+    is Iterable<*> -> JsonArray(map { it.toMcpJsonElement() })
+    is Array<*> -> JsonArray(map { it.toMcpJsonElement() })
+    else -> throw IllegalArgumentException("MCP 参数包含不支持的值类型。")
+}
+
+private fun validateMcpToolResult(result: CallToolResult) {
+    val encoded = Json.encodeToString(CallToolResult.serializer(), result)
+    if (encoded.toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_RESULT_BYTES) {
+        throw McpToolResultTooLargeException()
+    }
 }

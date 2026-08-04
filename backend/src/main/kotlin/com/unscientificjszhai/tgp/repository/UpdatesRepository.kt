@@ -6,6 +6,7 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
@@ -63,7 +64,7 @@ class UpdatesRepository private constructor(
     private var requiresStorageValidationBeforeWrite: Boolean,
 ) {
     private val logger = LoggerFactory.getLogger(UpdatesRepository::class.java)
-    private val storage = AtomicJsonStorage(configFile.toPath(), fileOperations)
+    private val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.UPDATES_BYTES, fileOperations)
 
     /**
      * 创建使用默认配置文件的更新状态仓储。
@@ -283,7 +284,7 @@ class UpdatesRepository private constructor(
 
     private companion object {
         fun load(configFile: File, fileOperations: AtomicJsonFileOperations): LoadedUpdates {
-            val storage = AtomicJsonStorage(configFile.toPath(), fileOperations)
+            val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.UPDATES_BYTES, fileOperations)
             return when (val read = storage.readValidatedAndRecover(::decodeLoadedUpdates)) {
                 AtomicJsonRead.Missing -> LoadedUpdates(BotUpdatesData(), null)
                 is AtomicJsonRead.Valid -> read.value

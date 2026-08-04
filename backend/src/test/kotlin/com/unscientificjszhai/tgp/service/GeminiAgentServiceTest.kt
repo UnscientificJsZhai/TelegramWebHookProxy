@@ -288,6 +288,7 @@ class GeminiAgentServiceTest {
         settingsRepository.saveSettings(AppSettings(ai = AISettings()))
         every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns newChat
         every { newChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("新会话回复"))
+        every { newChat.getHistory(true) } returns ImmutableList.of()
         injectClient(chats)
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, oldChat)
         GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
@@ -556,6 +557,7 @@ class GeminiAgentServiceTest {
         every { chat.sendMessage(any<Content>()) } returns toolCallResponse
         every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns newChat
         every { newChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("新会话"))
+        every { newChat.getHistory(true) } returns ImmutableList.of()
         injectClient(chats)
         injectChat(chat)
 
@@ -566,17 +568,18 @@ class GeminiAgentServiceTest {
         assertEquals("工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。", exception.message)
         verify(exactly = 1) { chat.sendMessage(any<List<Content>>()) }
         verify(exactly = MAX_TOOL_CALL_ROUNDS) { chat.sendMessage(any<Content>()) }
-        val chatField = GeminiAgentService::class.java.getDeclaredField("chat").apply {
+        val recoveryJob = assertNotNull(
+            GeminiAgentService::class.java.getDeclaredField("resetSessionJob").apply {
+                isAccessible = true
+            }.get(service) as? Job,
+        )
+        withTimeout(5.seconds) { recoveryJob.join() }
+        assertFalse(recoveryJob.isCancelled)
+        assertEquals(newChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
             isAccessible = true
-        }
-        withContext(Dispatchers.Default) {
-            withTimeout(5.seconds) {
-                while (chatField.get(service) == null) delay(10)
-            }
-        }
-        assertEquals(newChat, chatField.get(service))
+        }.get(service))
         assertEquals("新会话", service.sendMessage("继续对话"))
-        verify(exactly = 1) { chats.create(any<String>(), any<GenerateContentConfig>()) }
+        verify(exactly = 2) { chats.create(any<String>(), any<GenerateContentConfig>()) }
         verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
     }
 

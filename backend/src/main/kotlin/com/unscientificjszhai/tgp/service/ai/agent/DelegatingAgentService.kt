@@ -405,6 +405,9 @@ class DelegatingAgentService @Inject constructor(
      * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
      * @param mediaData 要发送的媒体数据列表；可为空。
      * @return 底层代理生成的回复文本；未生成可返回内容时返回空字符串。
+     * @throws AudioTranscriptionTooLargeException 当当前 OpenAI 代理收到超过
+     * [MAX_AUDIO_TRANSCRIPTION_BYTES] 的 OGG 语音时，在上传前抛出。
+     * @throws AudioTranscriptionFailedException 当当前 OpenAI 代理的 OGG 语音转写失败或返回空文本时抛出。
      * @throws AgentTurnFailedException 当当前 OpenAI 代理未完成回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务尚未初始化、已禁用或已关闭时抛出。
      * @throws Exception 当当前非 OpenAI 代理以其原有语义报告失败时抛出。

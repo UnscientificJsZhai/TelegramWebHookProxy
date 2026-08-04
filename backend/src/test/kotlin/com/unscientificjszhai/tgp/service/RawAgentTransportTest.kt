@@ -3,10 +3,14 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.CancellableOkHttpTransport
+import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionFailedException
+import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionTooLargeException
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_AUDIO_TRANSCRIPTION_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import io.mockk.coEvery
@@ -29,8 +33,10 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
@@ -144,6 +150,109 @@ class RawAgentTransportTest {
         service.close().join()
     }
 
+    /**
+     * 验证 Telegram OGG 语音以 multipart 转写为文本后才进入 OpenAI 聊天请求。
+     */
+    @Test
+    fun `OpenAI raw transport transcribes normalized Telegram OGG before chatting`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key")),
+        )
+        val service =
+            OpenAIAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawOpenAITransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(MockResponse.Builder().body("""{"text":"转写后的内容"}""").build())
+        server.enqueue(
+            MockResponse.Builder().body(
+                """{"id":"chat-ogg","object":"chat.completion","created":0,"model":"gpt-5.6-luna","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"语音回复"}}]}""",
+            ).build(),
+        )
+
+        assertEquals(
+            "语音回复",
+            service.sendMessage(
+                "请处理语音",
+                listOf(MediaData("ogg-payload".encodeToByteArray(), "audio/ogg; codecs=opus"))
+            ),
+        )
+        val transcriptionRequest = assertNotNull(server.takeRequest())
+        assertEquals("/gateway/v1/audio/transcriptions", transcriptionRequest.target)
+        assertEquals("Bearer openai-key", transcriptionRequest.headers["Authorization"])
+        val multipart = transcriptionRequest.body!!.utf8()
+        assertTrue(multipart.contains("name=\"model\""))
+        assertTrue(multipart.contains("gpt-4o-mini-transcribe"))
+        assertTrue(multipart.contains("name=\"file\"; filename=\"telegram-voice.ogg\""))
+        assertTrue(multipart.contains("Content-Type: audio/ogg"))
+        assertTrue(multipart.contains("ogg-payload"))
+
+        val chatRequest = assertNotNull(server.takeRequest())
+        assertEquals("/gateway/v1/chat/completions", chatRequest.target)
+        val chatPayload = chatRequest.body!!.utf8()
+        assertTrue(chatPayload.contains("请处理语音"))
+        assertTrue(chatPayload.contains("转写后的内容"))
+        service.close().join()
+    }
+
+    /**
+     * 验证 OGG 转写的空文本和本地大小拒绝都不会提交聊天历史或创建聊天请求。
+     */
+    @Test
+    fun `failed or oversized OGG transcription leaves OpenAI history untouched`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key")),
+        )
+        val service =
+            OpenAIAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawOpenAITransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(MockResponse.Builder().body("""{"text":"   "}""").build())
+
+        assertFailsWith<AudioTranscriptionFailedException> {
+            service.sendMessage(null, listOf(MediaData(byteArrayOf(1), "audio/ogg")))
+        }
+        assertEquals("/gateway/v1/audio/transcriptions", assertNotNull(server.takeRequest()).target)
+        assertNull(server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS))
+        assertTrue(service.createChatCompletionParams(emptyList()).messages().isEmpty())
+
+        assertFailsWith<AudioTranscriptionTooLargeException> {
+            service.sendMessage(null, listOf(MediaData(ByteArray(MAX_AUDIO_TRANSCRIPTION_BYTES + 1), "audio/ogg")))
+        }
+        assertNull(server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS))
+        assertTrue(service.createChatCompletionParams(emptyList()).messages().isEmpty())
+        service.close().join()
+    }
+
+    /**
+     * 验证只有 WAV 和 MP3 会作为支持音频模型的直接输入，且不触发 OGG 转写端点。
+     */
+    @Test
+    fun `OpenAI raw transport keeps WAV and MP3 as direct input audio`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key")),
+        )
+        val service =
+            OpenAIAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawOpenAITransport(service)
+        setPrivateField(service, "currentModel", "gpt-4o-audio-preview")
+        assertNotNull(service.resetSession()).join()
+        listOf(
+            "audio/wav" to "wav",
+            "audio/mpeg" to "mp3",
+        ).forEach { (mimeType, format) ->
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"id":"chat-$format","object":"chat.completion","created":0,"model":"gpt-4o-audio-preview","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"$format reply"}}]}""",
+                ).build(),
+            )
+            assertEquals("$format reply", service.sendMessage(null, listOf(MediaData(byteArrayOf(1, 2), mimeType))))
+            val request = assertNotNull(server.takeRequest())
+            assertEquals("/gateway/v1/chat/completions", request.target)
+            assertTrue(request.body!!.utf8().contains("\"format\":\"$format\""))
+        }
+        service.close().join()
+    }
+
     /** 验证取消原生 Gemini 调用会释放会话锁且不会提交暂存历史。 */
     @Test
     fun `cancelled Gemini raw request releases mutex and rolls back history`() = runBlocking {
@@ -184,6 +293,35 @@ class RawAgentTransportTest {
 
         val requestJob = async(Dispatchers.Default) { service.sendMessage("cancel me") }
         assertNotNull(server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS))
+        requestJob.cancelAndJoin()
+
+        assertTrue(requestJob.isCancelled)
+        assertTrue(service.createChatCompletionParams(emptyList()).messages().isEmpty())
+        withTimeout(5.seconds) {
+            assertNotNull(service.resetSession()).join()
+        }
+        service.close().join()
+    }
+
+    /** 验证取消 OGG 转写请求会原样传播取消并保持 OpenAI 历史为空。 */
+    @Test
+    fun `cancelled OpenAI OGG transcription releases mutex and rolls back history`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key")),
+        )
+        val service =
+            OpenAIAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawOpenAITransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(MockResponse.Builder().headersDelay(5, java.util.concurrent.TimeUnit.SECONDS).build())
+
+        val requestJob = async(Dispatchers.Default) {
+            service.sendMessage(null, listOf(MediaData(byteArrayOf(1), "audio/ogg")))
+        }
+        assertEquals(
+            "/gateway/v1/audio/transcriptions",
+            assertNotNull(server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)).target
+        )
         requestJob.cancelAndJoin()
 
         assertTrue(requestJob.isCancelled)

@@ -299,11 +299,11 @@ class TaskSchedulerServiceTest {
         backupFile.writeText(ConfigJson.encodeToString(listOf(recoveredTask)))
         var blockBackupRead = true
         val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAllBytes(path: Path): ByteArray {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
                 if (blockBackupRead && path == backupFile.toPath()) {
                     throw IOException("injected backup read failure")
                 }
-                return DefaultAtomicJsonFileOperations.readAllBytes(path)
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
         }
         service.close()

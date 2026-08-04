@@ -4,6 +4,7 @@ import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.google.genai.types.Type
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.McpToolResultTooLargeException
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
@@ -120,8 +121,10 @@ class McpFunctionProvider(
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (_: McpToolResultTooLargeException) {
+            toolResultTooLargeError()
         } catch (e: Exception) {
-            logger.warn("MCP tool execution failed", e)
+            logger.warn("MCP tool execution failed with a safe local error category.")
             unavailableToolError()
         }
     }
@@ -193,6 +196,11 @@ class McpFunctionProvider(
         put("error", MCP_TOOL_UNAVAILABLE)
     }
 
+    /** 返回不包含服务器响应内容的 MCP 工具结果过大错误。 */
+    private fun toolResultTooLargeError(): JsonObject = buildJsonObject {
+        put("error", MCP_TOOL_RESULT_TOO_LARGE)
+    }
+
     /**
      * 将 MCP 的 JSON Schema 转换为 Gemini 兼容的格式（主要是 Type 大写）。
      */
@@ -223,6 +231,7 @@ class McpFunctionProvider(
 
     private companion object {
         const val MCP_TOOL_UNAVAILABLE = "mcp_tool_unavailable"
+        const val MCP_TOOL_RESULT_TOO_LARGE = "mcp_tool_result_too_large"
         val MCP_TOOL_ALIAS_PATTERN = Regex("[A-Za-z0-9_-]{1,64}")
     }
 }

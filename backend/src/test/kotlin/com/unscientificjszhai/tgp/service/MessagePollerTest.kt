@@ -15,6 +15,8 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionFailedException
+import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionTooLargeException
 import com.unscientificjszhai.tgp.service.ai.agent.DelegatingAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
@@ -318,6 +320,71 @@ class MessagePollerTest {
     }
 
     /**
+     * 验证转写失败和超大语音会返回稳定提示，且不向 Telegram 回显提供商或底层错误内容。
+     */
+    @Test
+    fun `voice transcription errors return safe feedback`() = runBlocking {
+        listOf<Exception>(
+            AudioTranscriptionFailedException(IllegalStateException("provider response must stay private")),
+            AudioTranscriptionTooLargeException(),
+        ).zip(
+            listOf(
+                "语音转写失败，请稍后重试。",
+                "语音文件过大，最大支持 24 MiB，请发送更短的语音消息。",
+            ),
+        ).forEach { (failure, expectedReply) ->
+            val fixture = fixture()
+            val chat = Chat(id = 123L, type = "private", firstName = "Test")
+            fixture.updates.saveLastUpdateId("100", 10)
+            fixture.saveSettings(
+                AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+            )
+            coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+                ok = true,
+                result = listOf(
+                    Update(
+                        11,
+                        message = Message(
+                            1,
+                            chat,
+                            voice = Voice("voice-id", "voice-unique-id", duration = 1),
+                        ),
+                    ),
+                ),
+            ) andThen GetUpdatesResponse(ok = true)
+            coEvery { fixture.telegram.sendChatActionForToken("100:A", "123", "typing") } returns mockk()
+            coEvery { fixture.telegram.getFileForToken("100:A", "voice-id") } returns FileResponse(
+                ok = true,
+                result = TelegramFile("voice-id", "voice-unique-id", filePath = "voices/voice.ogg"),
+            )
+            coEvery { fixture.telegram.downloadFileForToken("100:A", "voices/voice.ogg") } returns byteArrayOf(1)
+            coEvery { fixture.agent.sendMessage(null, any()) } throws failure
+            coEvery {
+                fixture.telegram.sendMessageForToken("100:A", "123", expectedReply, any())
+            } returns mockk()
+
+            fixture.poller.start()
+            try {
+                eventually {
+                    coVerify(exactly = 1) {
+                        fixture.telegram.sendMessageForToken("100:A", "123", expectedReply, any())
+                    }
+                    coVerify(exactly = 0) {
+                        fixture.telegram.sendMessageForToken(
+                            "100:A",
+                            "123",
+                            match { it.contains("provider response must stay private") },
+                            any(),
+                        )
+                    }
+                }
+            } finally {
+                fixture.poller.close()
+            }
+        }
+    }
+
+    /**
      * 验证处理超时的反馈固定使用触发该会话的 token。
      */
     @Test
@@ -382,7 +449,7 @@ class MessagePollerTest {
         }
         coEvery {
             fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
-        } returns mockk()
+        } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 
         fixture.poller.start()
         try {
@@ -408,6 +475,97 @@ class MessagePollerTest {
                 fixture.telegram.sendMessageForToken("200:B", "123", match { it.contains("处理队列已满") }, any())
             }
         } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证通知抛错、非成功状态、`ok:false` 或空/畸形正文都会保留被拒绝更新及后缀以便重试。
+     */
+    @Test
+    fun `unaccepted queue full feedback retries rejected update after committing admitted prefix`() = runBlocking {
+        for (notificationResponse in listOf(
+            TelegramApiResponse(HttpStatusCode.OK, """{"ok":false}"""),
+            TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":true}"""),
+            TelegramApiResponse(HttpStatusCode.OK, ""),
+            TelegramApiResponse(HttpStatusCode.OK, "not-json"),
+        )) {
+            assertUnacceptedQueueFeedbackRetries(notificationResponse)
+        }
+        assertUnacceptedQueueFeedbackRetries(notificationFailure = IllegalStateException("notification unavailable"))
+    }
+
+    /** 验证仅 HTTP `2xx` 且 API `ok:true` 的队满提示才会确认被拒绝更新和其后缀。 */
+    @Test
+    fun `accepted queue full feedback confirms rejected update and suffix`() = runBlocking {
+        val firstBatchRequested = CompletableDeferred<Unit>()
+        val allowFirstBatch = CompletableDeferred<Unit>()
+        val blockStarted = CompletableDeferred<Unit>()
+        val allowBlockToFinish = CompletableDeferred<Unit>()
+        val nextPollRequested = CompletableDeferred<Unit>()
+        val fixture = fixture()
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } coAnswers {
+            firstBatchRequested.complete(Unit)
+            allowFirstBatch.await()
+            GetUpdatesResponse(
+                ok = true,
+                result = listOf(
+                    Update(11, message = Message(11, chat, text = "prefix")),
+                    Update(12, message = Message(12, chat, text = "rejected")),
+                    Update(13, message = Message(13, chat, text = "suffix")),
+                ),
+            )
+        }
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 14, 30) } coAnswers {
+            nextPollRequested.complete(Unit)
+            GetUpdatesResponse(ok = true)
+        }
+        coEvery { fixture.agent.sendMessage(any()) } returns ""
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            blockStarted.complete(Unit)
+            allowBlockToFinish.await()
+            ""
+        }
+        coEvery {
+            fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
+        } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { firstBatchRequested.await() }
+            fixture.poller.handleUpdate(Update(100, message = Message(100, chat, text = "block")))
+            withTimeout(2.seconds) { blockStarted.await() }
+            (101L..109L).forEach { updateId ->
+                fixture.poller.handleUpdate(
+                    Update(
+                        updateId,
+                        message = Message(updateId, chat, text = "queued-$updateId")
+                    )
+                )
+            }
+            allowFirstBatch.complete(Unit)
+            eventually {
+                coVerify(exactly = 2) {
+                    fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
+                }
+            }
+
+            allowBlockToFinish.complete(Unit)
+            eventually {
+                assertEquals(13, fixture.updates.getData("100").lastUpdateId)
+                coVerify(exactly = 1) { fixture.agent.sendMessage("prefix") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("rejected") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("suffix") }
+            }
+            withTimeout(3.seconds) { nextPollRequested.await() }
+        } finally {
+            allowFirstBatch.complete(Unit)
+            allowBlockToFinish.complete(Unit)
             fixture.poller.close()
         }
     }
@@ -1086,6 +1244,115 @@ class MessagePollerTest {
                     delay(20)
                 }
             }
+        }
+    }
+
+    private suspend fun assertUnacceptedQueueFeedbackRetries(
+        notificationResponse: TelegramApiResponse? = null,
+        notificationFailure: Exception? = null,
+    ) {
+        require((notificationResponse == null) != (notificationFailure == null))
+        val firstBatchRequested = CompletableDeferred<Unit>()
+        val allowFirstBatch = CompletableDeferred<Unit>()
+        val blockStarted = CompletableDeferred<Unit>()
+        val allowBlockToFinish = CompletableDeferred<Unit>()
+        val retryStarted = CompletableDeferred<Duration>()
+        val allowRetry = CompletableDeferred<Unit>()
+        var retryFetchCount = 0
+        val fixture = fixture(
+            retryDelay = { delayDuration ->
+                retryStarted.complete(delayDuration)
+                allowRetry.await()
+            },
+        )
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } coAnswers {
+            firstBatchRequested.complete(Unit)
+            allowFirstBatch.await()
+            GetUpdatesResponse(
+                ok = true,
+                result = listOf(
+                    Update(11, message = Message(11, chat, text = "prefix")),
+                    Update(20, message = Message(20, chat, text = "rejected")),
+                    Update(21, message = Message(21, chat, text = "suffix")),
+                ),
+            )
+        }
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 20, 30) } coAnswers {
+            if (++retryFetchCount == 1) {
+                GetUpdatesResponse(ok = true)
+            } else {
+                GetUpdatesResponse(
+                    ok = true,
+                    result = listOf(
+                        Update(20, message = Message(20, chat, text = "rejected")),
+                        Update(21, message = Message(21, chat, text = "suffix")),
+                    ),
+                )
+            }
+        }
+        coEvery { fixture.agent.sendMessage(any()) } returns ""
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            blockStarted.complete(Unit)
+            allowBlockToFinish.await()
+            ""
+        }
+        if (notificationFailure != null) {
+            coEvery {
+                fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
+            } throws notificationFailure
+        } else {
+            coEvery {
+                fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
+            } returns requireNotNull(notificationResponse)
+        }
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { firstBatchRequested.await() }
+            fixture.poller.handleUpdate(Update(100, message = Message(100, chat, text = "block")))
+            withTimeout(2.seconds) { blockStarted.await() }
+            (101L..109L).forEach { updateId ->
+                fixture.poller.handleUpdate(
+                    Update(
+                        updateId,
+                        message = Message(updateId, chat, text = "queued-$updateId")
+                    )
+                )
+            }
+            allowFirstBatch.complete(Unit)
+            eventually {
+                coVerify(exactly = 1) {
+                    fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
+                }
+            }
+
+            allowBlockToFinish.complete(Unit)
+            eventually {
+                assertEquals(11, fixture.updates.getData("100").lastUpdateId)
+                coVerify(exactly = 1) { fixture.agent.sendMessage("prefix") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("suffix") }
+            }
+            assertEquals(1.seconds, withTimeout(2.seconds) { retryStarted.await() })
+            coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:A", 20, 30) }
+
+            allowRetry.complete(Unit)
+            eventually {
+                assertEquals(21, fixture.updates.getData("100").lastUpdateId)
+                coVerify(atLeast = 2) { fixture.telegram.getUpdatesForToken("100:A", 20, 30) }
+                coVerify(exactly = 1) { fixture.agent.sendMessage("prefix") }
+                coVerify(exactly = 1) { fixture.agent.sendMessage("rejected") }
+                coVerify(exactly = 1) { fixture.agent.sendMessage("suffix") }
+            }
+        } finally {
+            allowFirstBatch.complete(Unit)
+            allowBlockToFinish.complete(Unit)
+            allowRetry.complete(Unit)
+            fixture.poller.close()
         }
     }
 

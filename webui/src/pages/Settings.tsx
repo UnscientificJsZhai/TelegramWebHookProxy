@@ -24,14 +24,7 @@ import AddIcon from '@mui/icons-material/Add';
 import {useNavigate} from 'react-router-dom';
 import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from '../settingsClient';
 import {parseMcpHeaders, validateMcpServers, type MCPServerConfig} from './mcpSettingsValidation';
-
-interface ProxySettings {
-    host: string;
-    port: number;
-    type: string;
-    username: string | null;
-    password: string | null;
-}
+import {isValidProxyAuthentication, withProxyType, type ProxySettings, type ProxyType} from './proxySettings';
 
 interface AISettings {
     provider: 'GEMINI' | 'OPENAI';
@@ -249,15 +242,12 @@ const Settings: React.FC = () => {
 
     const handleProxyTypeChange = (event: SelectChangeEvent) => {
         if (!settings) return;
-        const {value} = event.target;
+        const value = event.target.value as ProxyType;
         setSettings(prev => {
             if (!prev || !prev.proxy) return prev;
             return {
                 ...prev,
-                proxy: {
-                    ...prev.proxy,
-                    type: value
-                }
+                proxy: withProxyType(prev.proxy, value)
             };
         });
     };
@@ -378,6 +368,14 @@ const Settings: React.FC = () => {
         }
         if ((settings.ai?.autoCleanContextIntervalMinutes || 0) > 0 && autoCleanIntervalError) {
             setSnackbar({open: true, message: '清理间隔必须是正整数', severity: 'error'});
+            return;
+        }
+        if (!isValidProxyAuthentication(settings.proxy)) {
+            setSnackbar({
+                open: true,
+                message: 'HTTP 代理用户名和密码必须同时填写；SOCKS 代理不支持认证。',
+                severity: 'error'
+            });
             return;
         }
         if (!validateMcpServers(settings.ai?.mcpServers || [])) {
@@ -518,6 +516,7 @@ const Settings: React.FC = () => {
                                     type="password"
                                     value={ai.geminiApiKey}
                                     onChange={handleChange}
+                                    inputProps={{maxLength: 512}}
                                     variant="outlined"
                                 />
                             </Grid>
@@ -531,6 +530,7 @@ const Settings: React.FC = () => {
                                         type="password"
                                         value={ai.openAiApiKey}
                                         onChange={handleChange}
+                                        inputProps={{maxLength: 512}}
                                         variant="outlined"
                                     />
                                 </Grid>
@@ -541,6 +541,7 @@ const Settings: React.FC = () => {
                                         name="ai.openAiBaseUrl"
                                         value={ai.openAiBaseUrl}
                                         onChange={handleChange}
+                                        inputProps={{maxLength: 2048}}
                                         variant="outlined"
                                         placeholder="https://api.openai.com/v1"
                                         helperText="留空则使用默认地址。可用于配置国内代理或中转接口。"
@@ -557,6 +558,7 @@ const Settings: React.FC = () => {
                                     name="ai.agentChatId"
                                     value={ai.agentChatId}
                                     onChange={handleChange}
+                                    inputProps={{maxLength: 64}}
                                     variant="outlined"
                                     helperText="AI 将只在此 Chat ID 的会话中回复消息，且可以响应 /reset"
                                 />
@@ -577,9 +579,11 @@ const Settings: React.FC = () => {
                                 name="ai.globalContext"
                                 value={ai.globalContext}
                                 onChange={handleChange}
+                                inputProps={{maxLength: 16384}}
                                 variant="outlined"
                                 multiline
                                 rows={4}
+                                helperText="最大 64 KiB（按 UTF-8 字节计）"
                             />
                         </Grid>
 
@@ -745,6 +749,13 @@ const Settings: React.FC = () => {
                                 </Select>
                             </FormControl>
                         </Grid>
+                        {settings.proxy.type === 'SOCKS' && (
+                            <Grid size={{xs: 12}}>
+                                <Typography color="text.secondary" variant="body2">
+                                    SOCKS 代理不支持用户名和密码认证。
+                                </Typography>
+                            </Grid>
+                        )}
                         <Grid size={{xs: 12, sm: 6}}>
                             <TextField
                                 fullWidth

@@ -3,11 +3,13 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.PageResult
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.models.SkillBrief
+import com.unscientificjszhai.tgp.models.validateSkill
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -46,7 +48,7 @@ class SkillRepository private constructor(
     }
 
     private val logger = LoggerFactory.getLogger(SkillRepository::class.java)
-    private val storage = AtomicJsonStorage(configFile.toPath(), fileOperations)
+    private val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SKILLS_BYTES, fileOperations)
     private val storageLock = ReentrantLock()
     private var requiresStorageValidationBeforeWrite = false
 
@@ -81,6 +83,8 @@ class SkillRepository private constructor(
      * @return 包含总技能数和当前页技能的结果；技能顺序与配置文件一致。
      */
     fun getAllSkills(page: Int = 1, size: Int = 10): PageResult<Skill> {
+        require(page >= 1) { "页码必须大于等于 1。" }
+        require(size in 1..50) { "每页数量必须在 1..50 范围内。" }
         return storageLock.withLock {
             val skills = readSkillsForRead()
             val startIndex = (page - 1) * size
@@ -126,6 +130,7 @@ class SkillRepository private constructor(
      */
     fun saveSkill(skill: Skill) {
         storageLock.withLock {
+            validateSkill(skill)
             val skills = readSkillsForMutation().items.toMutableList()
             val existingIndex = skills.indexOfFirst { it.id == skill.id }
             if (existingIndex >= 0) {
@@ -133,6 +138,7 @@ class SkillRepository private constructor(
             } else {
                 skills += skill
             }
+            require(skills.size <= 64) { "技能数量不能超过 64 个。" }
             storage.commit(ConfigJson.encodeToString(skills).toByteArray(StandardCharsets.UTF_8))
             _skillsUpdateEvent.tryEmit(Unit)
         }
@@ -239,7 +245,10 @@ class SkillRepository private constructor(
         if (content.isBlank()) {
             throw IllegalArgumentException("Skills data must not be blank")
         }
-        return ConfigJson.decodeFromString(content)
+        return ConfigJson.decodeFromString<List<Skill>>(content).also { skills ->
+            require(skills.size <= 64) { "技能数量不能超过 64 个。" }
+            skills.forEach(::validateSkill)
+        }
     }
 
     private data class SkillSnapshot(

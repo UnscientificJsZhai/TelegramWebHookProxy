@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, {useState, useEffect, useCallback} from 'react';
 import {
     Box,
     Button,
@@ -23,24 +23,28 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import AddIcon from '@mui/icons-material/Add';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
-import { useNavigate } from 'react-router-dom';
-import { getSkills, saveSkill, deleteSkill } from '../api';
-import type { Skill } from '../api';
+import {useNavigate} from 'react-router-dom';
+import {getSkills, saveSkill, deleteSkill} from '../api';
+import type {Skill} from '../api';
 
 const SkillPage: React.FC = () => {
     const navigate = useNavigate();
     const [skills, setSkills] = useState<Skill[]>([]);
     const [open, setOpen] = useState(false);
     const [currentSkill, setCurrentSkill] = useState<Partial<Skill>>({});
-    const [snackbar, setSnackbar] = useState<{ open: boolean, message: string, severity: 'success' | 'error' } | null>(null);
-    
+    const [snackbar, setSnackbar] = useState<{
+        open: boolean,
+        message: string,
+        severity: 'success' | 'error'
+    } | null>(null);
+
     // Pagination state
     const [page, setPage] = useState(1);
     const [total, setTotal] = useState(0);
     const pageSize = 10;
 
     const showSnackbar = (message: string, severity: 'success' | 'error') => {
-        setSnackbar({ open: true, message, severity });
+        setSnackbar({open: true, message, severity});
     };
 
     const fetchSkills = useCallback(async () => {
@@ -116,25 +120,25 @@ const SkillPage: React.FC = () => {
     const totalPages = Math.ceil(total / pageSize);
 
     return (
-        <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+        <Container maxWidth="lg" sx={{mt: 4, mb: 4}}>
             <Box display="flex" alignItems="center" mb={3}>
-                <IconButton onClick={() => navigate('/settings')} sx={{ mr: 2 }}>
-                    <ArrowBackIcon />
+                <IconButton onClick={() => navigate('/settings')} sx={{mr: 2}}>
+                    <ArrowBackIcon/>
                 </IconButton>
-                <Typography variant="h4" component="h1" gutterBottom sx={{ mb: 0 }}>
+                <Typography variant="h4" component="h1" gutterBottom sx={{mb: 0}}>
                     技能管理
                 </Typography>
-                <Box flexGrow={1} />
-                <Button variant="contained" startIcon={<AddIcon />} onClick={() => handleOpen()}>
+                <Box flexGrow={1}/>
+                <Button variant="contained" startIcon={<AddIcon/>} onClick={() => handleOpen()}>
                     新增技能
                 </Button>
             </Box>
 
             <Grid container spacing={3}>
                 {skills.map((skill) => (
-                    <Grid size={{ xs: 12, sm: 6, md: 4 }} key={skill.id}>
-                        <Card elevation={3} sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-                            <CardContent sx={{ flexGrow: 1 }}>
+                    <Grid size={{xs: 12, sm: 6, md: 4}} key={skill.id}>
+                        <Card elevation={3} sx={{height: '100%', display: 'flex', flexDirection: 'column'}}>
+                            <CardContent sx={{flexGrow: 1}}>
                                 <Typography variant="h6" gutterBottom noWrap>
                                     {skill.description}
                                 </Typography>
@@ -151,20 +155,20 @@ const SkillPage: React.FC = () => {
                                     ID: {skill.id}
                                 </Typography>
                             </CardContent>
-                            <CardActions sx={{ justifyContent: 'flex-end' }}>
+                            <CardActions sx={{justifyContent: 'flex-end'}}>
                                 <IconButton size="small" onClick={() => handleOpen(skill)} color="primary">
-                                    <EditIcon />
+                                    <EditIcon/>
                                 </IconButton>
                                 <IconButton size="small" onClick={() => handleDelete(skill.id)} color="error">
-                                    <DeleteIcon />
+                                    <DeleteIcon/>
                                 </IconButton>
                             </CardActions>
                         </Card>
                     </Grid>
                 ))}
                 {skills.length === 0 && (
-                    <Grid size={{ xs: 12 }}>
-                        <Paper sx={{ p: 3, textAlign: 'center' }}>
+                    <Grid size={{xs: 12}}>
+                        <Paper sx={{p: 3, textAlign: 'center'}}>
                             <Typography color="textSecondary">暂无技能，点击“新增技能”开始创建。</Typography>
                         </Paper>
                     </Grid>
@@ -173,11 +177,11 @@ const SkillPage: React.FC = () => {
 
             {totalPages > 1 && (
                 <Box display="flex" justifyContent="center" mt={4}>
-                    <Pagination 
-                        count={totalPages} 
-                        page={page} 
-                        onChange={handlePageChange} 
-                        color="primary" 
+                    <Pagination
+                        count={totalPages}
+                        page={page}
+                        onChange={handlePageChange}
+                        color="primary"
                     />
                 </Box>
             )}
@@ -192,8 +196,10 @@ const SkillPage: React.FC = () => {
                         fullWidth
                         variant="outlined"
                         value={currentSkill.description || ''}
-                        onChange={(e) => setCurrentSkill({ ...currentSkill, description: e.target.value })}
-                        sx={{ mb: 2 }}
+                        onChange={(e) => setCurrentSkill({...currentSkill, description: e.target.value})}
+                        inputProps={{maxLength: 256}}
+                        helperText="最多 1 KiB（按 UTF-8 字节计）"
+                        sx={{mb: 2}}
                     />
                     <TextField
                         margin="dense"
@@ -203,7 +209,9 @@ const SkillPage: React.FC = () => {
                         multiline
                         rows={10}
                         value={currentSkill.content || ''}
-                        onChange={(e) => setCurrentSkill({ ...currentSkill, content: e.target.value })}
+                        onChange={(e) => setCurrentSkill({...currentSkill, content: e.target.value})}
+                        inputProps={{maxLength: 16384}}
+                        helperText="最多 64 KiB（按 UTF-8 字节计）"
                     />
                 </DialogContent>
                 <DialogActions>
@@ -217,9 +225,9 @@ const SkillPage: React.FC = () => {
                     open={snackbar.open}
                     autoHideDuration={6000}
                     onClose={() => setSnackbar(null)}
-                    anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+                    anchorOrigin={{vertical: 'bottom', horizontal: 'center'}}
                 >
-                    <Alert severity={snackbar.severity} sx={{ width: '100%' }}>
+                    <Alert severity={snackbar.severity} sx={{width: '100%'}}>
                         {snackbar.message}
                     </Alert>
                 </Snackbar>

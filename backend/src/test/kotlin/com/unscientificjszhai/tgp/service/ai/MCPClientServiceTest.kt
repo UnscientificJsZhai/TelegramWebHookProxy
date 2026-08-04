@@ -7,6 +7,8 @@ import io.mockk.mockk
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ListToolsResult
+import io.modelcontextprotocol.kotlin.sdk.types.Tool
+import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.*
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
@@ -16,6 +18,39 @@ import kotlin.time.Duration.Companion.seconds
  * MCP 客户端连接更新与终态关闭行为的测试设计。
  */
 class MCPClientServiceTest {
+
+    /**
+     * 验证超出工具数量上限的候选连接会被关闭，且不会破坏既有快照。
+     */
+    @Test
+    fun `over limit discovery closes its candidate and retains the previous connection`() = runBlocking {
+        val stableClient = mockk<Client>()
+        val rejectedClient = mockk<Client>()
+        val clients = ArrayDeque(listOf(stableClient, rejectedClient))
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+        val stableConfig = MCPServerConfig(name = "stable", url = "https://stable.example.com/mcp")
+        val rejectedConfig = MCPServerConfig(name = "rejected", url = "https://rejected.example.com/mcp")
+
+        coEvery { stableClient.connect(any()) } returns Unit
+        coEvery { stableClient.listTools() } returns ListToolsResult(emptyList())
+        coEvery { stableClient.callTool("tool", emptyMap()) } returns CallToolResult(emptyList())
+        coEvery { stableClient.close() } returns Unit
+        coEvery { rejectedClient.connect(any()) } returns Unit
+        coEvery { rejectedClient.listTools() } returns ListToolsResult(
+            List(MAX_MCP_TOOLS_PER_SERVER + 1) { Tool("tool-$it", ToolSchema()) },
+        )
+        coEvery { rejectedClient.close() } returns Unit
+
+        service.connect(listOf(stableConfig))
+        service.connect(listOf(rejectedConfig))
+
+        assertEquals(CallToolResult(emptyList()), service.callTool("stable", "tool", emptyMap()))
+        coVerify(exactly = 1) { rejectedClient.close() }
+        coVerify(exactly = 0) { stableClient.close() }
+
+        service.close().join()
+        coVerify(exactly = 1) { stableClient.close() }
+    }
 
     /**
      * 验证直接调用 connect 会在断开已有连接前校验完整列表，非法配置不会扰动当前状态。
@@ -116,7 +151,7 @@ class MCPClientServiceTest {
     @Test
     fun `关闭等待在途工具调用并拒绝后续操作且可重复调用`() = runBlocking {
         val client = mockk<Client>()
-        val result = mockk<CallToolResult>()
+        val result = CallToolResult(emptyList())
         val toolCallStarted = CompletableDeferred<Unit>()
         val releaseToolCall = CompletableDeferred<Unit>()
         val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }

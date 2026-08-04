@@ -72,4 +72,16 @@ class CancellableOkHttpTransportTest {
         }
         Unit
     }
+
+    /** 验证上游响应在流式读取时超过硬上限会被拒绝。 */
+    @Test
+    fun `oversized response is rejected without constructing a full result`() = runBlocking {
+        val transport = CancellableOkHttpTransport(OkHttpClient())
+        server.enqueue(MockResponse.Builder().body("x".repeat(MAX_RAW_RESPONSE_BYTES + 1)).build())
+
+        assertFailsWith<UpstreamResponseTooLargeException> {
+            transport.execute(Request.Builder().url(server.url("/oversized")).build())
+        }
+        transport.close()
+    }
 }

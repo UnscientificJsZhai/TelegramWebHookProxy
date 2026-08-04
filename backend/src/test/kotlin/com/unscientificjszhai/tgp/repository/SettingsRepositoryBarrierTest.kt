@@ -303,10 +303,16 @@ class SettingsRepositoryBarrierTest {
         val originalSettingsUpdate = repository.settingsUpdateFlow.value
         val originalTokenUpdate = repository.telegramTokenUpdateFlow.value
 
-        assertFailsWith<IllegalArgumentException> {
-            repository.saveSettings(
-                initialSettings.copy(proxy = ProxySettings("proxy.example.com", 65536, ProxyType.HTTP)),
-            )
+        listOf(
+            ProxySettings("proxy.example.com", 65536, ProxyType.HTTP),
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = "user"),
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, password = "password"),
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = " "),
+            ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
+        ).forEach { invalidProxy ->
+            assertFailsWith<IllegalArgumentException> {
+                repository.saveSettings(initialSettings.copy(proxy = invalidProxy))
+            }
         }
 
         assertEquals(initialSettings, repository.settingsFlow.value)
@@ -376,6 +382,40 @@ class SettingsRepositoryBarrierTest {
         assertEquals(resolvedSettings, repository.settingsFlow.value)
         assertFalse(repository.hasHistoricalInvalidProxy)
         assertTrue(barrier.isSwitching)
+    }
+
+    /** 验证历史非法认证凭据会禁用代理，并要求显式提供合法替代设置。 */
+    @Test
+    fun `historical invalid proxy credentials fail closed until explicitly replaced`() {
+        val invalidProxies = listOf(
+            """{"host":"proxy.example.com","port":8080,"type":"HTTP","username":"user"}""" to
+                    ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"),
+            """{"host":"proxy.example.com","port":8080,"type":"HTTP","password":"password"}""" to
+                    ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"),
+            """{"host":"proxy.example.com","port":8080,"type":"HTTP","username":" ","password":" "}""" to
+                    ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"),
+            """{"host":"proxy.example.com","port":1080,"type":"SOCKS","username":"user","password":"password"}""" to
+                    ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS),
+        )
+
+        invalidProxies.forEachIndexed { index, (proxyJson, replacementProxy) ->
+            val configFile = File(tempDirectory, "historical-proxy-credentials-$index.json")
+            val originalContent = """{"telegramToken":"100:token","chatId":"chat","proxy":$proxyJson}"""
+            configFile.writeText(originalContent)
+            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+            assertEquals(null, repository.settingsFlow.value.proxy)
+            assertTrue(repository.hasHistoricalInvalidProxy)
+            assertFailsWith<IllegalArgumentException> {
+                repository.saveSettings(repository.settingsFlow.value.copy(chatId = "new-chat"))
+            }
+            assertEquals(originalContent, configFile.readText())
+
+            val replacement = repository.settingsFlow.value.copy(proxy = replacementProxy)
+            repository.saveSettings(replacement)
+            assertEquals(replacement, repository.settingsFlow.value)
+            assertFalse(repository.hasHistoricalInvalidProxy)
+        }
     }
 
     /**
@@ -597,11 +637,11 @@ class SettingsRepositoryBarrierTest {
         backupFile.writeText(validBackup)
         var blockBackupRead = true
         val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAllBytes(path: Path): ByteArray {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
                 if (blockBackupRead && path == backupFile.toPath()) {
                     throw IOException("injected backup read failure")
                 }
-                return DefaultAtomicJsonFileOperations.readAllBytes(path)
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
         }
 
@@ -635,11 +675,11 @@ class SettingsRepositoryBarrierTest {
         backupFile.writeText(validBackup)
         var blockPrimaryRead = true
         val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAllBytes(path: Path): ByteArray {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
                 if (blockPrimaryRead && path == configFile.toPath()) {
                     throw IOException("injected primary read failure")
                 }
-                return DefaultAtomicJsonFileOperations.readAllBytes(path)
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
         }
 
@@ -674,11 +714,11 @@ class SettingsRepositoryBarrierTest {
         var blockBackupRead = true
         var failCandidatePrimaryReplace = false
         val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAllBytes(path: Path): ByteArray {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
                 if (blockBackupRead && path == backupFile.toPath()) {
                     throw IOException("injected backup read failure")
                 }
-                return DefaultAtomicJsonFileOperations.readAllBytes(path)
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
 
             override fun atomicReplace(source: Path, target: Path) {

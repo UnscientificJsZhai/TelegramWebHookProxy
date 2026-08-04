@@ -8,11 +8,14 @@ import com.unscientificjszhai.tgp.repository.SettingsRevisionMismatchException
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdateResult
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.server.plugins.bodylimit.*
+import io.ktor.server.plugins.PayloadTooLargeException
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -25,6 +28,7 @@ import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.nio.charset.StandardCharsets
 
 /**
  * 注册应用设置、聊天记录和消息发送的 HTTP API 路由。
@@ -45,94 +49,115 @@ fun Application.apiModule(appComponent: AppComponent) {
                 call.response.headers.append(HttpHeaders.ETag, snapshot.revision.toStrongETag())
                 call.respondCompleteSettings(snapshot.settings)
             }
-            put("/settings") {
-                call.handleFullSettingsUpdate(settingsRepository, telegramService)
-            }
-            // 保留既有 POST 路径，且与 PUT 使用相同的严格完整替换契约。
-            post("/settings") {
-                call.handleFullSettingsUpdate(settingsRepository, telegramService)
-            }
-            patch("/settings") {
-                val expectedRevision = call.requiredSettingsRevision() ?: return@patch
-                val patch = call.readSettingsJsonObject() ?: return@patch
-                try {
-                    patch.validateSettingsPatch()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    call.respondSettingsError(HttpStatusCode.BadRequest, "设置请求格式不合法。")
-                    return@patch
+            route("/settings") {
+                install(RequestBodyLimit) { bodyLimit { ResourceLimits.SETTINGS_REQUEST_BYTES } }
+                put {
+                    call.handleFullSettingsUpdate(settingsRepository, telegramService)
                 }
-                val update = call.commitSettingsUpdate(
-                    settingsRepository,
-                    telegramService,
-                    expectedRevision,
-                    patch.explicitlyReplacesHistoricalMcpServers(),
-                ) { current ->
-                    current.mergeSettingsPatch(patch)
-                } ?: return@patch
-                call.respondSettingsUpdate(update)
-            }
-            post("/settings/chat") {
-                val expectedRevision = call.requiredSettingsRevision() ?: return@post
-                val request = call.readSettingsJsonObject() ?: return@post
-                val chatId = try {
-                    request.requireExactKeys(CHAT_SETTINGS_FIELDS)
-                    request.getValue("chatId").requireNonNullJsonValue()
-                    strictSettingsJson.decodeFromJsonElement<ChatSettingsRequest>(request).chatId
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    call.respondSettingsError(HttpStatusCode.BadRequest, "聊天设置请求格式不合法。")
-                    return@post
+                // 保留既有 POST 路径，且与 PUT 使用相同的严格完整替换契约。
+                post {
+                    call.handleFullSettingsUpdate(settingsRepository, telegramService)
                 }
-                val update =
-                    call.commitSettingsUpdate(settingsRepository, telegramService, expectedRevision) { current ->
-                        current.copy(chatId = chatId)
-                    } ?: return@post
-                call.respondSettingsUpdate(update)
+                patch {
+                    val expectedRevision = call.requiredSettingsRevision() ?: return@patch
+                    val patch = call.readSettingsJsonObject() ?: return@patch
+                    try {
+                        patch.validateSettingsPatch()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        call.respondSettingsError(HttpStatusCode.BadRequest, "设置请求格式不合法。")
+                        return@patch
+                    }
+                    val update = call.commitSettingsUpdate(
+                        settingsRepository,
+                        telegramService,
+                        expectedRevision,
+                        patch.explicitlyReplacesHistoricalMcpServers(),
+                    ) { current ->
+                        current.mergeSettingsPatch(patch)
+                    } ?: return@patch
+                    call.respondSettingsUpdate(update)
+                }
             }
-            post("/send-message") {
-                val messageField = call.request.queryParameters["messagefield"] ?: "text"
-                val chatIdField = call.request.queryParameters["chatidfield"] ?: "chatId"
-
-                val contentType = call.request.contentType()
-                val (requestChatId, requestText) = when {
-                    contentType.match(ContentType.Application.Json) -> {
-                        val json = call.receive<JsonObject>()
-                        val chatId = json[chatIdField]?.jsonPrimitive?.content
-                        val text = json[messageField]?.jsonPrimitive?.content ?: ""
-                        chatId to text
-                    }
-
-                    contentType.match(ContentType.Application.FormUrlEncoded) -> {
-                        val parameters = call.receiveParameters()
-                        val chatId = parameters[chatIdField]
-                        val text = parameters[messageField] ?: ""
-                        chatId to text
-                    }
-
-                    else -> {
-                        call.respond(HttpStatusCode.UnsupportedMediaType)
+            route("/settings/chat") {
+                install(RequestBodyLimit) { bodyLimit { ResourceLimits.CHAT_SETTINGS_REQUEST_BYTES } }
+                post {
+                    val expectedRevision = call.requiredSettingsRevision() ?: return@post
+                    val request = call.readSettingsJsonObject() ?: return@post
+                    val chatId = try {
+                        request.requireExactKeys(CHAT_SETTINGS_FIELDS)
+                        request.getValue("chatId").requireNonNullJsonValue()
+                        strictSettingsJson.decodeFromJsonElement<ChatSettingsRequest>(request).chatId
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        call.respondSettingsError(HttpStatusCode.BadRequest, "聊天设置请求格式不合法。")
                         return@post
                     }
+                    val update =
+                        call.commitSettingsUpdate(settingsRepository, telegramService, expectedRevision) { current ->
+                            current.copy(chatId = chatId)
+                        } ?: return@post
+                    call.respondSettingsUpdate(update)
                 }
-
-                if (requestText.isBlank()) {
-                    call.respond(HttpStatusCode.BadRequest, "Message text is required")
-                    return@post
-                }
-
-                try {
-                    val chatId = (requestChatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
-                    if (chatId.isBlank()) {
-                        call.respond(HttpStatusCode.BadRequest, "Chat ID is required")
+            }
+            route("/send-message") {
+                install(RequestBodyLimit) { bodyLimit { ResourceLimits.SEND_MESSAGE_REQUEST_BYTES } }
+                post {
+                    val messageField = call.request.queryParameters["messagefield"] ?: "text"
+                    val chatIdField = call.request.queryParameters["chatidfield"] ?: "chatId"
+                    if (messageField.utf8Size() > 64 || chatIdField.utf8Size() > 64) {
+                        call.respond(HttpStatusCode.BadRequest, "自定义字段名过长")
                         return@post
                     }
-                    val response = telegramService.sendMessage(chatId, requestText)
-                    call.respond(response.status, response.body)
-                } catch (e: Exception) {
-                    call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred")
+
+                    val contentType = call.request.contentType()
+                    val (requestChatId, requestText) = when {
+                        contentType.match(ContentType.Application.Json) -> {
+                            val json = call.receive<JsonObject>()
+                            val chatId = json[chatIdField]?.jsonPrimitive?.content
+                            val text = json[messageField]?.jsonPrimitive?.content ?: ""
+                            chatId to text
+                        }
+
+                        contentType.match(ContentType.Application.FormUrlEncoded) -> {
+                            val parameters = call.receiveParameters()
+                            val chatId = parameters[chatIdField]
+                            val text = parameters[messageField] ?: ""
+                            chatId to text
+                        }
+
+                        else -> {
+                            call.respond(HttpStatusCode.UnsupportedMediaType)
+                            return@post
+                        }
+                    }
+
+                    if (requestText.utf8Size() > ResourceLimits.SEND_MESSAGE_REQUEST_BYTES ||
+                        (requestChatId?.utf8Size() ?: 0) > 64
+                    ) {
+                        call.respond(HttpStatusCode.BadRequest, "消息或聊天标识超过限制")
+                        return@post
+                    }
+                    if (requestText.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, "Message text is required")
+                        return@post
+                    }
+
+                    try {
+                        val chatId = (requestChatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
+                        if (chatId.isBlank()) {
+                            call.respond(HttpStatusCode.BadRequest, "Chat ID is required")
+                            return@post
+                        }
+                        val response = telegramService.sendMessage(chatId, requestText)
+                        call.respond(response.status, response.body)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        call.respond(HttpStatusCode.BadGateway, "消息发送失败。")
+                    }
                 }
             }
             get("/chats") {
@@ -230,11 +255,15 @@ private data class ChatSettingsRequest(val chatId: String)
 @Serializable
 private data class SettingsErrorResponse(val error: String)
 
+private fun String.utf8Size(): Long = toByteArray(StandardCharsets.UTF_8).size.toLong()
+
 /** 读取并严格解析设置请求的原始 JSON 对象；不会使用应用全局的宽松 JSON 配置。 */
 private suspend fun ApplicationCall.readSettingsJsonObject(): JsonObject? = try {
     strictSettingsJson.parseToJsonElement(receiveText()) as? JsonObject
         ?: throw IllegalArgumentException("Settings request root must be a JSON object.")
 } catch (e: CancellationException) {
+    throw e
+} catch (e: PayloadTooLargeException) {
     throw e
 } catch (_: Exception) {
     respondSettingsError(HttpStatusCode.BadRequest, "设置请求格式不合法。")

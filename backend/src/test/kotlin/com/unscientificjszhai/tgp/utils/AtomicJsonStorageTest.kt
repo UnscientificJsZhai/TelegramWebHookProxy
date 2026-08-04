@@ -40,7 +40,7 @@ class AtomicJsonStorageTest {
             val oldBackup = "old-distinct-backup".encodeToByteArray()
             Files.writeString(target, "old-primary")
             Files.write(backup, oldBackup)
-            val storage = AtomicJsonStorage(target, FailingFileOperations(stage))
+            val storage = AtomicJsonStorage(target, 1024 * 1024, FailingFileOperations(stage))
 
             assertFailsWith<IOException> { storage.commit("new-primary".encodeToByteArray()) }
 
@@ -60,7 +60,7 @@ class AtomicJsonStorageTest {
         val firstTarget = tempDirectory.resolve("first-commit.json")
         val firstBackup = tempDirectory.resolve("first-commit.json.bak")
 
-        AtomicJsonStorage(firstTarget).commit("initial-content".encodeToByteArray())
+        AtomicJsonStorage(firstTarget, 1024 * 1024).commit("initial-content".encodeToByteArray())
 
         assertEquals("initial-content", Files.readString(firstTarget))
         assertTrue(Files.notExists(firstBackup))
@@ -69,13 +69,13 @@ class AtomicJsonStorageTest {
         val backup = tempDirectory.resolve("without-backup.json.bak")
         Files.writeString(target, "old-primary")
 
-        AtomicJsonStorage(target).commit("new-primary".encodeToByteArray())
+        AtomicJsonStorage(target, 1024 * 1024).commit("new-primary".encodeToByteArray())
 
         assertEquals("new-primary", Files.readString(target))
         assertTrue(Files.notExists(backup))
 
         Files.writeString(backup, "legacy-backup")
-        AtomicJsonStorage(target).commit("newer-primary".encodeToByteArray())
+        AtomicJsonStorage(target, 1024 * 1024).commit("newer-primary".encodeToByteArray())
 
         assertEquals("newer-primary", Files.readString(target))
         assertEquals("legacy-backup", Files.readString(backup))
@@ -92,7 +92,7 @@ class AtomicJsonStorageTest {
         Files.writeString(target, "old-primary")
         Files.write(backup, oldBackup)
         val operations = FailingFileOperations(FailureStage.ATOMIC_MOVE_UNSUPPORTED)
-        val storage = AtomicJsonStorage(target, operations)
+        val storage = AtomicJsonStorage(target, 1024 * 1024, operations)
 
         assertFailsWith<AtomicMoveNotSupportedException> { storage.commit("new-primary".encodeToByteArray()) }
 
@@ -114,7 +114,7 @@ class AtomicJsonStorageTest {
         Files.writeString(target, "not-valid")
         val backupBytes = "valid-backup-with-layout\n".encodeToByteArray()
         Files.write(backup, backupBytes)
-        val storage = AtomicJsonStorage(target)
+        val storage = AtomicJsonStorage(target, 1024 * 1024)
 
         val result = storage.readValidatedAndRecover { bytes ->
             require(bytes.contentEquals(backupBytes)) { "not a valid semantic payload" }
@@ -136,7 +136,7 @@ class AtomicJsonStorageTest {
         val backupBytes = "valid-backup-with-layout\n".encodeToByteArray()
         Files.write(backup, backupBytes)
 
-        val result = AtomicJsonStorage(target).readValidatedAndRecover { bytes ->
+        val result = AtomicJsonStorage(target, 1024 * 1024).readValidatedAndRecover { bytes ->
             require(bytes.contentEquals(backupBytes))
             "decoded"
         }
@@ -144,6 +144,44 @@ class AtomicJsonStorageTest {
         assertEquals(AtomicJsonRead.Valid("decoded"), result)
         assertTrue(Files.readAllBytes(target).contentEquals(backupBytes))
         assertTrue(Files.readAllBytes(backup).contentEquals(backupBytes))
+    }
+
+    /**
+     * 验证超出上限的主文件不会完整读取或解析，而是可由有效且受限的备份恢复。
+     */
+    @Test
+    fun `oversized primary is recovered from a bounded valid backup`() {
+        val target = tempDirectory.resolve("oversized-primary.json")
+        val backup = tempDirectory.resolve("oversized-primary.json.bak")
+        val backupBytes = "valid".encodeToByteArray()
+        Files.write(target, ByteArray(17) { 'x'.code.toByte() })
+        Files.write(backup, backupBytes)
+        val storage = AtomicJsonStorage(target, 16)
+
+        val result = storage.readValidatedAndRecover { bytes ->
+            require(bytes.contentEquals(backupBytes))
+            "decoded"
+        }
+
+        assertEquals(AtomicJsonRead.Valid("decoded"), result)
+        assertContentEquals(backupBytes, Files.readAllBytes(target))
+    }
+
+    /**
+     * 验证超过持久化上限的提交在创建临时文件前失败，既不替换主文件也不更新备份。
+     */
+    @Test
+    fun `oversized commit preserves existing files`() {
+        val target = tempDirectory.resolve("oversized-commit.json")
+        val backup = tempDirectory.resolve("oversized-commit.json.bak")
+        Files.writeString(target, "old-primary")
+        Files.writeString(backup, "old-backup")
+        val storage = AtomicJsonStorage(target, 8)
+
+        assertFailsWith<IllegalArgumentException> { storage.commit("too-large".encodeToByteArray()) }
+
+        assertEquals("old-primary", Files.readString(target))
+        assertEquals("old-backup", Files.readString(backup))
     }
 
     /**
@@ -166,7 +204,7 @@ class AtomicJsonStorageTest {
             }
         }
 
-        val result = AtomicJsonStorage(primaryPath, operations).readValidatedAndRecover { bytes ->
+        val result = AtomicJsonStorage(primaryPath, 1024 * 1024, operations).readValidatedAndRecover { bytes ->
             require(bytes.contentEquals(backupBytes))
             "decoded"
         }
@@ -185,7 +223,7 @@ class AtomicJsonStorageTest {
         Files.writeString(target, "old-primary")
         val operations = RecordingFileOperations(failDirectoryForce = true)
 
-        AtomicJsonStorage(target, operations).commit("new-primary".encodeToByteArray())
+        AtomicJsonStorage(target, 1024 * 1024, operations).commit("new-primary".encodeToByteArray())
 
         val primaryReplacement = operations.events.indexOf("replace:commit-order.json")
         val directoryForce = operations.events.indexOf("force-directory")

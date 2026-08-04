@@ -245,6 +245,8 @@ const Home: React.FC = () => {
                         label="消息文本"
                         value={text}
                         onChange={(e) => setText(e.target.value)}
+                        inputProps={{maxLength: 16384}}
+                        helperText="消息最大 64 KiB（按 UTF-8 字节计）"
                         variant="outlined"
                         multiline
                         rows={4}

@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.utils
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
@@ -22,6 +23,22 @@ internal interface AtomicJsonFileOperations {
     fun createTempFile(directory: Path, prefix: String, suffix: String): Path
 
     fun readAllBytes(path: Path): ByteArray
+
+    /**
+     * 最多读取 [maxBytes] 个字节的文件内容。
+     *
+     * 默认实现仅供确定性测试替身复用；生产实现必须在读取期间实施上限，而不能先完整载入文件。
+     *
+     * @param path 要读取的文件路径。
+     * @param maxBytes 允许读取的最大正数字节数。
+     * @return 长度不超过 [maxBytes] 的完整文件内容。
+     * @throws JsonStorageSizeLimitExceededException 文件超过上限时抛出。
+     */
+    fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+        val bytes = readAllBytes(path)
+        if (bytes.size > maxBytes) throw JsonStorageSizeLimitExceededException(maxBytes)
+        return bytes
+    }
 
     fun writeAndForce(path: Path, bytes: ByteArray)
 
@@ -45,6 +62,26 @@ internal object DefaultAtomicJsonFileOperations : AtomicJsonFileOperations {
         Files.createTempFile(directory, prefix, suffix)
 
     override fun readAllBytes(path: Path): ByteArray = Files.readAllBytes(path)
+
+    override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+        require(maxBytes > 0) { "Maximum JSON file size must be positive." }
+        FileChannel.open(path, StandardOpenOption.READ).use { channel ->
+            if (channel.size() > maxBytes) throw JsonStorageSizeLimitExceededException(maxBytes)
+            val output = ByteArrayOutputStream(minOf(channel.size().toInt(), maxBytes))
+            val buffer = ByteBuffer.allocate(minOf(8192, maxBytes + 1))
+            var total = 0
+            while (true) {
+                buffer.clear()
+                val read = channel.read(buffer)
+                if (read < 0) break
+                if (read == 0) continue
+                total += read
+                if (total > maxBytes) throw JsonStorageSizeLimitExceededException(maxBytes)
+                output.write(buffer.array(), 0, read)
+            }
+            return output.toByteArray()
+        }
+    }
 
     override fun writeAndForce(path: Path, bytes: ByteArray) {
         FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING).use { channel ->
@@ -90,6 +127,9 @@ internal sealed interface AtomicJsonRawRead {
 
     class Present(val bytes: ByteArray) : AtomicJsonRawRead
 
+    /** 文件超过所属存储的上限，不能安全解码。 */
+    data class TooLarge(val limitBytes: Int) : AtomicJsonRawRead
+
     data class IoFailure(val cause: IOException) : AtomicJsonRawRead
 }
 
@@ -130,9 +170,14 @@ internal sealed interface AtomicJsonRead<out T> {
  */
 internal class AtomicJsonStorage(
     private val target: Path,
+    private val maxBytes: Int,
     private val fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
     private val logger: Logger = LoggerFactory.getLogger(AtomicJsonStorage::class.java),
 ) {
+    init {
+        require(maxBytes > 0) { "JSON storage maximum size must be positive." }
+    }
+
     private val directory: Path = target.parent
         ?: throw IllegalArgumentException("JSON storage target must have a parent directory: $target")
     private val backup: Path = target.resolveSibling("${target.fileName}.bak")
@@ -147,6 +192,11 @@ internal class AtomicJsonStorage(
     fun <T> readValidatedAndRecover(decode: (ByteArray) -> T): AtomicJsonRead<T> {
         return when (val primary = readRaw(target)) {
             AtomicJsonRawRead.Missing -> recoverMissingPrimary(decode)
+            is AtomicJsonRawRead.TooLarge -> recoverFromBackup(
+                JsonStorageSizeLimitExceededException(primary.limitBytes),
+                decode,
+            )
+
             is AtomicJsonRawRead.IoFailure -> AtomicJsonRead.IoFailure(primary.cause)
             is AtomicJsonRawRead.Present -> decodeOrRecover(primary.bytes, decode)
         }
@@ -160,6 +210,12 @@ internal class AtomicJsonStorage(
      * 任意失败都会清理本次临时文件并抛出异常，不会降级为普通移动。
      */
     fun commit(bytes: ByteArray) {
+        require(bytes.size <= maxBytes) { "JSON 文件超过 $maxBytes 字节上限。" }
+        when (val read = readRaw(target)) {
+            AtomicJsonRawRead.Missing, is AtomicJsonRawRead.Present -> Unit
+            is AtomicJsonRawRead.TooLarge -> throw JsonStorageSizeLimitExceededException(read.limitBytes)
+            is AtomicJsonRawRead.IoFailure -> throw read.cause
+        }
         fileOperations.createDirectories(directory)
 
         var primaryTemporary: Path? = null
@@ -187,6 +243,7 @@ internal class AtomicJsonStorage(
     private fun <T> recoverMissingPrimary(decode: (ByteArray) -> T): AtomicJsonRead<T> {
         return when (val backupRead = readRaw(backup)) {
             AtomicJsonRawRead.Missing -> AtomicJsonRead.Missing
+            is AtomicJsonRawRead.TooLarge -> AtomicJsonRead.Corrupt(JsonStorageSizeLimitExceededException(backupRead.limitBytes))
             is AtomicJsonRawRead.IoFailure -> AtomicJsonRead.RecoverabilityPending(backupRead.cause)
             is AtomicJsonRawRead.Present -> {
                 val backupValue = runCatching { decode(backupRead.bytes) }
@@ -203,6 +260,7 @@ internal class AtomicJsonStorage(
     private fun <T> recoverFromBackup(primaryFailure: Exception, decode: (ByteArray) -> T): AtomicJsonRead<T> {
         val backupBytes = when (val backupRead = readRaw(backup)) {
             AtomicJsonRawRead.Missing -> return AtomicJsonRead.Corrupt(primaryFailure)
+            is AtomicJsonRawRead.TooLarge -> return AtomicJsonRead.Corrupt(primaryFailure)
             is AtomicJsonRawRead.IoFailure -> return AtomicJsonRead.RecoverabilityPending(backupRead.cause)
             is AtomicJsonRawRead.Present -> backupRead.bytes
         }
@@ -239,9 +297,11 @@ internal class AtomicJsonStorage(
     }
 
     private fun readRaw(path: Path): AtomicJsonRawRead = try {
-        AtomicJsonRawRead.Present(fileOperations.readAllBytes(path))
+        AtomicJsonRawRead.Present(fileOperations.readAtMost(path, maxBytes))
     } catch (_: NoSuchFileException) {
         AtomicJsonRawRead.Missing
+    } catch (e: JsonStorageSizeLimitExceededException) {
+        AtomicJsonRawRead.TooLarge(e.limitBytes)
     } catch (e: IOException) {
         AtomicJsonRawRead.IoFailure(e)
     }

@@ -9,7 +9,10 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
+import io.ktor.server.plugins.PayloadTooLargeException
 import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.plugins.statuspages.*
+import io.ktor.server.response.*
 import io.ktor.server.testing.*
 import io.mockk.every
 import io.mockk.mockk
@@ -86,9 +89,84 @@ class SkillAPIModuleTest {
         }
     }
 
+    /**
+     * 验证小于请求体阈值但超过技能字段限制的 JSON 会作为客户端错误拒绝。
+     */
+    @Test
+    fun `oversized skill field returns bad request instead of a server error`() {
+        val temporaryDirectory = createTempDirectory("skill-api-resource-limit-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                client.post("/api/skills") {
+                    header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                    setBody(
+                        Json.encodeToString(
+                            Skill(
+                                id = "oversized",
+                                description = "ok",
+                                content = "x".repeat(64 * 1024 + 1)
+                            )
+                        )
+                    )
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+                assertEquals(0, skillRepository.getAllSkills(size = 50).total)
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /**
+     * 验证路由级请求体限制会在 JSON 解码和持久化前返回 413。
+     */
+    @Test
+    fun `skill request body over the route limit returns payload too large`() {
+        val temporaryDirectory = createTempDirectory("skill-api-body-limit-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                client.post("/api/skills") {
+                    header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                    setBody(
+                        Json.encodeToString(
+                            Skill(
+                                id = "large-request",
+                                description = "ok",
+                                content = "x".repeat(128 * 1024)
+                            )
+                        )
+                    )
+                }.apply {
+                    assertEquals(HttpStatusCode.PayloadTooLarge, status)
+                }
+                assertEquals(0, skillRepository.getAllSkills(size = 50).total)
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
     private fun Application.configureSkillApi(appComponent: AppComponent) {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
+        }
+        install(StatusPages) {
+            exception<PayloadTooLargeException> { call, _ ->
+                call.respond(HttpStatusCode.PayloadTooLarge, mapOf("error" to "payload too large"))
+            }
         }
         skillAPIModule(appComponent)
     }

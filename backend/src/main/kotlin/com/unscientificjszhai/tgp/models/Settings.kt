@@ -285,6 +285,27 @@ data class MCPServerConfig(
     val headers: Map<String, String> = emptyMap(),
 )
 
+/** 校验设置中直接接收的文本字段不会超过入口与持久化资源边界。 */
+internal fun validateAppSettingsResourceLimits(settings: AppSettings) {
+    require(settings.telegramToken.utf8ByteSize() <= 256) { "Telegram 令牌不能超过 256 字节。" }
+    require(settings.chatId.utf8ByteSize() <= 64) { "聊天标识不能超过 64 字节。" }
+    settings.proxy?.let { proxy ->
+        require((proxy.username?.utf8ByteSize() ?: 0) <= 512) { "代理用户名不能超过 512 字节。" }
+        require((proxy.password?.utf8ByteSize() ?: 0) <= 512) { "代理密码不能超过 512 字节。" }
+    }
+    settings.ai?.let { ai ->
+        listOf(ai.geminiApiKey, ai.openAiApiKey).forEach { key ->
+            require(key.utf8ByteSize() <= 512) { "API 密钥不能超过 512 字节。" }
+        }
+        require(ai.openAiBaseUrl.utf8ByteSize() <= 2 * 1024) { "OpenAI 基础地址不能超过 2 KiB。" }
+        require(ai.selectedModel.utf8ByteSize() <= 256) { "模型名称不能超过 256 字节。" }
+        require(ai.agentChatId.utf8ByteSize() <= 64) { "代理聊天标识不能超过 64 字节。" }
+        require(ai.globalContext.utf8ByteSize() <= 64 * 1024) { "全局上下文不能超过 64 KiB。" }
+    }
+}
+
+private fun String.utf8ByteSize(): Int = toByteArray(StandardCharsets.UTF_8).size
+
 /**
  * 校验 MCP 服务器配置是否满足持久化、连接和工具发现共用的安全边界。
  *
@@ -393,8 +414,10 @@ private val MCP_FORBIDDEN_HEADER_NAMES = setOf(
  * @property host 代理服务器主机名或 IP 地址；不得为空。
  * @property port 代理服务器端口；必须在 `1..65535` 范围内。
  * @property type 代理协议类型。
- * @property username 代理认证用户名；`null` 表示不提供用户名。
- * @property password 代理认证密码；`null` 表示不提供密码。
+ * @property username HTTP 代理认证用户名；与 [password] 必须同时提供或同时为 `null`。
+ * SOCKS 代理必须为 `null`。
+ * @property password HTTP 代理认证密码；与 [username] 必须同时提供或同时为 `null`。
+ * SOCKS 代理必须为 `null`。
  */
 @Serializable
 data class ProxySettings(
@@ -412,7 +435,7 @@ data class ProxySettings(
  * 地址，或未加方括号的标准 IPv6 地址；不接受 URL、用户信息或附带端口的主机字符串。
  *
  * @param proxy 要校验的代理设置；`null` 表示不使用代理，视为合法。
- * @throws IllegalArgumentException 主机、端口或协议类型不符合约束时抛出。
+ * @throws IllegalArgumentException 主机、端口、协议类型或认证凭据组合不符合约束时抛出。
  */
 fun validateProxySettings(proxy: ProxySettings?) {
     if (proxy == null) {
@@ -439,6 +462,13 @@ fun validateProxySettings(proxy: ProxySettings?) {
         ProxyType.HTTP,
         ProxyType.SOCKS,
             -> Unit
+    }
+    require((proxy.username == null) == (proxy.password == null)) { "代理认证用户名和密码必须同时提供。" }
+    if (proxy.username != null) {
+        require(proxy.username.isNotBlank() && proxy.password!!.isNotBlank()) { "代理认证用户名和密码不能为空白。" }
+    }
+    if (proxy.type == ProxyType.SOCKS) {
+        require(proxy.username == null && proxy.password == null) { "SOCKS 代理不支持用户名和密码认证。" }
     }
 }
 

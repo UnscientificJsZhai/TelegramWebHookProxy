@@ -5,19 +5,19 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import io.ktor.client.*
-import io.ktor.client.call.*
 import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.json.Json
-import okhttp3.Credentials
+import io.ktor.utils.io.readAvailable
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -323,10 +323,11 @@ class TelegramService private constructor(
         val url = "https://api.telegram.org/bot$token/getUpdates"
 
         return withClientLease { client ->
-            client.get(url) {
+            val response = client.get(url) {
                 offset?.let { parameter("offset", it) }
                 timeout?.let { parameter("timeout", it) }
-            }.body()
+            }
+            telegramJson.decodeFromString(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
         }
     }
 
@@ -348,9 +349,10 @@ class TelegramService private constructor(
         val url = "https://api.telegram.org/bot$token/getFile"
 
         return withClientLease { client ->
-            client.get(url) {
+            val response = client.get(url) {
                 parameter("file_id", fileId)
-            }.body()
+            }
+            telegramJson.decodeFromString(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
         }
     }
 
@@ -371,7 +373,7 @@ class TelegramService private constructor(
         requireTelegramToken(token)
         val url = "https://api.telegram.org/file/bot$token/$filePath"
 
-        return withClientLease { client -> client.get(url).readRawBytes() }
+        return withClientLease { client -> client.get(url).readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES) }
     }
 
     /**
@@ -460,7 +462,7 @@ class TelegramService private constructor(
     }
 
     private suspend fun HttpResponse.toTelegramApiResponse(): TelegramApiResponse =
-        TelegramApiResponse(status = status, body = bodyAsText())
+        TelegramApiResponse(status = status, body = readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
 
     private class ClientLease(
         val client: HttpClient,
@@ -468,6 +470,38 @@ class TelegramService private constructor(
         var retired: Boolean = false,
         var closed: Boolean = false,
     )
+}
+
+private const val MAX_TELEGRAM_API_BYTES = 1024 * 1024
+private const val MAX_TELEGRAM_DOWNLOAD_BYTES = 24 * 1024 * 1024
+private val telegramJson = Json { ignoreUnknownKeys = true }
+
+/** Telegram 响应在解压后的实际读取字节超过当前调用的硬上限。 */
+class TelegramPayloadTooLargeException : IllegalStateException("Telegram 响应超过资源上限。")
+
+private suspend fun HttpResponse.readTelegramBytes(limit: Int): ByteArray {
+    val channel = bodyAsChannel()
+    headers[HttpHeaders.ContentLength]?.toLongOrNull()?.let { declared ->
+        if (declared > limit) {
+            val exception = TelegramPayloadTooLargeException()
+            channel.cancel(exception)
+            throw exception
+        }
+    }
+    val bytes = ByteArray(limit + 1)
+    var total = 0
+    try {
+        while (total < bytes.size) {
+            val count = channel.readAvailable(bytes, total, bytes.size - total)
+            if (count < 0) break
+            total += count
+        }
+        if (total > limit) throw TelegramPayloadTooLargeException()
+        return bytes.copyOf(total)
+    } catch (e: TelegramPayloadTooLargeException) {
+        channel.cancel(e)
+        throw e
+    }
 }
 
 private fun createDefaultClient(proxySettingsToUse: ProxySettings?): HttpClient = HttpClient(OkHttp) {
@@ -485,24 +519,7 @@ private fun createDefaultClient(proxySettingsToUse: ProxySettings?): HttpClient 
             proxy = Proxy(proxyType, InetSocketAddress(proxySettings.host, proxySettings.port))
         }
         config {
-            proxySettingsToUse?.let { proxySettings ->
-                val username = proxySettings.username
-                val password = proxySettings.password
-                if (
-                    proxySettings.type == ProxyType.HTTP &&
-                    !username.isNullOrBlank() &&
-                    !password.isNullOrBlank()
-                ) {
-                    val credentials = Credentials.basic(username, password)
-                    proxyAuthenticator { _, response ->
-                        if (response.request.header("Proxy-Authorization") == null) {
-                            response.request.newBuilder().header("Proxy-Authorization", credentials).build()
-                        } else {
-                            null
-                        }
-                    }
-                }
-            }
+            configureHttpProxyBasicAuthentication(proxySettingsToUse)
         }
     }
     install(ContentNegotiation) {

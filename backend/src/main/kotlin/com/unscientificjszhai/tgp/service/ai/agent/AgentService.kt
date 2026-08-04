@@ -17,6 +17,16 @@ data class ModelSnapshot(
 )
 
 internal const val MAX_TOOL_CALL_ROUNDS = 10
+internal const val MAX_TOOL_CALLS_PER_MODEL_RESPONSE = 8
+internal const val MAX_TOOL_CALLS_PER_TURN = 16
+internal const val MAX_AGENT_HISTORY_BYTES = 8 * 1024 * 1024
+internal const val MAX_AGENT_HISTORY_ENTRIES = 64
+internal const val MAX_AGENT_TURN_RESERVATION_BYTES = 4 * 1024 * 1024
+internal const val MAX_AGENT_TEXT_BYTES = 64 * 1024
+internal const val MAX_AGENT_INLINE_MEDIA_BYTES = 2 * 1024 * 1024
+
+/** Telegram OGG 语音在提交转写前允许的最大字节数。 */
+const val MAX_AUDIO_TRANSCRIPTION_BYTES = 24 * 1024 * 1024
 
 internal class ToolCallLimitExceededException : IllegalStateException(
     "工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。",
@@ -37,6 +47,27 @@ class AgentTurnFailedException(
 ) : IllegalStateException(message, cause)
 
 /**
+ * 语音文件超过转写服务允许的本地请求大小。
+ *
+ * 异常在创建 multipart 请求前抛出，因此不会读取、写入或上传临时文件。调用方可提示用户发送更短的语音，
+ * 但不得将底层文件内容或路径回显给用户。
+ */
+class AudioTranscriptionTooLargeException : IllegalArgumentException(
+    "语音文件超过 ${MAX_AUDIO_TRANSCRIPTION_BYTES / (1024 * 1024)} MiB 转写限制。",
+)
+
+/**
+ * 语音转写未能取得可用于模型对话的文本。
+ *
+ * 异常不会包含提供商响应体或音频内容；本次代理回合的会话历史不会提交，调用方可在稍后重试。
+ *
+ * @param cause 转写请求、协议解析或空文本结果的底层原因；可为 `null`，且不应直接回显给最终用户。
+ */
+class AudioTranscriptionFailedException(
+    cause: Throwable? = null,
+) : IllegalStateException("语音转写失败。", cause)
+
+/**
  * 确保本轮工具调用没有超过上限，避免模型持续请求工具而无法生成最终回复。
  *
  * @param toolCallRounds 已完成的工具调用轮次数；达到 [MAX_TOOL_CALL_ROUNDS] 时抛出异常。
@@ -44,6 +75,15 @@ class AgentTurnFailedException(
  */
 internal fun ensureToolCallRoundIsAllowed(toolCallRounds: Int) {
     if (toolCallRounds >= MAX_TOOL_CALL_ROUNDS) {
+        throw ToolCallLimitExceededException()
+    }
+}
+
+/** 确保单个模型响应与整个回合不会执行过多工具调用。 */
+internal fun ensureToolCallCountIsAllowed(responseCount: Int, completedTurnCount: Int) {
+    if (responseCount > MAX_TOOL_CALLS_PER_MODEL_RESPONSE ||
+        completedTurnCount + responseCount > MAX_TOOL_CALLS_PER_TURN
+    ) {
         throw ToolCallLimitExceededException()
     }
 }
@@ -142,6 +182,9 @@ abstract class AgentService {
      * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
      * @param mediaData 要发送的媒体数据列表；可为空，元素的 MIME 类型必须与具体实现支持的格式匹配。
      * @return AI 的回复文本；未生成可返回内容时返回空字符串。
+     * @throws AudioTranscriptionTooLargeException 当 OpenAI 实现收到超过 [MAX_AUDIO_TRANSCRIPTION_BYTES] 的 OGG
+     * 语音时，在上传前抛出。
+     * @throws AudioTranscriptionFailedException 当 OpenAI OGG 语音转写失败或返回空文本时抛出。
      * @throws AgentTurnFailedException 当 OpenAI 实现无法完成本次回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务已关闭或当前会话不可用，且具体实现选择以异常报告时抛出。
      * @throws Exception 当非 OpenAI 提供商以其原有语义报告失败时抛出。
