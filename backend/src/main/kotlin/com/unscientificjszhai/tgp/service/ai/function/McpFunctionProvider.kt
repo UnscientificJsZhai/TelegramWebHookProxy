@@ -8,18 +8,41 @@ import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.Collections
+
+/**
+ * 为 MCP 服务器工具生成模型可见安全别名的策略。
+ *
+ * 实现必须为同一 `serverName` 与 `rawToolName` 返回稳定名称。测试可注入固定实现以验证碰撞、非法名称及
+ * 生成失败的 fail-closed 行为。
+ */
+fun interface McpToolAliasGenerator {
+    /**
+     * 生成一个 MCP 工具别名。
+     *
+     * @param serverName 工具所属 MCP 服务器的已校验名称。
+     * @param rawToolName MCP 服务器原始声明的工具名称；可包含模型函数名不支持的字符。
+     * @return 面向模型的别名；必须匹配 `[A-Za-z0-9_-]{1,64}`，默认实现返回 `mcp_` 后接 43 个 Base64URL
+     * 无填充字符。
+     */
+    fun alias(serverName: String, rawToolName: String): String
+}
 
 /**
  * 将已连接 MCP 服务器的工具暴露为模型可调用函数的提供者。
  *
- * 每个函数名称由服务器名称和工具名称组合而成。读取 [providedFunctions] 会发布包含函数声明和真实 MCP
- * 目标的同一不可变快照；[canHandle] 与 [execute] 只读取最近一次已发布快照。
+ * 每个函数名称均是固定长度的 SHA-256 Base64URL 别名，不直接暴露服务器或原始工具名称。读取
+ * [providedFunctions] 会发布包含函数声明和真实 MCP 目标的同一不可变快照；[canHandle] 与 [execute]
+ * 只读取最近一次已发布快照。
  *
  * @param mcpClientService 提供 MCP 连接、工具快照和工具调用能力的服务。
+ * @param toolAliasGenerator 生成安全模型函数名的策略；默认使用不可逆的固定 SHA-256 别名。
  */
 class McpFunctionProvider(
     private val mcpClientService: MCPClientService,
+    private val toolAliasGenerator: McpToolAliasGenerator = McpToolAliasGenerator(::defaultMcpToolAlias),
 ) : LocalFunctionProvider() {
     private val logger = LoggerFactory.getLogger(McpFunctionProvider::class.java)
 
@@ -112,7 +135,7 @@ class McpFunctionProvider(
     override fun canHandle(functionName: String): Boolean = toolSnapshot.bindings.containsKey(functionName)
 
     private fun createSnapshot(mcpTools: List<Pair<String, Tool>>): ToolSnapshot {
-        val candidates = mcpTools.map { (serverName, mcpTool) ->
+        val candidates = mcpTools.mapNotNull { (serverName, mcpTool) ->
             val schemaJson =
                 buildJsonObject {
                     put("type", "OBJECT")
@@ -131,7 +154,16 @@ class McpFunctionProvider(
                     }
                 }.toString()
             val schema = Schema.fromJson(schemaJson) ?: Schema.builder().type(Type(Type.Known.OBJECT)).build()
-            val functionName = "${serverName}_${mcpTool.name}"
+            val functionName = try {
+                toolAliasGenerator.alias(serverName, mcpTool.name)
+            } catch (e: Exception) {
+                logger.warn("Ignoring MCP tool whose alias could not be generated.", e)
+                return@mapNotNull null
+            }
+            if (!MCP_TOOL_ALIAS_PATTERN.matches(functionName)) {
+                logger.warn("Ignoring MCP tool with an invalid generated alias.")
+                return@mapNotNull null
+            }
             functionName to Pair(
                 FunctionDeclaration
                     .builder()
@@ -143,7 +175,10 @@ class McpFunctionProvider(
             )
         }
         val groupedCandidates = candidates.groupBy { it.first }
-        val unambiguousCandidates = groupedCandidates.values.filter { it.size == 1 }.map { it.single() }
+        val unambiguousCandidates = groupedCandidates.values
+            .filter { it.size == 1 }
+            .map { it.single() }
+            .sortedBy { it.first }
         val collidingNames = groupedCandidates.filterValues { it.size > 1 }.keys
         if (collidingNames.isNotEmpty()) {
             logger.warn("Ignoring {} colliding MCP tool declaration(s)", collidingNames.size)
@@ -188,5 +223,24 @@ class McpFunctionProvider(
 
     private companion object {
         const val MCP_TOOL_UNAVAILABLE = "mcp_tool_unavailable"
+        val MCP_TOOL_ALIAS_PATTERN = Regex("[A-Za-z0-9_-]{1,64}")
     }
 }
+
+private fun defaultMcpToolAlias(serverName: String, rawToolName: String): String {
+    val serverBytes = serverName.toByteArray(Charsets.UTF_8)
+    val toolBytes = rawToolName.toByteArray(Charsets.UTF_8)
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update(serverBytes.size.toFourByteLength())
+    digest.update(serverBytes)
+    digest.update(toolBytes.size.toFourByteLength())
+    digest.update(toolBytes)
+    return "mcp_" + Base64.getUrlEncoder().withoutPadding().encodeToString(digest.digest())
+}
+
+private fun Int.toFourByteLength(): ByteArray = byteArrayOf(
+    (this ushr 24).toByte(),
+    (this ushr 16).toByte(),
+    (this ushr 8).toByte(),
+    toByte(),
+)

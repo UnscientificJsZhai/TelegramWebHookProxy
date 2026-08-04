@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
+import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.models.validateProxySettings
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -75,6 +76,10 @@ class SettingsRepository private constructor(
 
     @Volatile
     internal var hasHistoricalInvalidProxy = loadedSettings.hasInvalidProxy
+        private set
+
+    @Volatile
+    internal var hasHistoricalInvalidMcp = loadedSettings.hasInvalidMcp
         private set
     private var requiresStorageValidationBeforeWrite = loadedSettings.requiresStorageValidationBeforeWrite
 
@@ -199,39 +204,26 @@ class SettingsRepository private constructor(
     private fun publishRecoveredSettings(validated: LoadedSettings) {
         val recoveredSettings = validated.settings
         val previousSettings = _settingsFlow.value
+        val tokenChanged = recoveredSettings.telegramToken != previousSettings.telegramToken
         val switchGeneration = if (recoveredSettings.requiresAgentLifecycleBarrier(previousSettings)) {
             modelSwitchBarrier.beginSwitch()
         } else {
             null
         }
-        publishSettings(
-            settings = recoveredSettings,
-            previousSettings = previousSettings,
-            hasInvalidProxy = validated.hasInvalidProxy,
-            switchGeneration = switchGeneration,
-        )
-    }
-
-    private fun publishSettings(
-        settings: AppSettings,
-        previousSettings: AppSettings,
-        hasInvalidProxy: Boolean,
-        switchGeneration: Long?,
-    ) {
-        val tokenChanged = settings.telegramToken != previousSettings.telegramToken
         val publish = {
-            hasHistoricalInvalidProxy = hasInvalidProxy
+            hasHistoricalInvalidProxy = validated.hasInvalidProxy
+            hasHistoricalInvalidMcp = validated.hasInvalidMcp
             if (tokenChanged) {
                 _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
-                    token = settings.telegramToken,
+                    token = recoveredSettings.telegramToken,
                     generation = ++telegramTokenGeneration,
                 )
             }
-            _settingsFlow.value = settings
-            if (settings != previousSettings) {
-                settingsRevision = settings.revision()
+            _settingsFlow.value = recoveredSettings
+            settingsRevision = recoveredSettings.revision()
+            if (recoveredSettings != previousSettings) {
                 _settingsUpdateFlow.value = SettingsUpdate(
-                    settings = settings,
+                    settings = recoveredSettings,
                     version = ++settingsVersion,
                     switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingGeneration(),
                 )
@@ -281,26 +273,23 @@ class SettingsRepository private constructor(
     }
 
     private fun materializeSettingsCandidate(candidate: SettingsCandidate): LoadedSettings = when (candidate) {
-        is SettingsCandidate.Decoded -> candidate.settings.failClosedHttpToolSettings().let { settings ->
-            LoadedSettings(
-                settings = settings,
-                hasInvalidProxy = settings.proxy.isInvalidProxy(),
-            )
-        }
+        is SettingsCandidate.Decoded -> candidate.settings.toLoadedSettings()
 
-        is SettingsCandidate.Protected -> LoadedSettings(
-            candidate.settings.failClosedHttpToolSettings(),
-            hasInvalidProxy = true,
-        )
+        is SettingsCandidate.Protected -> candidate.settings.toLoadedSettings(hasInvalidProxy = true)
 
         is SettingsCandidate.Migratable -> {
-            try {
-                val settings = candidate.settings.failClosedHttpToolSettings()
-                storage.commit(ConfigJson.encodeToString(settings).toByteArray(StandardCharsets.UTF_8))
-                LoadedSettings(settings, hasInvalidProxy = false)
-            } catch (e: Exception) {
-                logger.error("Could not persist migrated legacy proxy; keeping original file protected", e)
-                LoadedSettings(candidate.protectedSettings, hasInvalidProxy = true)
+            val loaded = candidate.settings.toLoadedSettings()
+            if (loaded.hasInvalidMcp) {
+                // 不能在代理迁移时顺带覆盖历史非法 MCP 配置；必须由一次显式替换解决。
+                loaded
+            } else {
+                try {
+                    storage.commit(ConfigJson.encodeToString(loaded.settings).toByteArray(StandardCharsets.UTF_8))
+                    loaded
+                } catch (e: Exception) {
+                    logger.error("Could not persist migrated legacy proxy; keeping original file protected", e)
+                    candidate.protectedSettings.toLoadedSettings(hasInvalidProxy = true)
+                }
             }
         }
     }
@@ -331,13 +320,17 @@ class SettingsRepository private constructor(
      *
      * @param expectedRevision 期望的当前修订值；`null` 表示局部变换不执行 CAS，非空值必须是此前
      * [currentSettingsSnapshot] 返回的 64 位小写十六进制 SHA-256。
+     * @param replacesHistoricalInvalidMcpServers 此次变换是否明确替换历史非法 MCP 服务器列表；仅当
+     * 该列表由请求或调用方显式提供时可传入 `true`，避免无关保存覆盖原始非法配置。
      * @param transform 接收锁内最新不可变设置并返回候选完整设置的同步变换；不得递归调用本仓储的
      * 同步方法，也不得执行长时间阻塞操作。
      * @return 提交前和提交后的原子快照；无操作时两个快照相等。
      * @throws SettingsRevisionMismatchException [expectedRevision] 与锁内当前修订值不一致时抛出；
      * 不调用 [transform]，也不改变文件、屏障或任何设置流。
-     * @throws IllegalArgumentException 代理或 HTTP 工具设置不合法，或历史非法代理尚未被显式替换为
-     * 合法代理时抛出；不会改变屏障、文件或任何设置流。
+     * @throws HistoricalInvalidMcpConfigurationException 历史非法 MCP 列表尚未由本次变换显式替换时抛出；
+     * 不会改变屏障、文件或任何设置流。
+     * @throws IllegalArgumentException 代理、HTTP 工具或 MCP 设置不合法，或历史非法代理尚未被显式替换时
+     * 抛出；不会改变屏障、文件或任何设置流。
      * @throws Exception 配置文件无法编码或原子提交，设置文件不可读取或可恢复性未验证，设置文件及备份
      * 均已损坏，或有效备份无法恢复主文件时抛出。恢复出有效磁盘设置时会先发布该快照，并抛出
      * [StorageRecoveredRetryException]；调用方必须基于新快照重试。
@@ -345,6 +338,7 @@ class SettingsRepository private constructor(
     @Synchronized
     fun updateSettings(
         expectedRevision: String? = null,
+        replacesHistoricalInvalidMcpServers: Boolean = false,
         transform: (AppSettings) -> AppSettings,
     ): SettingsUpdateResult {
         ensureStorageValidatedBeforeWrite()
@@ -358,12 +352,18 @@ class SettingsRepository private constructor(
         if (hasHistoricalInvalidProxy && settings.proxy == null) {
             throw IllegalArgumentException("历史代理设置不合法，必须显式提供合法代理后才能保存设置。")
         }
+        if (hasHistoricalInvalidMcp && !replacesHistoricalInvalidMcpServers) {
+            throw HistoricalInvalidMcpConfigurationException()
+        }
         validateProxySettings(settings.proxy)
         settings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
-        if (settings == previousSettings) {
+        settings.ai?.mcpServers?.let(::validateMcpServerConfigs)
+        val resolvesHistoricalInvalidMcp = hasHistoricalInvalidMcp && replacesHistoricalInvalidMcpServers
+        if (settings == previousSettings && !resolvesHistoricalInvalidMcp) {
             return SettingsUpdateResult(previousSnapshot, previousSnapshot)
         }
 
+        val tokenChanged = settings.telegramToken != previousSettings.telegramToken
         val switchGeneration = if (settings.requiresAgentLifecycleBarrier(previousSettings)) {
             modelSwitchBarrier.beginSwitch()
         } else {
@@ -377,12 +377,37 @@ class SettingsRepository private constructor(
             throw e
         }
 
-        publishSettings(
-            settings = settings,
-            previousSettings = previousSettings,
-            hasInvalidProxy = false,
-            switchGeneration = switchGeneration,
-        )
+        if (settings == previousSettings) {
+            // 显式以 fail-closed 后的同值列表修复历史磁盘配置时，只更新保护状态；不发布虚假的设置版本或
+            // Agent 生命周期切换。
+            hasHistoricalInvalidMcp = false
+            return SettingsUpdateResult(previousSnapshot, previousSnapshot)
+        }
+
+        val publish = {
+            hasHistoricalInvalidProxy = false
+            hasHistoricalInvalidMcp = false
+            if (tokenChanged) {
+                _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
+                    token = settings.telegramToken,
+                    generation = ++telegramTokenGeneration,
+                )
+            }
+            _settingsFlow.value = settings
+            settingsRevision = settings.revision()
+            _settingsUpdateFlow.value = SettingsUpdate(
+                settings = settings,
+                version = ++settingsVersion,
+                // 无关的保存操作可能会在 StateFlow 中抢在模型切换之前反映。
+                // 将最高待处理代次向后传递，使最新快照覆盖此前所有待处理的切换。
+                switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingGeneration(),
+            )
+        }
+        if (tokenChanged) {
+            telegramTokenLifecycleLock.withLock(publish)
+        } else {
+            publish()
+        }
         return SettingsUpdateResult(
             previous = previousSnapshot,
             current = SettingsSnapshot(settings, settingsRevision),
@@ -396,8 +421,12 @@ class SettingsRepository private constructor(
      *
      * @param settings 要替换的完整测试设置。
      */
+    @Deprecated(
+        "生产代码请使用 updateSettings 在锁内基于最新快照变换。",
+        ReplaceWith("updateSettings { settings }"),
+    )
     internal fun saveSettings(settings: AppSettings) {
-        updateSettings { settings }
+        updateSettings(replacesHistoricalInvalidMcpServers = true) { settings }
     }
 
     /**
@@ -477,6 +506,16 @@ data class SettingsUpdateResult(
  */
 class SettingsRevisionMismatchException : IllegalStateException("设置修订值已变更。")
 
+/**
+ * 尝试保存设置时未显式替换历史非法 MCP 服务器列表。
+ *
+ * 异常表示原始配置文件仍被保护，调用方必须在同一次完整写入或 PATCH 中明确提供 `ai.mcpServers`，或设置
+ * `ai` 为 `null` 后才能提交；异常不会泄露原始服务器 URL 或请求头。
+ */
+class HistoricalInvalidMcpConfigurationException : IllegalArgumentException(
+    "历史 MCP 配置不合法，必须显式替换 MCP 服务器后才能保存设置。",
+)
+
 private fun ProxySettings?.isInvalidProxy(): Boolean = runCatching {
     validateProxySettings(this)
 }.isFailure
@@ -488,6 +527,25 @@ private fun AppSettings.failClosedHttpToolSettings(): AppSettings {
     } else {
         copy(ai = aiSettings.copy(httpToolSettings = HttpToolSettings()))
     }
+}
+
+private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInvalidProxy()): LoadedSettings {
+    val aiSettings = ai
+    val hasInvalidMcp = aiSettings?.mcpServers?.let { configs ->
+        runCatching { validateMcpServerConfigs(configs) }.isFailure
+    } == true
+    val failClosedSettings = failClosedHttpToolSettings().let { settings ->
+        if (hasInvalidMcp && settings.ai != null) {
+            settings.copy(ai = settings.ai.copy(mcpServers = emptyList()))
+        } else {
+            settings
+        }
+    }
+    return LoadedSettings(
+        settings = failClosedSettings,
+        hasInvalidProxy = hasInvalidProxy,
+        hasInvalidMcp = hasInvalidMcp,
+    )
 }
 
 private fun AppSettings.serializedBytes(): ByteArray =
@@ -512,6 +570,7 @@ private fun JsonElement.canonicalized(): JsonElement = when (this) {
 private data class LoadedSettings(
     val settings: AppSettings,
     val hasInvalidProxy: Boolean,
+    val hasInvalidMcp: Boolean = false,
     val requiresStorageValidationBeforeWrite: Boolean = false,
 )
 

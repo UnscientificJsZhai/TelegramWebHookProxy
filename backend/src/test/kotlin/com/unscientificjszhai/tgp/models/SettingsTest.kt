@@ -182,4 +182,46 @@ class SettingsTest {
             assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy) }
         }
     }
+
+    /**
+     * 验证 MCP 配置共用校验限制服务器身份、绝对 HTTP(S) URL 和不可注入的固定请求头。
+     */
+    @Test
+    fun `MCP server validation accepts bounded safe configurations only`() {
+        validateMcpServerConfigs(
+            listOf(
+                MCPServerConfig(
+                    name = "main_server",
+                    url = "https://mcp.example.com/v1?tenant=test",
+                    headers = mapOf("Authorization" to "Bearer token", "X-Request-Id" to "request-1"),
+                ),
+            ),
+        )
+
+        listOf(
+            listOf(MCPServerConfig("", "https://mcp.example.com")),
+            listOf(MCPServerConfig("服务", "https://mcp.example.com")),
+            listOf(MCPServerConfig("server", "ftp://mcp.example.com")),
+            listOf(MCPServerConfig("server", "HTTPS://mcp.example.com")),
+            listOf(MCPServerConfig("server", "https://user:secret@mcp.example.com")),
+            listOf(MCPServerConfig("server", "https://mcp.example.com#fragment")),
+            listOf(MCPServerConfig("server", "https://mcp.example.com", mapOf("Bad Header" to "value"))),
+            listOf(MCPServerConfig("server", "https://mcp.example.com", mapOf("X-Test" to "line\r\nbreak"))),
+            listOf(MCPServerConfig("server", "https://mcp.example.com", mapOf("Host" to "mcp.example.com"))),
+            listOf(MCPServerConfig("server", "https://mcp.example.com", mapOf("X-Test" to "值"))),
+            listOf(
+                MCPServerConfig(
+                    "server",
+                    "https://mcp.example.com",
+                    ('A'..'D').associate { name -> name.toString() to "a".repeat(4_093) },
+                ),
+            ),
+            listOf(
+                MCPServerConfig("server", "https://first.example.com"),
+                MCPServerConfig("server", "https://second.example.com"),
+            ),
+        ).forEach { configs ->
+            assertFailsWith<IllegalArgumentException> { validateMcpServerConfigs(configs) }
+        }
+    }
 }

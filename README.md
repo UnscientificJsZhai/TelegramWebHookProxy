@@ -122,16 +122,23 @@ curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chati
 
 ### 常用接口
 
-| 方法     | 路径                         | 说明                       |
-|----------|------------------------------|----------------------------|
-| `GET`    | `/api/settings`              | 获取当前设置               |
-| `POST`   | `/api/settings`              | 保存全局设置               |
-| `POST`   | `/api/settings/chat`         | 更新默认 Telegram 会话     |
-| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话 |
-| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话         |
-| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill             |
-| `POST`   | `/api/skills`                | 新增或更新 Skill           |
-| `DELETE` | `/api/skills/{id}`           | 删除 Skill                 |
+| 方法     | 路径                         | 说明                             |
+|----------|------------------------------|----------------------------------|
+| `GET`    | `/api/settings`              | 获取当前设置                     |
+| `PUT`    | `/api/settings`              | 使用完整严格 JSON 替换全局设置   |
+| `PATCH`  | `/api/settings`              | 使用严格 JSON 局部更新全局设置   |
+| `POST`   | `/api/settings`              | 兼容的完整设置替换，语义同 `PUT` |
+| `POST`   | `/api/settings/chat`         | 兼容的默认 Telegram 会话更新     |
+| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话       |
+| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话               |
+| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill                   |
+| `POST`   | `/api/skills`                | 新增或更新 Skill                 |
+| `DELETE` | `/api/skills/{id}`           | 删除 Skill                       |
+
+设置写入必须携带 `GET /api/settings` 返回的单个强 `ETag` 作为 `If-Match`。`PUT` 要求 提供所有顶层与非空嵌套字段；`PATCH`
+仅修改出现的字段，`proxy` 与 `ai` 可用 `null` 删除，
+`proxy.username` 与 `proxy.password` 可用 `null` 清除。嵌套对象递归合并，列表与 MCP
+`headers` 映射整体替换；除 `headers` 的动态键外，未知字段均会被拒绝。
 
 ## AI Agent
 

@@ -23,6 +23,7 @@ import {
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import api from '../api';
+import {fetchVersionedSettings, isSettingsConflict, patchVersionedSettings} from '../settingsClient';
 
 interface ChatInfo {
     id: string;
@@ -33,6 +34,7 @@ interface ChatInfo {
 interface AppSettings {
     chatId: string;
     telegramToken: string;
+
     [key: string]: unknown;
 }
 
@@ -48,7 +50,8 @@ const Home: React.FC = () => {
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [pendingChatId, setPendingChatId] = useState<string | null>(null);
     const [isTokenSet, setIsTokenSet] = useState(false);
-    
+    const [settingsRevision, setSettingsRevision] = useState<string | null>(null);
+
     const [confirmDeleteDialogOpen, setConfirmDeleteDialogOpen] = useState(false);
     const [chatToDeleteId, setChatToDeleteId] = useState<string | null>(null);
 
@@ -61,16 +64,17 @@ const Home: React.FC = () => {
     };
 
     useEffect(() => {
-        api.get<AppSettings>('/settings')
+        fetchVersionedSettings<AppSettings>()
             .then(response => {
-                if (response.data.chatId) {
-                    setSelectedChatId(response.data.chatId);
+                if (response.settings.chatId) {
+                    setSelectedChatId(response.settings.chatId);
                 }
-                if (response.data.telegramToken && typeof response.data.telegramToken === 'string' && response.data.telegramToken.trim() !== '') {
+                if (response.settings.telegramToken && typeof response.settings.telegramToken === 'string' && response.settings.telegramToken.trim() !== '') {
                     setIsTokenSet(true);
                 } else {
                     setIsTokenSet(false);
                 }
+                setSettingsRevision(response.etag);
             })
             .catch(error => console.error('Failed to fetch settings:', error));
 
@@ -88,14 +92,22 @@ const Home: React.FC = () => {
 
     const handleConfirmChange = () => {
         if (pendingChatId) {
-            api.post('/settings/chat', {chatId: pendingChatId})
-                .then(() => {
-                    setSelectedChatId(pendingChatId);
+            const nextChatId = pendingChatId;
+            patchVersionedSettings<AppSettings>({chatId: nextChatId}, settingsRevision)
+                .then(response => {
+                    setSelectedChatId(response.settings.chatId);
+                    setSettingsRevision(response.etag);
                     setSnackbar({open: true, message: '聊天设置已更新', severity: 'success'});
                 })
                 .catch(error => {
                     console.error('Failed to update chat settings:', error);
-                    setSnackbar({open: true, message: '更新聊天设置失败: ' + (error.response?.data || error.message), severity: 'error'});
+                    setSnackbar({
+                        open: true,
+                        message: isSettingsConflict(error)
+                            ? '配置已被其他操作修改，请刷新页面后重试'
+                            : '更新聊天设置失败',
+                        severity: 'error'
+                    });
                 })
                 .finally(() => {
                     setConfirmDialogOpen(false);
@@ -121,13 +133,17 @@ const Home: React.FC = () => {
                 .then(() => {
                     setChats(chats.filter(c => c.id !== chatToDeleteId));
                     if (selectedChatId === chatToDeleteId) {
-                         setSelectedChatId(null);
+                        setSelectedChatId(null);
                     }
                     setSnackbar({open: true, message: '聊天已从列表中删除', severity: 'success'});
                 })
                 .catch(error => {
                     console.error('Failed to delete chat:', error);
-                    setSnackbar({open: true, message: '删除聊天失败: ' + (error.response?.data || error.message), severity: 'error'});
+                    setSnackbar({
+                        open: true,
+                        message: '删除聊天失败: ' + (error.response?.data || error.message),
+                        severity: 'error'
+                    });
                 })
                 .finally(() => {
                     setConfirmDeleteDialogOpen(false);
@@ -156,7 +172,7 @@ const Home: React.FC = () => {
         } catch (error: unknown) {
             console.error('Failed to send message:', error);
             const errMsg = error instanceof Error ? error.message : String(error);
-            const errRespData = (error as {response?: {data?: string}})?.response?.data;
+            const errRespData = (error as { response?: { data?: string } })?.response?.data;
             setSnackbar({open: true, message: '消息发送失败: ' + (errRespData || errMsg), severity: 'error'});
         }
     };
@@ -174,14 +190,14 @@ const Home: React.FC = () => {
                 <Grid size={{xs: 12}}>
                     <Typography variant="h6">
                         已选择: {selectedChatId
-                            ? (chats.find(chat => chat.id === selectedChatId)?.title || `ID: ${selectedChatId}`)
-                            : '无'}
+                        ? (chats.find(chat => chat.id === selectedChatId)?.title || `ID: ${selectedChatId}`)
+                        : '无'}
                     </Typography>
                 </Grid>
-                
+
                 <Grid size={{xs: 12}}>
-                     <Box display="flex" flexDirection="column" gap={2}>
-                        <Paper variant="outlined" sx={{ height: 300, overflow: 'auto' }}>
+                    <Box display="flex" flexDirection="column" gap={2}>
+                        <Paper variant="outlined" sx={{height: 300, overflow: 'auto'}}>
                             <List dense component="div" role="list">
                                 {chats.map((chat) => {
                                     const labelId = `chat-list-item-${chat.id}-label`;
@@ -191,29 +207,32 @@ const Home: React.FC = () => {
                                             role="listitem"
                                             disablePadding
                                             secondaryAction={
-                                                <IconButton edge="end" aria-label="delete" onClick={(e) => handleDeleteChat(e, chat.id)}>
-                                                    <DeleteIcon />
+                                                <IconButton edge="end" aria-label="delete"
+                                                            onClick={(e) => handleDeleteChat(e, chat.id)}>
+                                                    <DeleteIcon/>
                                                 </IconButton>
                                             }
                                         >
-                                            <ListItemButton role={undefined} onClick={() => handleToggleChat(chat.id)} dense>
+                                            <ListItemButton role={undefined} onClick={() => handleToggleChat(chat.id)}
+                                                            dense>
                                                 <ListItemIcon>
                                                     <Checkbox
                                                         edge="start"
                                                         checked={selectedChatId === chat.id}
                                                         tabIndex={-1}
                                                         disableRipple
-                                                        inputProps={{ 'aria-labelledby': labelId }}
+                                                        inputProps={{'aria-labelledby': labelId}}
                                                     />
                                                 </ListItemIcon>
-                                                <ListItemText id={labelId} primary={chat.title} secondary={`${chat.type} (ID: ${chat.id})`} />
+                                                <ListItemText id={labelId} primary={chat.title}
+                                                              secondary={`${chat.type} (ID: ${chat.id})`}/>
                                             </ListItemButton>
                                         </ListItem>
                                     );
                                 })}
                                 {chats.length === 0 && (
                                     <ListItem>
-                                        <ListItemText primary="暂无聊天记录，请先刷新或与机器人交互" />
+                                        <ListItemText primary="暂无聊天记录，请先刷新或与机器人交互"/>
                                     </ListItem>
                                 )}
                             </List>
@@ -233,7 +252,8 @@ const Home: React.FC = () => {
                 </Grid>
                 <Grid size={{xs: 12}}>
                     <Box mt={2}>
-                        <Button variant="contained" color="primary" onClick={handleSend} disabled={!selectedChatId || !text || !isTokenSet}>
+                        <Button variant="contained" color="primary" onClick={handleSend}
+                                disabled={!selectedChatId || !text || !isTokenSet}>
                             发送消息
                         </Button>
                     </Box>
@@ -285,7 +305,8 @@ const Home: React.FC = () => {
                 </DialogTitle>
                 <DialogContent>
                     <DialogContentText id="alert-dialog-delete-description">
-                        您确定要删除聊天 "{chats.find(c => c.id === chatToDeleteId)?.title || chatToDeleteId}" 吗？此操作将从列表中移除该聊天。如果已经选中此聊天，选中状态不会修改。
+                        您确定要删除聊天 "{chats.find(c => c.id === chatToDeleteId)?.title || chatToDeleteId}"
+                        吗？此操作将从列表中移除该聊天。如果已经选中此聊天，选中状态不会修改。
                     </DialogContentText>
                 </DialogContent>
                 <DialogActions>

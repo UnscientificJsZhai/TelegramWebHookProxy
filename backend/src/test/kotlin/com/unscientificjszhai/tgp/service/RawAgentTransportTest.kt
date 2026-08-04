@@ -29,6 +29,7 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -214,7 +215,8 @@ class RawAgentTransportTest {
 
         assertEquals("schema preserved", service.sendMessage("check schema"))
         val payload = assertNotNull(server.takeRequest()).body!!.utf8()
-        assertTrue(payload.contains("schema_constrained"))
+        assertFalse(payload.contains("schema_constrained"))
+        assertTrue(Regex("mcp_[A-Za-z0-9_-]{43}").containsMatchIn(payload))
         assertTrue(payload.contains("\"anyOf\""))
         assertTrue(payload.contains("\"maxLength\":12"))
         assertTrue(payload.contains("\"minimum\":1.0"))

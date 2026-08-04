@@ -379,6 +379,66 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
+     * 验证历史非法 MCP 列表 fail-closed 为无连接列表，保留其余 AI 设置和原始文件直到显式替换。
+     */
+    @Test
+    fun `historical invalid MCP configuration preserves AI settings until explicitly replaced`() {
+        val barrier = ModelSwitchBarrier()
+        val configFile = File(tempDirectory, "historical-invalid-mcp.json")
+        val originalContent =
+            """
+            {"telegramToken":"100:token","chatId":"chat","ai":{"provider":"OPENAI","openAiApiKey":"key","agentEnabled":true,"mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}]}}
+            """.trimIndent()
+        configFile.writeText(originalContent)
+        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val recoveredSettings = repository.settingsFlow.value
+
+        assertEquals(AIProvider.OPENAI, recoveredSettings.ai?.provider)
+        assertEquals("key", recoveredSettings.ai?.openAiApiKey)
+        assertTrue(recoveredSettings.ai?.mcpServers.orEmpty().isEmpty())
+        assertTrue(repository.hasHistoricalInvalidMcp)
+        assertEquals(originalContent, configFile.readText())
+
+        assertFailsWith<IllegalArgumentException> {
+            repository.updateSettings { current -> current.copy(chatId = "unrelated-change") }
+        }
+        assertEquals(recoveredSettings, repository.settingsFlow.value)
+        assertEquals(originalContent, configFile.readText())
+        assertFalse(barrier.isSwitching)
+
+        val resolved = recoveredSettings.copy(
+            chatId = "resolved-chat",
+            ai = recoveredSettings.ai!!.copy(mcpServers = emptyList()),
+        )
+        repository.updateSettings(replacesHistoricalInvalidMcpServers = true) { resolved }
+
+        assertEquals(resolved, repository.settingsFlow.value)
+        assertFalse(repository.hasHistoricalInvalidMcp)
+        assertFalse(barrier.isSwitching)
+    }
+
+    /**
+     * 验证从备份恢复的历史非法 MCP 配置也不会触发连接，并保持显式替换保护。
+     */
+    @Test
+    fun `recovered historical invalid MCP configuration remains fail closed`() {
+        val configFile = File(tempDirectory, "recovered-invalid-mcp.json")
+        val backupFile = File(tempDirectory, "recovered-invalid-mcp.json.bak")
+        val backupContent =
+            """
+            {"telegramToken":"100:token","ai":{"geminiApiKey":"key","mcpServers":[{"name":"bad","url":"https://user:secret@mcp.example.com","headers":{}}]}}
+            """.trimIndent()
+        configFile.writeText("{ invalid")
+        backupFile.writeText(backupContent)
+
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+        assertTrue(repository.settingsFlow.value.ai?.mcpServers.orEmpty().isEmpty())
+        assertTrue(repository.hasHistoricalInvalidMcp)
+        assertEquals(backupContent, configFile.readText())
+    }
+
+    /**
      * 验证缺少类型且端口非法的旧代理不会被迁移或改写，并保留其他设置。
      */
     @Test

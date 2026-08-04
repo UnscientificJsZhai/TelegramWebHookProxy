@@ -23,7 +23,23 @@ export const saveVersionedSettings = async <T>(
     if (!etag) {
         throw new Error('Missing settings ETag');
     }
-    const response = await api.post<T>('/settings', settings, {
+    const response = await api.put<T>('/settings', settings, {
+        headers: {'If-Match': etag}
+    });
+    return {
+        settings: response.data,
+        etag: responseETag(response.headers)
+    };
+};
+
+export const patchVersionedSettings = async <T>(
+    patch: Partial<T>,
+    etag: string | null
+): Promise<VersionedSettings<T>> => {
+    if (!etag) {
+        throw new Error('Missing settings ETag');
+    }
+    const response = await api.patch<T>('/settings', patch, {
         headers: {'If-Match': etag}
     });
     return {

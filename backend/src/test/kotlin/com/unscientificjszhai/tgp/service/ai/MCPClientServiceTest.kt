@@ -18,6 +18,29 @@ import kotlin.time.Duration.Companion.seconds
 class MCPClientServiceTest {
 
     /**
+     * 验证直接调用 connect 会在断开已有连接前校验完整列表，非法配置不会扰动当前状态。
+     */
+    @Test
+    fun `invalid direct connect leaves existing MCP connections untouched`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        val validConfig = MCPServerConfig(name = "server", url = "https://example.com/mcp")
+        val invalidConfig = MCPServerConfig(name = "invalid", url = "ftp://example.com/mcp")
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools() } returns ListToolsResult(emptyList())
+        coEvery { client.close() } returns Unit
+
+        service.connect(listOf(validConfig))
+        assertFailsWith<IllegalArgumentException> {
+            service.connect(listOf(invalidConfig))
+        }
+
+        coVerify(exactly = 1) { client.connect(any()) }
+        coVerify(exactly = 0) { client.close() }
+        service.close().join()
+    }
+
+    /**
      * 验证同名 MCP 配置更新时的重连设计。
      *
      * 验证旧连接会关闭，且服务会使用新配置建立连接。

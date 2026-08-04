@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service.ai
 
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.MCPServerConfig
+import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.*
@@ -95,19 +96,22 @@ class MCPClientService internal constructor(
      * 但不会阻止处理其余服务器；取消协程时会关闭正在建立的客户端并重新抛出取消异常。服务关闭后
      * 调用会失败，不会重新建立连接。
      *
-     * @param configs 目标 MCP 服务器配置列表；列表为空时断开所有当前服务器，服务器名称应在
-     * 列表内唯一。
+     * @param configs 目标 MCP 服务器配置列表；列表为空时断开所有当前服务器。方法会在连接互斥锁内先复制并
+     * 校验列表及请求头，服务器名称应在复制后的列表内唯一且符合 [validateMcpServerConfigs] 的连接边界。
      * @throws IllegalStateException 当服务已经 [close] 时抛出。
+     * @throws IllegalArgumentException [configs] 包含不合法 MCP 配置时抛出；不会断开已有连接或发布部分状态。
      */
     suspend fun connect(configs: List<MCPServerConfig>) {
         ensureOpen()
         connectionMutex.withLock {
             ensureOpen()
-            val newNames = configs.map { it.name }.toSet()
+            val requestedConfigs = configs.map { config -> config.copy(headers = config.headers.toMap()) }
+            validateMcpServerConfigs(requestedConfigs)
+            val newNames = requestedConfigs.map { it.name }.toSet()
             val toRemove = currentConnectionState().clients.keys - newNames
             toRemove.forEach { disconnectLocked(it) }
 
-            for (config in configs) {
+            for (config in requestedConfigs) {
                 val previousConfig = currentConnectionState().configs[config.name]
                 if (previousConfig != null && previousConfig != config) {
                     disconnectLocked(config.name)

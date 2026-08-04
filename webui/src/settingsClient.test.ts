@@ -1,13 +1,19 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
-import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from './settingsClient';
+import {
+    fetchVersionedSettings,
+    isSettingsConflict,
+    patchVersionedSettings,
+    saveVersionedSettings
+} from './settingsClient';
 
-const {get, post} = vi.hoisted(() => ({
+const {get, patch, put} = vi.hoisted(() => ({
     get: vi.fn(),
-    post: vi.fn(),
+    patch: vi.fn(),
+    put: vi.fn(),
 }));
 
 vi.mock('./api', () => ({
-    default: {get, post},
+    default: {get, patch, put},
 }));
 
 describe('带修订值的设置 API', () => {
@@ -28,7 +34,7 @@ describe('带修订值的设置 API', () => {
     });
 
     it('保存时发送 If-Match 并采用响应设置和新 ETag', async () => {
-        post.mockResolvedValueOnce({
+        put.mockResolvedValueOnce({
             data: {chatId: 'server-value'},
             headers: {etag: '"revision-2"'},
         });
@@ -37,7 +43,7 @@ describe('带修订值的设置 API', () => {
             settings: {chatId: 'server-value'},
             etag: '"revision-2"',
         });
-        expect(post).toHaveBeenCalledWith(
+        expect(put).toHaveBeenCalledWith(
             '/settings',
             {chatId: 'edited'},
             {headers: {'If-Match': '"revision-1"'}},
@@ -46,7 +52,26 @@ describe('带修订值的设置 API', () => {
 
     it('缺少 ETag 时不发送保存请求', async () => {
         await expect(saveVersionedSettings({chatId: 'edited'}, null)).rejects.toThrow('Missing settings ETag');
-        expect(post).not.toHaveBeenCalled();
+        expect(put).not.toHaveBeenCalled();
+    });
+
+    it('局部保存使用 PATCH、If-Match 和响应 ETag', async () => {
+        patch.mockResolvedValueOnce({
+            data: {chatId: 'selected-chat'},
+            headers: {etag: '"revision-3"'},
+        });
+
+        await expect(patchVersionedSettings<{
+            chatId: string
+        }>({chatId: 'selected-chat'}, '"revision-2"')).resolves.toEqual({
+            settings: {chatId: 'selected-chat'},
+            etag: '"revision-3"',
+        });
+        expect(patch).toHaveBeenCalledWith(
+            '/settings',
+            {chatId: 'selected-chat'},
+            {headers: {'If-Match': '"revision-2"'}},
+        );
     });
 
     it.each([412, 428])('将 HTTP %s 识别为并发冲突', status => {

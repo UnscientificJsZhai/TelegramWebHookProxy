@@ -3,6 +3,9 @@ package com.unscientificjszhai.tgp.models
 import kotlinx.serialization.Serializable
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.URI
+import java.nio.charset.StandardCharsets
+import java.util.Locale
 
 /**
  * 应用运行所需的持久化设置。
@@ -270,15 +273,118 @@ enum class AIProvider {
 /**
  * MCP 服务器的连接配置。
  *
- * @property name 服务器显示名称；用于在连接集合中标识该服务器。
- * @property url MCP 服务器的连接地址；必须是客户端支持的 URL。
- * @property headers 连接请求附加的 HTTP 请求头；空映射表示不附加请求头。
+ * @property name 服务器显示名称；列表内精确唯一，长度为 `1..64`，且仅可使用 ASCII 字母、数字、`_` 与 `-`。
+ * @property url MCP 服务器的连接地址；必须为无用户信息、无片段且包含主机名的绝对 `http` 或 `https` URL。
+ * @property headers 连接请求附加的 HTTP 请求头；名称必须是 HTTP token，值必须为可见 ASCII 字符，且不能覆盖
+ * 路由控制请求头；空映射表示不附加请求头。
  */
 @Serializable
 data class MCPServerConfig(
     val name: String,
     val url: String,
     val headers: Map<String, String> = emptyMap(),
+)
+
+/**
+ * 校验 MCP 服务器配置是否满足持久化、连接和工具发现共用的安全边界。
+ *
+ * 配置名称在列表内精确唯一且只能使用安全 ASCII 字符；每个 URL 都必须是没有用户信息或片段的绝对、小写
+ * `http` 或 `https` 地址。请求头会作为固定的 MCP 连接头，名称必须是 HTTP token，值只能使用可见 ASCII
+ * 字符，并且不得覆盖路由控制请求头。
+ *
+ * @param configs 要校验的 MCP 服务器配置列表；最多包含 [MAX_MCP_SERVER_CONFIGS] 项。
+ * @throws IllegalArgumentException 服务器数量、名称、URL 或请求头不符合 MCP 连接边界时抛出。
+ */
+fun validateMcpServerConfigs(configs: List<MCPServerConfig>) {
+    require(configs.size <= MAX_MCP_SERVER_CONFIGS) { "MCP 服务器不能超过 $MAX_MCP_SERVER_CONFIGS 个。" }
+    val names = HashSet<String>()
+    configs.forEach { config ->
+        require(config.name.length in 1..MAX_MCP_SERVER_NAME_LENGTH && config.name.all(::isMcpServerNameCharacter)) {
+            "MCP 服务器名称必须是长度为 1..$MAX_MCP_SERVER_NAME_LENGTH 的 ASCII 字母、数字、下划线或连字符。"
+        }
+        require(names.add(config.name)) { "MCP 服务器名称不能重复。" }
+        validateMcpServerUrl(config.url)
+        validateMcpHeaders(config.headers)
+    }
+}
+
+/** MCP 服务器数量上限。 */
+const val MAX_MCP_SERVER_CONFIGS = 16
+
+/** MCP 服务器名称最大 ASCII 字符数。 */
+const val MAX_MCP_SERVER_NAME_LENGTH = 64
+
+/** MCP 服务器 URL 最大 UTF-16 字符数。 */
+const val MAX_MCP_SERVER_URL_LENGTH = 2_048
+
+/** 单个 MCP 服务器允许的请求头数量上限。 */
+const val MAX_MCP_SERVER_HEADERS = 32
+
+/** 单个 MCP 请求头名称最大 UTF-8 字节数。 */
+const val MAX_MCP_HEADER_NAME_LENGTH = 128
+
+/** 单个 MCP 请求头值最大 UTF-8 字节数。 */
+const val MAX_MCP_HEADER_VALUE_LENGTH = 4_096
+
+/** 单个 MCP 服务器全部请求头 UTF-8 字节数上限。 */
+const val MAX_MCP_HEADERS_TOTAL_BYTES = 16_384
+
+private fun validateMcpServerUrl(value: String) {
+    require(value.length in 1..MAX_MCP_SERVER_URL_LENGTH) {
+        "MCP 服务器 URL 长度必须在 1..$MAX_MCP_SERVER_URL_LENGTH 个字符范围内。"
+    }
+    require(value.none { it.isWhitespace() || it.isISOControl() }) { "MCP 服务器 URL 不能包含空白或控制字符。" }
+    val url = runCatching { URI(value) }.getOrElse { throw IllegalArgumentException("MCP 服务器 URL 格式不合法。") }
+    require(url.isAbsolute && url.scheme in setOf("http", "https")) {
+        "MCP 服务器 URL 必须是绝对 http 或 https 地址。"
+    }
+    require(!url.host.isNullOrBlank()) { "MCP 服务器 URL 必须包含主机名。" }
+    require(url.userInfo == null) { "MCP 服务器 URL 不能包含用户信息。" }
+    require(url.fragment == null) { "MCP 服务器 URL 不能包含片段。" }
+    require(url.port == -1 || url.port in 1..65535) { "MCP 服务器 URL 端口必须在 1..65535 范围内。" }
+}
+
+private fun validateMcpHeaders(headers: Map<String, String>) {
+    require(headers.size <= MAX_MCP_SERVER_HEADERS) { "MCP 请求头不能超过 $MAX_MCP_SERVER_HEADERS 个。" }
+    val normalizedNames = HashSet<String>()
+    var totalBytes = 0
+    headers.forEach { (name, value) ->
+        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
+        val valueBytes = value.toByteArray(StandardCharsets.UTF_8)
+        require(nameBytes.size in 1..MAX_MCP_HEADER_NAME_LENGTH && name.all(::isMcpHeaderTokenCharacter)) {
+            "MCP 请求头名称必须是长度不超过 $MAX_MCP_HEADER_NAME_LENGTH 的 HTTP token。"
+        }
+        require(normalizedNames.add(name.lowercase(Locale.ROOT))) { "MCP 请求头名称不能按大小写重复。" }
+        require(name.lowercase(Locale.ROOT) !in MCP_FORBIDDEN_HEADER_NAMES) { "MCP 请求头不能覆盖路由控制头。" }
+        require(valueBytes.size <= MAX_MCP_HEADER_VALUE_LENGTH) {
+            "MCP 请求头值不能超过 $MAX_MCP_HEADER_VALUE_LENGTH 个字节。"
+        }
+        require(value.all(::isVisibleAsciiCharacter)) { "MCP 请求头值只能包含可见 ASCII 字符。" }
+        totalBytes += nameBytes.size + MCP_HEADER_LINE_DELIMITER_BYTES + valueBytes.size + MCP_HEADER_LINE_END_BYTES
+        require(totalBytes <= MAX_MCP_HEADERS_TOTAL_BYTES) {
+            "MCP 请求头总大小不能超过 $MAX_MCP_HEADERS_TOTAL_BYTES 字节。"
+        }
+    }
+}
+
+private fun isMcpHeaderTokenCharacter(character: Char): Boolean =
+    character.isAsciiLetterOrDigit() || character == '$' || character in "!#%&'*+-.^_`|~"
+
+private fun isMcpServerNameCharacter(character: Char): Boolean =
+    character.isAsciiLetterOrDigit() || character == '_' || character == '-'
+
+private fun isVisibleAsciiCharacter(character: Char): Boolean = character.code in 32..126
+
+private const val MCP_HEADER_LINE_DELIMITER_BYTES = 2
+private const val MCP_HEADER_LINE_END_BYTES = 2
+private val MCP_FORBIDDEN_HEADER_NAMES = setOf(
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
 )
 
 /**

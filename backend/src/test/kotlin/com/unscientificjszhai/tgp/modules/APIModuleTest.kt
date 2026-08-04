@@ -25,6 +25,10 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
@@ -32,7 +36,13 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+
+private val completeSettingsJson = Json {
+    encodeDefaults = true
+    explicitNulls = true
+}
 
 /**
  * 设置 HTTP API 的测试设计。
@@ -59,10 +69,10 @@ class APIModuleTest {
         )
 
         val revision = currentSettingsETag()
-        client.post("/api/settings") {
+        client.put("/api/settings") {
             header(HttpHeaders.IfMatch, revision)
             header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-            setBody(Json.encodeToString(testSettings))
+            setBody(completeSettingsJson.encodeToString(testSettings))
         }.apply {
             assertEquals(HttpStatusCode.OK, status)
             assertEquals(testSettings, Json.decodeFromString<AppSettings>(bodyAsText()))
@@ -96,9 +106,9 @@ class APIModuleTest {
     fun `settings API enforces strong If-Match preconditions`() = withTestApi { repository, _, configFile ->
         val requested = AppSettings(telegramToken = "100:requested")
 
-        client.post("/api/settings") {
+        client.put("/api/settings") {
             contentType(ContentType.Application.Json)
-            setBody(Json.encodeToString(requested))
+            setBody(completeSettingsJson.encodeToString(requested))
         }.apply {
             assertEquals(HttpStatusCode(428, "Precondition Required"), status)
         }
@@ -108,10 +118,10 @@ class APIModuleTest {
             "\"${repository.currentSettingsSnapshot().revision}\", \"other\"",
             "\"not-a-sha256\"",
         ).forEach { invalid ->
-            client.post("/api/settings") {
+            client.put("/api/settings") {
                 header(HttpHeaders.IfMatch, invalid)
                 contentType(ContentType.Application.Json)
-                setBody(Json.encodeToString(requested))
+                setBody(completeSettingsJson.encodeToString(requested))
             }.apply {
                 assertEquals(HttpStatusCode.BadRequest, status)
             }
@@ -120,10 +130,10 @@ class APIModuleTest {
         val staleETag = currentSettingsETag()
         repository.updateSettings { it.copy(chatId = "concurrent-chat") }
         val contentBeforeStaleWrite = configFile.readText()
-        client.post("/api/settings") {
+        client.put("/api/settings") {
             header(HttpHeaders.IfMatch, staleETag)
             contentType(ContentType.Application.Json)
-            setBody(Json.encodeToString(requested))
+            setBody(completeSettingsJson.encodeToString(requested))
         }.apply {
             assertEquals(HttpStatusCode.PreconditionFailed, status)
         }
@@ -140,16 +150,17 @@ class APIModuleTest {
         val staleETag = currentSettingsETag()
 
         client.post("/api/settings/chat") {
+            header(HttpHeaders.IfMatch, staleETag)
             contentType(ContentType.Application.Json)
             setBody("""{"chatId":"new-chat"}""")
         }.apply {
             assertEquals(HttpStatusCode.OK, status)
         }
 
-        client.post("/api/settings") {
+        client.put("/api/settings") {
             header(HttpHeaders.IfMatch, staleETag)
             contentType(ContentType.Application.Json)
-            setBody(Json.encodeToString(AppSettings(telegramToken = "100:new-token")))
+            setBody(completeSettingsJson.encodeToString(AppSettings(telegramToken = "100:new-token")))
         }.apply {
             assertEquals(HttpStatusCode.PreconditionFailed, status)
         }
@@ -180,10 +191,10 @@ class APIModuleTest {
         )
 
         val revision = currentSettingsETag()
-        client.post("/api/settings") {
+        client.put("/api/settings") {
             header(HttpHeaders.IfMatch, revision)
             header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-            setBody(Json.encodeToString(unsafe))
+            setBody(completeSettingsJson.encodeToString(unsafe))
         }.apply {
             assertEquals(HttpStatusCode.BadRequest, status)
         }
@@ -206,10 +217,10 @@ class APIModuleTest {
 
         suspend fun save(settings: AppSettings): AppSettings {
             val revision = currentSettingsETag()
-            client.post("/api/settings") {
+            client.put("/api/settings") {
                 header(HttpHeaders.IfMatch, revision)
                 header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-                setBody(Json.encodeToString(settings))
+                setBody(completeSettingsJson.encodeToString(settings))
             }.apply {
                 assertEquals(HttpStatusCode.OK, status)
             }
@@ -281,10 +292,10 @@ class APIModuleTest {
         )
 
         val revision = currentSettingsETag()
-        client.post("/api/settings") {
+        client.put("/api/settings") {
             header(HttpHeaders.IfMatch, revision)
             contentType(ContentType.Application.Json)
-            setBody(Json.encodeToString(openAiSettings))
+            setBody(completeSettingsJson.encodeToString(openAiSettings))
         }.apply {
             assertEquals(HttpStatusCode.OK, status)
         }
@@ -303,11 +314,11 @@ class APIModuleTest {
             val originalContent = configFile.readText()
 
             val revision = currentSettingsETag()
-            client.post("/api/settings") {
+            client.put("/api/settings") {
                 header(HttpHeaders.IfMatch, revision)
                 contentType(ContentType.Application.Json)
                 setBody(
-                    Json.encodeToString(
+                    completeSettingsJson.encodeToString(
                         original.copy(
                             telegramToken = "200:new",
                             proxy = ProxySettings("proxy.example.com", 0, ProxyType.HTTP),
@@ -318,7 +329,7 @@ class APIModuleTest {
                 assertEquals(HttpStatusCode.BadRequest, status)
             }
 
-            client.post("/api/settings") {
+            client.put("/api/settings") {
                 header(HttpHeaders.IfMatch, revision)
                 contentType(ContentType.Application.Json)
                 setBody("""{"proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"}}""")
@@ -354,6 +365,7 @@ class APIModuleTest {
                 application { configureTestApi(appComponent) }
 
                 client.post("/api/settings/chat") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
                     contentType(ContentType.Application.Json)
                     setBody("""{"chatId":"new-chat"}""")
                 }.apply {
@@ -367,10 +379,10 @@ class APIModuleTest {
                     proxy = ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS),
                 )
                 val revision = currentSettingsETag()
-                client.post("/api/settings") {
+                client.put("/api/settings") {
                     header(HttpHeaders.IfMatch, revision)
                     contentType(ContentType.Application.Json)
-                    setBody(Json.encodeToString(resolvedSettings))
+                    setBody(completeSettingsJson.encodeToString(resolvedSettings))
                 }.apply {
                     assertEquals(HttpStatusCode.OK, status)
                 }
@@ -417,6 +429,7 @@ class APIModuleTest {
                 application { configureTestApi(appComponent) }
 
                 client.post("/api/settings/chat") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
                     contentType(ContentType.Application.Json)
                     setBody("""{"chatId":"new-chat"}""")
                 }.apply {
@@ -425,6 +438,7 @@ class APIModuleTest {
 
                 blockBackupRead = false
                 client.post("/api/settings/chat") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
                     contentType(ContentType.Application.Json)
                     setBody("""{"chatId":"new-chat"}""")
                 }.apply {
@@ -433,6 +447,7 @@ class APIModuleTest {
                 assertEquals(recovered, repository.settingsFlow.value)
 
                 client.post("/api/settings/chat") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
                     contentType(ContentType.Application.Json)
                     setBody("""{"chatId":"new-chat"}""")
                 }.apply {
@@ -448,6 +463,308 @@ class APIModuleTest {
         } finally {
             temporaryDirectory.deleteRecursively()
         }
+    }
+
+    /**
+     * 验证历史非法 MCP 列表不能被无关聊天更新覆盖，只有请求中明确给出 `mcpServers` 的更新才能替换它。
+     */
+    @Test
+    fun `settings routes require an explicit MCP replacement for historical invalid configuration`() {
+        val temporaryDirectory = createTempDirectory("api-invalid-mcp-history-test").toFile()
+        try {
+            val configFile = temporaryDirectory.resolve("settings.json")
+            val historicalContent =
+                """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}]}}"""
+            configFile.writeText(historicalContent)
+            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            val recoveredSettings = repository.settingsFlow.value
+            val recoveredUpdate = repository.settingsUpdateFlow.value
+            val telegramService = mockk<TelegramService>(relaxed = true)
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.settingsRepository } returns repository
+            every { appComponent.telegramService } returns telegramService
+
+            testApplication {
+                application { configureTestApi(appComponent) }
+
+                client.post("/api/settings/chat") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"chatId":"new-chat"}""")
+                }.apply {
+                    assertEquals(HttpStatusCode.Conflict, status)
+                }
+                assertEquals(recoveredSettings, repository.settingsFlow.value)
+                assertEquals(historicalContent, configFile.readText())
+
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"ai":{"mcpServers":[]}}""")
+                }.apply {
+                    assertEquals(HttpStatusCode.OK, status)
+                }
+                assertFalse(repository.hasHistoricalInvalidMcp)
+                assertTrue(repository.settingsFlow.value.ai?.mcpServers.orEmpty().isEmpty())
+                assertEquals(recoveredUpdate, repository.settingsUpdateFlow.value)
+                assertFalse(configFile.readText() == historicalContent)
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /**
+     * 验证完整写入拒绝顶层和嵌套未知字段、缺失嵌套字段及宽松 JSON，且错误不回显敏感请求内容。
+     */
+    @Test
+    fun `strict complete settings reject unknown incomplete and malformed JSON safely`() =
+        withTestApi { repository, _, _ ->
+            val original =
+                AppSettings(telegramToken = "100:stored-secret", ai = AISettings(geminiApiKey = "stored-key"))
+            repository.saveSettings(original)
+            val revision = currentSettingsETag()
+
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"telegramToken":"100:request-secret","chatId":"","proxy":null,"ai":null,"telegramTokne":"typo"}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+                assertFalse(bodyAsText().contains("request-secret"))
+                assertFalse(bodyAsText().contains("stored-secret"))
+            }
+
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"telegramToken":"","chatId":"","proxy":null,"ai":{}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+
+            val complete = completeSettingsJson.encodeToJsonElement(original).jsonObject
+            val aiWithUnknownField = buildJsonObject {
+                complete.forEach { (key, value) -> put(key, value) }
+                put("ai", buildJsonObject {
+                    complete.getValue("ai").jsonObject.forEach { (key, value) -> put(key, value) }
+                    put("unknownNestedField", true)
+                })
+            }
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
+                contentType(ContentType.Application.Json)
+                setBody(aiWithUnknownField.toString())
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"telegramToken":"","chatId":"","proxy":null,"ai":null,}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+            assertEquals(original, repository.settingsFlow.value)
+        }
+
+    /**
+     * 验证 PATCH 区分缺失、显式 null 和值；对象递归合并而列表及动态 headers 映射整体替换。
+     */
+    @Test
+    fun `settings patch merges objects and replaces collections with strict null semantics`() =
+        withTestApi { repository, _, _ ->
+            val original = AppSettings(
+                telegramToken = "100:token",
+                proxy = ProxySettings(
+                    "proxy.example.com",
+                    1080,
+                    ProxyType.HTTP,
+                    username = "user",
+                    password = "password"
+                ),
+                ai = AISettings(
+                    selectedModel = "models/kept",
+                    mcpServers = listOf(
+                        com.unscientificjszhai.tgp.models.MCPServerConfig(
+                            name = "old",
+                            url = "https://old.example.com/mcp",
+                            headers = mapOf("X-Old" to "old"),
+                        ),
+                    ),
+                ),
+            )
+            repository.saveSettings(original)
+            val revision = currentSettingsETag()
+
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
+                contentType(ContentType.Application.Json)
+                setBody(
+                    """
+                {"proxy":{"username":null},"ai":{"mcpServers":[
+                  {"name":"replacement","url":"https://new.example.com/mcp","headers":{"Authorization":"new","X-Dynamic":"allowed"}}
+                ]}}
+                """.trimIndent(),
+                )
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+                assertEquals("models/kept", Json.decodeFromString<AppSettings>(bodyAsText()).ai?.selectedModel)
+                assertNotNull(headers[HttpHeaders.ETag])
+            }
+            val patched = repository.settingsFlow.value
+            assertEquals("proxy.example.com", patched.proxy?.host)
+            assertEquals(null, patched.proxy?.username)
+            assertEquals("password", patched.proxy?.password)
+            assertEquals(
+                mapOf("Authorization" to "new", "X-Dynamic" to "allowed"),
+                patched.ai?.mcpServers?.single()?.headers,
+            )
+
+            val invalidNullRevision = currentSettingsETag()
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, invalidNullRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"telegramToken":null}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, invalidNullRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"ai":{"geminiApiKey":null}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, invalidNullRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"ai":{"unknownNestedField":"no"}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+            }
+            assertEquals(patched, repository.settingsFlow.value)
+
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, invalidNullRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"proxy":null,"ai":null}""")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+            assertEquals(null, repository.settingsFlow.value.proxy)
+            assertEquals(null, repository.settingsFlow.value.ai)
+        }
+
+    /**
+     * 验证 PUT、PATCH 和兼容聊天端点共享 ETag 条件写入、模型清理和机器人命令副作用。
+     */
+    @Test
+    fun `settings write routes share etag model clearing and command side effects`() =
+        withTestApi { repository, telegramService, _ ->
+            val original = AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(
+                    provider = AIProvider.GEMINI,
+                    geminiApiKey = "gemini-key",
+                    selectedModel = "models/selected",
+                    agentEnabled = true,
+                ),
+            )
+            repository.saveSettings(original)
+            val staleRevision = currentSettingsETag()
+
+            val afterKeyPatch = client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, staleRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"ai":{"geminiApiKey":"replacement-key"}}""")
+            }
+            assertEquals(HttpStatusCode.OK, afterKeyPatch.status)
+            val keyPatchRevision = assertNotNull(afterKeyPatch.headers[HttpHeaders.ETag])
+            assertEquals("", repository.settingsFlow.value.ai?.selectedModel)
+
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, staleRevision)
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(repository.settingsFlow.value))
+            }.apply {
+                assertEquals(HttpStatusCode.PreconditionFailed, status)
+            }
+
+            val afterChatUpdate = client.post("/api/settings/chat") {
+                header(HttpHeaders.IfMatch, keyPatchRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"chatId":"new-chat"}""")
+            }
+            assertEquals(HttpStatusCode.OK, afterChatUpdate.status)
+            val chatRevision = assertNotNull(afterChatUpdate.headers[HttpHeaders.ETag])
+
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, keyPatchRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"telegramToken":"200:stale"}""")
+            }.apply {
+                assertEquals(HttpStatusCode.PreconditionFailed, status)
+            }
+
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, chatRevision)
+                contentType(ContentType.Application.Json)
+                setBody("""{"ai":{"provider":"OPENAI","openAiApiKey":"openai-key","selectedModel":"gpt-selected"}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+            assertEquals("", repository.settingsFlow.value.ai?.selectedModel)
+            coVerify(exactly = 1) { telegramService.updateBotCommands("100:token", AIProvider.OPENAI) }
+        }
+
+    /** 验证兼容 POST 仍使用与 PUT 相同的完整严格设置契约。 */
+    @Test
+    fun `post settings remains a strict complete replacement compatibility route`() = withTestApi { repository, _, _ ->
+        val requested = AppSettings(telegramToken = "100:post-compatible")
+        val revision = currentSettingsETag()
+
+        client.post("/api/settings") {
+            header(HttpHeaders.IfMatch, revision)
+            contentType(ContentType.Application.Json)
+            setBody(completeSettingsJson.encodeToString(requested))
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertNotNull(headers[HttpHeaders.ETag])
+        }
+        assertEquals(requested, repository.settingsFlow.value)
+    }
+
+    /**
+     * 验证读取和成功写入响应包含严格 PUT 所需的默认值及显式 null，可直接作为完整请求体回写。
+     */
+    @Test
+    fun `settings responses are complete strict PUT representations`() = withTestApi { repository, _, _ ->
+        val original = AppSettings(
+            telegramToken = "100:roundtrip",
+            proxy = ProxySettings("proxy.example.com", 1080, ProxyType.HTTP, username = null, password = null),
+            ai = AISettings(),
+        )
+        repository.saveSettings(original)
+
+        val getResponse = client.get("/api/settings")
+        assertEquals(HttpStatusCode.OK, getResponse.status)
+        val body = getResponse.bodyAsText()
+        assertTrue(body.contains("\"username\":null"))
+        assertTrue(body.contains("\"password\":null"))
+        assertTrue(body.contains("\"httpToolSettings\""))
+        val revision = assertNotNull(getResponse.headers[HttpHeaders.ETag])
+
+        client.put("/api/settings") {
+            header(HttpHeaders.IfMatch, revision)
+            contentType(ContentType.Application.Json)
+            setBody(body)
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertEquals(original, completeSettingsJson.decodeFromString<AppSettings>(bodyAsText()))
+        }
+        assertEquals(original, repository.settingsFlow.value)
     }
 
     private fun withTestApi(test: suspend ApplicationTestBuilder.(SettingsRepository, TelegramService, File) -> Unit) {

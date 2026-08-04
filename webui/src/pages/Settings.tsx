@@ -23,20 +23,14 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
 import {useNavigate} from 'react-router-dom';
 import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from '../settingsClient';
+import {parseMcpHeaders, validateMcpServers, type MCPServerConfig} from './mcpSettingsValidation';
 
 interface ProxySettings {
     host: string;
     port: number;
     type: string;
-    username?: string;
-    password?: string;
-}
-
-interface MCPServerConfig {
-    name: string;
-    url: string;
-    headers: Record<string, string>;
-    _headerString?: string;
+    username: string | null;
+    password: string | null;
 }
 
 interface AISettings {
@@ -51,6 +45,14 @@ interface AISettings {
     autoCleanContextIntervalMinutes: number;
     silentContextCleanup: boolean;
     mcpServers: MCPServerConfig[];
+    httpToolSettings: HttpToolSettings;
+}
+
+interface HttpToolSettings {
+    enabled: boolean;
+    targets: unknown[];
+    requestTimeoutMillis: number;
+    maxConcurrentRequests: number;
 }
 
 interface AppSettings {
@@ -71,15 +73,30 @@ const defaultAiSettings: AISettings = {
     globalContext: '',
     autoCleanContextIntervalMinutes: 0,
     silentContextCleanup: false,
-    mcpServers: []
+    mcpServers: [],
+    httpToolSettings: {
+        enabled: false,
+        targets: [],
+        requestTimeoutMillis: 10000,
+        maxConcurrentRequests: 2
+    }
 };
 
 const normalizeSettings = (settings: AppSettings): AppSettings => ({
     ...settings,
+    proxy: settings.proxy ? {
+        ...settings.proxy,
+        username: settings.proxy.username ?? null,
+        password: settings.proxy.password ?? null
+    } : null,
     ai: settings.ai ? {
         ...defaultAiSettings,
         ...settings.ai,
-        mcpServers: settings.ai.mcpServers || []
+        mcpServers: settings.ai.mcpServers || [],
+        httpToolSettings: {
+            ...defaultAiSettings.httpToolSettings,
+            ...settings.ai.httpToolSettings
+        }
     } : null
 });
 
@@ -124,11 +141,14 @@ const Settings: React.FC = () => {
         if (section === 'proxy') {
             setSettings(prev => {
                 if (!prev || !prev.proxy) return prev;
+                const proxyValue = field === 'port'
+                    ? Number(value)
+                    : ((field === 'username' || field === 'password') && value === '' ? null : value);
                 return {
                     ...prev,
                     proxy: {
                         ...prev.proxy,
-                        [field]: value
+                        [field]: proxyValue
                     }
                 };
             });
@@ -214,7 +234,9 @@ const Settings: React.FC = () => {
                 proxy: {
                     host: '127.0.0.1',
                     port: 7890,
-                    type: 'HTTP'
+                    type: 'HTTP',
+                    username: null,
+                    password: null
                 }
             }));
         } else {
@@ -330,16 +352,7 @@ const Settings: React.FC = () => {
             const ai = prev.ai || defaultAiSettings;
             const updatedServers = [...(ai.mcpServers || [])];
 
-            let parsedHeaders = updatedServers[index].headers;
-            try {
-                if (headerString.trim() !== '') {
-                    parsedHeaders = JSON.parse(headerString);
-                } else {
-                    parsedHeaders = {};
-                }
-            } catch {
-                // Ignore parsing errors, keep old headers object but update the string
-            }
+            const parsedHeaders = parseMcpHeaders(headerString) ?? updatedServers[index].headers;
 
             updatedServers[index] = {
                 ...updatedServers[index],
@@ -365,6 +378,10 @@ const Settings: React.FC = () => {
         }
         if ((settings.ai?.autoCleanContextIntervalMinutes || 0) > 0 && autoCleanIntervalError) {
             setSnackbar({open: true, message: '清理间隔必须是正整数', severity: 'error'});
+            return;
+        }
+        if (!validateMcpServers(settings.ai?.mcpServers || [])) {
+            setSnackbar({open: true, message: 'MCP 服务器配置不合法，请检查名称、URL 和请求头。', severity: 'error'});
             return;
         }
 
@@ -648,15 +665,11 @@ const Settings: React.FC = () => {
                                                 onChange={(e) => handleMCPHeaderChange(index, e.target.value)}
                                                 variant="outlined"
                                                 size="small"
-                                                error={(() => {
-                                                    try {
-                                                        const toParse = server._headerString !== undefined ? server._headerString : JSON.stringify(server.headers || {});
-                                                        if (toParse.trim() !== '') JSON.parse(toParse);
-                                                        return false;
-                                                    } catch {
-                                                        return true;
-                                                    }
-                                                })() as unknown as boolean}
+                                                error={!validateMcpServers([{
+                                                    ...server,
+                                                    name: 'header-validation',
+                                                    url: 'https://mcp.example.com'
+                                                }])}
                                             />
                                         </Grid>
                                         <Grid size={{xs: 12, md: 1}} sx={{textAlign: 'center'}}>
