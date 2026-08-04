@@ -2,6 +2,9 @@ package com.unscientificjszhai.tgp.service.ai
 
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
+import com.unscientificjszhai.tgp.repository.ActiveTelegramBotUnavailableException
+import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.TelegramBotLease
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
@@ -46,16 +49,20 @@ import kotlin.time.Duration.Companion.minutes
  * 存储故障时保留任务并按至少一次语义重试，而非承诺 exactly-once。
  * 代理未完成或抛出普通异常时也会保留任务供后续扫描重试。代理正常返回后，结果投递仅作尽力而为
  * 处理：Telegram 请求抛错或返回非成功结果只会记录日志，不会再次调用代理，也不保证跨重启投递。
+ * 扫描在 token 生命周期锁内获取短执行租约；租约取得后的在途 AI 回合可继续完成，
+ * 并始终使用捕获 token 投递结果。
  *
  * @param parentScope 后台扫描任务所属的协程作用域；取消该作用域会停止扫描。
  * @param telegramService 用于投递任务执行结果的 Telegram 服务。
  * @param agentService 用于取得执行任务指令的 AI 代理服务的提供者。
+ * @param settingsRepository 用于在线性化 token 生命周期内捕获执行租约的仓储。
  */
 @Singleton
 class TaskSchedulerService private constructor(
     parentScope: CoroutineScope,
     private val telegramService: TelegramService,
     private val agentService: Provider<AgentService>,
+    private val settingsRepository: SettingsRepository,
     private val storage: AtomicJsonStorage,
     startImmediately: Boolean,
 ) : AutoCloseable {
@@ -67,16 +74,19 @@ class TaskSchedulerService private constructor(
      * @param parentScope 后台扫描任务所属的协程作用域。
      * @param telegramService 用于投递任务执行结果的 Telegram 服务。
      * @param agentService 用于取得 AI 代理的提供者。
+     * @param settingsRepository 用于捕获执行租约的设置仓储。
      */
     @Inject
     constructor(
         parentScope: CoroutineScope,
         telegramService: TelegramService,
         agentService: Provider<AgentService>,
+        settingsRepository: SettingsRepository,
     ) : this(
         parentScope,
         telegramService,
         agentService,
+        settingsRepository,
         AtomicJsonStorage(File("config/schedule.json").toPath()),
         startImmediately = true,
     )
@@ -86,6 +96,7 @@ class TaskSchedulerService private constructor(
         parentScope: CoroutineScope,
         telegramService: TelegramService,
         agentService: Provider<AgentService>,
+        settingsRepository: SettingsRepository,
         scheduleFile: File,
         fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
         startImmediately: Boolean = false,
@@ -93,6 +104,7 @@ class TaskSchedulerService private constructor(
         parentScope,
         telegramService,
         agentService,
+        settingsRepository,
         AtomicJsonStorage(scheduleFile.toPath(), fileOperations),
         startImmediately,
     )
@@ -235,9 +247,7 @@ class TaskSchedulerService private constructor(
                 logger.error("Failed to revalidate task storage before scanning; this scan will retry later", e)
                 return@withLock emptyList()
             }
-            tasks.filter { task ->
-                task.executionTime <= currentTime && executingTaskIds.add(task.id)
-            }
+            tasks.filter { task -> task.executionTime <= currentTime && executingTaskIds.add(task.id) }
         }
 
         try {
@@ -245,7 +255,7 @@ class TaskSchedulerService private constructor(
                 executeTask(task)
             }
         } finally {
-            stateLock.withLock { tasksToExecute.forEach { executingTaskIds.remove(it.id) } }
+            stateLock.withLock { tasksToExecute.forEach { task -> executingTaskIds.remove(task.id) } }
         }
     }
 
@@ -259,13 +269,21 @@ class TaskSchedulerService private constructor(
      * @throws CancellationException 当代理调用、Telegram 调用或当前协程被取消时抛出。
      */
     private suspend fun executeTask(task: ScheduledTask) {
+        val executionLease = try {
+            settingsRepository.withActiveTelegramBotLease { botLease ->
+                TaskExecutionLease(botLease, agentService.get())
+            }
+        } catch (e: ActiveTelegramBotUnavailableException) {
+            logger.warn("Skipping task {} because no valid active Telegram Bot is available", task.id)
+            return
+        }
         logger.info("Executing task: {} - {}", task.id, task.instruction)
         var agentTurnCompleted = false
         try {
-            val result = agentService.get()
+            val result = executionLease.agentService
                 .sendMessage("以下是一个定时任务指令：\n${task.instruction}\n\n请直接执行并返回结果。")
             if (result.isNotBlank()) {
-                deliverTaskResult(task, result)
+                deliverTaskResult(task, executionLease.botLease.token, result)
             }
             agentTurnCompleted = true
         } catch (e: CancellationException) {
@@ -287,12 +305,17 @@ class TaskSchedulerService private constructor(
      * 非取消失败和 API 非成功响应只记录日志，避免因投递问题重复执行可能带外部副作用的代理回合。
      *
      * @param task 已完成代理回合的任务。
+     * @param token 在任务执行租约中捕获的 Telegram Bot token。
      * @param result 要发送给任务会话的非空结果文本。
      * @throws CancellationException 当当前协程或 Telegram 调用被取消时抛出。
      */
-    private suspend fun deliverTaskResult(task: ScheduledTask, result: String) {
+    private suspend fun deliverTaskResult(task: ScheduledTask, token: String, result: String) {
         try {
-            val response = telegramService.sendMessage(task.agentChatId, "⏰ 定时任务执行结果：\n\n$result")
+            val response = telegramService.sendMessageForToken(
+                token,
+                task.agentChatId,
+                "⏰ 定时任务执行结果：\n\n$result",
+            )
             if (!response.isTelegramOk()) {
                 logger.warn("Telegram did not accept task result for {}", task.id)
             }
@@ -369,7 +392,6 @@ class TaskSchedulerService private constructor(
      * 创建并持久化一个定时任务。
      *
      * 仅当完整任务列表已原子持久化成功后才返回新标识；持久化失败时内存任务列表保持不变。
-     *
      * @param instruction 到期时发送给 AI 代理的指令文本；允许为空字符串，将按原样保存。
      * @param executionTime 首次执行的 Unix 时间戳，单位为毫秒；可为过去时间，此时会在下一次
      * 扫描时执行。
@@ -432,4 +454,9 @@ class TaskSchedulerService private constructor(
         job = null
         logger.info("Task scheduler stopped.")
     }
+
+    private data class TaskExecutionLease(
+        val botLease: TelegramBotLease,
+        val agentService: AgentService,
+    )
 }

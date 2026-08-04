@@ -1,10 +1,11 @@
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.openai.client.OpenAIClient
-import com.openai.client.okhttp.OpenAIOkHttpClient
+import com.openai.core.jsonMapper
 import com.openai.models.ChatModel
 import com.openai.models.ReasoningEffort
 import com.openai.models.chat.completions.*
+import com.openai.models.models.Model
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -25,9 +26,15 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.time.Duration
 import java.util.*
 import javax.inject.Inject
 import javax.inject.Provider
@@ -36,8 +43,8 @@ import kotlin.jvm.optionals.getOrNull
 /**
  * 基于 OpenAI API 维护对话会话并执行模型工具调用的 AI 代理服务。
  *
- * 服务在创建时根据当前设置初始化 OpenAI 客户端；会话重置会同步 MCP 工具和技能提示词。
- * 调用 [close] 返回的任务完成后，服务持有的 OpenAI SDK 客户端、HTTP 工具客户端与 MCP 连接均已释放。
+ * 服务在创建时根据当前设置初始化 OpenAI 兼容协议的原生可取消 HTTP 传输；会话重置会同步 MCP 工具和技能提示词。
+ * 调用 [close] 返回的任务完成后，服务持有的 HTTP 传输、HTTP 工具客户端与 MCP 连接均已释放。
  *
  * @param parentScope 服务任务所属的父协程作用域。
  * @param settingsRepository 提供 OpenAI、MCP 和代理设置的仓库。
@@ -85,6 +92,12 @@ class OpenAIAgentService @Inject constructor(
 
     @Volatile
     private var client: OpenAIClient? = null
+
+    /** 生产 API 请求使用的原生可取消传输；SDK 客户端仅保留给未配置传输的旧会话兼容路径。 */
+    @Volatile
+    private var rawTransport: CancellableOkHttpTransport? = null
+    private var rawBaseUrl: String? = null
+    private var rawApiKey: String? = null
     private val history = mutableListOf<ChatCompletionMessageParam>()
 
     /** 串行化完整对话与会话重置，避免历史记录交错。 */
@@ -152,21 +165,9 @@ class OpenAIAgentService @Inject constructor(
                 configuredApiKey = aiSettings.openAiApiKey
                 configuredBaseUrl = aiSettings.openAiBaseUrl
                 configuredProxy = proxySettings
-                client = OpenAIOkHttpClient.builder()
-                    .apiKey(aiSettings.openAiApiKey)
-                    .apply {
-                        if (aiSettings.openAiBaseUrl.isNotBlank()) {
-                            baseUrl(aiSettings.openAiBaseUrl)
-                        }
-                        if (proxySettings != null) {
-                            val type = when (proxySettings.type) {
-                                ProxyType.HTTP -> Proxy.Type.HTTP
-                                ProxyType.SOCKS -> Proxy.Type.SOCKS
-                            }
-                            proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
-                        }
-                    }
-                    .build()
+                rawApiKey = aiSettings.openAiApiKey
+                rawBaseUrl = aiSettings.openAiBaseUrl.trim().trimEnd('/').ifBlank { "https://api.openai.com/v1" }
+                rawTransport = CancellableOkHttpTransport(createOpenAIHttpClient(proxySettings))
 
                 initialMcpConnectionJob = resetSession()
                     ?: failedInitializationJob()
@@ -180,9 +181,24 @@ class OpenAIAgentService @Inject constructor(
             } catch (e: Exception) {
                 logger.error("Failed to initialize OpenAI client", e)
                 client = null
+                rawTransport?.close()
+                rawTransport = null
                 initialMcpConnectionJob = failedInitializationJob()
             }
         }
+    }
+
+    /** 创建 OpenAI 兼容服务的原生客户端，保留既有 HTTP/SOCKS 路由但不处理代理认证。 */
+    private fun createOpenAIHttpClient(proxySettings: ProxySettings?): OkHttpClient {
+        val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
+        if (proxySettings != null) {
+            val type = when (proxySettings.type) {
+                ProxyType.HTTP -> Proxy.Type.HTTP
+                ProxyType.SOCKS -> Proxy.Type.SOCKS
+            }
+            builder.proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
+        }
+        return builder.build()
     }
 
     /**
@@ -237,7 +253,7 @@ class OpenAIAgentService @Inject constructor(
      *
      * 若当前选择的模型不再可用，会选择内置回退模型并重置会话；刷新失败不会修改当前模型列表。
      *
-     * @return 刷新成功后的模型快照；客户端不可用、服务已关闭或刷新结果过期时返回 `null`。
+     * @return 刷新成功后的模型快照；HTTP 传输不可用、服务已关闭或刷新结果过期时返回 `null`。
      */
     override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
         try {
@@ -245,9 +261,15 @@ class OpenAIAgentService @Inject constructor(
                 return@withLock null
             }
             val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
-            val currentClient = client ?: return@withLock null
-            val models = withContext(Dispatchers.IO) {
-                currentClient.models().list().data()
+            val models = when (val currentTransport = rawTransport) {
+                null -> {
+                    val currentClient = client ?: return@withLock null
+                    withContext(Dispatchers.IO) {
+                        currentClient.models().list().data()
+                    }
+                }
+
+                else -> listRawOpenAIModels(currentTransport)
             }
             val refreshedModels = models.map { it.id() }
             val refreshResult = sessionMutex.withLock {
@@ -424,12 +446,13 @@ class OpenAIAgentService @Inject constructor(
      * 文本是模型的正常回复。
      * @throws AgentTurnFailedException 当 API、协议、工具调用上限或其他非取消错误导致本次回合未完成时
      * 抛出；本次回合历史不会提交。
-     * @throws IllegalStateException 当服务已关闭或 OpenAI 客户端尚未初始化时抛出。
+     * @throws IllegalStateException 当服务已关闭或 OpenAI HTTP 传输尚未初始化时抛出。
      * @throws CancellationException 当调用协程、模型调用或工具调用被取消时抛出。
      */
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String = sessionMutex.withLock {
         check(!closed) { "OpenAI client is closed." }
-        val currentClient = client ?: throw IllegalStateException("OpenAI client is not initialized.")
+        val currentClient = client
+        check(currentClient != null || rawTransport != null) { "OpenAI client is not initialized." }
 
         val contentParts = mutableListOf<ChatCompletionContentPart>()
 
@@ -523,7 +546,7 @@ class OpenAIAgentService @Inject constructor(
      * 执行完整的模型与工具调用流程。调用方必须已持有 [sessionMutex]。
      */
     private suspend fun performChatLocked(
-        client: OpenAIClient,
+        client: OpenAIClient?,
         tentativeHistory: MutableList<ChatCompletionMessageParam>,
         functionRouteSnapshot: LocalFunctionRouteSnapshot = functionRouter().refresh(),
         toolCallRounds: Int = 0,
@@ -538,9 +561,15 @@ class OpenAIAgentService @Inject constructor(
 
         val paramsBuilder = createChatCompletionParams(tools, tentativeHistory)
 
-        // OpenAI 阻塞客户端会同步执行网络请求，避免占用调用方的默认调度器线程。
-        val response = withContext(Dispatchers.IO) {
-            client.chat().completions().create(paramsBuilder)
+        val response = when (val currentTransport = rawTransport) {
+            null -> {
+                val currentClient = client ?: throw IllegalStateException("OpenAI client is not initialized.")
+                withContext(Dispatchers.IO) {
+                    currentClient.chat().completions().create(paramsBuilder)
+                }
+            }
+
+            else -> executeRawOpenAIChat(currentTransport, paramsBuilder)
         }
         val choice = response.choices().firstOrNull()
             ?: throw AgentTurnFailedException("OpenAI 响应未包含 assistant 消息。")
@@ -732,6 +761,68 @@ class OpenAIAgentService @Inject constructor(
     }
 
     /**
+     * 使用 SDK 的参数 DTO 生成请求体和附加头/查询参数，但由原生 OkHttp Call 执行实际请求。
+     *
+     * 这避免 SDK 高层 Future 的取消断链，同时继续遵守 SDK 对联合消息、工具和新增字段的序列化规则。
+     */
+    private suspend fun executeRawOpenAIChat(
+        transport: CancellableOkHttpTransport,
+        params: ChatCompletionCreateParams,
+    ): ChatCompletion {
+        val mapper = jsonMapper()
+        val request = rawOpenAIRequestBuilder(
+            "chat/completions", params._headers().names().associateWith(params._headers()::values),
+            params._queryParams().keys().associateWith(params._queryParams()::values)
+        )
+            .post(
+                mapper.writeValueAsString(params._body()).toRequestBody("application/json; charset=utf-8".toMediaType())
+            )
+            .build()
+        val response = transport.execute(request)
+        requireOpenAISuccess(response)
+        return mapper.readValue(response.body, ChatCompletion::class.java)
+    }
+
+    /** 列出 OpenAI 兼容服务的模型，并通过 SDK 的 [Model] DTO 校验每个条目。 */
+    private suspend fun listRawOpenAIModels(transport: CancellableOkHttpTransport): List<Model> {
+        val response = transport.execute(rawOpenAIRequestBuilder("models").get().build())
+        requireOpenAISuccess(response)
+        val mapper = jsonMapper()
+        val root = mapper.readTree(response.body)
+        val data = root.path("data")
+        if (!data.isArray) {
+            throw IllegalStateException("OpenAI models response did not contain a data array.")
+        }
+        return data.map { node -> mapper.treeToValue(node, Model::class.java) }
+    }
+
+    /** 构建保留自定义基础路径、Bearer 认证和 SDK 附加参数的原生 OpenAI 请求。 */
+    private fun rawOpenAIRequestBuilder(
+        path: String,
+        additionalHeaders: Map<String, List<String>> = emptyMap(),
+        additionalQuery: Map<String, List<String>> = emptyMap(),
+    ): Request.Builder {
+        val baseUrl = rawBaseUrl ?: throw IllegalStateException("OpenAI base URL is not initialized.")
+        val apiKey = rawApiKey ?: throw IllegalStateException("OpenAI API key is not initialized.")
+        val urlBuilder = baseUrl.toHttpUrl().newBuilder().addPathSegments(path)
+        additionalQuery.forEach { (name, values) -> values.forEach { urlBuilder.addQueryParameter(name, it) } }
+        return Request.Builder()
+            .url(urlBuilder.build())
+            .header("Authorization", "Bearer $apiKey")
+            .header("Accept", "application/json")
+            .apply {
+                additionalHeaders.forEach { (name, values) -> values.forEach { addHeader(name, it) } }
+            }
+    }
+
+    /** 将非 2xx OpenAI 结果隔离在协议边界，防止其被误解为成功 DTO。 */
+    private fun requireOpenAISuccess(response: HttpResult) {
+        if (response.statusCode !in 200..299) {
+            throw IllegalStateException("OpenAI API returned HTTP ${response.statusCode}: ${response.body.take(1024)}")
+        }
+    }
+
+    /**
      * 返回模型列表刷新后应优先使用的模型。
      */
     internal fun preferredModel(models: List<String>): String? =
@@ -765,11 +856,11 @@ class OpenAIAgentService @Inject constructor(
     }
 
     /**
-     * 关闭 OpenAI SDK 客户端、会话任务及其工具连接。
+     * 关闭 OpenAI 原生 HTTP 传输、会话任务及其工具连接。
      *
      * 首次调用在返回前会拒绝新的消息、会话重置和模型刷新。重复调用会返回同一个等待任务；若调用方
      * 取消此前返回的等待任务，后续调用会提供新的等待任务，
-     * 而不会取消已启动的资源清理。等待任务完成后，正在进行的模型刷新已退出，OpenAI SDK 客户端、
+     * 而不会取消已启动的资源清理。等待任务完成后，正在进行的模型刷新已退出，OpenAI HTTP 传输、
      * HTTP 工具客户端和 MCP 连接均已释放。
      *
      * @return 异步关闭任务；等待该任务完成后服务不再保留会话状态或网络资源。
@@ -777,6 +868,8 @@ class OpenAIAgentService @Inject constructor(
     override fun close(): Job = synchronized(lifecycleLock) {
         val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
             closed = true
+            // 关闭先中断原生 HTTP Call，绝不等待 sessionMutex 中的网络回合返回。
+            rawTransport?.close()
             initialModelUpdateJob?.cancel()
             initialModelUpdateJob = null
             initialMcpConnectionJob?.cancel()
@@ -799,14 +892,15 @@ class OpenAIAgentService @Inject constructor(
     /**
      * 在独立且不可取消的作用域中释放本服务拥有的资源。
      *
-     * 先摘取会话中的 SDK 客户端，再等待已取消的服务任务和模型刷新退出，确保 SDK 客户端不会与在途
-     * 请求并发关闭。各资源的关闭通过嵌套的 `finally` 串联，以便前一资源关闭失败时仍继续清理。
+     * 原生 HTTP 调用已在取得会话锁前取消；本方法再摘取兼容路径的 SDK 客户端、等待已取消服务任务和
+     * 模型刷新退出。各资源的关闭通过嵌套的 `finally` 串联，以便前一资源关闭失败时仍继续清理。
      */
     private suspend fun closeResources(completion: CompletableDeferred<Unit>) = withContext(NonCancellable) {
         try {
             val detachedClient = sessionMutex.withLock {
                 val currentClient = client
                 client = null
+                rawTransport = null
                 history.clear()
                 cancelCurrentMcpConnection()
                 currentClient

@@ -116,6 +116,7 @@ data class SendTelegramMessageRequest(
  * @property result 按 Telegram 返回顺序排列的更新列表；请求失败或没有更新时为空列表。
  * @property errorCode 请求失败时的 Telegram 错误码；成功时为 `null`。
  * @property description 请求失败时的错误说明；成功或未提供说明时为 `null`。
+ * @property parameters Telegram 返回的附加错误参数；成功或未提供参数时为 `null`。
  */
 @Serializable
 data class GetUpdatesResponse(
@@ -123,6 +124,17 @@ data class GetUpdatesResponse(
     val result: List<Update> = emptyList(),
     @SerialName("error_code") val errorCode: Int? = null,
     val description: String? = null,
+    val parameters: TelegramResponseParameters? = null,
+)
+
+/**
+ * Telegram API 失败响应携带的附加参数。
+ *
+ * @property retryAfter 服务器要求客户端等待后再试的秒数；为 `null`、`0` 或负数时表示不可用于缩短本地退避。
+ */
+@Serializable
+data class TelegramResponseParameters(
+    @SerialName("retry_after") val retryAfter: Long? = null,
 )
 
 /**

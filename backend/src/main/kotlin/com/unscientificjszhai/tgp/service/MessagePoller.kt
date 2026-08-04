@@ -18,6 +18,8 @@ import kotlin.time.Duration
 import kotlin.concurrent.withLock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
+import kotlin.random.Random
 
 /**
  * 后台轮询 Telegram 更新，并将授权聊天的消息依次交给 AI 代理处理。
@@ -82,6 +84,14 @@ class MessagePoller @Inject constructor(
     private var settingsJob: Job? = null
     private var currentSession: PollingSession? = null
     private var processingTimeout: Duration = 10.minutes
+    private var retryDelay: suspend (Duration) -> Unit = { delay(it) }
+    private var retryJitter: (Duration) -> Duration = { backoff ->
+        if (backoff <= Duration.ZERO) {
+            Duration.ZERO
+        } else {
+            Random.nextLong((backoff.inWholeMilliseconds / 5) + 1).milliseconds
+        }
+    }
 
     /**
      * 使用指定单条消息处理时限创建仅供测试使用的轮询服务。
@@ -93,6 +103,8 @@ class MessagePoller @Inject constructor(
      * @param updatesRepository 持久化按机器人隔离的状态的仓储。
      * @param modelSwitchBarrier 与设置仓储及代理服务共享的启动和模型切换屏障。
      * @param processingTimeout 单条排队消息允许的最长处理时长；必须大于零。
+     * @param retryDelay 执行一次失败退避的挂起函数；只接收非负时长，测试可注入无等待实现。
+     * @param retryJitter 基于本地退避上限生成额外抖动的函数；返回负值会被忽略，测试可返回零以获得确定性时长。
      */
     internal constructor(
         parentScope: CoroutineScope,
@@ -102,9 +114,13 @@ class MessagePoller @Inject constructor(
         updatesRepository: UpdatesRepository,
         modelSwitchBarrier: ModelSwitchBarrier,
         processingTimeout: Duration,
+        retryDelay: suspend (Duration) -> Unit = { delay(it) },
+        retryJitter: (Duration) -> Duration = { Duration.ZERO },
     ) : this(parentScope, telegramService, agentService, settingsRepository, updatesRepository, modelSwitchBarrier) {
         require(processingTimeout.isPositive()) { "processingTimeout must be positive." }
         this.processingTimeout = processingTimeout
+        this.retryDelay = retryDelay
+        this.retryJitter = retryJitter
     }
 
     /**
@@ -118,6 +134,8 @@ class MessagePoller @Inject constructor(
      * @param settingsRepository 提供机器人与 AI 设置的仓储，且必须持有共享屏障。
      * @param updatesRepository 持久化按机器人隔离的状态的仓储。
      * @param processingTimeout 单条排队消息允许的最长处理时长；必须大于零。
+     * @param retryDelay 执行一次失败退避的挂起函数；只接收非负时长，测试可注入无等待实现。
+     * @param retryJitter 基于本地退避上限生成额外抖动的函数；返回负值会被忽略，测试可返回零以获得确定性时长。
      */
     @Deprecated("新的测试应显式传入与 SettingsRepository 共享的 ModelSwitchBarrier。")
     internal constructor(
@@ -127,6 +145,8 @@ class MessagePoller @Inject constructor(
         settingsRepository: SettingsRepository,
         updatesRepository: UpdatesRepository,
         processingTimeout: Duration,
+        retryDelay: suspend (Duration) -> Unit = { delay(it) },
+        retryJitter: (Duration) -> Duration = { Duration.ZERO },
     ) : this(
         parentScope,
         telegramService,
@@ -135,6 +155,8 @@ class MessagePoller @Inject constructor(
         updatesRepository,
         settingsRepository.modelSwitchBarrier,
         processingTimeout,
+        retryDelay,
+        retryJitter,
     )
 
     private class PollingSession(
@@ -146,6 +168,8 @@ class MessagePoller @Inject constructor(
         var pollJob: Job? = null,
         var consumerJob: Job? = null,
         var lastAiReplyAtMillis: Long? = null,
+        var consecutivePollingFailures: Int = 0,
+        var initialOffsetResolved: Boolean = false,
     )
 
     private data class QueuedUpdate(
@@ -153,6 +177,13 @@ class MessagePoller @Inject constructor(
         val entryTime: Long,
         val completion: CompletableDeferred<Unit>,
     )
+
+    /** 单次初始化或长轮询请求的结果；失败结果绝不包含可推进偏移量的更新。 */
+    private sealed interface PollingAttempt {
+        data object Succeeded : PollingAttempt
+        data object Stopped : PollingAttempt
+        data class ApiFailure(val response: GetUpdatesResponse) : PollingAttempt
+    }
 
     /**
      * 启动 token 生命周期监听，并按需创建唯一轮询会话。
@@ -246,40 +277,60 @@ class MessagePoller @Inject constructor(
     private suspend fun runPolling(session: PollingSession) {
         while (currentCoroutineContext().isActive) {
             try {
-                if (!pollOnce(session)) {
-                    return
+                when (val attempt = pollOnce(session)) {
+                    PollingAttempt.Succeeded -> {
+                        session.consecutivePollingFailures = 0
+                        // 成功轮询沿用既有短暂让步；失败路径绝不会再叠加这段延迟。
+                        delay(1000.milliseconds)
+                    }
+
+                    PollingAttempt.Stopped -> return
+                    is PollingAttempt.ApiFailure -> {
+                        if (!handleApiFailure(session, attempt.response)) {
+                            return
+                        }
+                    }
                 }
             } catch (_: CancellationException) {
                 return
             } catch (e: Exception) {
                 if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
-                    logger.warn("Polling timeout for bot {}: {}", session.botId, e.message ?: "Socket timeout expired")
+                    logger.warn(
+                        "Polling request timed out for bot {} at generation {} ({}).",
+                        session.botId,
+                        session.generation,
+                        e::class.simpleName,
+                    )
                 } else {
-                    logger.error("Error during polling for bot ${session.botId}", e)
-                    delay(5000.milliseconds)
+                    logger.warn(
+                        "Polling request failed for bot {} at generation {} ({}).",
+                        session.botId,
+                        session.generation,
+                        e::class.simpleName,
+                    )
+                }
+                if (!delayAfterFailure(session)) {
+                    return
                 }
             }
         }
     }
 
-    private suspend fun pollOnce(session: PollingSession): Boolean {
+    /** 执行一次初始化或正常长轮询；只有成功响应才会保存初始化偏移量或确认队列更新。 */
+    private suspend fun pollOnce(session: PollingSession): PollingAttempt {
         if (!isCurrent(session)) {
-            return false
+            return PollingAttempt.Stopped
         }
         var lastStoredId = readForCurrent(session) {
             updatesRepository.getData(session.botId).lastUpdateId
-        } ?: return false
-        if (lastStoredId == 0L) {
+        } ?: return PollingAttempt.Stopped
+        if (lastStoredId == 0L && !session.initialOffsetResolved) {
             val initialResponse = telegramService.getUpdatesForToken(session.token, offset = -1, timeout = 0)
             if (!isCurrent(session)) {
-                return false
+                return PollingAttempt.Stopped
             }
             if (!initialResponse.ok) {
-                throw IllegalStateException(
-                    "Failed to initialize lastUpdateId: Telegram API error " +
-                            "${initialResponse.errorCode ?: "unknown"}: " +
-                            (initialResponse.description ?: "no description"),
-                )
+                return PollingAttempt.ApiFailure(initialResponse)
             }
             if (initialResponse.result.isNotEmpty()) {
                 lastStoredId = initialResponse.result.last().updateId
@@ -287,14 +338,12 @@ class MessagePoller @Inject constructor(
                         updatesRepository.saveLastUpdateId(session.botId, lastStoredId)
                     }
                 ) {
-                    return false
+                    return PollingAttempt.Stopped
                 }
                 logger.info("Initialized lastUpdateId for bot {} to {}", session.botId, lastStoredId)
             }
-            delay(1000.milliseconds)
-            if (!isCurrent(session)) {
-                return false
-            }
+            session.initialOffsetResolved = true
+            return PollingAttempt.Succeeded
         }
 
         val response = telegramService.getUpdatesForToken(
@@ -303,43 +352,140 @@ class MessagePoller @Inject constructor(
             timeout = 30,
         )
         if (!isCurrent(session)) {
+            return PollingAttempt.Stopped
+        }
+        if (!response.ok) {
+            return PollingAttempt.ApiFailure(response)
+        }
+        val completions = mutableListOf<Pair<Long, CompletableDeferred<Unit>>>()
+        val discoveredChats = LinkedHashMap<String, ChatInfo>()
+        for (update in response.result) {
+            update.chatInfo()?.let { discoveredChats[it.id] = it }
+            try {
+                completions += update.updateId to enqueueUpdate(session, update)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Error handling update ${update.updateId}", e)
+                completions += update.updateId to completedSignal()
+            }
+        }
+        if (discoveredChats.isNotEmpty() && !saveForCurrent(session) {
+                updatesRepository.mergeChats(session.botId, discoveredChats.values)
+            }
+        ) {
+            return PollingAttempt.Stopped
+        }
+        for ((updateId, completion) in completions.sortedBy { it.first }) {
+            completion.await()
+            if (updateId > lastStoredId) {
+                if (!saveForCurrent(session) {
+                        updatesRepository.saveLastUpdateId(session.botId, updateId)
+                    }
+                ) {
+                    return PollingAttempt.Stopped
+                }
+                lastStoredId = updateId
+            }
+        }
+        return if (isCurrent(session)) PollingAttempt.Succeeded else PollingAttempt.Stopped
+    }
+
+    /** 分类 Telegram API 的失败；认证失败会仅在本会话仍当前时终止整套轮询资源。 */
+    private suspend fun handleApiFailure(session: PollingSession, response: GetUpdatesResponse): Boolean =
+        when (response.errorCode) {
+            401,
+            403,
+                -> {
+                logger.error(
+                    "Telegram authentication failed for bot {} at generation {} with HTTP {}: {}. Polling session will stop.",
+                    session.botId,
+                    session.generation,
+                    response.errorCode,
+                    response.description ?: "no description",
+                )
+                terminateAuthenticationFailedSession(session)
+                false
+            }
+
+            409 -> {
+                logger.error(
+                    "Telegram getUpdates conflict for bot {} at generation {}: another getUpdates consumer exists ({}).",
+                    session.botId,
+                    session.generation,
+                    response.description ?: "no description",
+                )
+                delayAfterFailure(session)
+            }
+
+            429 -> {
+                val retryAfter = response.parameters?.retryAfter?.takeIf { it > 0 }?.seconds
+                logger.warn(
+                    "Telegram rate limited bot {} at generation {} (retry_after={}): {}.",
+                    session.botId,
+                    session.generation,
+                    retryAfter?.inWholeSeconds ?: "ignored",
+                    response.description ?: "no description",
+                )
+                delayAfterFailure(session, retryAfter)
+            }
+
+            else -> {
+                logger.warn(
+                    "Telegram getUpdates failed for bot {} at generation {} with API error {}: {}.",
+                    session.botId,
+                    session.generation,
+                    response.errorCode ?: "unknown",
+                    response.description ?: "no description",
+                )
+                delayAfterFailure(session)
+            }
+        }
+
+    /**
+     * 增加会话失败计数并执行唯一、可取消的退避。
+     *
+     * 不会持有会话锁或 token 生命周期锁；token 切换和关闭会取消会话 scope，从而中断该等待。
+     */
+    private suspend fun delayAfterFailure(session: PollingSession, retryAfter: Duration? = null): Boolean {
+        if (!isCurrent(session)) {
             return false
         }
-        if (response.ok) {
-            val completions = mutableListOf<Pair<Long, CompletableDeferred<Unit>>>()
-            val discoveredChats = LinkedHashMap<String, ChatInfo>()
-            for (update in response.result) {
-                update.chatInfo()?.let { discoveredChats[it.id] = it }
-                try {
-                    completions += update.updateId to enqueueUpdate(session, update)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.error("Error handling update ${update.updateId}", e)
-                    completions += update.updateId to completedSignal()
-                }
-            }
-            if (discoveredChats.isNotEmpty() && !saveForCurrent(session) {
-                    updatesRepository.mergeChats(session.botId, discoveredChats.values)
-                }
-            ) {
-                return false
-            }
-            for ((updateId, completion) in completions.sortedBy { it.first }) {
-                completion.await()
-                if (updateId > lastStoredId) {
-                    if (!saveForCurrent(session) {
-                            updatesRepository.saveLastUpdateId(session.botId, updateId)
-                        }
-                    ) {
-                        return false
-                    }
-                    lastStoredId = updateId
-                }
+        session.consecutivePollingFailures = (session.consecutivePollingFailures + 1).coerceAtMost(7)
+        val localBackoff = localBackoff(session.consecutivePollingFailures)
+        val requiredDelay = maxOf(localBackoff, retryAfter ?: Duration.ZERO)
+        val jitter = retryJitter(localBackoff).coerceAtLeast(Duration.ZERO)
+        val delayDuration = requiredDelay + jitter
+        logger.info(
+            "Polling retry for bot {} at generation {} after {} ms (failure #{}, local={} ms).",
+            session.botId,
+            session.generation,
+            delayDuration.inWholeMilliseconds,
+            session.consecutivePollingFailures,
+            localBackoff.inWholeMilliseconds,
+        )
+        retryDelay(delayDuration)
+        return isCurrent(session)
+    }
+
+    /** 返回 `1, 2, 4, …, 60` 秒的本地指数退避上限。 */
+    private fun localBackoff(failureCount: Int): Duration =
+        (1L shl (failureCount - 1).coerceIn(0, 6)).seconds.coerceAtMost(60.seconds)
+
+    /** 原子摘除仍为当前代次的认证失败会话，并在锁外取消该会话 scope。 */
+    private fun terminateAuthenticationFailedSession(session: PollingSession) {
+        val shouldCancel = sessionLock.withLock {
+            if (!closed && currentSession === session && isTokenGenerationCurrent(session)) {
+                currentSession = null
+                session.updateChannel.close()
+                true
+            } else {
+                false
             }
         }
-        delay(1000.milliseconds)
-        return isCurrent(session)
+        if (shouldCancel) {
+            session.scope.cancel(CancellationException("Telegram authentication failed"))
+        }
     }
 
     private suspend fun consumeQueue(session: PollingSession) {
@@ -408,7 +554,6 @@ class MessagePoller @Inject constructor(
      *
      * @param update 要检查的 Telegram 更新；不含可处理消息时不会入队。
      */
-    @Suppress("unused")
     suspend fun handleUpdate(update: Update) {
         activeSession()?.let { enqueueUpdate(it, update) }
     }
@@ -564,18 +709,33 @@ class MessagePoller @Inject constructor(
     private fun AppSettings.hasSameModelServiceConfiguration(expected: AppSettings): Boolean {
         val currentAi = ai ?: return false
         val expectedAi = expected.ai ?: return false
-        return currentAi.provider == expectedAi.provider &&
-                currentAi.agentEnabled == expectedAi.agentEnabled &&
-                currentAi.selectedModel == expectedAi.selectedModel &&
-                proxy == expected.proxy &&
-                currentAi.httpToolSettings == expectedAi.httpToolSettings &&
-                currentAi.mcpServers == expectedAi.mcpServers &&
-                when (currentAi.provider) {
-                    AIProvider.GEMINI -> currentAi.geminiApiKey == expectedAi.geminiApiKey
-                    AIProvider.OPENAI ->
-                        currentAi.openAiApiKey == expectedAi.openAiApiKey &&
-                                currentAi.openAiBaseUrl == expectedAi.openAiBaseUrl
-                }
+        return !(
+                currentAi.provider != expectedAi.provider ||
+                        currentAi.agentEnabled != expectedAi.agentEnabled ||
+                        currentAi.selectedModel != expectedAi.selectedModel ||
+                        proxy != expected.proxy ||
+                        currentAi.httpToolSettings != expectedAi.httpToolSettings ||
+                        currentAi.mcpServers != expectedAi.mcpServers
+                ) && when (currentAi.provider) {
+            AIProvider.GEMINI -> currentAi.geminiApiKey == expectedAi.geminiApiKey
+            AIProvider.OPENAI ->
+                currentAi.openAiApiKey == expectedAi.openAiApiKey &&
+                        currentAi.openAiBaseUrl == expectedAi.openAiBaseUrl
+        }
+    }
+
+    /**
+     * 使用当前活跃会话将文本消息交给 AI 代理。
+     *
+     * 当前没有有效会话时不会产生副作用；所有 Telegram 调用都使用会话开始时捕获的 token。
+     *
+     * @param chatId 接收回复的聊天标识，不能为空。
+     * @param text 要发送给 AI 的文本，允许为空字符串。
+     * @param messageId 原始 Telegram 消息标识，用于关联回复。
+     */
+    @Suppress("unused")
+    suspend fun handleAiMessage(chatId: String, text: String, messageId: Long) {
+        activeSession()?.let { handleAiMessage(it, chatId, text, messageId) }
     }
 
     private suspend fun handleAiMessage(session: PollingSession, chatId: String, text: String, messageId: Long) {
@@ -603,6 +763,22 @@ class MessagePoller @Inject constructor(
             logger.error("Failed to handle AI message", e)
             sendMessageForSession(session, chatId, "AI 处理消息时出错：${e.message}", ReplyParameters(messageId))
         }
+    }
+
+    /**
+     * 使用当前活跃会话下载并处理语音消息。
+     *
+     * 当前没有有效会话时不会产生副作用；文件下载、聊天动作、正常回复和错误提示均使用会话
+     * 开始时捕获的 token。
+     *
+     * @param chatId 接收回复的聊天标识，不能为空。
+     * @param voice 要处理的 Telegram 语音文件，必须包含有效文件标识。
+     * @param caption 语音消息的可选说明文字；没有说明时为 `null`。
+     * @param messageId 原始 Telegram 消息标识，用于关联回复。
+     */
+    @Suppress("unused")
+    suspend fun handleVoiceMessage(chatId: String, voice: Voice, caption: String?, messageId: Long) {
+        activeSession()?.let { handleVoiceMessage(it, chatId, voice, caption, messageId) }
     }
 
     private suspend fun handleVoiceMessage(

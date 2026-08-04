@@ -35,10 +35,7 @@ class ScheduleTaskFunctionProviderTest {
     @Test
     fun `create and cancel persistence failures return errors without success`() = runTest {
         val scheduler = mockk<TaskSchedulerService>()
-        val settingsRepository = mockk<SettingsRepository>()
-        every {
-            settingsRepository.settingsFlow
-        } returns MutableStateFlow(AppSettings(ai = AISettings(agentChatId = "12345")))
+        val settingsRepository = settingsRepository()
         every { scheduler.createTask(any(), any(), any(), any()) } throws IOException("disk unavailable")
         every { scheduler.cancelTask(any()) } throws IOException("disk unavailable")
         val provider = ScheduleTaskFunctionProvider(schedulerProvider(scheduler), settingsRepository)

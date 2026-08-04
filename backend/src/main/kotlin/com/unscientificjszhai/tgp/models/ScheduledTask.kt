@@ -35,5 +35,5 @@ data class ScheduledTask(
     val instruction: String,
     val executionTime: Long,
     val loopMode: LoopMode,
-    val agentChatId: String
+    val agentChatId: String,
 )

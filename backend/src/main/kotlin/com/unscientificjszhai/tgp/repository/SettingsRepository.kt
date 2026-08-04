@@ -413,6 +413,39 @@ class SettingsRepository private constructor(
     internal fun <T> withTelegramTokenLifecycleLock(action: () -> T): T =
         telegramTokenLifecycleLock.withLock(action)
 
+    /**
+     * 在 Telegram token 生命周期锁内捕获当前有效机器人的身份快照。
+     *
+     * [action] 只能执行短暂的同步内存操作；不得进行协程挂起、网络、文件 I/O 或等待 token
+     * 生命周期变更的操作。token 无效时明确失败，避免调用方把未归属的操作与任意机器人关联。
+     *
+     * @param action 接收当前 token、其 bot 标识和单调代次的短同步操作。
+     * @return [action] 的返回值。
+     * @throws ActiveTelegramBotUnavailableException 当前 token 为空、格式无效或无法提取 bot 标识时抛出。
+     */
+    internal fun <T> withActiveTelegramBotLease(action: (TelegramBotLease) -> T): T =
+        telegramTokenLifecycleLock.withLock {
+            val token = _settingsFlow.value.telegramToken
+            val botId = token.botIdFromTelegramToken()
+                ?: throw ActiveTelegramBotUnavailableException()
+            action(TelegramBotLease(botId, token, telegramTokenGeneration))
+        }
+
+    /**
+     * 在 Telegram token 生命周期锁内捕获当前有效机器人的身份及其完整设置快照。
+     *
+     * 当一次设置保存同时改变 token 和代理会话标识时，[action] 收到的 Bot 身份与设置来自同一已发布
+     * 快照，调用方可在锁外安全使用其返回值。回调只能执行短暂的同步内存操作，不得进行 I/O 或挂起。
+     *
+     * @param action 接收当前 Bot 租约和同一生命周期点的完整应用设置的短同步操作。
+     * @return [action] 的返回值。
+     * @throws ActiveTelegramBotUnavailableException 当前 token 为空、格式无效或无法提取 bot 标识时抛出。
+     */
+    @Suppress("unused")
+    internal fun <T> withActiveTelegramBotSettingsLease(
+        action: (TelegramBotLease, AppSettings) -> T,
+    ): T = withActiveTelegramBotLease { lease -> action(lease, _settingsFlow.value) }
+
 }
 
 /**
@@ -508,6 +541,24 @@ private class StorageRecoveredRetryException : IllegalStateException(
 internal data class TelegramTokenUpdate(
     val token: String,
     val generation: Long,
+)
+
+/**
+ * 在 Telegram token 生命周期锁内获得的机器人身份快照。
+ *
+ * @property botId 从 [token] 提取的非空 Bot 标识。
+ * @property token 当前活动的有效 Telegram Bot token。
+ * @property generation 与 [token] 对应的单调 token 生命周期代次。
+ */
+internal data class TelegramBotLease(
+    val botId: String,
+    val token: String,
+    val generation: Long,
+)
+
+/** 当前设置未提供可用于活动 Bot 操作的有效 Telegram Bot token。 */
+internal class ActiveTelegramBotUnavailableException : IllegalStateException(
+    "当前 Telegram Bot token 无效，无法获取活动 Bot 租约。",
 )
 
 /**

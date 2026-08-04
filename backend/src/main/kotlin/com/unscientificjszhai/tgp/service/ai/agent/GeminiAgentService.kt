@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.google.genai.Chat
 import com.google.genai.Client
+import com.google.genai.JsonSerializable
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.AIProvider
@@ -23,20 +24,37 @@ import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import okhttp3.Credentials
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.slf4j.LoggerFactory
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.time.Duration
 import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
-import com.google.genai.types.ProxyType as GeminiProxyType
 
 /**
  * 基于 Gemini API 维护对话会话并执行模型工具调用的 AI 代理服务。
  *
- * 服务在创建时根据当前设置初始化 Gemini 客户端，并在会话重置时同步 MCP 工具和技能提示词。
- * 调用 [close] 返回的任务完成后，服务持有的客户端与 MCP 连接均已释放。
+ * 服务在创建时根据当前设置初始化 Gemini 原生可取消 HTTP 传输，并在会话重置时同步 MCP 工具和技能提示词。
+ * 调用 [close] 返回的任务完成后，服务持有的 HTTP 传输与 MCP 连接均已释放。
  *
  * @param parentScope 服务任务所属的父协程作用域。
  * @param settingsRepository 提供 Gemini、MCP 和代理设置的仓库。
@@ -59,6 +77,7 @@ class GeminiAgentService @Inject constructor(
     }
 
     private val logger = LoggerFactory.getLogger(GeminiAgentService::class.java)
+    private val wireJson = Json { ignoreUnknownKeys = true }
     private val serviceJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -84,6 +103,12 @@ class GeminiAgentService @Inject constructor(
     @Volatile
     private var client: Client? = null
 
+    /** 生产请求使用的原生可取消 HTTP 传输；SDK 客户端仅保留给旧会话兼容路径。 */
+    @Volatile
+    private var rawTransport: CancellableOkHttpTransport? = null
+    private var rawBaseUrl: String? = null
+    private var rawApiKey: String? = null
+
     @Volatile
     private var chat: Chat? = null
 
@@ -91,6 +116,7 @@ class GeminiAgentService @Inject constructor(
     private var chatFunctionRouteSnapshot: LocalFunctionRouteSnapshot? = null
 
     private var savedHistory: List<Content>? = null
+    private var rawSession: RawGeminiSession? = null
 
     @Volatile
     private var resetSessionJob: Job? = null
@@ -110,6 +136,14 @@ class GeminiAgentService @Inject constructor(
     private var initialModelUpdateJob: Job? = null
     private var configuredApiKey: String? = null
     private var configuredProxy: ProxySettings? = null
+
+    /** 由本服务维护、仅在成功回合后提交的 Gemini 会话快照。 */
+    private data class RawGeminiSession(
+        val model: String,
+        val config: JsonObject,
+        val functionRouteSnapshot: LocalFunctionRouteSnapshot,
+        val history: List<JsonObject>,
+    )
 
     /**
      * 获取当前会话实际使用的 Gemini 模型名称。
@@ -152,23 +186,9 @@ class GeminiAgentService @Inject constructor(
             try {
                 configuredApiKey = aiSettings.geminiApiKey
                 configuredProxy = proxySettings
-                val clientOptionsBuilder = ClientOptions.builder()
-                if (proxySettings != null) {
-                    val geminiProxyType = when (proxySettings.type) {
-                        ProxyType.HTTP -> GeminiProxyType(GeminiProxyType.Known.HTTP)
-                        ProxyType.SOCKS -> GeminiProxyType(GeminiProxyType.Known.SOCKS)
-                    }
-                    clientOptionsBuilder.proxyOptions(
-                        ProxyOptions.builder().type(geminiProxyType).host(proxySettings.host).port(proxySettings.port)
-                            .apply {
-                                proxySettings.username?.let { username(it) }
-                                proxySettings.password?.let { password(it) }
-                            }.build(),
-                    )
-                }
-
-                client =
-                    Client.builder().apiKey(aiSettings.geminiApiKey).clientOptions(clientOptionsBuilder.build()).build()
+                rawApiKey = aiSettings.geminiApiKey
+                rawBaseUrl = geminiBaseUrl()
+                rawTransport = CancellableOkHttpTransport(createGeminiHttpClient(proxySettings))
 
                 this.resetSessionJob = resetSession()
                 initialReadinessJob = createInitialReadinessJob(resetSessionJob)
@@ -177,7 +197,10 @@ class GeminiAgentService @Inject constructor(
             } catch (e: Exception) {
                 logger.error("Failed to initialize Gemini client", e)
                 client = null
+                rawTransport?.close()
+                rawTransport = null
                 chat = null
+                rawSession = null
                 chatFunctionRouteSnapshot = null
                 initialReadinessJob = failedInitializationJob()
             }
@@ -200,7 +223,7 @@ class GeminiAgentService @Inject constructor(
             logger.error("Gemini agent initialization did not become ready", error)
         }) {
             initialResetJob.join()
-            if (initialResetJob.isCancelled || chat == null) {
+            if (initialResetJob.isCancelled || (chat == null && rawSession == null)) {
                 throw IllegalStateException("Gemini agent initialization failed")
             }
         }
@@ -230,6 +253,43 @@ class GeminiAgentService @Inject constructor(
             logger.warn("Failed to capture history", e)
             return savedHistory
         }
+    }
+
+    /** 创建 Gemini 原生传输客户端，并保留既有 HTTP/SOCKS 代理及其认证语义。 */
+    private fun createGeminiHttpClient(proxySettings: ProxySettings?): OkHttpClient {
+        val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
+        if (proxySettings != null) {
+            val type = when (proxySettings.type) {
+                ProxyType.HTTP -> Proxy.Type.HTTP
+                ProxyType.SOCKS -> Proxy.Type.SOCKS
+            }
+            builder.proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
+            if (proxySettings.type == ProxyType.HTTP && !proxySettings.username.isNullOrEmpty()) {
+                val username = proxySettings.username
+                val password = proxySettings.password.orEmpty()
+                builder.proxyAuthenticator { _, response ->
+                    response.request.newBuilder()
+                        .header("Proxy-Authorization", Credentials.basic(username, password))
+                        .build()
+                }
+            }
+        }
+        return builder.build()
+    }
+
+    /**
+     * 返回 Gemini REST 根地址。
+     *
+     * `GOOGLE_GEMINI_BASE_URL` 可以指向服务根地址或已经包含 `v1beta` 的测试端点；其余情况统一使用
+     * Gemini 开发者 API 的 `v1beta` 路径。
+     */
+    private fun geminiBaseUrl(): String {
+        val configured = System.getenv("GOOGLE_GEMINI_BASE_URL")
+            ?.trim()
+            ?.trimEnd('/')
+            ?.takeIf(String::isNotEmpty)
+            ?: "https://generativelanguage.googleapis.com"
+        return if (configured.endsWith("/v1beta")) configured else "$configured/v1beta"
     }
 
     private data class ModelSwitchRequest(
@@ -272,7 +332,7 @@ class GeminiAgentService @Inject constructor(
      *
      * 若当前模型不再可用，会选择内置回退模型并重置会话；刷新失败不会修改当前模型列表。
      *
-     * @return 刷新成功后的模型快照；客户端不可用、服务已关闭或刷新结果过期时返回 `null`。
+     * @return 刷新成功后的模型快照；HTTP 传输不可用、服务已关闭或刷新结果过期时返回 `null`。
      */
     override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
         try {
@@ -280,9 +340,15 @@ class GeminiAgentService @Inject constructor(
                 return@withLock null
             }
             val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
-            val models = client?.models ?: return@withLock null
-            val refreshedModels = withContext(Dispatchers.IO) {
-                models.list(ListModelsConfig.builder().build()).mapNotNull { it.name().getOrNull() }
+            val currentTransport = rawTransport
+            val refreshedModels = when {
+                currentTransport != null -> listRawModels(currentTransport)
+                else -> {
+                    val models = client?.models ?: return@withLock null
+                    withContext(Dispatchers.IO) {
+                        models.list(ListModelsConfig.builder().build()).mapNotNull { it.name().getOrNull() }
+                    }
+                }
             }
             val refreshResult = synchronized(modelStateLock) {
                 if (modelSelectionVersion != selectionVersion) {
@@ -318,7 +384,7 @@ class GeminiAgentService @Inject constructor(
     /**
      * 异步重置当前会话并重新应用系统提示词、技能与 MCP 工具。
      *
-     * @return 已开始重置时返回对应任务；服务已关闭或 Gemini 客户端不可用时返回 `null`。调用方必须在
+     * @return 已开始重置时返回对应任务；服务已关闭或 Gemini HTTP 传输不可用时返回 `null`。调用方必须在
      * [Job.join] 后检查 [Job.isCancelled]：只有任务正常完成时，新会话才已原子替换旧会话；候选创建
      * 失败或任务取消都会保留旧会话状态。
      */
@@ -330,6 +396,9 @@ class GeminiAgentService @Inject constructor(
     ): Job? {
         if (closed) {
             return null
+        }
+        if (rawTransport != null) {
+            return resetRawSession(captureHistory, switchRequest)
         }
         val currentClient = client
         if (currentClient == null) {
@@ -384,6 +453,64 @@ class GeminiAgentService @Inject constructor(
             } catch (e: Throwable) {
                 switchRequest?.let(::abandonModelSwitch)
                 throw e
+            }
+        }
+    }
+
+    /**
+     * 建立候选的原生 Gemini 会话并在成功时一次性发布。
+     *
+     * REST API 没有服务端 Chat 资源，因此候选会话只包含不可变配置、工具路由和已经成功提交的本地历史。
+     * 构建或 MCP 连接被取消时，该候选不会写入 [rawSession]。
+     */
+    private fun resetRawSession(
+        captureHistory: Boolean,
+        switchRequest: ModelSwitchRequest?,
+    ): Job? {
+        val currentTransport = rawTransport ?: return null
+        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
+        return scope.launch(CoroutineExceptionHandler { _, error ->
+            logger.error("Gemini raw session reset failed", error)
+        }) {
+            try {
+                sessionMutex.withLock {
+                    ensureResetCanCommit(switchRequest)
+                    val candidateHistory = if (captureHistory) rawSession?.history.orEmpty() else emptyList()
+                    mcpClientService.connect(aiSettings.mcpServers)
+                    currentCoroutineContext().ensureActive()
+                    ensureResetCanCommit(switchRequest)
+                    check(rawTransport === currentTransport) { "Gemini HTTP transport was replaced" }
+                    val routeSnapshot = localFunctionRouter.refresh()
+                    val model = switchRequest?.model ?: currentModel
+                    val candidate = RawGeminiSession(
+                        model = model,
+                        config = createGeminiWireConfig(aiSettings, routeSnapshot),
+                        functionRouteSnapshot = routeSnapshot,
+                        history = candidateHistory,
+                    )
+                    commitRawCandidateSession(candidate, switchRequest)
+                    logger.info("Gemini raw session reset with model: {}", model)
+                }
+            } catch (e: Throwable) {
+                switchRequest?.let(::abandonModelSwitch)
+                throw e
+            }
+        }
+    }
+
+    /** 在模型状态锁内提交已完整建立的原生会话候选。 */
+    private fun commitRawCandidateSession(candidate: RawGeminiSession, switchRequest: ModelSwitchRequest?) {
+        synchronized(modelStateLock) {
+            if (switchRequest != null) {
+                check(modelSelectionVersion == switchRequest.version && pendingModel == switchRequest.model) {
+                    "Gemini model switch was superseded before commit"
+                }
+            }
+            rawSession = candidate
+            if (switchRequest != null) {
+                currentModel = switchRequest.model
+                pendingModel = null
+                pendingModelSwitchJob = null
             }
         }
     }
@@ -499,6 +626,9 @@ class GeminiAgentService @Inject constructor(
         text: String?,
         mediaData: List<MediaData>,
     ): String {
+        if (rawTransport != null) {
+            return sendRawMessage(text, mediaData)
+        }
         val audioParts = mediaData.map {
             Part.builder().inlineData(
                 Blob.builder().mimeType(it.mimeType).data(it.data).build()
@@ -506,6 +636,249 @@ class GeminiAgentService @Inject constructor(
         }
         return sendMessageWithParts(text, audioParts)
     }
+
+    /** 使用原生 REST 传输完成一个 Gemini 回合，并只在最终回答成功时提交历史。 */
+    private suspend fun sendRawMessage(text: String?, mediaData: List<MediaData>): String {
+        val initialSession = sessionMutex.withLock {
+            check(!closed) { "Gemini client is closed." }
+            rawSession
+        }
+        val session = initialSession ?: resetSessionJob?.let { job ->
+            job.join()
+            sessionMutex.withLock {
+                check(!closed) { "Gemini client is closed." }
+                rawSession
+            }
+        } ?: throw IllegalStateException("Gemini chat session is not initialized.")
+        return sessionMutex.withLock {
+            check(!closed) { "Gemini client is closed." }
+            val currentTransport =
+                rawTransport ?: throw IllegalStateException("Gemini HTTP transport is not initialized.")
+            val tentativeHistory = session.history.toMutableList()
+            tentativeHistory += createGeminiUserContent(text, mediaData)
+
+            try {
+                var toolCallRounds = 0
+                while (!closed) {
+                    val candidate = requestGeminiContent(currentTransport, session, tentativeHistory)
+                    tentativeHistory += candidate
+                    val functionCalls = geminiFunctionCalls(candidate)
+                    if (functionCalls.isEmpty()) {
+                        val reply = candidate["parts"]?.jsonArray
+                            ?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull }
+                            ?.joinToString("")
+                            .orEmpty()
+                        currentCoroutineContext().ensureActive()
+                        check(!closed && rawSession === session) { "Gemini session was replaced before commit" }
+                        rawSession = session.copy(history = tentativeHistory)
+                        return@withLock reply
+                    }
+
+                    ensureToolCallRoundIsAllowed(toolCallRounds++)
+                    val responses = functionCalls.map { functionCall ->
+                        createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot)
+                    }
+                    tentativeHistory += buildJsonObject {
+                        put("role", "user")
+                        put("parts", JsonArray(responses))
+                    }
+                }
+            } catch (e: ToolCallLimitExceededException) {
+                logger.error("Tool call limit reached for Gemini session", e)
+                resetSessionJob = resetSession()
+                throw e
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Error while sending message to Gemini", e)
+                throw e
+            }
+            throw IllegalStateException("Gemini session was closed before a response was committed.")
+        }
+    }
+
+    /** 将文本与内联媒体转换为 Gemini REST 的用户内容。 */
+    private fun createGeminiUserContent(text: String?, mediaData: List<MediaData>): JsonObject = buildJsonObject {
+        put("role", "user")
+        put("parts", buildJsonArray {
+            text?.let { add(buildJsonObject { put("text", it) }) }
+            mediaData.forEach { media ->
+                add(buildJsonObject {
+                    put("inlineData", buildJsonObject {
+                        put("mimeType", media.mimeType)
+                        put("data", java.util.Base64.getEncoder().encodeToString(media.data))
+                    })
+                })
+            }
+        })
+    }
+
+    /** 发起一次 Gemini `generateContent` 调用并返回首个候选内容。 */
+    private suspend fun requestGeminiContent(
+        transport: CancellableOkHttpTransport,
+        session: RawGeminiSession,
+        contents: List<JsonObject>,
+    ): JsonObject {
+        val apiKey = rawApiKey ?: throw IllegalStateException("Gemini API key is not initialized.")
+        val baseUrl = rawBaseUrl ?: throw IllegalStateException("Gemini base URL is not initialized.")
+        val model = session.model.removePrefix("models/")
+        val url = "$baseUrl/models/$model:generateContent".toHttpUrl().newBuilder()
+            .addQueryParameter("key", apiKey)
+            .build()
+        val requestBody = buildJsonObject {
+            put("contents", JsonArray(contents))
+            session.config.forEach { (key, value) -> put(key, value) }
+        }
+        val response = transport.execute(
+            Request.Builder()
+                .url(url)
+                .header("Content-Type", "application/json")
+                .post(wireJson.encodeToString(JsonObject.serializer(), requestBody).toRequestBodyJson())
+                .build(),
+        )
+        requireGeminiSuccess(response)
+        val root = wireJson.parseToJsonElement(response.body).jsonObject
+        return root["candidates"]?.jsonArray
+            ?.firstOrNull()
+            ?.jsonObject
+            ?.get("content")
+            ?.jsonObject
+            ?: throw IllegalStateException("Gemini response did not contain a candidate content.")
+    }
+
+    /** 抽取候选中的函数调用，保留服务器返回的调用标识。 */
+    private fun geminiFunctionCalls(content: JsonObject): List<JsonObject> = content["parts"]?.jsonArray
+        ?.mapNotNull { it.jsonObject["functionCall"]?.jsonObject }
+        .orEmpty()
+
+    /** 执行一个 Gemini 函数调用，并构造对应的协议函数响应。 */
+    private suspend fun createGeminiFunctionResponse(
+        functionCall: JsonObject,
+        routeSnapshot: LocalFunctionRouteSnapshot,
+    ): JsonObject {
+        val name = functionCall["name"]?.jsonPrimitive?.contentOrNull
+        val args = functionCall["args"] as? JsonObject
+        val result = try {
+            when {
+                name.isNullOrBlank() -> buildJsonObject { put("error", "Function call name is missing") }
+                args == null -> buildJsonObject { put("error", "Function $name arguments are invalid") }
+                !routeSnapshot.canHandle(name) -> buildJsonObject { put("error", "Function $name not found") }
+                else -> routeSnapshot.execute(name, args.toMap())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error("Failed to execute Gemini function call: {}", name, e)
+            buildJsonObject { put("error", e.message ?: "Function $name failed") }
+        }
+        return buildJsonObject {
+            put("functionResponse", buildJsonObject {
+                put("name", name.orEmpty())
+                functionCall["id"]?.let { put("id", it) }
+                put("response", result)
+            })
+        }
+    }
+
+    /** 构建 Gemini REST 请求中允许出现的顶层配置字段。 */
+    private fun createGeminiWireConfig(
+        aiSettings: AISettings,
+        routeSnapshot: LocalFunctionRouteSnapshot,
+    ): JsonObject = buildJsonObject {
+        val skillPrompt = getSkillPrompt(skillRepository.getSkillSummaries())
+        val instruction = skillPrompt + aiSettings.globalContext
+        if (instruction.isNotBlank()) {
+            put("systemInstruction", buildJsonObject {
+                put("parts", buildJsonArray { add(buildJsonObject { put("text", instruction) }) })
+            })
+        }
+        val declarations = routeSnapshot.providedFunctions()
+        if (declarations.isNotEmpty()) {
+            put("tools", buildJsonArray {
+                add(buildJsonObject {
+                    put("functionDeclarations", JsonArray(declarations.map(::geminiFunctionDeclarationJson)))
+                })
+            })
+        }
+    }
+
+    /** 显式转换一个函数声明，避免把 SDK 的完整配置对象直接序列化为 REST 请求。 */
+    private fun geminiFunctionDeclarationJson(declaration: FunctionDeclaration): JsonObject = buildJsonObject {
+        declaration.name().getOrNull()?.let { put("name", it) }
+        declaration.description().getOrNull()?.let { put("description", it) }
+        declaration.parameters().getOrNull()?.let { put("parameters", geminiSchemaJson(it)) }
+        declaration.response().getOrNull()?.let { put("response", geminiSchemaJson(it)) }
+    }
+
+    /** 显式转换 Gemini 工具 JSON Schema，完整保留 SDK 已公开的约束、组合和展示字段。 */
+    private fun geminiSchemaJson(schema: Schema): JsonObject = buildJsonObject {
+        schema.anyOf().getOrNull()?.let { variants -> put("anyOf", JsonArray(variants.map(::geminiSchemaJson))) }
+        schema.default_().getOrNull()?.let { put("default", geminiSchemaValueJson(it)) }
+        schema.type().getOrNull()?.let { put("type", it.toString()) }
+        schema.description().getOrNull()?.let { put("description", it) }
+        schema.example().getOrNull()?.let { put("example", geminiSchemaValueJson(it)) }
+        schema.format().getOrNull()?.let { put("format", it) }
+        schema.maxItems().getOrNull()?.let { put("maxItems", it) }
+        schema.maxLength().getOrNull()?.let { put("maxLength", it) }
+        schema.maxProperties().getOrNull()?.let { put("maxProperties", it) }
+        schema.maximum().getOrNull()?.let { put("maximum", it) }
+        schema.minItems().getOrNull()?.let { put("minItems", it) }
+        schema.minLength().getOrNull()?.let { put("minLength", it) }
+        schema.minProperties().getOrNull()?.let { put("minProperties", it) }
+        schema.minimum().getOrNull()?.let { put("minimum", it) }
+        schema.nullable().getOrNull()?.let { put("nullable", it) }
+        schema.pattern().getOrNull()?.let { put("pattern", it) }
+        schema.propertyOrdering().getOrNull()?.let { ordering ->
+            put("propertyOrdering", JsonArray(ordering.map(::JsonPrimitive)))
+        }
+        schema.required().getOrNull()?.let { required -> put("required", JsonArray(required.map(::JsonPrimitive))) }
+        schema.enum_().getOrNull()?.let { values -> put("enum", JsonArray(values.map(::JsonPrimitive))) }
+        schema.items().getOrNull()?.let { put("items", geminiSchemaJson(it)) }
+        schema.properties().getOrNull()?.let { properties ->
+            put("properties", buildJsonObject {
+                properties.forEach { (name, property) -> put(name, geminiSchemaJson(property)) }
+            })
+        }
+        schema.title().getOrNull()?.let { put("title", it) }
+    }
+
+    /**
+     * 将 Schema 的自由默认值或示例值转换为 JSON，并在值不能被安全编码时明确失败而不是静默丢弃约束。
+     */
+    private fun geminiSchemaValueJson(value: Any): JsonElement =
+        when (value) {
+            is JsonElement -> value
+            else -> try {
+                wireJson.parseToJsonElement(JsonSerializable.toJsonString(value))
+            } catch (e: Exception) {
+                throw IllegalArgumentException("Gemini Schema value cannot be represented as JSON.", e)
+            }
+        }
+
+    /** 刷新 Gemini 模型列表并只接受服务声明的名称。 */
+    private suspend fun listRawModels(transport: CancellableOkHttpTransport): List<String> {
+        val apiKey = rawApiKey ?: throw IllegalStateException("Gemini API key is not initialized.")
+        val baseUrl = rawBaseUrl ?: throw IllegalStateException("Gemini base URL is not initialized.")
+        val response = transport.execute(
+            Request.Builder()
+                .url("$baseUrl/models".toHttpUrl().newBuilder().addQueryParameter("key", apiKey).build())
+                .get()
+                .build(),
+        )
+        requireGeminiSuccess(response)
+        return wireJson.parseToJsonElement(response.body).jsonObject["models"]?.jsonArray
+            ?.mapNotNull { it.jsonObject["name"]?.jsonPrimitive?.contentOrNull }
+            .orEmpty()
+    }
+
+    /** 将 HTTP 失败转换为携带有限响应正文的异常，避免把失败结果当作模型协议解析。 */
+    private fun requireGeminiSuccess(response: HttpResult) {
+        if (response.statusCode !in 200..299) {
+            throw IllegalStateException("Gemini API returned HTTP ${response.statusCode}: ${response.body.take(1024)}")
+        }
+    }
+
+    private fun String.toRequestBodyJson() = toRequestBody("application/json; charset=utf-8".toMediaType())
 
     /**
      * 发送包含 Gemini Part 的消息。
@@ -653,16 +1026,18 @@ class GeminiAgentService @Inject constructor(
     }
 
     /**
-     * 关闭 Gemini 客户端、会话任务与 MCP 连接。
+     * 关闭 Gemini 原生 HTTP 传输、会话任务与 MCP 连接。
      *
      * 重复调用会返回同一个等待任务；若调用方取消此前返回的等待任务，后续调用会提供新的等待任务，
      * 而不会取消已启动的资源清理。
      *
-     * @return 异步关闭任务；等待该任务完成后不再保留 Gemini 客户端和 MCP 连接。
+     * @return 异步关闭任务；等待该任务完成后不再保留 Gemini HTTP 传输和 MCP 连接。
      */
     override fun close(): Job = synchronized(lifecycleLock) {
         val completion = closeCompletion ?: CompletableDeferred<Unit>().also { newCompletion ->
             closed = true
+            // 先取消实际 HTTP Call；不要等待 sessionMutex，否则超时请求会阻塞关闭路径。
+            rawTransport?.close()
             initialModelUpdateJob?.cancel()
             initialModelUpdateJob = null
             resetSessionJob?.cancel()
@@ -675,6 +1050,8 @@ class GeminiAgentService @Inject constructor(
                             val currentClient = sessionMutex.withLock {
                                 val clientToClose = client
                                 client = null
+                                rawTransport = null
+                                rawSession = null
                                 chat = null
                                 savedHistory = null
                                 clientToClose

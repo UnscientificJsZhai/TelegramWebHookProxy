@@ -1,10 +1,13 @@
 package com.unscientificjszhai.tgp.service
 
+import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
+import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
+import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
@@ -13,7 +16,9 @@ import io.mockk.coVerify
 import io.mockk.mockk
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import java.io.File
 import java.io.IOException
@@ -30,6 +35,7 @@ class TaskSchedulerServiceTest {
 
     private lateinit var telegramService: TelegramService
     private lateinit var agentService: AgentService
+    private lateinit var settingsRepository: SettingsRepository
     private lateinit var service: TaskSchedulerService
     private val tempDirectory = createTempDirectory("task-scheduler-test").toFile()
     private val scheduleFile = File(tempDirectory, "schedule.json")
@@ -41,8 +47,10 @@ class TaskSchedulerServiceTest {
 
         val agentProvider = Provider { agentService }
         val testScope = CoroutineScope(EmptyCoroutineContext)
+        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
+        settingsRepository.saveSettings(AppSettings(telegramToken = BOT_A_TOKEN))
 
-        service = TaskSchedulerService(testScope, telegramService, agentProvider, scheduleFile)
+        service = TaskSchedulerService(testScope, telegramService, agentProvider, settingsRepository, scheduleFile)
     }
 
     @AfterTest
@@ -91,12 +99,14 @@ class TaskSchedulerServiceTest {
         service.createTask(instruction, System.currentTimeMillis() - 1000, LoopMode.ONCE, chatId)
 
         coEvery { agentService.sendMessage(any()) } returns "LLM result"
-        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
         coVerify { agentService.sendMessage(any()) }
-        coVerify { telegramService.sendMessage(chatId, match { it.contains("LLM result") }) }
+        coVerify {
+            telegramService.sendMessageForToken(BOT_A_TOKEN, chatId, match { it.contains("LLM result") }, any())
+        }
 
         assertEquals(0, service.listTasks().size, "ONCE task should be removed after execution")
     }
@@ -114,7 +124,7 @@ class TaskSchedulerServiceTest {
         service.createTask(instruction, executionTime, LoopMode.HOURLY, chatId)
 
         coEvery { agentService.sendMessage(any()) } returns "LLM result"
-        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
@@ -134,6 +144,7 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             scheduleFile,
             failingOperations,
         )
@@ -149,6 +160,7 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             cancelScheduleFile,
         )
         val taskId = service.createTask("persisted", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
@@ -158,6 +170,7 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             cancelScheduleFile,
             primaryReplaceFailingOperations(cancelScheduleFile),
         )
@@ -176,11 +189,12 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             scheduleFile,
             primaryReplaceFailingOperations(),
         )
         coEvery { agentService.sendMessage(any()) } returns "result"
-        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
@@ -205,6 +219,7 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             scheduleFile,
             primaryReplaceFailingOperations(),
         )
@@ -231,6 +246,7 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             scheduleFile,
         )
 
@@ -254,6 +270,7 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             scheduleFile,
         )
 
@@ -271,8 +288,13 @@ class TaskSchedulerServiceTest {
     @Test
     fun `scan revalidates recovered backup before executing due task`() = runTest {
         val backupFile = File(tempDirectory, "schedule.json.bak")
-        val recoveredTask =
-            ScheduledTask("backup", "instruction", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val recoveredTask = ScheduledTask(
+            "backup",
+            "instruction",
+            System.currentTimeMillis() - 1_000,
+            LoopMode.ONCE,
+            "12345",
+        )
         scheduleFile.writeText("[ invalid")
         backupFile.writeText(ConfigJson.encodeToString(listOf(recoveredTask)))
         var blockBackupRead = true
@@ -289,11 +311,12 @@ class TaskSchedulerServiceTest {
             CoroutineScope(EmptyCoroutineContext),
             telegramService,
             Provider { agentService },
+            settingsRepository,
             scheduleFile,
             fileOperations,
         )
         coEvery { agentService.sendMessage(any()) } returns "done"
-        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
         blockBackupRead = false
         service.scanAndExecute()
@@ -314,7 +337,7 @@ class TaskSchedulerServiceTest {
         service.scanAndExecute()
 
         assertEquals(listOf(incompleteTask), service.listTasks().map { it.id })
-        coVerify(exactly = 0) { telegramService.sendMessage(any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
 
         coEvery { agentService.sendMessage(any()) } throws IllegalStateException("ordinary failure")
         service.scanAndExecute()
@@ -330,7 +353,7 @@ class TaskSchedulerServiceTest {
     fun `normal error text completes task`() = runTest {
         service.createTask("normal error text", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } returns "Error: 模型正常文本"
-        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
         service.scanAndExecute()
 
@@ -345,7 +368,14 @@ class TaskSchedulerServiceTest {
     fun `result delivery failure does not rerun completed agent turn`() = runTest {
         service.createTask("delivery throw", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } returns "done"
-        coEvery { telegramService.sendMessage(any(), any()) } throws IOException("delivery failure")
+        coEvery {
+            telegramService.sendMessageForToken(
+                any(),
+                any(),
+                any(),
+                any()
+            )
+        } throws IOException("delivery failure")
 
         service.scanAndExecute()
 
@@ -360,7 +390,7 @@ class TaskSchedulerServiceTest {
     fun `non ok result delivery does not rerun completed agent turn`() = runTest {
         service.createTask("delivery non ok", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } returns "done"
-        coEvery { telegramService.sendMessage(any(), any()) } returns TelegramApiResponse(
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(
             HttpStatusCode.OK,
             """{"ok":false}""",
         )
@@ -378,7 +408,14 @@ class TaskSchedulerServiceTest {
     fun `cancelled result delivery keeps one shot task for retry`() = runTest {
         val taskId = service.createTask("delivery cancel", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } returns "done"
-        coEvery { telegramService.sendMessage(any(), any()) } throws CancellationException("delivery cancelled")
+        coEvery {
+            telegramService.sendMessageForToken(
+                any(),
+                any(),
+                any(),
+                any()
+            )
+        } throws CancellationException("delivery cancelled")
 
         assertFailsWith<CancellationException> { service.scanAndExecute() }
 
@@ -412,7 +449,7 @@ class TaskSchedulerServiceTest {
             }
             "done"
         }
-        coEvery { telegramService.sendMessage(any(), any()) } returns successfulTelegramResponse()
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
         assertFailsWith<CancellationException> { service.scanAndExecute() }
         coVerify(exactly = 0) { agentService.sendMessage(match { it.contains("second") }) }
@@ -422,6 +459,80 @@ class TaskSchedulerServiceTest {
         assertTrue(service.listTasks().isEmpty())
         coVerify(exactly = 1) { agentService.sendMessage(match { it.contains("second") }) }
     }
+
+    /**
+     * 验证租约内捕获的 token 会用于已开始回合的投递，即使回合期间切换了活动 Bot。
+     */
+    @Test
+    fun `in flight task delivery uses the token captured by its execution lease`() = runTest {
+        service.createTask("task", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "chat-a")
+        val agentStarted = CompletableDeferred<Unit>()
+        val allowAgentToFinish = CompletableDeferred<Unit>()
+        coEvery { agentService.sendMessage(any()) } coAnswers {
+            agentStarted.complete(Unit)
+            allowAgentToFinish.await()
+            "done"
+        }
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
+
+        val execution = async { service.scanAndExecute() }
+        agentStarted.await()
+        settingsRepository.saveSettings(AppSettings(telegramToken = BOT_B_TOKEN))
+        allowAgentToFinish.complete(Unit)
+        execution.await()
+
+        coVerify(exactly = 1) { telegramService.sendMessageForToken(BOT_A_TOKEN, "chat-a", any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(BOT_B_TOKEN, any(), any(), any()) }
+    }
+
+    /**
+     * 验证无效 token 不会执行、投递或推进定时任务。
+     */
+    @Test
+    fun `invalid token leaves scheduled tasks untouched`() = runTest {
+        val taskId = service.createTask("task", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "chat-a")
+        settingsRepository.saveSettings(AppSettings(telegramToken = "invalid-token"))
+
+        service.scanAndExecute()
+
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        assertEquals(listOf(taskId), service.listTasks().map { it.id })
+    }
+
+    /**
+     * 验证主文件替换失败时内存和主文件都维持提交前快照，且不产生备份。
+     */
+    @Test
+    fun `primary replacement failure leaves memory and primary unchanged without creating a backup`() {
+        service.createTask("existing", Long.MAX_VALUE, LoopMode.ONCE, "chat-a")
+        val primaryBefore = scheduleFile.readText()
+        val backupFile = File(tempDirectory, "schedule.json.bak")
+        assertFalse(backupFile.exists())
+
+        service.close()
+        service = newService(scheduleFile, primaryReplaceFailingOperations())
+
+        assertFailsWith<IOException> {
+            service.createTask("new", Long.MAX_VALUE, LoopMode.ONCE, "chat-a")
+        }
+
+        assertEquals(primaryBefore, scheduleFile.readText())
+        assertFalse(backupFile.exists())
+        assertEquals(1, service.listTasks().size)
+    }
+
+    private fun newService(
+        file: File,
+        fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
+    ): TaskSchedulerService = TaskSchedulerService(
+        CoroutineScope(EmptyCoroutineContext),
+        telegramService,
+        Provider { agentService },
+        settingsRepository,
+        file,
+        fileOperations,
+    )
 
     private fun primaryReplaceFailingOperations(targetFile: File = scheduleFile): AtomicJsonFileOperations =
         object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
@@ -436,3 +547,6 @@ class TaskSchedulerServiceTest {
     private fun successfulTelegramResponse(): TelegramApiResponse =
         TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 }
+
+private const val BOT_A_TOKEN = "100:token-a"
+private const val BOT_B_TOKEN = "200:token-b"

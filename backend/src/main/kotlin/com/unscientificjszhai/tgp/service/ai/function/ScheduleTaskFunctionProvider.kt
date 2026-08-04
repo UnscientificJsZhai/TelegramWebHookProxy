@@ -18,7 +18,7 @@ import javax.inject.Provider
 /**
  * 提供创建、查询和取消 AI 定时任务的模型函数。
  *
- * 所有任务操作均委托给 [TaskSchedulerService]，创建任务时使用当前 AI 设置中的代理会话标识。
+ * 所有任务操作均委托给 [TaskSchedulerService]。创建任务时使用当前 AI 设置中的代理会话标识。
  *
  * @param taskSchedulerService 延迟提供定时任务调度服务，以避免初始化循环依赖。
  * @param settingsRepository 提供创建任务所需代理会话标识的设置仓库。
@@ -242,4 +242,5 @@ class ScheduleTaskFunctionProvider(
             .toInstant()
             .toEpochMilli()
     }
+
 }

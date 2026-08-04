@@ -8,6 +8,7 @@ import com.unscientificjszhai.tgp.models.FileResponse
 import com.unscientificjszhai.tgp.models.GetUpdatesResponse
 import com.unscientificjszhai.tgp.models.Message
 import com.unscientificjszhai.tgp.models.TelegramFile
+import com.unscientificjszhai.tgp.models.TelegramResponseParameters
 import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.models.Voice
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -35,6 +36,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.net.SocketTimeoutException
 import java.util.concurrent.CountDownLatch
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
@@ -46,6 +48,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -761,7 +764,286 @@ class MessagePollerTest {
         }
     }
 
-    private fun fixture(processingTimeout: Duration? = null): Fixture {
+    /**
+     * 验证失败响应使用一次退避，遵循 `retry_after`、指数增长和成功后的计数重置规则。
+     */
+    @Test
+    fun `polling failures use retry after exponential backoff and reset after success`() = runBlocking {
+        val observedDelays = mutableListOf<Duration>()
+        val sixthDelayObserved = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = { duration ->
+                synchronized(observedDelays) {
+                    observedDelays += duration
+                    if (observedDelays.size == 6) {
+                        sixthDelayObserved.complete(Unit)
+                    }
+                }
+            },
+            retryJitter = { localBackoff -> localBackoff / 2 },
+        )
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 429,
+            parameters = TelegramResponseParameters(retryAfter = 3),
+        ) andThen GetUpdatesResponse(
+            ok = false,
+            errorCode = 429,
+        ) andThen GetUpdatesResponse(
+            ok = false,
+            errorCode = 429,
+            parameters = TelegramResponseParameters(retryAfter = 0),
+        ) andThen GetUpdatesResponse(
+            ok = false,
+            errorCode = 409,
+            description = "Conflict: terminated by other getUpdates request",
+        ) andThen GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+        ) andThen GetUpdatesResponse(ok = true) andThen GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+        )
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            withTimeout(3.seconds) { sixthDelayObserved.await() }
+            assertEquals(
+                listOf(
+                    3500.milliseconds,
+                    3.seconds,
+                    6.seconds,
+                    12.seconds,
+                    24.seconds,
+                    1500.milliseconds,
+                ),
+                synchronized(observedDelays) { observedDelays.take(6) },
+            )
+            assertEquals(10, fixture.updates.getData("100").lastUpdateId)
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证连续可重试失败的本地指数退避饱和在 60 秒，而不会无限增长。
+     */
+    @Test
+    fun `polling failure backoff caps at sixty seconds`() = runBlocking {
+        val observedDelays = mutableListOf<Duration>()
+        val seventhDelayStarted = CompletableDeferred<Unit>()
+        val keepSeventhDelay = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = { duration ->
+                observedDelays += duration
+                if (observedDelays.size == 7) {
+                    seventhDelayStarted.complete(Unit)
+                    keepSeventhDelay.await()
+                }
+            },
+        )
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+        )
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { seventhDelayStarted.await() }
+            assertEquals(
+                listOf(1.seconds, 2.seconds, 4.seconds, 8.seconds, 16.seconds, 32.seconds, 60.seconds),
+                observedDelays,
+            )
+        } finally {
+            keepSeventhDelay.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证网络异常进入与 API 失败相同的可取消退避路径，且不推进偏移量。
+     */
+    @Test
+    fun `network polling failures retry without changing the offset`() = runBlocking {
+        val observedDelay = CompletableDeferred<Duration>()
+        val keepRetrying = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = { duration ->
+                observedDelay.complete(duration)
+                keepRetrying.await()
+            },
+        )
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } throws SocketTimeoutException("timeout")
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            assertEquals(1.seconds, withTimeout(2.seconds) { observedDelay.await() })
+            assertEquals(10, fixture.updates.getData("100").lastUpdateId)
+            coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:A", 11, 30) }
+        } finally {
+            keepRetrying.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证初始化请求失败不会写入偏移量，并在下一轮仍使用初始化请求而非正常长轮询。
+     */
+    @Test
+    fun `failed initial polling retries initialization without changing the offset`() = runBlocking {
+        val retryDelays = mutableListOf<Duration>()
+        val normalPollStarted = CompletableDeferred<Unit>()
+        val neverCompletes = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = { duration -> retryDelays += duration },
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", -1, 0) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+        ) andThen GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 1, 30) } coAnswers {
+            normalPollStarted.complete(Unit)
+            neverCompletes.await()
+            GetUpdatesResponse(ok = true)
+        }
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            withTimeout(3.seconds) { normalPollStarted.await() }
+            coVerify(exactly = 2) { fixture.telegram.getUpdatesForToken("100:A", -1, 0) }
+            assertEquals(listOf(1.seconds), retryDelays)
+            assertEquals(0, fixture.updates.getData("100").lastUpdateId)
+        } finally {
+            neverCompletes.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证 token 切换会取消旧会话的失败退避，且不会由旧 token 发起额外请求。
+     */
+    @Test
+    fun `token switch cancels old polling backoff before another old request`() = runBlocking {
+        val backoffStarted = CompletableDeferred<Unit>()
+        val backoffCancelled = CompletableDeferred<Unit>()
+        val neverCompletes = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = {
+                backoffStarted.complete(Unit)
+                try {
+                    neverCompletes.await()
+                } finally {
+                    backoffCancelled.complete(Unit)
+                }
+            },
+        )
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("200:B", -1, 0) } returns GetUpdatesResponse(ok = true)
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { backoffStarted.await() }
+            fixture.saveSettings(AppSettings(telegramToken = "200:B"))
+
+            withTimeout(2.seconds) { backoffCancelled.await() }
+            eventually {
+                coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:A", 11, 30) }
+                coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("200:B", -1, 0) }
+            }
+        } finally {
+            neverCompletes.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证关闭服务会取消正在等待的失败退避，且不再发起轮询。
+     */
+    @Test
+    fun `close cancels polling backoff without issuing another request`() = runBlocking {
+        val backoffStarted = CompletableDeferred<Unit>()
+        val backoffCancelled = CompletableDeferred<Unit>()
+        val neverCompletes = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = {
+                backoffStarted.complete(Unit)
+                try {
+                    neverCompletes.await()
+                } finally {
+                    backoffCancelled.complete(Unit)
+                }
+            },
+        )
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+            ok = false,
+            errorCode = 500,
+        )
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        withTimeout(2.seconds) { backoffStarted.await() }
+        fixture.poller.close()
+        withTimeout(2.seconds) { backoffCancelled.await() }
+        coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:A", 11, 30) }
+        neverCompletes.cancel()
+    }
+
+    /**
+     * 验证 401 会仅移除当前会话、关闭其队列并取消其作用域，后续 token 仍可建立新会话。
+     */
+    @Test
+    fun `authentication failure removes only its current session and later token can poll`() = runBlocking {
+        val authenticationRequestStarted = CompletableDeferred<Unit>()
+        val allowAuthenticationFailure = CompletableDeferred<Unit>()
+        val fixture = fixture()
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } coAnswers {
+            authenticationRequestStarted.complete(Unit)
+            allowAuthenticationFailure.await()
+            GetUpdatesResponse(ok = false, errorCode = 401, description = "Unauthorized")
+        }
+        coEvery { fixture.telegram.getUpdatesForToken("200:B", -1, 0) } returns GetUpdatesResponse(ok = true)
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { authenticationRequestStarted.await() }
+            val failedSession = currentSession(fixture.poller)
+            allowAuthenticationFailure.complete(Unit)
+
+            eventually { assertNull(currentSessionOrNull(fixture.poller)) }
+            assertTrue(sessionQueue(failedSession).trySend(mockk()).isFailure)
+            assertTrue(sessionJob(failedSession).isCancelled)
+
+            fixture.saveSettings(AppSettings(telegramToken = "200:B"))
+            eventually {
+                coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("200:B", -1, 0) }
+                assertEquals("200:B", sessionToken(currentSession(fixture.poller)))
+            }
+        } finally {
+            allowAuthenticationFailure.complete(Unit)
+            fixture.poller.close()
+        }
+    }
+
+    private fun fixture(
+        processingTimeout: Duration = 10.minutes,
+        retryDelay: suspend (Duration) -> Unit = { delay(it) },
+        retryJitter: (Duration) -> Duration = { Duration.ZERO },
+    ): Fixture {
         val barrier = ModelSwitchBarrier()
         val settings =
             SettingsRepository.forTesting(tempDirectory.resolve("settings-${System.nanoTime()}.json"), barrier)
@@ -775,9 +1057,17 @@ class MessagePollerTest {
             updates = updates,
             telegram = telegram,
             agent = agent,
-            poller = processingTimeout?.let { timeout ->
-                MessagePoller(parentScope, telegram, agent, settings, updates, barrier, timeout)
-            } ?: MessagePoller(parentScope, telegram, agent, settings, updates, barrier),
+            poller = MessagePoller(
+                parentScope,
+                telegram,
+                agent,
+                settings,
+                updates,
+                barrier,
+                processingTimeout,
+                retryDelay,
+                retryJitter,
+            ),
         )
     }
 
@@ -802,6 +1092,19 @@ class MessagePollerTest {
     private fun currentSession(poller: MessagePoller): Any = assertNotNull(
         MessagePoller::class.java.getDeclaredField("currentSession").apply { isAccessible = true }.get(poller),
     )
+
+    private fun currentSessionOrNull(poller: MessagePoller): Any? =
+        MessagePoller::class.java.getDeclaredField("currentSession").apply { isAccessible = true }.get(poller)
+
+    private fun sessionToken(session: Any): String = session.javaClass.getDeclaredField("token").apply {
+        isAccessible = true
+    }.get(session) as String
+
+    private fun sessionJob(session: Any): Job = session.javaClass.getDeclaredField("scope").apply {
+        isAccessible = true
+    }.get(session).let { scope ->
+        (scope as CoroutineScope).coroutineContext[Job]!!
+    }
 
     @Suppress("UNCHECKED_CAST")
     private fun sessionQueue(session: Any): Channel<Any> = session.javaClass.getDeclaredField("updateChannel").apply {
