@@ -528,6 +528,41 @@ class OpenAIAgentServiceTest {
     }
 
     /**
+     * 验证技能存储隔离会使候选代理初始化失败，而不会将隔离的数据误作空技能列表继续发布。
+     */
+    @Test
+    fun `initial OpenAI readiness rejects isolated skill storage`() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        val skillsFile = File(tempDirectory, "skills.json")
+        val invalidSkills = """[{"id":"safe?legacy","description":"invalid","content":"invalid"}]"""
+        skillsFile.writeText(invalidSkills)
+        skillRepository = SkillRepository.forTesting(skillsFile)
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
+                    agentEnabled = true,
+                ),
+            ),
+        )
+        val candidate = newService()
+
+        try {
+            val readiness = assertNotNull(candidate.initializationJob())
+            withTimeout(5.seconds) { readiness.join() }
+
+            assertTrue(readiness.isCancelled)
+            assertEquals(invalidSkills, skillsFile.readText())
+        } finally {
+            candidate.close().join()
+            server.close()
+        }
+    }
+
+    /**
      * 验证首轮模型列表不含当前模型时，回退会话的 MCP 取消会使 OpenAI 组合就绪任务失败。
      */
     @Test

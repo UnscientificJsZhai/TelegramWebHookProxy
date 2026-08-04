@@ -162,7 +162,7 @@ class TaskSchedulerService private constructor(
     }
 
     private fun loadTasks() {
-        when (val read = storage.readValidatedAndRecover(::decodeTasks)) {
+        when (val read = storage.readValidated(::decodeTasks)) {
             AtomicJsonRead.Missing -> Unit
             is AtomicJsonRead.Valid -> stateLock.withLock {
                 tasks.clear()
@@ -172,7 +172,7 @@ class TaskSchedulerService private constructor(
 
             is AtomicJsonRead.Corrupt -> {
                 requiresStorageValidationBeforeWrite = true
-                logger.error("Schedule file and its backup are semantically invalid; preserving both files", read.cause)
+                logger.error("Schedule file is semantically invalid; preserving it", read.cause)
             }
 
             is AtomicJsonRead.IoFailure -> {
@@ -180,21 +180,6 @@ class TaskSchedulerService private constructor(
                 logger.error("Unable to read scheduled tasks; delaying writes until it can be revalidated", read.cause)
             }
 
-            is AtomicJsonRead.RecoveryFailed -> {
-                requiresStorageValidationBeforeWrite = true
-                logger.error(
-                    "Validated schedule backup could not be restored; preserving files and disabling writes",
-                    read.cause,
-                )
-            }
-
-            is AtomicJsonRead.RecoverabilityPending -> {
-                requiresStorageValidationBeforeWrite = true
-                logger.error(
-                    "Schedule recovery is blocked by I/O; delaying writes until revalidation",
-                    read.cause,
-                )
-            }
         }
     }
 
@@ -215,24 +200,14 @@ class TaskSchedulerService private constructor(
         if (!requiresStorageValidationBeforeWrite) {
             return
         }
-        val validated = when (val read = storage.readValidatedAndRecover(::decodeTasks)) {
+        val validated = when (val read = storage.readValidated(::decodeTasks)) {
             AtomicJsonRead.Missing -> emptyList()
             is AtomicJsonRead.Valid -> read.value
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException(
-                "定时任务文件及备份均已损坏，拒绝覆盖现场。",
-                read.cause
-            )
-
+            is AtomicJsonRead.Corrupt -> throw IllegalStateException("定时任务文件已损坏，拒绝覆盖现场。", read.cause)
             is AtomicJsonRead.IoFailure -> throw IllegalStateException(
                 "定时任务文件尚不可读取，拒绝覆盖现场。",
                 read.cause
             )
-
-            is AtomicJsonRead.RecoveryFailed ->
-                throw IllegalStateException("有效定时任务备份无法恢复主文件，拒绝覆盖现场。", read.cause)
-
-            is AtomicJsonRead.RecoverabilityPending ->
-                throw IllegalStateException("定时任务备份尚不可读取或验证，拒绝覆盖现场。", read.cause)
         }
         tasks.clear()
         tasks.addAll(validated)
@@ -459,7 +434,7 @@ class TaskSchedulerService private constructor(
      * @param loopMode 任务到期后的循环方式；[LoopMode.ONCE] 表示仅执行一次。
      * @param agentChatId 接收执行结果的 Telegram 会话标识；允许为空字符串，将按原样保存。
      * @return 已成功持久化的新任务八位标识符。
-     * @throws IllegalStateException 文件、备份不可安全恢复或暂不可读取时抛出；不会添加内存任务。
+     * @throws IllegalStateException 文件已损坏或暂不可读取时抛出；不会添加内存任务。
      * @throws Exception 编码或原子持久化失败时抛出；不会添加内存任务。
      */
     fun createTask(instruction: String, executionTime: Long, loopMode: LoopMode, agentChatId: String): String {
@@ -495,7 +470,7 @@ class TaskSchedulerService private constructor(
      *
      * @param taskId 要取消的任务标识；空字符串或不存在的标识不会取消任务。
      * @return 找到并成功持久化移除任务时返回 `true`；不存在匹配任务时返回 `false`。
-     * @throws IllegalStateException 文件、备份不可安全恢复或暂不可读取时抛出；不会移除内存任务。
+     * @throws IllegalStateException 文件已损坏或暂不可读取时抛出；不会移除内存任务。
      * @throws Exception 编码或原子持久化失败时抛出；不会移除内存任务。
      */
     fun cancelTask(taskId: String): Boolean = stateLock.withLock {

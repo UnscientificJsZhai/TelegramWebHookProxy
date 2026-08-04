@@ -304,26 +304,23 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证从备份恢复历史非法 OpenAI 地址时使用原始字节，不会将其规范化或清空为默认地址。
+     * 验证损坏主文件不会读取遗留 `.bak` 中的历史 OpenAI 地址。
      */
     @Test
-    fun `backup recovery preserves historical invalid OpenAI base URL bytes`() {
-        val configFile = File(tempDirectory, "recovered-invalid-openai-url.json")
-        val backupFile = File(tempDirectory, "recovered-invalid-openai-url.json.bak")
+    fun `damaged primary ignores legacy bak historical invalid OpenAI base URL`() {
+        val configFile = File(tempDirectory, "invalid-openai-primary.json")
+        val sidecarFile = File(tempDirectory, "invalid-openai-primary.json.bak")
         val historicalContent =
             """{"ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/audio/%74ranscriptions","agentEnabled":true}}"""
         configFile.writeText("{ damaged")
-        backupFile.writeText(historicalContent)
+        sidecarFile.writeText(historicalContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
 
-        assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
-        assertEquals(
-            "https://gateway.example.com/v1/audio/%74ranscriptions",
-            repository.settingsFlow.value.ai?.openAiBaseUrl
-        )
-        assertEquals(historicalContent, configFile.readText())
-        assertEquals(historicalContent, backupFile.readText())
+        assertFalse(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertEquals("{ damaged", configFile.readText())
+        assertEquals(historicalContent, sidecarFile.readText())
     }
 
     /**
@@ -560,24 +557,25 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证从备份恢复的历史非法 MCP 配置也不会触发连接，并保持显式替换保护。
+     * 验证损坏主文件不会读取遗留 `.bak` 中的历史非法 MCP 配置。
      */
     @Test
-    fun `recovered historical invalid MCP configuration remains fail closed`() {
-        val configFile = File(tempDirectory, "recovered-invalid-mcp.json")
-        val backupFile = File(tempDirectory, "recovered-invalid-mcp.json.bak")
-        val backupContent =
+    fun `damaged primary ignores legacy bak historical invalid MCP configuration`() {
+        val configFile = File(tempDirectory, "invalid-mcp-primary.json")
+        val sidecarFile = File(tempDirectory, "invalid-mcp-primary.json.bak")
+        val sidecarContent =
             """
             {"telegramToken":"100:token","ai":{"geminiApiKey":"key","mcpServers":[{"name":"bad","url":"https://user:secret@mcp.example.com","headers":{}}]}}
             """.trimIndent()
         configFile.writeText("{ invalid")
-        backupFile.writeText(backupContent)
+        sidecarFile.writeText(sidecarContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
 
         assertTrue(repository.settingsFlow.value.ai?.mcpServers.orEmpty().isEmpty())
-        assertTrue(repository.hasHistoricalInvalidMcp)
-        assertEquals(backupContent, configFile.readText())
+        assertFalse(repository.hasHistoricalInvalidMcp)
+        assertEquals("{ invalid", configFile.readText())
+        assertEquals(sidecarContent, sidecarFile.readText())
     }
 
     /**
@@ -604,20 +602,19 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证主文件语义损坏时会以经验证备份的原始字节恢复设置。
+     * 验证主文件语义损坏时返回安全默认值，且不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `damaged settings primary recovers from a valid backup without reencoding it`() {
+    fun `damaged settings primary ignores legacy bak`() {
         val configFile = File(tempDirectory, "recover-settings.json")
         val backupContent = "{\n  \"telegramToken\": \"100:backup\",\n  \"chatId\": \"backup-chat\"\n}\n"
         configFile.writeText("{ invalid")
         File(tempDirectory, "recover-settings.json.bak").writeText(backupContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
 
-        assertEquals("100:backup", repository.settingsFlow.value.telegramToken)
-        assertEquals("backup-chat", repository.settingsFlow.value.chatId)
-        assertEquals(backupContent, configFile.readText())
+        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertEquals("{ invalid", configFile.readText())
         assertEquals(backupContent, File(tempDirectory, "recover-settings.json.bak").readText())
     }
 
@@ -660,26 +657,17 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证有效备份恢复主文件失败后，设置仓储保持安全默认值并拒绝覆盖两个原始文件。
+     * 验证损坏主文件后续保存被拒绝，且不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `failed settings recovery disables later saves without touching primary or backup`() {
+    fun `damaged settings primary disables later saves without touching legacy bak`() {
         val configFile = File(tempDirectory, "settings-recovery-failure.json")
         val backupFile = File(tempDirectory, "settings-recovery-failure.json.bak")
         val damagedPrimary = "{ invalid"
         val validBackup = ConfigJson.encodeToString(AppSettings(telegramToken = "100:backup"))
         configFile.writeText(damagedPrimary)
         backupFile.writeText(validBackup)
-        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun atomicReplace(source: Path, target: Path) {
-                if (target == configFile.toPath()) {
-                    throw IOException("injected recovery replacement failure")
-                }
-                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
-            }
-        }
-
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
 
         assertEquals(AppSettings(), repository.settingsFlow.value)
         assertFailsWith<IllegalStateException> {
@@ -690,19 +678,19 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证主设置文件缺失时会从有效备份恢复，而不是以默认设置覆盖备份。
+     * 验证主设置文件缺失时使用默认值，且不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `missing settings primary restores valid backup`() {
+    fun `missing settings primary ignores legacy bak`() {
         val configFile = File(tempDirectory, "missing-settings.json")
         val backupFile = File(tempDirectory, "missing-settings.json.bak")
         val backupContent = "{\n  \"telegramToken\": \"100:backup\",\n  \"chatId\": \"backup-chat\"\n}\n"
         backupFile.writeText(backupContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
 
-        assertEquals("100:backup", repository.settingsFlow.value.telegramToken)
-        assertEquals(backupContent, configFile.readText())
+        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertFalse(configFile.exists())
         assertEquals(backupContent, backupFile.readText())
     }
 
@@ -726,53 +714,30 @@ class SettingsRepositoryBarrierTest {
         assertEquals(damagedBackup, backupFile.readText())
     }
 
-    /**
-     * 验证主文件损坏且备份暂时不可读时，恢复成功前不允许写入；恢复后提交保留验证过的备份。
-     */
+    /** 验证主文件损坏时遗留 `.bak` 文件不可读也不会影响安全失败。 */
     @Test
-    fun `pending backup read is revalidated before save without copying damaged primary to backup`() {
+    fun `damaged settings primary does not access unreadable legacy bak`() {
         val configFile = File(tempDirectory, "pending-settings.json")
         val backupFile = File(tempDirectory, "pending-settings.json.bak")
-        val damagedPrimary = "{ invalid"
-        val validBackup = "{\n  \"telegramToken\": \"100:backup\"\n}\n"
-        configFile.writeText(damagedPrimary)
-        backupFile.writeText(validBackup)
-        var blockBackupRead = true
-        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                if (blockBackupRead && path == backupFile.toPath()) {
-                    throw IOException("injected backup read failure")
-                }
-                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
-            }
-        }
+        configFile.writeText("{ invalid")
+        backupFile.writeText("{\"telegramToken\":\"100:ignored\"}")
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+
         assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:blocked")) }
-        assertEquals(damagedPrimary, configFile.readText())
-        assertEquals(validBackup, backupFile.readText())
-
-        blockBackupRead = false
-        assertFailsWith<IllegalStateException> {
-            repository.saveSettings(AppSettings(telegramToken = "200:committed"))
-        }
-        assertEquals("100:backup", repository.settingsFlow.value.telegramToken)
-        assertEquals(validBackup, configFile.readText())
-        repository.saveSettings(AppSettings(telegramToken = "200:committed"))
-
-        assertEquals(validBackup, backupFile.readText())
-        assertEquals("200:committed", ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken)
+        assertEquals("{ invalid", configFile.readText())
+        assertEquals("{\"telegramToken\":\"100:ignored\"}", backupFile.readText())
     }
 
     /**
-     * 验证首次主文件读取 I/O 失败同样会阻断默认状态写入；恢复可读后先恢复备份再保存。
+     * 验证首次主文件读取 I/O 失败会阻断默认状态写入；主文件恢复可读但仍损坏时继续拒绝保存。
      */
     @Test
-    fun `initial primary read failure is revalidated before save without overwriting backup`() {
+    fun `initial primary read failure is revalidated without reading legacy bak`() {
         val configFile = File(tempDirectory, "initial-io-settings.json")
         val backupFile = File(tempDirectory, "initial-io-settings.json.bak")
         val damagedPrimary = "{ invalid"
-        val validBackup = "{\n  \"telegramToken\": \"100:backup\"\n}\n"
+        val validBackup = "{\n  \"telegramToken\": \"100:ignored\"\n}\n"
         configFile.writeText(damagedPrimary)
         backupFile.writeText(validBackup)
         var blockPrimaryRead = true
@@ -781,6 +746,7 @@ class SettingsRepositoryBarrierTest {
                 if (blockPrimaryRead && path == configFile.toPath()) {
                     throw IOException("injected primary read failure")
                 }
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
                 return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
         }
@@ -794,65 +760,48 @@ class SettingsRepositoryBarrierTest {
         assertFailsWith<IllegalStateException> {
             repository.saveSettings(AppSettings(telegramToken = "200:committed"))
         }
-        assertEquals("100:backup", repository.settingsFlow.value.telegramToken)
-        assertEquals(validBackup, configFile.readText())
-        repository.saveSettings(AppSettings(telegramToken = "200:committed"))
-
+        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
-        assertEquals("200:committed", ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken)
     }
 
     /**
-     * 验证恢复发布快照后，候选保存失败不会使内存退回默认值，重试会基于恢复后的 token 提交。
+     * 验证损坏主文件不会从遗留 `.bak` 发布设置快照。
      */
     @Test
-    fun `recovery publishes settings before failed candidate save and retry`() {
-        val configFile = File(tempDirectory, "recovery-retry-settings.json")
-        val backupFile = File(tempDirectory, "recovery-retry-settings.json.bak")
-        val recovered = AppSettings(telegramToken = "100:backup", chatId = "backup-chat")
-        val validBackup = ConfigJson.encodeToString(recovered)
+    fun `damaged primary never publishes legacy bak sidecar snapshot`() {
+        val configFile = File(tempDirectory, "invalid-primary-no-sidecar-snapshot.json")
+        val sidecarFile = File(tempDirectory, "invalid-primary-no-sidecar-snapshot.json.bak")
+        val ignoredSettings = AppSettings(telegramToken = "100:ignored", chatId = "ignored-chat")
+        val sidecarContent = ConfigJson.encodeToString(ignoredSettings)
         configFile.writeText("{ invalid")
-        backupFile.writeText(validBackup)
-        var blockBackupRead = true
-        var failCandidatePrimaryReplace = false
+        sidecarFile.writeText(sidecarContent)
         val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
             override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                if (blockBackupRead && path == backupFile.toPath()) {
-                    throw IOException("injected backup read failure")
-                }
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
                 return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
-            }
-
-            override fun atomicReplace(source: Path, target: Path) {
-                if (failCandidatePrimaryReplace && target == configFile.toPath()) {
-                    throw IOException("injected candidate primary replace failure")
-                }
-                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
             }
         }
         val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
-        val initialGeneration = repository.telegramTokenUpdateFlow.value.generation
-
         assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:new")) }
-        blockBackupRead = false
         assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:new")) }
 
-        assertEquals(recovered, repository.settingsFlow.value)
-        assertEquals(initialGeneration + 1, repository.telegramTokenUpdateFlow.value.generation)
-        assertEquals(validBackup, configFile.readText())
-        assertEquals(validBackup, backupFile.readText())
-
-        failCandidatePrimaryReplace = true
-        assertFailsWith<IOException> { repository.saveSettings(AppSettings(telegramToken = "200:new")) }
-        assertEquals(recovered, repository.settingsFlow.value)
-        assertEquals(initialGeneration + 1, repository.telegramTokenUpdateFlow.value.generation)
-        assertEquals(validBackup, configFile.readText())
-        assertEquals(validBackup, backupFile.readText())
-
-        failCandidatePrimaryReplace = false
-        repository.saveSettings(AppSettings(telegramToken = "200:new"))
-        assertEquals("200:new", repository.settingsFlow.value.telegramToken)
-        assertEquals(initialGeneration + 2, repository.telegramTokenUpdateFlow.value.generation)
-        assertEquals(validBackup, backupFile.readText())
+        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertEquals(0, repository.telegramTokenUpdateFlow.value.generation)
+        assertEquals("{ invalid", configFile.readText())
+        assertEquals(sidecarContent, sidecarFile.readText())
     }
+
+    private fun rejectBakOperations(): AtomicJsonFileOperations =
+        object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
+            }
+
+            override fun writeAndForce(path: Path, bytes: ByteArray) {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be written" }
+                DefaultAtomicJsonFileOperations.writeAndForce(path, bytes)
+            }
+        }
 }

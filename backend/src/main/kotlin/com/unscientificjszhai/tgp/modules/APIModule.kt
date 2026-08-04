@@ -16,19 +16,23 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.plugins.bodylimit.*
+import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.plugins.ContentTransformationException
 import io.ktor.server.plugins.PayloadTooLargeException
+import io.ktor.server.plugins.statuspages.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import java.nio.charset.StandardCharsets
 
 /**
@@ -107,10 +111,10 @@ fun Application.apiModule(appComponent: AppComponent) {
             route("/send-message") {
                 install(RequestBodyLimit) { bodyLimit { ResourceLimits.SEND_MESSAGE_REQUEST_BYTES } }
                 post {
-                    val messageField = call.request.queryParameters["messagefield"] ?: "text"
-                    val chatIdField = call.request.queryParameters["chatidfield"] ?: "chatId"
+                    val messageField = call.singleCustomFieldName("messagefield", "text") ?: return@post
+                    val chatIdField = call.singleCustomFieldName("chatidfield", "chatId") ?: return@post
                     if (messageField.utf8Size() > 64 || chatIdField.utf8Size() > 64) {
-                        call.respond(HttpStatusCode.BadRequest, "自定义字段名过长")
+                        call.respondApiInputError("自定义字段名过长")
                         return@post
                     }
 
@@ -118,8 +122,12 @@ fun Application.apiModule(appComponent: AppComponent) {
                     val (requestChatId, requestText) = when {
                         contentType.match(ContentType.Application.Json) -> {
                             val json = call.receive<JsonObject>()
-                            val chatId = json[chatIdField]?.jsonPrimitive?.content
-                            val text = json[messageField]?.jsonPrimitive?.content ?: ""
+                            val (chatId, text) = try {
+                                json.optionalStringValue(chatIdField) to json.requiredStringValue(messageField)
+                            } catch (_: IllegalArgumentException) {
+                                call.respondApiInputError("消息请求格式不合法")
+                                return@post
+                            }
                             chatId to text
                         }
 
@@ -139,18 +147,18 @@ fun Application.apiModule(appComponent: AppComponent) {
                     if (requestText.utf8Size() > ResourceLimits.SEND_MESSAGE_REQUEST_BYTES ||
                         (requestChatId?.utf8Size() ?: 0) > 64
                     ) {
-                        call.respond(HttpStatusCode.BadRequest, "消息或聊天标识超过限制")
+                        call.respondApiInputError("消息或聊天标识超过限制")
                         return@post
                     }
                     if (requestText.isBlank()) {
-                        call.respond(HttpStatusCode.BadRequest, "Message text is required")
+                        call.respondApiInputError("Message text is required")
                         return@post
                     }
 
                     try {
                         val chatId = (requestChatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
                         if (chatId.isBlank()) {
-                            call.respond(HttpStatusCode.BadRequest, "Chat ID is required")
+                            call.respondApiInputError("Chat ID is required")
                             return@post
                         }
                         val response = telegramService.sendMessage(chatId, requestText)
@@ -183,6 +191,32 @@ fun Application.apiModule(appComponent: AppComponent) {
                     call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred deleting chat")
                 }
             }
+        }
+    }
+}
+
+/**
+ * 注册 API 请求体的固定错误响应。
+ *
+ * 请求体超过各路由限制时优先响应 `413`；JSON 转换、序列化或其 Ktor 包装失败时响应不含异常详情的 `400`。
+ * 此方法应在注册使用请求体的 API 路由前调用一次。
+ *
+ * @receiver 已创建且尚未停止的 Ktor 应用实例。
+ */
+internal fun Application.installApiErrorPages() {
+    install(StatusPages) {
+        exception<PayloadTooLargeException> { call, _ ->
+            call.respond(HttpStatusCode.PayloadTooLarge, mapOf("error" to "请求体超过限制。"))
+        }
+        exception<ContentTransformationException> { call, _ ->
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "请求格式不合法。"))
+        }
+        exception<SerializationException> { call, _ ->
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "请求格式不合法。"))
+        }
+        // Ktor 会将部分 JSON 解码失败包装为 BadRequestException；同样不能把包装后的详情返回给客户端。
+        exception<BadRequestException> { call, _ ->
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "请求格式不合法。"))
         }
     }
 }
@@ -228,6 +262,32 @@ private val strictSettingsJson = Json {
     isLenient = false
     explicitNulls = true
     encodeDefaults = true
+}
+
+private suspend fun ApplicationCall.singleCustomFieldName(parameter: String, defaultValue: String): String? {
+    val values = request.queryParameters.getAll(parameter) ?: return defaultValue
+    if (values.size != 1 || values.single().isBlank()) {
+        respondApiInputError("自定义字段名不合法")
+        return null
+    }
+    return values.single()
+}
+
+private fun JsonObject.requiredStringValue(field: String): String =
+    this[field]?.asStringValue(field)
+        ?: throw IllegalArgumentException("$field must be present as a JSON string.")
+
+private fun JsonObject.optionalStringValue(field: String): String? = when (val value = this[field]) {
+    null, JsonNull -> null
+    else -> value.asStringValue(field)
+}
+
+private fun JsonElement.asStringValue(field: String): String =
+    (this as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+        ?: throw IllegalArgumentException("$field must be a JSON string.")
+
+private suspend fun ApplicationCall.respondApiInputError(message: String) {
+    respond(HttpStatusCode.BadRequest, mapOf("error" to message))
 }
 
 private val APP_SETTINGS_FIELDS = setOf("telegramToken", "chatId", "proxy", "ai")

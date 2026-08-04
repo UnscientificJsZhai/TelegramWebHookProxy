@@ -2,7 +2,7 @@ import {beforeEach, describe, expect, it, vi} from 'vitest';
 import type {Skill} from './api';
 import {deleteSkill, getSkills, saveSkill} from './api';
 
-const { deleteRequest, get, post } = vi.hoisted(() => ({
+const {deleteRequest, get, post} = vi.hoisted(() => ({
     deleteRequest: vi.fn(),
     get: vi.fn(),
     post: vi.fn(),
@@ -34,21 +34,21 @@ describe('技能 API', () => {
                 },
             ],
         };
-        get.mockResolvedValueOnce({ data: result });
+        get.mockResolvedValueOnce({data: result});
 
         await expect(getSkills()).resolves.toEqual(result);
         expect(get).toHaveBeenCalledWith('/skills', {
-            params: { page: 1, size: 10 },
+            params: {page: 1, size: 10},
         });
     });
 
     it('传递指定的分页参数', async () => {
-        get.mockResolvedValueOnce({ data: { total: 0, items: [] } });
+        get.mockResolvedValueOnce({data: {total: 0, items: []}});
 
         await getSkills(3, 20);
 
         expect(get).toHaveBeenCalledWith('/skills', {
-            params: { page: 3, size: 20 },
+            params: {page: 3, size: 20},
         });
     });
 
@@ -71,5 +71,13 @@ describe('技能 API', () => {
         await deleteSkill('skill-1');
 
         expect(deleteRequest).toHaveBeenCalledWith('/skills/skill-1');
+    });
+
+    it('删除技能时编码路径标识', async () => {
+        deleteRequest.mockResolvedValueOnce({});
+
+        await deleteSkill('safe?x=1/#fragment');
+
+        expect(deleteRequest).toHaveBeenCalledWith('/skills/safe%3Fx%3D1%2F%23fragment');
     });
 });

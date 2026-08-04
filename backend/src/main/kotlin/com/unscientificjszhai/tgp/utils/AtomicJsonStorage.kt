@@ -139,25 +139,11 @@ internal sealed interface AtomicJsonRead<out T> {
 
     data class Valid<T>(val value: T) : AtomicJsonRead<T>
 
-    /** 主文件或备份文件不能被语义验证，且现场未被修改。 */
+    /** 主文件不能被语义验证，且现场未被修改。 */
     data class Corrupt(val cause: Exception) : AtomicJsonRead<Nothing>
 
-    /** 权限等 I/O 异常；这不是 JSON 损坏，因此不会尝试备份恢复。 */
+    /** 权限等 I/O 异常；这不是 JSON 损坏。 */
     data class IoFailure(val cause: IOException) : AtomicJsonRead<Nothing>
-
-    /**
-     * 主文件已经损坏或缺失，但读取或验证备份被 I/O 异常阻塞。
-     *
-     * 调用者可以稍后重新尝试恢复，但在成功前不得写入默认内存状态。
-     */
-    data class RecoverabilityPending(val cause: IOException) : AtomicJsonRead<Nothing>
-
-    /**
-     * 备份已完成语义验证，但其原始字节无法原子恢复主文件。
-     *
-     * 主文件仍可能损坏，调用者必须进入不可写状态，避免后续提交把损坏主文件复制到备份。
-     */
-    data class RecoveryFailed(val cause: IOException) : AtomicJsonRead<Nothing>
 }
 
 /**
@@ -165,8 +151,7 @@ internal sealed interface AtomicJsonRead<out T> {
  *
  * 此类只保证同一进程调用者围绕 [commit] 组织事务时的文件提交顺序；它不提供跨进程同步，
  * 也不声称在跨文件系统移动时可用。所有临时文件均创建在目标文件所在目录。
- * 底层文件系统不能原子覆盖已有目标时，提交会安全失败而不会降级为普通移动。为兼容旧版本
- * 遗留的 `.bak` 文件，读取时仍可使用其恢复已损坏的主文件；提交不会创建或更新 `.bak` 文件。
+ * 底层文件系统不能原子覆盖已有目标时，提交会安全失败而不会降级为普通移动。
  */
 internal class AtomicJsonStorage(
     private val target: Path,
@@ -180,34 +165,35 @@ internal class AtomicJsonStorage(
 
     private val directory: Path = target.parent
         ?: throw IllegalArgumentException("JSON storage target must have a parent directory: $target")
-    private val backup: Path = target.resolveSibling("${target.fileName}.bak")
+
+    /** 读取主文件原始字节，不会尝试解析。 */
+    fun readPrimary(): AtomicJsonRawRead = readRaw(target)
 
     /**
-     * 读取文件并执行完整语义验证；主文件语义损坏或缺失且备份存在时才尝试备份恢复。只有主文件
-     * 与备份都不存在时才返回 [AtomicJsonRead.Missing]。
+     * 读取主文件并执行完整语义验证。
      *
-     * 备份恢复先由 [decode] 验证备份原始字节，随后直接原子恢复这些原始字节到主文件，不会
-     * 重新编码或覆盖唯一备份。
+     * 文件不存在时返回 [AtomicJsonRead.Missing]；文件过大或语义无法验证时返回
+     * [AtomicJsonRead.Corrupt]，读取 I/O 失败时返回 [AtomicJsonRead.IoFailure]。此方法不会
+     * 读取、创建或恢复任何其他文件。
      */
-    fun <T> readValidatedAndRecover(decode: (ByteArray) -> T): AtomicJsonRead<T> {
+    fun <T> readValidated(decode: (ByteArray) -> T): AtomicJsonRead<T> {
         return when (val primary = readRaw(target)) {
-            AtomicJsonRawRead.Missing -> recoverMissingPrimary(decode)
-            is AtomicJsonRawRead.TooLarge -> recoverFromBackup(
+            AtomicJsonRawRead.Missing -> AtomicJsonRead.Missing
+            is AtomicJsonRawRead.TooLarge -> AtomicJsonRead.Corrupt(
                 JsonStorageSizeLimitExceededException(primary.limitBytes),
-                decode,
             )
 
             is AtomicJsonRawRead.IoFailure -> AtomicJsonRead.IoFailure(primary.cause)
-            is AtomicJsonRawRead.Present -> decodeOrRecover(primary.bytes, decode)
+            is AtomicJsonRawRead.Present -> decodePrimary(primary.bytes, decode)
         }
     }
 
     /**
      * 原子提交已经编码的 JSON 字节。
      *
-     * 主文件替换成功后即视为逻辑提交成功。提交只创建主文件的临时文件，不会创建或更新 `.bak`
-     * 文件；目录同步失败只记录告警，绝不会把已经成功的主文件替换报告为提交失败。主文件替换前的
-     * 任意失败都会清理本次临时文件并抛出异常，不会降级为普通移动。
+     * 主文件替换成功后即视为逻辑提交成功。提交只创建主文件的临时文件；目录同步失败只记录告警，
+     * 绝不会把已经成功的主文件替换报告为提交失败。主文件替换前的任意失败都会清理本次临时文件
+     * 并抛出异常，不会降级为普通移动。
      */
     fun commit(bytes: ByteArray) {
         require(bytes.size <= maxBytes) { "JSON 文件超过 $maxBytes 字节上限。" }
@@ -225,75 +211,18 @@ internal class AtomicJsonStorage(
 
             fileOperations.atomicReplace(primaryTemporary, target)
             primaryTemporary = null
-            forceDirectoryBestEffort("primary replacement")
+            forceDirectoryBestEffort()
         } finally {
             primaryTemporary?.let(::deleteTemporaryQuietly)
         }
     }
 
-    private fun <T> decodeOrRecover(primaryBytes: ByteArray, decode: (ByteArray) -> T): AtomicJsonRead<T> {
+    private fun <T> decodePrimary(primaryBytes: ByteArray, decode: (ByteArray) -> T): AtomicJsonRead<T> {
         val primaryValue = runCatching { decode(primaryBytes) }
         primaryValue.getOrNull()?.let { return AtomicJsonRead.Valid(it) }
         val primaryFailure = primaryValue.exceptionOrNull() as? Exception
             ?: IllegalStateException("Unable to validate JSON primary file")
-
-        return recoverFromBackup(primaryFailure, decode)
-    }
-
-    private fun <T> recoverMissingPrimary(decode: (ByteArray) -> T): AtomicJsonRead<T> {
-        return when (val backupRead = readRaw(backup)) {
-            AtomicJsonRawRead.Missing -> AtomicJsonRead.Missing
-            is AtomicJsonRawRead.TooLarge -> AtomicJsonRead.Corrupt(JsonStorageSizeLimitExceededException(backupRead.limitBytes))
-            is AtomicJsonRawRead.IoFailure -> AtomicJsonRead.RecoverabilityPending(backupRead.cause)
-            is AtomicJsonRawRead.Present -> {
-                val backupValue = runCatching { decode(backupRead.bytes) }
-                val decodedBackup = backupValue.getOrElse {
-                    return AtomicJsonRead.Corrupt(
-                        it as? Exception ?: IllegalStateException("Unable to validate JSON backup file"),
-                    )
-                }
-                restoreValidatedBackup(backupRead.bytes, decodedBackup)
-            }
-        }
-    }
-
-    private fun <T> recoverFromBackup(primaryFailure: Exception, decode: (ByteArray) -> T): AtomicJsonRead<T> {
-        val backupBytes = when (val backupRead = readRaw(backup)) {
-            AtomicJsonRawRead.Missing -> return AtomicJsonRead.Corrupt(primaryFailure)
-            is AtomicJsonRawRead.TooLarge -> return AtomicJsonRead.Corrupt(primaryFailure)
-            is AtomicJsonRawRead.IoFailure -> return AtomicJsonRead.RecoverabilityPending(backupRead.cause)
-            is AtomicJsonRawRead.Present -> backupRead.bytes
-        }
-        val backupValue = runCatching { decode(backupBytes) }
-        val decodedBackup = backupValue.getOrElse {
-            return AtomicJsonRead.Corrupt(primaryFailure)
-        }
-
-        return restoreValidatedBackup(backupBytes, decodedBackup)
-    }
-
-    private fun <T> restoreValidatedBackup(backupBytes: ByteArray, decodedBackup: T): AtomicJsonRead<T> {
-        return try {
-            restorePrimaryFromBackupBytes(backupBytes)
-            logger.warn("Recovered damaged JSON file {} from {}", target, backup)
-            AtomicJsonRead.Valid(decodedBackup)
-        } catch (e: IOException) {
-            AtomicJsonRead.RecoveryFailed(e)
-        }
-    }
-
-    private fun restorePrimaryFromBackupBytes(bytes: ByteArray) {
-        fileOperations.createDirectories(directory)
-        var temporary: Path? = null
-        try {
-            temporary = createTemporary(".${target.name}.restore-")
-            fileOperations.writeAndForce(temporary, bytes)
-            fileOperations.atomicReplace(temporary, target)
-            temporary = null
-            forceDirectoryBestEffort("backup recovery")
-        } finally {
-            temporary?.let(::deleteTemporaryQuietly)
-        }
+        return AtomicJsonRead.Corrupt(primaryFailure)
     }
 
     private fun readRaw(path: Path): AtomicJsonRawRead = try {
@@ -313,8 +242,14 @@ internal class AtomicJsonStorage(
             .onFailure { logger.warn("Failed to remove temporary JSON file {}", path, it) }
     }
 
-    private fun forceDirectoryBestEffort(after: String) {
+    private fun forceDirectoryBestEffort() {
         runCatching { fileOperations.forceDirectory(directory) }
-            .onFailure { logger.warn("JSON storage directory sync after {} failed for {}", after, target, it) }
+            .onFailure {
+                logger.warn(
+                    "JSON storage directory sync after primary replacement failed for {}",
+                    target,
+                    it
+                )
+            }
     }
 }

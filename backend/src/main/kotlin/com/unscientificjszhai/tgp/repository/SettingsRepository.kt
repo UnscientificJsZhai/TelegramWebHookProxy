@@ -134,11 +134,11 @@ class SettingsRepository private constructor(
     }
 
     private fun loadSettings(): LoadedSettings {
-        return when (val read = storage.readValidatedAndRecover(::parseSettings)) {
+        return when (val read = storage.readValidated(::parseSettings)) {
             AtomicJsonRead.Missing -> LoadedSettings(AppSettings(), hasInvalidProxy = false)
             is AtomicJsonRead.Valid -> materializeSettingsCandidate(read.value)
             is AtomicJsonRead.Corrupt -> {
-                logger.error("Settings file and its backup are semantically invalid; preserving both files", read.cause)
+                logger.error("Settings file is semantically invalid; preserving it", read.cause)
                 LoadedSettings(
                     settings = AppSettings(),
                     hasInvalidProxy = false,
@@ -155,29 +155,6 @@ class SettingsRepository private constructor(
                 )
             }
 
-            is AtomicJsonRead.RecoveryFailed -> {
-                logger.error(
-                    "Validated settings backup could not be restored; preserving files and disabling writes",
-                    read.cause,
-                )
-                LoadedSettings(
-                    settings = AppSettings(),
-                    hasInvalidProxy = false,
-                    requiresStorageValidationBeforeWrite = true,
-                )
-            }
-
-            is AtomicJsonRead.RecoverabilityPending -> {
-                logger.error(
-                    "Settings recovery is blocked by I/O; preserving files and delaying writes until revalidation",
-                    read.cause,
-                )
-                LoadedSettings(
-                    settings = AppSettings(),
-                    hasInvalidProxy = false,
-                    requiresStorageValidationBeforeWrite = true,
-                )
-            }
         }
     }
 
@@ -185,7 +162,7 @@ class SettingsRepository private constructor(
         if (!requiresStorageValidationBeforeWrite) {
             return
         }
-        when (val read = storage.readValidatedAndRecover(::parseSettings)) {
+        when (val read = storage.readValidated(::parseSettings)) {
             AtomicJsonRead.Missing -> {
                 requiresStorageValidationBeforeWrite = false
                 return
@@ -193,26 +170,21 @@ class SettingsRepository private constructor(
 
             is AtomicJsonRead.Valid -> {
                 val validated = materializeSettingsCandidate(read.value)
-                publishRecoveredSettings(validated)
+                publishRevalidatedSettings(validated)
                 requiresStorageValidationBeforeWrite = false
-                throw StorageRecoveredRetryException()
+                throw StorageRevalidatedRetryException()
             }
 
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException("设置文件及备份均已损坏，拒绝覆盖现场。", read.cause)
+            is AtomicJsonRead.Corrupt -> throw IllegalStateException("设置文件已损坏，拒绝覆盖现场。", read.cause)
             is AtomicJsonRead.IoFailure -> throw IllegalStateException("设置文件尚不可读取，拒绝覆盖现场。", read.cause)
-            is AtomicJsonRead.RecoveryFailed ->
-                throw IllegalStateException("有效设置备份无法恢复主文件，拒绝覆盖现场。", read.cause)
-
-            is AtomicJsonRead.RecoverabilityPending ->
-                throw IllegalStateException("设置备份尚不可读取或验证，拒绝覆盖现场。", read.cause)
         }
     }
 
-    private fun publishRecoveredSettings(validated: LoadedSettings) {
-        val recoveredSettings = validated.settings
+    private fun publishRevalidatedSettings(validated: LoadedSettings) {
+        val revalidatedSettings = validated.settings
         val previousSettings = _settingsFlow.value
-        val tokenChanged = recoveredSettings.telegramToken != previousSettings.telegramToken
-        val switchGeneration = if (recoveredSettings.requiresAgentLifecycleBarrier(previousSettings)) {
+        val tokenChanged = revalidatedSettings.telegramToken != previousSettings.telegramToken
+        val switchGeneration = if (revalidatedSettings.requiresAgentLifecycleBarrier(previousSettings)) {
             modelSwitchBarrier.beginSwitch()
         } else {
             null
@@ -223,15 +195,15 @@ class SettingsRepository private constructor(
             hasHistoricalInvalidOpenAiBaseUrl = validated.hasInvalidOpenAiBaseUrl
             if (tokenChanged) {
                 _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
-                    token = recoveredSettings.telegramToken,
+                    token = revalidatedSettings.telegramToken,
                     generation = ++telegramTokenGeneration,
                 )
             }
-            _settingsFlow.value = recoveredSettings
-            settingsRevision = recoveredSettings.revision()
-            if (recoveredSettings != previousSettings) {
+            _settingsFlow.value = revalidatedSettings
+            settingsRevision = revalidatedSettings.revision()
+            if (revalidatedSettings != previousSettings) {
                 _settingsUpdateFlow.value = SettingsUpdate(
-                    settings = recoveredSettings,
+                    settings = revalidatedSettings,
                     version = ++settingsVersion,
                     switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingSettingsGeneration(),
                 )
@@ -322,7 +294,7 @@ class SettingsRepository private constructor(
     /**
      * 在同一同步临界区内基于最新设置执行变换并持久化结果。
      *
-     * 写入前会完成存储恢复检查及可选的修订值比较，然后调用 [transform]、校验结果并同步原子提交
+     * 写入前会完成存储状态检查及可选的修订值比较，然后调用 [transform]、校验结果并同步原子提交
      * 配置文件。仅主文件替换成功后才发布设置、Token 代次、生命周期屏障和历史代理状态。变换结果
      * 与当前设置相同时视为无操作，不写文件、不递增代次，也不发布设置事件。
      *
@@ -344,9 +316,7 @@ class SettingsRepository private constructor(
      * 显式替换时抛出；不会改变屏障、文件或任何设置流。
      * @throws IllegalArgumentException 代理、HTTP 工具或 MCP 设置不合法，或历史非法代理尚未被显式替换时
      * 抛出；不会改变屏障、文件或任何设置流。
-     * @throws Exception 配置文件无法编码或原子提交，设置文件不可读取或可恢复性未验证，设置文件及备份
-     * 均已损坏，或有效备份无法恢复主文件时抛出。恢复出有效磁盘设置时会先发布该快照，并抛出
-     * [StorageRecoveredRetryException]；调用方必须基于新快照重试。
+     * @throws Exception 配置文件无法编码或原子提交，或设置文件不可读取或已损坏时抛出。
      */
     @Synchronized
     fun updateSettings(
@@ -628,8 +598,8 @@ private sealed interface SettingsCandidate {
     ) : SettingsCandidate
 }
 
-private class StorageRecoveredRetryException : IllegalStateException(
-    "设置存储已恢复为磁盘快照；请基于最新设置重试保存。",
+private class StorageRevalidatedRetryException : IllegalStateException(
+    "设置存储已重新验证为磁盘快照；请基于最新设置重试保存。",
 )
 
 /**

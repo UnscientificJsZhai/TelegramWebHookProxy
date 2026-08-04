@@ -3,7 +3,10 @@ package com.unscientificjszhai.tgp.service.ai.function
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN
+import com.unscientificjszhai.tgp.models.isValidSkillId
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.repository.SkillStorageIsolationException
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 
@@ -31,7 +34,10 @@ class SkillFunctionProvider(
             put("properties", buildJsonObject {
                 put("id", buildJsonObject {
                     put("type", "STRING")
-                    put("description", "The ID of the skill to read.")
+                    put("description", "The ID of the skill to read. It must match the configured skill ID pattern.")
+                    put("pattern", SKILL_ID_PATTERN)
+                    put("minLength", 1)
+                    put("maxLength", 64)
                 })
             })
             put("required", buildJsonArray { add("id") })
@@ -42,7 +48,10 @@ class SkillFunctionProvider(
             put("properties", buildJsonObject {
                 put("id", buildJsonObject {
                     put("type", "STRING")
-                    put("description", "The ID of the skill to update. If null, a new skill will be created.")
+                    put("description", "The ID of the skill to update. If omitted, a new skill will be created.")
+                    put("pattern", SKILL_ID_PATTERN)
+                    put("minLength", 1)
+                    put("maxLength", 64)
                 })
                 put("description", buildJsonObject {
                     put("type", "STRING")
@@ -77,10 +86,10 @@ class SkillFunctionProvider(
      * 执行技能读取或保存函数。
      *
      * @param functionName 要执行的函数名称；非 [providedFunctions] 中声明的名称会得到 `error` 结果。
-     * @param args 函数参数映射。读取要求字符串 `id`；保存要求字符串 `description` 和 `content`，
-     * 可选字符串 `id` 用于更新既有技能，非字符串的可选 `id` 按缺失处理并创建新技能。
+     * @param args 函数参数映射。读取要求匹配 [SKILL_ID_PATTERN] 的字符串 `id`；保存要求字符串
+     * `description` 和 `content`，可选的 `id` 必须匹配该格式，用于更新既有技能。
      * @return 查询成功时包含技能字段、保存成功时包含 `status` 和 `id` 的 JSON 对象；参数无效、
-     * 技能不存在或函数不受支持时包含 `error` 字段。
+     * 技能不存在、存储被隔离或函数不受支持时包含不泄露存储内容的 `error` 字段。
      */
     override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
         logger.debug("Processing function {} {}", functionName, args)
@@ -88,7 +97,12 @@ class SkillFunctionProvider(
         return when (functionName) {
             "read_skill" -> {
                 val id = args["id"] as? String ?: return buildJsonObject { put("error", "Missing or invalid id") }
-                val skill = skillRepository.getSkillById(id)
+                if (!isValidSkillId(id)) return buildJsonObject { put("error", "Invalid skill id") }
+                val skill = try {
+                    skillRepository.getSkillById(id)
+                } catch (_: SkillStorageIsolationException) {
+                    return buildJsonObject { put("error", "Skill storage is unavailable") }
+                }
                 if (skill != null) {
                     buildJsonObject {
                         put("id", skill.id)
@@ -104,6 +118,9 @@ class SkillFunctionProvider(
 
             "write_skill" -> {
                 val id = args["id"] as? String
+                if (args.containsKey("id") && (id == null || !isValidSkillId(id))) {
+                    return buildJsonObject { put("error", "Invalid skill id") }
+                }
                 val description =
                     args["description"] as? String ?: return buildJsonObject { put("error", "Missing description") }
                 val content = args["content"] as? String ?: return buildJsonObject { put("error", "Missing content") }
@@ -114,7 +131,13 @@ class SkillFunctionProvider(
                     Skill(description = description, content = content)
                 }
 
-                skillRepository.saveSkill(skill)
+                try {
+                    skillRepository.saveSkill(skill)
+                } catch (_: IllegalArgumentException) {
+                    return buildJsonObject { put("error", "Invalid skill") }
+                } catch (_: SkillStorageIsolationException) {
+                    return buildJsonObject { put("error", "Skill storage is unavailable") }
+                }
                 buildJsonObject {
                     put("status", "success")
                     put("id", skill.id)

@@ -9,14 +9,12 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
-import io.ktor.server.plugins.PayloadTooLargeException
 import io.ktor.server.plugins.contentnegotiation.*
-import io.ktor.server.plugins.statuspages.*
-import io.ktor.server.response.*
 import io.ktor.server.testing.*
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 import java.io.File
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
@@ -159,15 +157,182 @@ class SkillAPIModuleTest {
         }
     }
 
+    /** 验证损坏的技能 JSON 只得到不泄露序列化实现细节的固定结构 400。 */
+    @Test
+    fun `malformed skill JSON returns a safe bad request`() {
+        val temporaryDirectory = createTempDirectory("skill-api-malformed-json-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                client.post("/api/skills") {
+                    contentType(ContentType.Application.Json)
+                    setBody("{\"id\":")
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                    val body = bodyAsText()
+                    assertTrue(Json.parseToJsonElement(body).jsonObject.containsKey("error"))
+                    assertFalse(body.contains("kotlinx"))
+                }
+            }
+            assertEquals(0, skillRepository.getAllSkills(size = 50).total)
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /**
+     * 验证不安全的技能标识会在新增 API 的仓储边界被作为客户端错误拒绝。
+     */
+    @Test
+    fun `invalid skill id returns bad request without persistence`() {
+        val temporaryDirectory = createTempDirectory("skill-api-id-validation-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                client.post("/api/skills") {
+                    header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                    setBody(
+                        Json.encodeToString(
+                            Skill(
+                                id = "safe?legacy",
+                                description = "invalid",
+                                content = "invalid"
+                            )
+                        )
+                    )
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+                assertEquals(0, skillRepository.getAllSkills(size = 10).total)
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /**
+     * 验证删除路由拒绝查询参数和非法路径标识，且不会删除已有技能。
+     */
+    @Test
+    fun `delete rejects query parameters and invalid ids without deleting a skill`() {
+        val temporaryDirectory = createTempDirectory("skill-api-delete-validation-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            skillRepository.saveSkill(Skill(id = "safe", description = "safe", content = "safe"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                client.delete("/api/skills/safe?x=1").apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+                client.delete("/api/skills/safe%3Fother").apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+
+                assertEquals(listOf("safe"), skillRepository.getAllSkills(size = 10).items.map(Skill::id))
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /**
+     * 验证隔离的技能仓储在读取、新增和删除 API 中都返回相同的安全服务不可用响应。
+     */
+    @Test
+    fun `isolated skill storage returns the same safe response from every endpoint`() {
+        val temporaryDirectory = createTempDirectory("skill-api-isolation-test").toFile()
+        try {
+            val skillsFile = File(temporaryDirectory, "skills.json")
+            val invalidSkills = """[{"id":"safe?legacy","description":"invalid","content":"invalid"}]"""
+            skillsFile.writeText(invalidSkills)
+            val skillRepository = SkillRepository.forTesting(skillsFile)
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                val getResponse = client.get("/api/skills")
+                val postResponse = client.post("/api/skills") {
+                    header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                    setBody(Json.encodeToString(Skill(id = "safe", description = "safe", content = "safe")))
+                }
+                val deleteResponse = client.delete("/api/skills/safe")
+                val responses = listOf(getResponse, postResponse, deleteResponse)
+
+                assertTrue(responses.all { it.status == HttpStatusCode.ServiceUnavailable })
+                assertEquals(1, responses.map { it.bodyAsText() }.toSet().size)
+                assertEquals(invalidSkills, skillsFile.readText())
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /**
+     * 验证分页参数只接受单个十进制范围内值，并且最大页码不会溢出为首页。
+     */
+    @Test
+    fun `skills pagination rejects malformed values and handles maximum page without overflow`() {
+        val temporaryDirectory = createTempDirectory("skill-api-pagination-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            skillRepository.saveSkill(Skill(id = "first", description = "first", content = "first"))
+            skillRepository.saveSkill(Skill(id = "second", description = "second", content = "second"))
+            val appComponent = mockk<AppComponent>()
+            every { appComponent.skillRepository } returns skillRepository
+
+            testApplication {
+                application { configureSkillApi(appComponent) }
+
+                client.get("/api/skills?page=2147483647&size=50").apply {
+                    assertEquals(HttpStatusCode.OK, status)
+                    val page = Json.decodeFromString<PageResult<Skill>>(bodyAsText())
+                    assertEquals(2, page.total)
+                    assertTrue(page.items.isEmpty())
+                }
+                listOf(
+                    "/api/skills?page=0",
+                    "/api/skills?page=abc",
+                    "/api/skills?page=",
+                    "/api/skills?page=1&page=2",
+                    "/api/skills?page=2147483648",
+                    "/api/skills?size=0",
+                    "/api/skills?size=abc",
+                    "/api/skills?size=",
+                    "/api/skills?size=1&size=2",
+                    "/api/skills?size=51",
+                ).forEach { url ->
+                    client.get(url).apply {
+                        assertEquals(HttpStatusCode.BadRequest, status)
+                        assertTrue(Json.parseToJsonElement(bodyAsText()).jsonObject.containsKey("error"))
+                    }
+                }
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
     private fun Application.configureSkillApi(appComponent: AppComponent) {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
-        install(StatusPages) {
-            exception<PayloadTooLargeException> { call, _ ->
-                call.respond(HttpStatusCode.PayloadTooLarge, mapOf("error" to "payload too large"))
-            }
-        }
+        installApiErrorPages()
         skillAPIModule(appComponent)
     }
 }

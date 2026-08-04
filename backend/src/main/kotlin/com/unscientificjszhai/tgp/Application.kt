@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.di.AppModule
 import com.unscientificjszhai.tgp.di.DaggerAppComponent
 import com.unscientificjszhai.tgp.modules.apiModule
+import com.unscientificjszhai.tgp.modules.installApiErrorPages
 import com.unscientificjszhai.tgp.modules.messagePollerModule
 import com.unscientificjszhai.tgp.modules.skillAPIModule
 import com.unscientificjszhai.tgp.modules.taskSchedulerModule
@@ -16,8 +17,6 @@ import io.ktor.server.engine.*
 import io.ktor.server.http.content.*
 import io.ktor.server.netty.*
 import io.ktor.server.plugins.contentnegotiation.*
-import io.ktor.server.plugins.PayloadTooLargeException
-import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.NonCancellable
@@ -61,11 +60,7 @@ fun Application.module() {
             },
         )
     }
-    install(StatusPages) {
-        exception<PayloadTooLargeException> { call, _ ->
-            call.respond(HttpStatusCode.PayloadTooLarge, mapOf("error" to "请求体超过限制。"))
-        }
-    }
+    installApiErrorPages()
 
     apiModule(appComponent)
     skillAPIModule(appComponent)

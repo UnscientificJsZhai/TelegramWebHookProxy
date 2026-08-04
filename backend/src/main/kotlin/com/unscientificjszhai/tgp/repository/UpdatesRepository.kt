@@ -44,9 +44,8 @@ data class UpdatesData(
 /**
  * 一项由轮询器持久化保护的 Agent 回合。
  *
- * 回合在任何模型、工具或外部调用前先写入 [AgentTurnJournalStatus.IN_PROGRESS]。仅当 Agent 返回结果
- * （包括空回复）后才会转为 [AgentTurnJournalStatus.FINAL]；进程重启后遇到没有本地 owner 的进行中回合，
- * 调用方必须降级为固定失败回复而不能重放 Agent。
+ * 回合在任何模型、工具或外部调用前先写入 `IN_PROGRESS`。仅当 Agent 返回结果（包括空回复）后才会转为
+ * `FINAL`；进程重启后遇到没有本地 owner 的进行中回合，调用方必须降级为固定失败回复而不能重放 Agent。
  * 该记录保留回复目标，保证最终状态即使跨重启也能原子写入 outbox 与更新偏移量。
  *
  * @property updateId 该回合所属的 Telegram 更新标识；必须为非负数，且同一机器人内唯一。
@@ -148,11 +147,10 @@ data class BotUpdatesData(
 /**
  * 持久化按 Telegram bot 标识隔离的聊天信息和更新处理进度。
  *
- * 同一 bot 标识的读取、变更和写入由同一实例锁串行化，因而聊天发现、聊天删除和偏移量
+ * 同一机器人标识的读取、变更和写入由同一实例锁串行化，因而聊天发现、聊天删除和偏移量
  * 更新不会互相覆盖。旧的单机器人文件在第一个有效 bot 标识访问状态时迁移给该机器人。
  *
- * 创建时从配置文件加载初始状态。应用父协程作用域只用于保持与现有注入 API 的生命周期一致，
- * 当前仓储不会创建后台协程。
+ * @constructor 创建更新状态仓储并从配置文件加载初始状态。
  */
 @Singleton
 class UpdatesRepository private constructor(
@@ -201,7 +199,7 @@ class UpdatesRepository private constructor(
         beforeSaveForTesting: (BotUpdatesData) -> Unit = {},
     ) : this(configFile, load(configFile, fileOperations), beforeSaveForTesting, fileOperations)
 
-    internal constructor(
+    private constructor(
         configFile: File,
         loaded: LoadedUpdates,
         beforeSaveForTesting: (BotUpdatesData) -> Unit = {},
@@ -228,7 +226,7 @@ class UpdatesRepository private constructor(
      *
      * @param botId token 冒号前的非空机器人标识；空白值不会读取或迁移任何共享状态。
      * @return 该机器人的状态；[botId] 无效或不存在时返回空状态。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取，因旧格式迁移不能安全提交时抛出。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取，因旧格式迁移不能安全提交时抛出。
      * @throws Exception 旧格式迁移的编码或原子提交失败时抛出；内存状态不变。
      */
     @Synchronized
@@ -250,7 +248,7 @@ class UpdatesRepository private constructor(
      * @param botId token 冒号前的非空机器人标识。
      * @param transform 基于当前完整状态生成新状态的纯变换函数。
      * @return 写入后的状态；[botId] 无效时返回空状态。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     @Synchronized
@@ -276,7 +274,7 @@ class UpdatesRepository private constructor(
      * @param botId token 冒号前的非空机器人标识。
      * @param chats 本次轮询发现的聊天信息；空集合不会删除已有聊天。
      * @return 合并后的完整机器人状态；[botId] 无效时返回空状态。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     fun mergeChats(botId: String, chats: Collection<ChatInfo>): UpdatesData = updateData(botId) { current ->
@@ -298,7 +296,7 @@ class UpdatesRepository private constructor(
      * @param lastUpdateId 要确认的更新标识；必须为非负数，`0` 表示未初始化。
      * @return 写入后的完整机器人状态；[botId] 无效时返回空状态。
      * @throws IllegalArgumentException 当 [lastUpdateId] 小于 `0` 时抛出。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     fun saveLastUpdateId(botId: String, lastUpdateId: Long): UpdatesData {
@@ -320,7 +318,7 @@ class UpdatesRepository private constructor(
      * @param reply 要投递的 Agent 回复；为 `null` 表示成功但无回复。
      * @return 写入后的完整机器人状态；[botId] 无效时返回空状态。
      * @throws IllegalArgumentException 当 [updateId] 为负数，或 [reply] 与 [updateId]、文本约束不一致时抛出。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     fun completeAgentUpdate(
@@ -355,7 +353,7 @@ class UpdatesRepository private constructor(
      * @param updateId 要查询的 Telegram 更新标识；必须为非负数。
      * @return 对应账本记录的不可变快照；不存在或 bot 无效时返回 `null`。
      * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
-     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出。
      */
     @Synchronized
     internal fun findAgentTurn(botId: String, updateId: Long): AgentTurnJournalEntry? {
@@ -381,9 +379,9 @@ class UpdatesRepository private constructor(
      * @param chatId 最终回复的聊天标识；不能为空。
      * @param replyParameters 可选的原消息回复参数；可以为 `null`。
      * @return 新占有的 [AgentTurnClaim.CLAIMED]、已有 FINAL 或 IN_PROGRESS 状态；偏移量已确认时返回
-     * [AgentTurnClaim.AlreadyConfirmed]。
+     * `AgentTurnClaim.AlreadyConfirmed`。
      * @throws IllegalArgumentException 当输入不满足账本约束时抛出。
-     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出。
      * @throws Exception 当状态无法原子写入时抛出；调用方不得进入 Agent。
      */
     @Synchronized
@@ -449,7 +447,7 @@ class UpdatesRepository private constructor(
      * @param reply 最终 Agent 回复；`null` 表示无需发送回复。
      * @return 写入后的 FINAL 记录；记录不存在、已完成或 bot 无效时返回 `null`。
      * @throws IllegalArgumentException 当更新标识或回复不满足账本约束时抛出。
-     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出。
      * @throws Exception 当状态无法原子写入时抛出。
      */
     @Synchronized
@@ -492,7 +490,7 @@ class UpdatesRepository private constructor(
      * @param failureReply 用于最终 outbox 的固定非空失败回复。
      * @return 已持久化的 FINAL 记录；记录不存在、已不是进行中状态或 bot 无效时返回 `null`。
      * @throws IllegalArgumentException 当输入不满足账本约束时抛出。
-     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出。
      * @throws Exception 当状态无法原子写入时抛出。
      */
     @Synchronized
@@ -512,7 +510,7 @@ class UpdatesRepository private constructor(
      *
      * @param botId token 冒号前的非空机器人标识。
      * @return 本次删除的记录数量；bot 无效或没有可回收记录时返回 `0`。
-     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出。
      * @throws Exception 当状态无法原子写入时抛出。
      */
     @Synchronized
@@ -541,7 +539,7 @@ class UpdatesRepository private constructor(
      *
      * @param botId token 冒号前的非空机器人标识。
      * @return 可投递回复的升序快照；[botId] 无效或没有待投递回复时返回空列表。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取，因旧格式迁移不能安全提交时抛出。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取，因旧格式迁移不能安全提交时抛出。
      * @throws Exception 旧格式迁移的编码或原子提交失败时抛出；内存状态不变。
      */
     fun getPendingTelegramReplies(botId: String): List<PendingTelegramReply> {
@@ -564,7 +562,7 @@ class UpdatesRepository private constructor(
      * @return 已把 [PendingTelegramReply.deliveryAttempts] 加一并持久化的回复；不存在记录、bot 无效或回退次数
      * 耗尽并已删除时返回 `null`。
      * @throws IllegalArgumentException 当 [updateId] 为负数，或存储中的目标回复违反投递阶段约束时抛出。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     @Synchronized
@@ -615,7 +613,7 @@ class UpdatesRepository private constructor(
      * @param replacement 要替换为的回复；其更新标识、聊天标识和阶段计数约束必须与 [expected] 一致。
      * @return 仅当匹配并已持久化替换时为 `true`；bot 无效或记录已变化、不存在时为 `false`。
      * @throws IllegalArgumentException 当 [expected] 或 [replacement] 违反回复约束，或更新标识不一致时抛出。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     @Synchronized
@@ -653,7 +651,7 @@ class UpdatesRepository private constructor(
      * @param updateId 要删除的回复所属更新标识；必须为非负数。
      * @return 写入后的完整机器人状态；[botId] 无效时返回空状态。
      * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     fun deletePendingTelegramReply(botId: String, updateId: Long): UpdatesData {
@@ -671,7 +669,7 @@ class UpdatesRepository private constructor(
      * @param botId token 冒号前的非空机器人标识。
      * @param chatId 要删除的聊天标识；按完全相等的字符串匹配。
      * @return 删除后的完整机器人状态；[botId] 无效时返回空状态。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     fun deleteChat(botId: String, chatId: String): UpdatesData = updateData(botId) { current ->
@@ -683,7 +681,7 @@ class UpdatesRepository private constructor(
      *
      * @param botId token 冒号前的非空机器人标识。
      * @return 聊天信息列表；[botId] 无效或没有聊天时为空列表。
-     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取，因旧格式迁移不能安全提交时抛出。
+     * @throws IllegalStateException 配置文件已损坏或暂不可读取，因旧格式迁移不能安全提交时抛出。
      * @throws Exception 旧格式迁移的编码或原子提交失败时抛出；内存状态不变。
      */
     fun getChats(botId: String): List<ChatInfo> = getData(botId).chats
@@ -740,7 +738,7 @@ class UpdatesRepository private constructor(
         }
     }
 
-    internal data class LoadedUpdates(
+    private data class LoadedUpdates(
         val state: BotUpdatesData,
         val legacyData: UpdatesData?,
         val requiresStorageValidationBeforeWrite: Boolean = false,
@@ -750,24 +748,14 @@ class UpdatesRepository private constructor(
         if (!requiresStorageValidationBeforeWrite) {
             return
         }
-        val validated = when (val read = storage.readValidatedAndRecover(::decodeLoadedUpdates)) {
+        val validated = when (val read = storage.readValidated(::decodeLoadedUpdates)) {
             AtomicJsonRead.Missing -> LoadedUpdates(BotUpdatesData(), null)
             is AtomicJsonRead.Valid -> read.value
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException(
-                "更新状态文件及备份均已损坏，拒绝覆盖现场。",
-                read.cause
-            )
-
+            is AtomicJsonRead.Corrupt -> throw IllegalStateException("更新状态文件已损坏，拒绝覆盖现场。", read.cause)
             is AtomicJsonRead.IoFailure -> throw IllegalStateException(
                 "更新状态文件尚不可读取，拒绝覆盖现场。",
                 read.cause
             )
-
-            is AtomicJsonRead.RecoveryFailed ->
-                throw IllegalStateException("有效更新备份无法恢复主文件，拒绝覆盖现场。", read.cause)
-
-            is AtomicJsonRead.RecoverabilityPending ->
-                throw IllegalStateException("更新状态备份尚不可读取或验证，拒绝覆盖现场。", read.cause)
         }
         state = validated.state
         legacyData = validated.legacyData
@@ -777,12 +765,12 @@ class UpdatesRepository private constructor(
     private companion object {
         fun load(configFile: File, fileOperations: AtomicJsonFileOperations): LoadedUpdates {
             val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.UPDATES_BYTES, fileOperations)
-            return when (val read = storage.readValidatedAndRecover(::decodeLoadedUpdates)) {
+            return when (val read = storage.readValidated(::decodeLoadedUpdates)) {
                 AtomicJsonRead.Missing -> LoadedUpdates(BotUpdatesData(), null)
                 is AtomicJsonRead.Valid -> read.value
                 is AtomicJsonRead.Corrupt -> {
                     LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Updates file and its backup are semantically invalid; preserving both files",
+                        "Updates file is semantically invalid; preserving it",
                         read.cause,
                     )
                     LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
@@ -796,21 +784,6 @@ class UpdatesRepository private constructor(
                     LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
                 }
 
-                is AtomicJsonRead.RecoveryFailed -> {
-                    LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Validated updates backup could not be restored; preserving files and disabling writes",
-                        read.cause,
-                    )
-                    LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
-                }
-
-                is AtomicJsonRead.RecoverabilityPending -> {
-                    LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Updates recovery is blocked by I/O; delaying writes until revalidation",
-                        read.cause,
-                    )
-                    LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
-                }
             }
         }
 
@@ -822,7 +795,7 @@ class UpdatesRepository private constructor(
             val decoded = when (val root = ConfigJson.parseToJsonElement(content)) {
                 is JsonArray -> LoadedUpdates(
                     BotUpdatesData(),
-                    UpdatesData(chats = ConfigJson.decodeFromString(content)),
+                    UpdatesData(chats = ConfigJson.decodeFromString<List<ChatInfo>>(content)),
                 )
 
                 is JsonObject -> {

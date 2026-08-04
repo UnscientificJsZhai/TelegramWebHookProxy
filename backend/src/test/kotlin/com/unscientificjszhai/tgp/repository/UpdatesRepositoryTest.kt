@@ -324,30 +324,28 @@ class UpdatesRepositoryTest {
     }
 
     /**
-     * 验证损坏主更新状态会以经过格式验证的备份原始字节恢复。
+     * 验证损坏主更新状态不会读取遗留 `.bak` 文件，且后续访问安全失败。
      */
     @Test
-    fun `damaged primary restores updates state from backup`() {
+    fun `damaged primary ignores legacy bak`() {
         val file = tempDirectory.resolve("updates-recovery.json")
-        val expected = BotUpdatesData(
-            bots = mapOf("100" to UpdatesData(listOf(ChatInfo("a", "Backup", "private")), 42)),
-        )
-        val backupContent = ConfigJson.encodeToString(expected)
+        val backupContent =
+            ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 42))))
         file.writeText("[ invalid")
         file.resolveSibling("updates-recovery.json.bak").writeText(backupContent)
 
-        val repository = UpdatesRepository(file)
+        val repository = UpdatesRepository(file, rejectBakOperations())
 
-        assertEquals(expected.bots["100"], repository.getData("100"))
-        assertEquals(backupContent, file.readText())
+        assertFailsWith<IllegalStateException> { repository.getData("100") }
+        assertEquals("[ invalid", file.readText())
         assertEquals(backupContent, file.resolveSibling("updates-recovery.json.bak").readText())
     }
 
     /**
-     * 验证有效更新备份无法恢复主文件时，后续 mutation 不会覆盖损坏主文件或备份。
+     * 验证损坏主文件会拒绝后续 mutation，且不会访问遗留 `.bak` 文件。
      */
     @Test
-    fun `failed updates recovery disables later mutations without touching primary or backup`() {
+    fun `damaged updates primary disables later mutations without touching legacy bak`() {
         val file = tempDirectory.resolve("updates-recovery-failure.json")
         val backup = file.resolveSibling("updates-recovery-failure.json.bak")
         val damagedPrimary = "{ invalid"
@@ -355,16 +353,7 @@ class UpdatesRepositoryTest {
             ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 7))))
         file.writeText(damagedPrimary)
         backup.writeText(validBackup)
-        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun atomicReplace(source: Path, target: Path) {
-                if (target == file.toPath()) {
-                    throw IOException("injected recovery replacement failure")
-                }
-                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
-            }
-        }
-
-        val repository = UpdatesRepository(file, fileOperations)
+        val repository = UpdatesRepository(file, rejectBakOperations())
 
         assertFailsWith<IllegalStateException> { repository.saveLastUpdateId("100", 8) }
         assertEquals(damagedPrimary, file.readText())
@@ -372,20 +361,20 @@ class UpdatesRepositoryTest {
     }
 
     /**
-     * 验证主更新状态缺失时会恢复有效备份并保留其原始字节。
+     * 验证主更新状态缺失时返回空状态，且不会访问遗留 `.bak` 文件。
      */
     @Test
-    fun `missing updates primary restores valid backup`() {
+    fun `missing updates primary ignores legacy bak`() {
         val file = tempDirectory.resolve("missing-updates.json")
         val backup = file.resolveSibling("missing-updates.json.bak")
-        val expected = BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 42)))
-        val backupContent = ConfigJson.encodeToString(expected)
+        val backupContent =
+            ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 42))))
         backup.writeText(backupContent)
 
-        val repository = UpdatesRepository(file)
+        val repository = UpdatesRepository(file, rejectBakOperations())
 
-        assertEquals(expected.bots["100"], repository.getData("100"))
-        assertEquals(backupContent, file.readText())
+        assertEquals(UpdatesData(), repository.getData("100"))
+        assertFalse(file.exists())
         assertEquals(backupContent, backup.readText())
     }
 
@@ -407,4 +396,17 @@ class UpdatesRepositoryTest {
         assertEquals(damagedPrimary, file.readText())
         assertEquals(damagedBackup, backup.readText())
     }
+
+    private fun rejectBakOperations(): AtomicJsonFileOperations =
+        object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
+            }
+
+            override fun writeAndForce(path: Path, bytes: ByteArray) {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be written" }
+                DefaultAtomicJsonFileOperations.writeAndForce(path, bytes)
+            }
+        }
 }

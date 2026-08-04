@@ -17,7 +17,7 @@ export interface PageResult<T> {
 
 export const getSkills = async (page: number = 1, size: number = 10) => {
     const response = await api.get<PageResult<Skill>>('/skills', {
-        params: { page, size }
+        params: {page, size}
     });
     return response.data;
 };
@@ -27,7 +27,7 @@ export const saveSkill = async (skill: Skill) => {
 };
 
 export const deleteSkill = async (id: string) => {
-    await api.delete(`/skills/${id}`);
+    await api.delete(`/skills/${encodeURIComponent(id)}`);
 };
 
 export default api;

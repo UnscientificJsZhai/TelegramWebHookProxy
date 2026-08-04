@@ -2,6 +2,8 @@ package com.unscientificjszhai.tgp.modules
 
 import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.models.isValidSkillId
+import com.unscientificjszhai.tgp.repository.SkillStorageIsolationException
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -25,9 +27,17 @@ fun Application.skillAPIModule(appComponent: AppComponent) {
     routing {
         route("/api/skills") {
             get {
-                val page = call.request.queryParameters["page"]?.toIntOrNull() ?: 1
-                val size = call.request.queryParameters["size"]?.toIntOrNull() ?: 10
-                call.respond(skillRepository.getAllSkills(page, size))
+                try {
+                    val page = call.strictDecimalQueryParameter("page", 1, 1..Int.MAX_VALUE) ?: return@get
+                    val size = call.strictDecimalQueryParameter("size", 10, 1..50) ?: return@get
+                    call.respond(skillRepository.getAllSkills(page, size))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: SkillStorageIsolationException) {
+                    call.respondSkillStorageUnavailable()
+                } catch (_: IllegalArgumentException) {
+                    call.respondSkillInputError("分页参数不合法")
+                }
             }
             route("") {
                 install(RequestBodyLimit) { bodyLimit { ResourceLimits.SKILL_REQUEST_BYTES } }
@@ -38,6 +48,8 @@ fun Application.skillAPIModule(appComponent: AppComponent) {
                         call.respond(HttpStatusCode.OK)
                     } catch (e: CancellationException) {
                         throw e
+                    } catch (_: SkillStorageIsolationException) {
+                        call.respondSkillStorageUnavailable()
                     } catch (_: IllegalArgumentException) {
                         call.respond(HttpStatusCode.BadRequest, "技能字段或数量超过限制")
                     }
@@ -45,13 +57,45 @@ fun Application.skillAPIModule(appComponent: AppComponent) {
             }
             delete("/{id}") {
                 val id = call.parameters["id"]
-                if (id == null) {
-                    call.respond(HttpStatusCode.BadRequest, "Missing skill ID")
+                if (call.request.queryParameters.names().isNotEmpty() || id == null || !isValidSkillId(id)) {
+                    call.respond(HttpStatusCode.BadRequest, "Invalid skill ID")
                     return@delete
                 }
-                skillRepository.deleteSkill(id)
-                call.respond(HttpStatusCode.OK)
+                try {
+                    skillRepository.deleteSkill(id)
+                    call.respond(HttpStatusCode.OK)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: SkillStorageIsolationException) {
+                    call.respondSkillStorageUnavailable()
+                }
             }
         }
     }
+}
+
+private suspend fun ApplicationCall.strictDecimalQueryParameter(
+    name: String,
+    defaultValue: Int,
+    acceptedRange: IntRange,
+): Int? {
+    val values = request.queryParameters.getAll(name) ?: return defaultValue
+    val value = values.singleOrNull()
+    val parsed = value?.takeIf { it.matches(DECIMAL_INTEGER) }?.toLongOrNull()
+    if (parsed == null || parsed !in acceptedRange.first.toLong()..acceptedRange.last.toLong()) {
+        respondSkillInputError("分页参数不合法")
+        return null
+    }
+    return parsed.toInt()
+}
+
+private val DECIMAL_INTEGER = Regex("[0-9]+")
+
+/** 在不泄露隔离存储细节的前提下响应技能存储不可用。 */
+private suspend fun ApplicationCall.respondSkillStorageUnavailable() {
+    respond(HttpStatusCode.ServiceUnavailable, mapOf("error" to "技能存储不可用。"))
+}
+
+private suspend fun ApplicationCall.respondSkillInputError(message: String) {
+    respond(HttpStatusCode.BadRequest, mapOf("error" to message))
 }

@@ -368,17 +368,17 @@ class TaskSchedulerServiceTest {
     }
 
     /**
-     * 验证有效备份恢复失败会禁用创建和取消，避免把损坏主文件复制到备份。
+     * 验证损坏主文件会禁用创建和取消，且不会访问遗留 `.bak` 文件。
      */
     @Test
-    fun `failed schedule recovery disables create and cancel without touching primary or backup`() {
-        val backupFile = File(tempDirectory, "schedule.json.bak")
+    fun `damaged schedule primary disables create and cancel without touching legacy bak`() {
+        val sidecarFile = File(tempDirectory, "schedule.json.bak")
         val damagedPrimary = "[ invalid"
-        val validBackup = ConfigJson.encodeToString(
-            listOf(ScheduledTask("backup", "instruction", 1L, LoopMode.ONCE, "12345")),
+        val sidecarContent = ConfigJson.encodeToString(
+            listOf(ScheduledTask("ignored", "instruction", 1L, LoopMode.ONCE, "12345")),
         )
         scheduleFile.writeText(damagedPrimary)
-        backupFile.writeText(validBackup)
+        sidecarFile.writeText(sidecarContent)
         service.close()
         service = TaskSchedulerService(
             CoroutineScope(EmptyCoroutineContext),
@@ -386,22 +386,22 @@ class TaskSchedulerServiceTest {
             Provider { agentService },
             settingsRepository,
             scheduleFile,
-            primaryReplaceFailingOperations(),
+            rejectBakOperations(),
         )
 
         assertFailsWith<IllegalStateException> {
             service.createTask("new", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
         }
-        assertFailsWith<IllegalStateException> { service.cancelTask("backup") }
+        assertFailsWith<IllegalStateException> { service.cancelTask("ignored") }
         assertEquals(damagedPrimary, scheduleFile.readText())
-        assertEquals(validBackup, backupFile.readText())
+        assertEquals(sidecarContent, sidecarFile.readText())
     }
 
     /**
-     * 验证主调度文件缺失时会恢复有效备份，任务仍可被正常列出。
+     * 验证主调度文件缺失时不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `missing schedule primary restores valid backup`() {
+    fun `missing schedule primary ignores legacy bak`() {
         val backupFile = File(tempDirectory, "schedule.json.bak")
         val expectedTask = ScheduledTask("backup", "instruction", 1L, LoopMode.ONCE, "12345")
         val backupContent = ConfigJson.encodeToString(listOf(expectedTask))
@@ -413,10 +413,11 @@ class TaskSchedulerServiceTest {
             Provider { agentService },
             settingsRepository,
             scheduleFile,
+            rejectBakOperations(),
         )
 
-        assertEquals(listOf(expectedTask), service.listTasks())
-        assertEquals(backupContent, scheduleFile.readText())
+        assertTrue(service.listTasks().isEmpty())
+        assertFalse(scheduleFile.exists())
         assertEquals(backupContent, backupFile.readText())
     }
 
@@ -448,29 +449,20 @@ class TaskSchedulerServiceTest {
     }
 
     /**
-     * 验证扫描会在短锁内重试恢复成功的备份，并执行恢复出的到期任务。
+     * 验证损坏主调度文件时不会读取遗留 `.bak` 任务或执行它。
      */
     @Test
-    fun `scan revalidates recovered backup before executing due task`() = runTest {
-        val backupFile = File(tempDirectory, "schedule.json.bak")
-        val recoveredTask = ScheduledTask(
-            "backup",
+    fun `scan ignores legacy bak task when primary is corrupt`() = runTest {
+        val sidecarFile = File(tempDirectory, "schedule.json.bak")
+        val ignoredSidecarTask = ScheduledTask(
+            "ignored",
             "instruction",
             System.currentTimeMillis() - 1_000,
             LoopMode.ONCE,
             "12345",
         )
         scheduleFile.writeText("[ invalid")
-        backupFile.writeText(ConfigJson.encodeToString(listOf(recoveredTask)))
-        var blockBackupRead = true
-        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                if (blockBackupRead && path == backupFile.toPath()) {
-                    throw IOException("injected backup read failure")
-                }
-                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
-            }
-        }
+        sidecarFile.writeText(ConfigJson.encodeToString(listOf(ignoredSidecarTask)))
         service.close()
         service = TaskSchedulerService(
             CoroutineScope(EmptyCoroutineContext),
@@ -478,15 +470,14 @@ class TaskSchedulerServiceTest {
             Provider { agentService },
             settingsRepository,
             scheduleFile,
-            fileOperations,
+            rejectBakOperations(),
         )
         coEvery { agentService.sendMessage(any()) } returns "done"
         coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
-        blockBackupRead = false
         service.scanAndExecute()
 
-        coVerify { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
         assertTrue(service.listTasks().isEmpty())
     }
 
@@ -726,6 +717,19 @@ class TaskSchedulerServiceTest {
             firstArg<suspend (AgentService) -> Any?>().invoke(agent)
         }
     }
+
+    private fun rejectBakOperations(): AtomicJsonFileOperations =
+        object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
+            }
+
+            override fun writeAndForce(path: Path, bytes: ByteArray) {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be written" }
+                DefaultAtomicJsonFileOperations.writeAndForce(path, bytes)
+            }
+        }
 }
 
 private const val BOT_A_TOKEN = "100:token-a"

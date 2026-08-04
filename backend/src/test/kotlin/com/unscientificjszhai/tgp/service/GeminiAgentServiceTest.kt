@@ -216,6 +216,37 @@ class GeminiAgentServiceTest {
     }
 
     /**
+     * 验证技能存储隔离会使 Gemini 候选初始化失败，而不会将隔离状态降级为空技能提示词。
+     */
+    @Test
+    fun `initial Gemini readiness rejects isolated skill storage`() = runBlocking {
+        val skillsFile = File(tempDirectory, "skills.json")
+        val invalidSkills = """[{"id":"safe?legacy","description":"invalid","content":"invalid"}]"""
+        skillsFile.writeText(invalidSkills)
+        skillRepository = com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(skillsFile)
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.GEMINI,
+                    geminiApiKey = "test-key",
+                    agentEnabled = true,
+                ),
+            ),
+        )
+        val candidate = newService()
+
+        try {
+            val readiness = assertNotNull(candidate.initializationJob())
+            withTimeout(5.seconds) { readiness.join() }
+
+            assertTrue(readiness.isCancelled)
+            assertEquals(invalidSkills, skillsFile.readText())
+        } finally {
+            candidate.close().join()
+        }
+    }
+
+    /**
      * 验证休眠的历史非法 OpenAI 地址不会阻止 Gemini 在首轮模型发现中完成内存回退，也不会改写原始文件。
      */
     @Test

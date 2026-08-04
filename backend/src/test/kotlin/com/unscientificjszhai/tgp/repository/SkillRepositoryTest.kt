@@ -56,15 +56,34 @@ class SkillRepositoryTest {
      */
     @Test
     fun `resource bounds reject oversized skills and invalid page sizes`() {
+        repository.saveSkill(Skill(id = "a", description = "ok", content = "ok"))
+        repository.saveSkill(Skill(id = "a".repeat(64), description = "ok", content = "ok"))
         assertFailsWith<IllegalArgumentException> {
             repository.saveSkill(Skill(id = "x".repeat(65), description = "ok", content = "ok"))
+        }
+        listOf(
+            "",
+            "safe?x=1",
+            "safe/path",
+            "safe#fragment",
+            "safe%value",
+            "safe.value",
+            "safe value",
+            "技能"
+        ).forEach { invalidId ->
+            assertFailsWith<IllegalArgumentException> {
+                repository.saveSkill(Skill(id = invalidId, description = "ok", content = "ok"))
+            }
+            assertFailsWith<IllegalArgumentException> { repository.getSkillById(invalidId) }
+            assertFailsWith<IllegalArgumentException> { repository.deleteSkill(invalidId) }
         }
         assertFailsWith<IllegalArgumentException> {
             repository.saveSkill(Skill(id = "ok", description = "ok", content = "x".repeat(64 * 1024 + 1)))
         }
         assertFailsWith<IllegalArgumentException> { repository.getAllSkills(page = 0) }
         assertFailsWith<IllegalArgumentException> { repository.getAllSkills(size = 51) }
-        assertTrue(repository.getAllSkills(size = 50).items.isEmpty())
+        assertEquals(2, repository.getAllSkills(size = 50).total)
+        assertTrue(repository.getAllSkills(page = Int.MAX_VALUE, size = 50).items.isEmpty())
     }
 
     /**
@@ -215,55 +234,48 @@ class SkillRepositoryTest {
     }
 
     /**
-     * 验证语义损坏的主文件会由有效备份原样恢复后供读取使用。
+     * 验证语义损坏的主文件安全返回空结果，且不会访问遗留 `.bak` 文件。
      */
     @Test
-    fun `damaged skills primary recovers from backup`() {
+    fun `damaged skills primary ignores legacy bak`() {
         val original = listOf(Skill(id = "backup", description = "backup", content = "content"))
         val backupContent = ConfigJson.encodeToString(original)
         skillsFile.writeText("[ invalid")
         File(tempDirectory, "skills.json.bak").writeText(backupContent)
-        repository = SkillRepository.forTesting(skillsFile)
+        repository = SkillRepository.forTesting(skillsFile, rejectBakOperations())
 
-        assertEquals(original, repository.getAllSkills(size = 10).items)
-        assertEquals(backupContent, skillsFile.readText())
-    }
-
-    /**
-     * 验证主技能文件缺失时，读取会恢复有效备份而不会把它当作空列表。
-     */
-    @Test
-    fun `missing skills primary restores valid backup`() {
-        val original = listOf(Skill(id = "backup", description = "backup", content = "content"))
-        val backupContent = ConfigJson.encodeToString(original)
-        File(tempDirectory, "skills.json.bak").writeText(backupContent)
-        repository = SkillRepository.forTesting(skillsFile)
-
-        assertEquals(original, repository.getAllSkills(size = 10).items)
-        assertEquals(backupContent, skillsFile.readText())
+        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
+        assertEquals("[ invalid", skillsFile.readText())
         assertEquals(backupContent, File(tempDirectory, "skills.json.bak").readText())
     }
 
     /**
-     * 验证技能备份有效但恢复主文件失败时，读返回安全空结果且写入不会覆盖任何现场文件。
+     * 验证主技能文件缺失时返回空列表，且不会访问遗留 `.bak` 文件。
      */
     @Test
-    fun `failed skills recovery rejects mutations without touching primary or backup`() {
+    fun `missing skills primary ignores legacy bak`() {
+        val original = listOf(Skill(id = "backup", description = "backup", content = "content"))
+        val backupContent = ConfigJson.encodeToString(original)
+        File(tempDirectory, "skills.json.bak").writeText(backupContent)
+        repository = SkillRepository.forTesting(skillsFile, rejectBakOperations())
+
+        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
+        assertFalse(skillsFile.exists())
+        assertEquals(backupContent, File(tempDirectory, "skills.json.bak").readText())
+    }
+
+    /**
+     * 验证主文件损坏时写入被拒绝，且遗留 `.bak` 文件不会被访问。
+     */
+    @Test
+    fun `damaged skills primary rejects mutations without touching legacy bak`() {
         val original = listOf(Skill(id = "backup", description = "backup", content = "content"))
         val validBackup = ConfigJson.encodeToString(original)
         val damagedPrimary = "[ invalid"
         skillsFile.writeText(damagedPrimary)
         val backupFile = File(tempDirectory, "skills.json.bak")
         backupFile.writeText(validBackup)
-        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun atomicReplace(source: Path, target: Path) {
-                if (target == skillsFile.toPath()) {
-                    throw IOException("injected recovery replacement failure")
-                }
-                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
-            }
-        }
-        repository = SkillRepository.forTesting(skillsFile, fileOperations)
+        repository = SkillRepository.forTesting(skillsFile, rejectBakOperations())
 
         assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
         assertFailsWith<IllegalStateException> {
@@ -292,4 +304,114 @@ class SkillRepositoryTest {
         assertEquals(damagedPrimary, skillsFile.readText())
         assertEquals(damagedBackup, File(tempDirectory, "skills.json.bak").readText())
     }
+
+    /**
+     * 验证可解析但标识非法的主文件会被隔离，不能借由合法备份恢复或被任意读写路径改写。
+     */
+    @Test
+    fun `invalid skill id in primary isolates storage without recovery or events`() = runTest {
+        val invalidPrimary = ConfigJson.encodeToString(
+            listOf(Skill(id = "safe?x=1", description = "invalid", content = "invalid")),
+        )
+        val validBackup = ConfigJson.encodeToString(
+            listOf(Skill(id = "backup", description = "backup", content = "backup")),
+        )
+        val backupFile = File(tempDirectory, "skills.json.bak")
+        skillsFile.writeText(invalidPrimary)
+        backupFile.writeText(validBackup)
+        repository = SkillRepository.forTesting(skillsFile)
+        val events = mutableListOf<Unit>()
+        val job = launch { repository.skillsUpdateEvent.collect { events += it } }
+        yield()
+
+        assertFailsWith<SkillStorageIsolationException> { repository.getAllSkills(size = 10) }
+        assertFailsWith<SkillStorageIsolationException> { repository.getSkillSummaries() }
+        assertFailsWith<SkillStorageIsolationException> { repository.getSkillById("backup") }
+        assertFailsWith<SkillStorageIsolationException> {
+            repository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+        }
+        assertFailsWith<SkillStorageIsolationException> { repository.deleteSkill("backup") }
+        delay(100.milliseconds)
+
+        assertEquals(invalidPrimary, skillsFile.readText())
+        assertEquals(validBackup, backupFile.readText())
+        assertTrue(events.isEmpty())
+        job.cancel()
+    }
+
+    /**
+     * 验证遗留 `.bak` 中的非法标识不会影响可读主文件，且文件不会被访问。
+     */
+    @Test
+    fun `invalid skill id in legacy bak does not isolate readable primary`() {
+        val validPrimary = ConfigJson.encodeToString(
+            listOf(Skill(id = "safe", description = "safe", content = "safe")),
+        )
+        val invalidBackup = ConfigJson.encodeToString(
+            listOf(Skill(id = "safe#old", description = "invalid", content = "invalid")),
+        )
+        val backupFile = File(tempDirectory, "skills.json.bak")
+        skillsFile.writeText(validPrimary)
+        backupFile.writeText(invalidBackup)
+        repository = SkillRepository.forTesting(skillsFile, rejectBakOperations())
+
+        assertEquals(
+            listOf(Skill(id = "safe", description = "safe", content = "safe")),
+            repository.getAllSkills(size = 10).items
+        )
+        repository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+
+        assertTrue(skillsFile.readText().contains("\"new\""))
+        assertEquals(invalidBackup, backupFile.readText())
+    }
+
+    /**
+     * 验证主文件缺失或语法损坏时，遗留 `.bak` 中的非法标识不会影响主文件行为。
+     */
+    @Test
+    fun `missing or damaged primary ignores invalid skills legacy bak`() = runTest {
+        listOf("missing" to null, "damaged" to "[ invalid").forEach { (name, primaryContent) ->
+            val primaryFile = File(tempDirectory, "$name-skills.json")
+            val backupFile = File(tempDirectory, "$name-skills.json.bak")
+            val invalidBackup = ConfigJson.encodeToString(
+                listOf(Skill(id = "safe?backup", description = "invalid", content = "invalid")),
+            )
+            primaryContent?.let(primaryFile::writeText)
+            backupFile.writeText(invalidBackup)
+            val isolatedRepository = SkillRepository.forTesting(primaryFile, rejectBakOperations())
+            val events = mutableListOf<Unit>()
+            val job = launch { isolatedRepository.skillsUpdateEvent.collect { events += it } }
+            yield()
+
+            assertTrue(isolatedRepository.getAllSkills(size = 10).items.isEmpty())
+            if (primaryContent == null) {
+                isolatedRepository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+                assertEquals("new", isolatedRepository.getSkillById("new")?.id)
+            } else {
+                assertFailsWith<IllegalStateException> {
+                    isolatedRepository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+                }
+            }
+            delay(100.milliseconds)
+
+            if (primaryContent != null) {
+                assertEquals(primaryContent, primaryFile.readText())
+            }
+            assertEquals(invalidBackup, backupFile.readText())
+            job.cancel()
+        }
+    }
+
+    private fun rejectBakOperations(): AtomicJsonFileOperations =
+        object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
+            }
+
+            override fun writeAndForce(path: Path, bytes: ByteArray) {
+                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be written" }
+                DefaultAtomicJsonFileOperations.writeAndForce(path, bytes)
+            }
+        }
 }

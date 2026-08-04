@@ -9,6 +9,7 @@ import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
@@ -22,6 +23,7 @@ import io.ktor.server.application.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.testing.*
 import io.mockk.coVerify
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.serialization.json.Json
@@ -48,6 +50,100 @@ private val completeSettingsJson = Json {
  * 设置 HTTP API 的测试设计。
  */
 class APIModuleTest {
+
+    /**
+     * 验证发送消息接口拒绝非字符串 JSON 文本及损坏 JSON，且不会调用 Telegram。
+     */
+    @Test
+    fun `send message rejects invalid JSON text without calling Telegram`() = withTestApi { _, telegramService, _ ->
+        val invalidBodies = listOf(
+            "{}",
+            """{"text":null}""",
+            """{"text":{}}""",
+            """{"text":[]}""",
+            """{"text":1}""",
+            """{"text":true}""",
+            """{"text":""",
+        )
+
+        invalidBodies.forEach { body ->
+            client.post("/api/send-message") {
+                contentType(ContentType.Application.Json)
+                setBody(body)
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+                assertSafeErrorBody(bodyAsText())
+            }
+        }
+        coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
+    }
+
+    /**
+     * 验证发送消息接口保留表单和自定义字段名兼容性，同时拒绝重复或空的字段名参数。
+     */
+    @Test
+    fun `send message supports custom fields but rejects invalid custom field parameters`() =
+        withTestApi { repository, telegramService, _ ->
+            coEvery { telegramService.sendMessage(any(), any(), any()) } returns TelegramApiResponse(
+                HttpStatusCode.OK,
+                """{"ok":true}""",
+            )
+
+            client.post("/api/send-message?messagefield=body&chatidfield=target") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"body":"json message","target":"json chat"}""")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+            client.post("/api/send-message?messagefield=body&chatidfield=target") {
+                contentType(ContentType.Application.FormUrlEncoded)
+                setBody("body=form+message&target=form+chat")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+            coVerify { telegramService.sendMessage("json chat", "json message", any()) }
+            coVerify { telegramService.sendMessage("form chat", "form message", any()) }
+
+            repository.updateSettings { it.copy(chatId = "default chat") }
+            client.post("/api/send-message") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"text":"default chat message","chatId":null}""")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+            coVerify { telegramService.sendMessage("default chat", "default chat message", any()) }
+
+            listOf(
+                "/api/send-message?messagefield=",
+                "/api/send-message?chatidfield=",
+                "/api/send-message?messagefield=one&messagefield=two",
+                "/api/send-message?chatidfield=one&chatidfield=two",
+            ).forEach { url ->
+                client.post(url) {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"text":"ignored"}""")
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                }
+            }
+            coVerify(exactly = 3) { telegramService.sendMessage(any(), any(), any()) }
+        }
+
+    /** 验证超出路由请求体限制时，`413` 错误优先于 JSON 解析。 */
+    @Test
+    fun `send message body limit returns a fixed payload too large response`() = withTestApi { _, telegramService, _ ->
+        client.post("/api/send-message") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"text":"${"x".repeat(65 * 1024)}"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.PayloadTooLarge, status)
+            assertEquals(
+                "请求体超过限制。",
+                Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.toString()?.trim('"')
+            )
+        }
+        coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
+    }
 
     /**
      * 验证设置 API 的读写设计。
@@ -423,24 +519,19 @@ class APIModuleTest {
         }
     }
 
-    /**
-     * 验证聊天设置 API 在恢复快照的本次请求返回冲突后，下一次复制操作使用恢复后的 token。
-     */
+    /** 验证聊天设置 API 只读取主文件，遗留 `.bak` 文件不可访问也不影响更新。 */
     @Test
-    fun `chat settings retries from recovered settings instead of overwriting recovered token`() {
-        val temporaryDirectory = createTempDirectory("api-settings-recovery-test").toFile()
+    fun `chat settings ignores inaccessible legacy bak sidecar`() {
+        val temporaryDirectory = createTempDirectory("api-settings-primary-only-test").toFile()
         try {
             val configFile = temporaryDirectory.resolve("settings.json")
-            val backupFile = temporaryDirectory.resolve("settings.json.bak")
-            val recovered = AppSettings(telegramToken = "100:backup", chatId = "old-chat")
-            configFile.writeText("{ invalid")
-            backupFile.writeText(ConfigJson.encodeToString(recovered))
-            var blockBackupRead = true
+            val sidecarFile = temporaryDirectory.resolve("settings.json.bak")
+            val primary = AppSettings(telegramToken = "100:primary", chatId = "old-chat")
+            configFile.writeText(ConfigJson.encodeToString(primary))
+            sidecarFile.writeText(ConfigJson.encodeToString(AppSettings(telegramToken = "100:ignored")))
             val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
                 override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                    if (blockBackupRead && path == backupFile.toPath()) {
-                        throw IOException("injected backup read failure")
-                    }
+                    check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
                     return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
                 }
             }
@@ -458,33 +549,14 @@ class APIModuleTest {
                     contentType(ContentType.Application.Json)
                     setBody("""{"chatId":"new-chat"}""")
                 }.apply {
-                    assertTrue(status == HttpStatusCode.Conflict || status == HttpStatusCode.InternalServerError)
-                }
-
-                blockBackupRead = false
-                client.post("/api/settings/chat") {
-                    header(HttpHeaders.IfMatch, currentSettingsETag())
-                    contentType(ContentType.Application.Json)
-                    setBody("""{"chatId":"new-chat"}""")
-                }.apply {
-                    assertEquals(HttpStatusCode.Conflict, status)
-                }
-                assertEquals(recovered, repository.settingsFlow.value)
-
-                client.post("/api/settings/chat") {
-                    header(HttpHeaders.IfMatch, currentSettingsETag())
-                    contentType(ContentType.Application.Json)
-                    setBody("""{"chatId":"new-chat"}""")
-                }.apply {
                     assertEquals(HttpStatusCode.OK, status)
                 }
-                assertEquals("100:backup", repository.settingsFlow.value.telegramToken)
-                assertEquals("new-chat", repository.settingsFlow.value.chatId)
-                assertEquals(
-                    "100:backup",
-                    ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken
-                )
             }
+
+            assertEquals("100:primary", repository.settingsFlow.value.telegramToken)
+            assertEquals("new-chat", repository.settingsFlow.value.chatId)
+            assertEquals("100:primary", ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken)
+            assertEquals("100:ignored", ConfigJson.decodeFromString<AppSettings>(sidecarFile.readText()).telegramToken)
         } finally {
             temporaryDirectory.deleteRecursively()
         }
@@ -885,7 +957,14 @@ class APIModuleTest {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
+        installApiErrorPages()
         apiModule(appComponent)
+    }
+
+    private fun assertSafeErrorBody(body: String) {
+        val error = Json.parseToJsonElement(body).jsonObject["error"]?.toString()?.trim('"')
+        assertNotNull(error)
+        assertFalse(body.contains("kotlinx"))
     }
 
     private suspend fun ApplicationTestBuilder.currentSettingsETag(): String =

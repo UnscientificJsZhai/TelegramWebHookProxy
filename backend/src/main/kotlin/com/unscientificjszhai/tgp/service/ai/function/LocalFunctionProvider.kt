@@ -133,6 +133,9 @@ abstract class LocalFunctionProvider {
             }
 
             geminiSchema.description()?.ifPresent { map["description"] = it }
+            geminiSchema.pattern()?.ifPresent { map["pattern"] = it }
+            geminiSchema.minLength()?.ifPresent { map["minLength"] = it }
+            geminiSchema.maxLength()?.ifPresent { map["maxLength"] = it }
 
             geminiSchema.properties()?.ifPresent { props ->
                 val propertiesMap = mutableMapOf<String, Any?>()

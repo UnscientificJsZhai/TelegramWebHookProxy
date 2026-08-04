@@ -358,7 +358,10 @@ class OpenAIAgentService @Inject constructor(
         if (closed) {
             return null
         }
-        return scope.launch(start = CoroutineStart.UNDISPATCHED) {
+        return scope.launch(
+            CoroutineExceptionHandler { _, error -> logger.error("OpenAI session reset failed", error) },
+            start = CoroutineStart.UNDISPATCHED,
+        ) {
             var mcpConnectionJob: Job? = null
             try {
                 mcpConnectionJob = sessionMutex.withLock {

@@ -7,13 +7,12 @@ import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
-import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * 原子 JSON 文件提交与旧备份恢复的故障注入测试设计。
+ * 原子 JSON 主文件读写的故障注入测试。
  */
 class AtomicJsonStorageTest {
     private val tempDirectory = createTempDirectory("atomic-json-storage-test")
@@ -24,10 +23,10 @@ class AtomicJsonStorageTest {
     }
 
     /**
-     * 验证主文件替换前的每个故障点都保留主文件和旧备份，且清理同目录临时文件。
+     * 验证主文件替换前的每个故障点都保留主文件，且清理同目录临时文件。
      */
     @Test
-    fun `pre primary replace failures keep the old primary and backup and remove temporary files`() {
+    fun `pre primary replace failures keep the old primary and remove temporary files`() {
         val stages = listOf(
             FailureStage.PRIMARY_TEMP_WRITE,
             FailureStage.PRIMARY_REPLACE,
@@ -36,16 +35,12 @@ class AtomicJsonStorageTest {
         stages.forEach { stage ->
             val directory = Files.createDirectory(tempDirectory.resolve(stage.name.lowercase()))
             val target = directory.resolve("state.json")
-            val backup = directory.resolve("state.json.bak")
-            val oldBackup = "old-distinct-backup".encodeToByteArray()
             Files.writeString(target, "old-primary")
-            Files.write(backup, oldBackup)
             val storage = AtomicJsonStorage(target, 1024 * 1024, FailingFileOperations(stage))
 
             assertFailsWith<IOException> { storage.commit("new-primary".encodeToByteArray()) }
 
             assertEquals("old-primary", Files.readString(target), "stage=$stage")
-            assertContentEquals(oldBackup, Files.readAllBytes(backup), "stage=$stage")
             Files.list(directory).use { files ->
                 assertTrue(files.noneMatch { it.fileName.toString().endsWith(".tmp") }, "stage=$stage")
             }
@@ -60,7 +55,11 @@ class AtomicJsonStorageTest {
         val firstTarget = tempDirectory.resolve("first-commit.json")
         val firstBackup = tempDirectory.resolve("first-commit.json.bak")
 
-        AtomicJsonStorage(firstTarget, 1024 * 1024).commit("initial-content".encodeToByteArray())
+        AtomicJsonStorage(
+            firstTarget,
+            1024 * 1024,
+            RejectBakFileOperations()
+        ).commit("initial-content".encodeToByteArray())
 
         assertEquals("initial-content", Files.readString(firstTarget))
         assertTrue(Files.notExists(firstBackup))
@@ -69,35 +68,31 @@ class AtomicJsonStorageTest {
         val backup = tempDirectory.resolve("without-backup.json.bak")
         Files.writeString(target, "old-primary")
 
-        AtomicJsonStorage(target, 1024 * 1024).commit("new-primary".encodeToByteArray())
+        AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations()).commit("new-primary".encodeToByteArray())
 
         assertEquals("new-primary", Files.readString(target))
         assertTrue(Files.notExists(backup))
 
         Files.writeString(backup, "legacy-backup")
-        AtomicJsonStorage(target, 1024 * 1024).commit("newer-primary".encodeToByteArray())
+        AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations()).commit("newer-primary".encodeToByteArray())
 
         assertEquals("newer-primary", Files.readString(target))
         assertEquals("legacy-backup", Files.readString(backup))
     }
 
     /**
-     * 验证不支持原子主替换时不会退化为普通移动，也不会预先覆盖已有备份。
+     * 验证不支持原子主替换时不会退化为普通移动。
      */
     @Test
-    fun `atomic move unsupported for an existing primary target keeps primary and backup without fallback`() {
+    fun `atomic move unsupported for an existing primary target keeps primary without fallback`() {
         val target = tempDirectory.resolve("unsupported.json")
-        val backup = tempDirectory.resolve("unsupported.json.bak")
-        val oldBackup = "old-distinct-backup".encodeToByteArray()
         Files.writeString(target, "old-primary")
-        Files.write(backup, oldBackup)
         val operations = FailingFileOperations(FailureStage.ATOMIC_MOVE_UNSUPPORTED)
         val storage = AtomicJsonStorage(target, 1024 * 1024, operations)
 
         assertFailsWith<AtomicMoveNotSupportedException> { storage.commit("new-primary".encodeToByteArray()) }
 
         assertEquals("old-primary", Files.readString(target))
-        assertContentEquals(oldBackup, Files.readAllBytes(backup))
         assertEquals(1, operations.replaceCount, "must not attempt a non-atomic fallback")
         Files.list(tempDirectory).use { files ->
             assertTrue(files.noneMatch { it.fileName.toString().endsWith(".tmp") })
@@ -105,66 +100,54 @@ class AtomicJsonStorageTest {
     }
 
     /**
-     * 验证只有主文件语义损坏时才会原样恢复经完整验证的备份，而不会旋转覆盖备份。
+     * 验证主文件语义损坏时直接返回损坏状态，遗留 `.bak` 文件不会被读取或改写。
      */
     @Test
-    fun `valid backup restores damaged primary as original bytes`() {
-        val target = tempDirectory.resolve("recover.json")
-        val backup = tempDirectory.resolve("recover.json.bak")
+    fun `corrupt primary ignores legacy bak file`() {
+        val target = tempDirectory.resolve("corrupt.json")
+        val backup = tempDirectory.resolve("corrupt.json.bak")
         Files.writeString(target, "not-valid")
-        val backupBytes = "valid-backup-with-layout\n".encodeToByteArray()
-        Files.write(backup, backupBytes)
-        val storage = AtomicJsonStorage(target, 1024 * 1024)
+        Files.writeString(backup, "valid-but-ignored")
+        val storage = AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations())
 
-        val result = storage.readValidatedAndRecover { bytes ->
-            require(bytes.contentEquals(backupBytes)) { "not a valid semantic payload" }
-            "decoded"
-        }
+        val result = storage.readValidated { throw IllegalArgumentException("invalid primary") }
 
-        assertEquals(AtomicJsonRead.Valid("decoded"), result)
-        assertTrue(Files.readAllBytes(target).contentEquals(backupBytes))
-        assertTrue(Files.readAllBytes(backup).contentEquals(backupBytes))
+        assertTrue(result is AtomicJsonRead.Corrupt)
+        assertEquals("not-valid", Files.readString(target))
+        assertEquals("valid-but-ignored", Files.readString(backup))
     }
 
     /**
-     * 验证主文件缺失但备份有效时会恢复主文件，而不是将配置当作首次启动的空状态。
+     * 验证主文件缺失时返回首次启动状态，遗留 `.bak` 文件不会被读取或改写。
      */
     @Test
-    fun `missing primary restores valid backup as original bytes`() {
+    fun `missing primary ignores legacy bak file`() {
         val target = tempDirectory.resolve("missing-primary.json")
         val backup = tempDirectory.resolve("missing-primary.json.bak")
-        val backupBytes = "valid-backup-with-layout\n".encodeToByteArray()
-        Files.write(backup, backupBytes)
+        Files.writeString(backup, "valid-but-ignored")
 
-        val result = AtomicJsonStorage(target, 1024 * 1024).readValidatedAndRecover { bytes ->
-            require(bytes.contentEquals(backupBytes))
-            "decoded"
-        }
+        val result = AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations()).readValidated { "decoded" }
 
-        assertEquals(AtomicJsonRead.Valid("decoded"), result)
-        assertTrue(Files.readAllBytes(target).contentEquals(backupBytes))
-        assertTrue(Files.readAllBytes(backup).contentEquals(backupBytes))
+        assertEquals(AtomicJsonRead.Missing, result)
+        assertTrue(Files.notExists(target))
+        assertEquals("valid-but-ignored", Files.readString(backup))
     }
 
     /**
-     * 验证超出上限的主文件不会完整读取或解析，而是可由有效且受限的备份恢复。
+     * 验证超出上限的主文件不会完整读取或解析，也不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `oversized primary is recovered from a bounded valid backup`() {
+    fun `oversized primary is corrupt and ignores legacy bak file`() {
         val target = tempDirectory.resolve("oversized-primary.json")
         val backup = tempDirectory.resolve("oversized-primary.json.bak")
-        val backupBytes = "valid".encodeToByteArray()
         Files.write(target, ByteArray(17) { 'x'.code.toByte() })
-        Files.write(backup, backupBytes)
-        val storage = AtomicJsonStorage(target, 16)
+        Files.writeString(backup, "valid-but-ignored")
+        val storage = AtomicJsonStorage(target, 16, RejectBakFileOperations())
 
-        val result = storage.readValidatedAndRecover { bytes ->
-            require(bytes.contentEquals(backupBytes))
-            "decoded"
-        }
+        val result = storage.readValidated { "decoded" }
 
-        assertEquals(AtomicJsonRead.Valid("decoded"), result)
-        assertContentEquals(backupBytes, Files.readAllBytes(target))
+        assertTrue(result is AtomicJsonRead.Corrupt)
+        assertEquals("valid-but-ignored", Files.readString(backup))
     }
 
     /**
@@ -185,33 +168,30 @@ class AtomicJsonStorageTest {
     }
 
     /**
-     * 验证旧备份已验证但无法替换损坏主文件时返回独立结果并保留两个原始文件。
+     * 验证主文件读取 I/O 失败时返回独立结果且不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `failed backup recovery is distinguished and preserves both files`() {
-        val primaryPath = tempDirectory.resolve("recovery-failure.json")
-        val backup = tempDirectory.resolve("recovery-failure.json.bak")
-        val damagedPrimary = "not-valid".encodeToByteArray()
-        val backupBytes = "valid-backup".encodeToByteArray()
-        Files.write(primaryPath, damagedPrimary)
-        Files.write(backup, backupBytes)
+    fun `primary io failure does not read legacy bak file`() {
+        val primaryPath = tempDirectory.resolve("io-failure.json")
+        val backup = tempDirectory.resolve("io-failure.json.bak")
+        Files.writeString(primaryPath, "primary")
+        Files.writeString(backup, "ignored")
         val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun atomicReplace(source: Path, target: Path) {
-                if (target == primaryPath) {
-                    throw IOException("injected recovery replacement failure")
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+                if (path == primaryPath) {
+                    throw IOException("injected primary read failure")
                 }
-                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
+                if (path.fileName.toString().endsWith(".bak")) {
+                    throw AssertionError("legacy bak file must not be read")
+                }
+                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
         }
 
-        val result = AtomicJsonStorage(primaryPath, 1024 * 1024, operations).readValidatedAndRecover { bytes ->
-            require(bytes.contentEquals(backupBytes))
-            "decoded"
-        }
+        val result = AtomicJsonStorage(primaryPath, 1024 * 1024, operations).readValidated { "decoded" }
 
-        assertTrue(result is AtomicJsonRead.RecoveryFailed)
-        assertTrue(Files.readAllBytes(primaryPath).contentEquals(damagedPrimary))
-        assertTrue(Files.readAllBytes(backup).contentEquals(backupBytes))
+        assertTrue(result is AtomicJsonRead.IoFailure)
+        assertEquals("ignored", Files.readString(backup))
     }
 
     /**
@@ -279,6 +259,29 @@ class AtomicJsonStorageTest {
             if (failDirectoryForce) {
                 throw IOException("injected post-commit directory sync failure")
             }
+        }
+    }
+
+    /** 任何尝试访问遗留 `.bak` 文件的存储操作都会让测试立即失败。 */
+    private class RejectBakFileOperations : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+        override fun readAtMost(path: Path, maxBytes: Int): ByteArray =
+            rejectBak(path) { DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes) }
+
+        override fun writeAndForce(path: Path, bytes: ByteArray) {
+            rejectBak(path) { DefaultAtomicJsonFileOperations.writeAndForce(path, bytes) }
+        }
+
+        override fun atomicReplace(source: Path, target: Path) {
+            rejectBak(source) { rejectBak(target) { DefaultAtomicJsonFileOperations.atomicReplace(source, target) } }
+        }
+
+        override fun deleteIfExists(path: Path) {
+            rejectBak(path) { DefaultAtomicJsonFileOperations.deleteIfExists(path) }
+        }
+
+        private fun <T> rejectBak(path: Path, action: () -> T): T {
+            check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be accessed: $path" }
+            return action()
         }
     }
 }
