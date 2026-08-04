@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -105,5 +106,29 @@ class SettingsTest {
         assertEquals(0, aiSettings.autoCleanContextIntervalMinutes)
         assertEquals(false, aiSettings.silentContextCleanup)
         assertEquals("", aiSettings.selectedModel)
+    }
+
+    /**
+     * 验证代理校验只接受不含 URL 组成部分的裸主机和合法端口，并支持未加方括号的 IPv6。
+     */
+    @Test
+    fun `proxy validation accepts bare hosts and rejects URLs or invalid ports`() {
+        validateProxySettings(ProxySettings("proxy.example.com", 8080, ProxyType.HTTP))
+        validateProxySettings(ProxySettings("123", 8080, ProxyType.HTTP))
+        validateProxySettings(ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS))
+        validateProxySettings(ProxySettings("2001:db8::1", 1080, ProxyType.SOCKS))
+
+        listOf(
+            ProxySettings("", 8080, ProxyType.HTTP),
+            ProxySettings("https://proxy.example.com", 8080, ProxyType.HTTP),
+            ProxySettings("proxy.example.com/path", 8080, ProxyType.HTTP),
+            ProxySettings("user@proxy.example.com", 8080, ProxyType.HTTP),
+            ProxySettings("proxy.example.com:8080", 8080, ProxyType.HTTP),
+            ProxySettings("proxy\n.example.com", 8080, ProxyType.HTTP),
+            ProxySettings("proxy.example.com", 0, ProxyType.HTTP),
+            ProxySettings("proxy.example.com", 65536, ProxyType.HTTP),
+        ).forEach { proxy ->
+            assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy) }
+        }
     }
 }

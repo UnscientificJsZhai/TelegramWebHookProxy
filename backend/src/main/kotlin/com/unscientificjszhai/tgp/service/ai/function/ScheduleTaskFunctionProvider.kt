@@ -141,7 +141,13 @@ class ScheduleTaskFunctionProvider(
                 )
             }
 
-        val taskId = taskSchedulerService.get().createTask(instruction, executionTime, loopMode, agentChatId)
+        val taskId = try {
+            taskSchedulerService.get().createTask(instruction, executionTime, loopMode, agentChatId)
+        } catch (e: Exception) {
+            return buildJsonObject {
+                put("error", "Failed to persist scheduled task: ${e.message ?: e::class.simpleName}")
+            }
+        }
         return buildJsonObject {
             put("status", "success")
             put("taskId", taskId)
@@ -174,7 +180,13 @@ class ScheduleTaskFunctionProvider(
 
     private fun cancelScheduledTask(args: Map<String, Any?>): JsonObject {
         val taskId = args["taskId"] as? String ?: return buildJsonObject { put("error", "Missing taskId") }
-        val success = taskSchedulerService.get().cancelTask(taskId)
+        val success = try {
+            taskSchedulerService.get().cancelTask(taskId)
+        } catch (e: Exception) {
+            return buildJsonObject {
+                put("error", "Failed to persist task cancellation: ${e.message ?: e::class.simpleName}")
+            }
+        }
         return if (success) {
             buildJsonObject {
                 put("status", "success")

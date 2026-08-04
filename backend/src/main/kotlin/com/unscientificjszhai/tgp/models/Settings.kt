@@ -95,6 +95,99 @@ data class ProxySettings(
 )
 
 /**
+ * 校验代理设置能否作为本应用的连接目标使用。
+ *
+ * 此校验只检查输入的语法，不会执行 DNS 查询或任何网络请求。主机必须是裸主机名、IPv4
+ * 地址，或未加方括号的标准 IPv6 地址；不接受 URL、用户信息或附带端口的主机字符串。
+ *
+ * @param proxy 要校验的代理设置；`null` 表示不使用代理，视为合法。
+ * @throws IllegalArgumentException 主机、端口或协议类型不符合约束时抛出。
+ */
+fun validateProxySettings(proxy: ProxySettings?) {
+    if (proxy == null) {
+        return
+    }
+
+    val host = proxy.host
+    if (host.isBlank()) {
+        throw IllegalArgumentException("代理主机不能为空。")
+    }
+    if (host.any { it.isWhitespace() || it.isISOControl() }) {
+        throw IllegalArgumentException("代理主机不能包含空白或控制字符。")
+    }
+    if (host.contains("://") || host.any { it == '/' || it == '?' || it == '#' || it == '@' }) {
+        throw IllegalArgumentException("代理主机必须是裸主机名或 IP 地址，不能包含 URL 组成部分。")
+    }
+    if (!isValidProxyHost(host)) {
+        throw IllegalArgumentException("代理主机必须是裸主机名、IPv4 地址或未加方括号的 IPv6 地址。")
+    }
+    if (proxy.port !in 1..65535) {
+        throw IllegalArgumentException("代理端口必须在 1..65535 范围内。")
+    }
+    when (proxy.type) {
+        ProxyType.HTTP,
+        ProxyType.SOCKS,
+            -> Unit
+    }
+}
+
+private fun isValidProxyHost(host: String): Boolean =
+    when {
+        host.contains(':') -> isValidIpv6Address(host)
+        host.all { it.isDigit() || it == '.' } -> isValidIpv4Address(host) || isValidHostname(host)
+        else -> isValidHostname(host)
+    }
+
+private fun isValidHostname(host: String): Boolean =
+    host.length <= 253 && !host.startsWith('.') && !host.endsWith('.') && host.split('.').all { label ->
+        label.length in 1..63 &&
+                label.first().isLetterOrDigit() &&
+                label.last().isLetterOrDigit() &&
+                label.all { it.isLetterOrDigit() || it == '-' }
+    }
+
+private fun isValidIpv4Address(host: String): Boolean {
+    val octets = host.split('.')
+    return octets.size == 4 && octets.all { octet ->
+        octet.isNotEmpty() &&
+                octet.all(Char::isDigit) &&
+                octet.toIntOrNull()?.let { it in 0..255 } == true
+    }
+}
+
+private fun isValidIpv6Address(host: String): Boolean {
+    if (
+        host.contains(":::") ||
+        host.indexOf("::") != host.lastIndexOf("::")
+    ) {
+        return false
+    }
+
+    val hasCompression = host.contains("::")
+    if (
+        (!hasCompression && (host.startsWith(':') || host.endsWith(':'))) ||
+        (host.startsWith(':') && !host.startsWith("::")) ||
+        (host.endsWith(':') && !host.endsWith("::"))
+    ) {
+        return false
+    }
+
+    val parts = host.split(':').filter(String::isNotEmpty)
+    if (parts.isEmpty()) {
+        return host == "::"
+    }
+
+    val ipv4Part = parts.last().takeIf { it.contains('.') }
+    if (parts.dropLast(1).any { it.contains('.') } || (ipv4Part != null && !isValidIpv4Address(ipv4Part))) {
+        return false
+    }
+
+    val groupCount = parts.sumOf { part -> if (part == ipv4Part) 2 else 1 }
+    return parts.all { part -> part == ipv4Part || part.matches(Regex("[0-9A-Fa-f]{1,4}")) } &&
+            if (hasCompression) groupCount < 8 else groupCount == 8
+}
+
+/**
  * 支持的代理协议类型。
  */
 @Serializable

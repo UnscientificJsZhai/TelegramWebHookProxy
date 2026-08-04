@@ -3,19 +3,22 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.PageResult
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.models.SkillBrief
+import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.AtomicJsonRead
+import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
+import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.json.decodeToSequence
 import org.slf4j.LoggerFactory
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.concurrent.withLock
 
 @Singleton
 /**
@@ -24,7 +27,8 @@ import javax.inject.Singleton
  * 技能存储在 JSON 配置文件中；保存和删除会以替换文件的方式提交更新，并在成功后发布事件。
  */
 class SkillRepository private constructor(
-    private val configFile: File,
+    configFile: File,
+    fileOperations: AtomicJsonFileOperations,
 ) {
     /**
      * 创建使用默认技能配置文件的仓储。
@@ -32,13 +36,19 @@ class SkillRepository private constructor(
      * @constructor 创建使用 `config/skills.json` 的仓储；该目录不存在时会创建。
      */
     @Inject
-    constructor() : this(File("config/skills.json"))
+    constructor() : this(File("config/skills.json"), DefaultAtomicJsonFileOperations)
 
     companion object {
-        internal fun forTesting(configFile: File): SkillRepository = SkillRepository(configFile)
+        internal fun forTesting(
+            configFile: File,
+            fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
+        ): SkillRepository = SkillRepository(configFile, fileOperations)
     }
 
     private val logger = LoggerFactory.getLogger(SkillRepository::class.java)
+    private val storage = AtomicJsonStorage(configFile.toPath(), fileOperations)
+    private val storageLock = ReentrantLock()
+    private var requiresStorageValidationBeforeWrite = false
 
     private val _skillsUpdateEvent = MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,
@@ -53,65 +63,43 @@ class SkillRepository private constructor(
     val skillsUpdateEvent: SharedFlow<Unit> = _skillsUpdateEvent.asSharedFlow()
 
     init {
-        if (!configFile.parentFile.exists()) {
-            configFile.parentFile.mkdirs()
+        configFile.parentFile?.let { parent ->
+            if (!parent.exists()) {
+                parent.mkdirs()
+            }
         }
     }
 
     /**
      * 分页读取所有技能。
      *
-     * 配置文件不存在、为空或无法解析时返回总数为 `0` 的空页。
+     * 配置文件不存在时返回总数为 `0` 的空页；主文件语义损坏但 `.bak` 完整时会先恢复备份。
+     * 主文件和备份均无法解析时返回空页而不改写现场。
      *
      * @param page 从 `1` 开始的页码；调用方应传入正整数。
      * @param size 每页最大技能数；调用方应传入正整数。
      * @return 包含总技能数和当前页技能的结果；技能顺序与配置文件一致。
      */
-    @OptIn(ExperimentalSerializationApi::class)
     fun getAllSkills(page: Int = 1, size: Int = 10): PageResult<Skill> {
-        if (!configFile.exists() || configFile.length() == 0L) {
-            return PageResult(0, emptyList())
-        }
-        return try {
-            configFile.inputStream().use { inputStream ->
-                var total = 0
-                val items = mutableListOf<Skill>()
-                val startIndex = (page - 1) * size
-                val endIndex = startIndex + size
-
-                ConfigJson.decodeToSequence<Skill>(inputStream).forEachIndexed { index, skill ->
-                    total++
-                    if (index in startIndex..<endIndex) {
-                        items.add(skill)
-                    }
-                }
-                PageResult(total, items)
-            }
-        } catch (e: Exception) {
-            logger.error("Error loading skills.json for getAllSkills", e)
-            PageResult(0, emptyList())
+        return storageLock.withLock {
+            val skills = readSkillsForRead()
+            val startIndex = (page - 1) * size
+            val endIndex = startIndex + size
+            PageResult(skills.size, skills.filterIndexed { index, _ -> index in startIndex..<endIndex })
         }
     }
 
     /**
      * 读取所有技能的摘要信息。
      *
-     * 配置文件不存在、为空或无法解析时返回空列表。
+     * 配置文件不存在时返回空列表；主文件语义损坏但 `.bak` 完整时会先恢复备份。主文件和备份
+     * 均无法解析时返回空列表而不改写现场。
      *
      * @return 技能摘要列表，顺序与配置文件一致；没有可读取的技能时为空列表。
      */
-    @OptIn(ExperimentalSerializationApi::class)
     fun getSkillSummaries(): List<SkillBrief> {
-        if (!configFile.exists() || configFile.length() == 0L) {
-            return emptyList()
-        }
-        return try {
-            configFile.inputStream().use { inputStream ->
-                ConfigJson.decodeToSequence<SkillBrief>(inputStream).toList()
-            }
-        } catch (e: Exception) {
-            logger.error("Error loading skills.json for getSkillSummaries", e)
-            emptyList()
+        return storageLock.withLock {
+            readSkillsForRead().map { SkillBrief(it.id, it.description) }
         }
     }
 
@@ -119,17 +107,11 @@ class SkillRepository private constructor(
      * 按标识读取单个技能。
      *
      * @param id 要查询的技能标识，不能为空；按完全相等的字符串匹配。
-     * @return 匹配的技能；未找到或配置文件无法读取时为 `null`。
+     * @return 匹配的技能；未找到、文件不可读取或主文件和备份均无法解析时为 `null`。
      */
-    @OptIn(ExperimentalSerializationApi::class)
     fun getSkillById(id: String): Skill? {
-        return try {
-            configFile.inputStream().use { inputStream ->
-                ConfigJson.decodeToSequence<Skill>(inputStream).find { it.id == id }
-            }
-        } catch (e: Exception) {
-            logger.error("Error loading skills.json while finding skill id $id", e)
-            return null
+        return storageLock.withLock {
+            readSkillsForRead().find { it.id == id }
         }
     }
 
@@ -139,56 +121,20 @@ class SkillRepository private constructor(
      * 标识相同的已有技能会被 [skill] 完全替换；成功后会发布一次 [skillsUpdateEvent]。
      *
      * @param skill 要持久化的完整技能，不能为空。
-     * @throws Exception 配置文件无法读取、编码、写入或替换时抛出。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；不会发布变更事件。
+     * @throws Exception 配置文件无法编码或原子提交时抛出；不会发布变更事件。
      */
-    @OptIn(ExperimentalSerializationApi::class)
     fun saveSkill(skill: Skill) {
-        if (!configFile.exists() || configFile.length() == 0L) {
-            configFile.parentFile.mkdirs()
-            configFile.writeText("[\n${ConfigJson.encodeToString(skill)}\n]")
-            _skillsUpdateEvent.tryEmit(Unit)
-            return
-        }
-        val tmpFile = File.createTempFile("tmp_skill", ".json")
-        try {
-            configFile.inputStream().use { inputStream ->
-                tmpFile.outputStream().bufferedWriter().use { writer ->
-                    val elements = ConfigJson.decodeToSequence<Skill>(inputStream)
-
-                    writer.write("[\n")
-                    var isFirst = true
-                    var alreadyUpdated = false
-
-                    elements.forEach { element ->
-                        if (!isFirst) writer.write(",\n")
-
-                        if (element.id == skill.id) {
-                            writer.write(ConfigJson.encodeToString(skill))
-                            alreadyUpdated = true
-                        } else {
-                            writer.write(ConfigJson.encodeToString(element))
-                        }
-                        isFirst = false
-                    }
-
-                    if (!alreadyUpdated) {
-                        if (!isFirst) writer.write(",\n")
-                        writer.write(ConfigJson.encodeToString(skill))
-                    }
-
-                    writer.write("\n]")
-                }
+        storageLock.withLock {
+            val skills = readSkillsForMutation().items.toMutableList()
+            val existingIndex = skills.indexOfFirst { it.id == skill.id }
+            if (existingIndex >= 0) {
+                skills[existingIndex] = skill
+            } else {
+                skills += skill
             }
-
-            Files.move(
-                tmpFile.toPath(),
-                configFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING
-            )
+            storage.commit(ConfigJson.encodeToString(skills).toByteArray(StandardCharsets.UTF_8))
             _skillsUpdateEvent.tryEmit(Unit)
-        } catch (e: Exception) {
-            tmpFile.delete()
-            throw e
         }
     }
 
@@ -199,40 +145,105 @@ class SkillRepository private constructor(
      * 即使未找到匹配技能也是如此。
      *
      * @param id 要删除的技能标识，不能为空；按完全相等的字符串匹配。
-     * @throws Exception 配置文件无法读取、编码、写入或替换时抛出。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；不会发布变更事件。
+     * @throws Exception 配置文件无法编码或原子提交时抛出；不会发布变更事件。
      */
-    @OptIn(ExperimentalSerializationApi::class)
     fun deleteSkill(id: String) {
-        if (!configFile.exists() || configFile.length() == 0L) {
-            return
-        }
-        val tmpFile = File.createTempFile("tmp_skill", ".json")
-        try {
-            configFile.inputStream().use { inputStream ->
-                tmpFile.outputStream().bufferedWriter().use { writer ->
-                    val elements = ConfigJson.decodeToSequence<Skill>(inputStream)
-                    writer.write("[\n")
-                    var isFirst = true
-                    elements.forEach { element ->
-                        if (element.id != id) {
-                            if (!isFirst) writer.write(",\n")
-                            writer.write(ConfigJson.encodeToString(element))
-                            isFirst = false
-                        }
-                    }
-                    writer.write("\n]")
-                }
+        storageLock.withLock {
+            val snapshot = readSkillsForMutation()
+            if (!snapshot.exists) {
+                return
             }
-
-            Files.move(
-                tmpFile.toPath(),
-                configFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING
+            storage.commit(
+                ConfigJson.encodeToString(snapshot.items.filterNot { it.id == id }).toByteArray(StandardCharsets.UTF_8),
             )
             _skillsUpdateEvent.tryEmit(Unit)
-        } catch (e: Exception) {
-            tmpFile.delete()
-            throw e
         }
     }
+
+    private fun readSkillsForRead(): List<Skill> = when (val read = storage.readValidatedAndRecover(::decodeSkills)) {
+        AtomicJsonRead.Missing -> {
+            requiresStorageValidationBeforeWrite = false
+            emptyList()
+        }
+
+        is AtomicJsonRead.Valid -> {
+            requiresStorageValidationBeforeWrite = false
+            read.value
+        }
+
+        is AtomicJsonRead.Corrupt -> {
+            requiresStorageValidationBeforeWrite = true
+            logger.error("Skills file and its backup are semantically invalid; preserving both files", read.cause)
+            emptyList()
+        }
+
+        is AtomicJsonRead.IoFailure -> {
+            requiresStorageValidationBeforeWrite = true
+            logger.error("Unable to read skills data; delaying writes until it can be revalidated", read.cause)
+            emptyList()
+        }
+
+        is AtomicJsonRead.RecoveryFailed -> {
+            requiresStorageValidationBeforeWrite = true
+            logger.error(
+                "Validated skills backup could not be restored; preserving files and disabling writes",
+                read.cause
+            )
+            emptyList()
+        }
+
+        is AtomicJsonRead.RecoverabilityPending -> {
+            requiresStorageValidationBeforeWrite = true
+            logger.error("Skills recovery is blocked by I/O; delaying writes until revalidation", read.cause)
+            emptyList()
+        }
+    }
+
+    private fun readSkillsForMutation(): SkillSnapshot {
+        return when (val read = storage.readValidatedAndRecover(::decodeSkills)) {
+            AtomicJsonRead.Missing -> {
+                requiresStorageValidationBeforeWrite = false
+                SkillSnapshot(exists = false, items = emptyList())
+            }
+
+            is AtomicJsonRead.Valid -> {
+                requiresStorageValidationBeforeWrite = false
+                SkillSnapshot(exists = true, items = read.value)
+            }
+
+            is AtomicJsonRead.Corrupt -> {
+                requiresStorageValidationBeforeWrite = true
+                throw IllegalStateException("技能文件及备份均已损坏，拒绝覆盖现场。", read.cause)
+            }
+
+            is AtomicJsonRead.IoFailure -> {
+                requiresStorageValidationBeforeWrite = true
+                throw IllegalStateException("技能文件尚不可读取，拒绝覆盖现场。", read.cause)
+            }
+
+            is AtomicJsonRead.RecoveryFailed -> {
+                requiresStorageValidationBeforeWrite = true
+                throw IllegalStateException("有效技能备份无法恢复主文件，拒绝覆盖现场。", read.cause)
+            }
+
+            is AtomicJsonRead.RecoverabilityPending -> {
+                requiresStorageValidationBeforeWrite = true
+                throw IllegalStateException("技能备份尚不可读取或验证，拒绝覆盖现场。", read.cause)
+            }
+        }
+    }
+
+    private fun decodeSkills(bytes: ByteArray): List<Skill> {
+        val content = bytes.toString(StandardCharsets.UTF_8)
+        if (content.isBlank()) {
+            throw IllegalArgumentException("Skills data must not be blank")
+        }
+        return ConfigJson.decodeFromString(content)
+    }
+
+    private data class SkillSnapshot(
+        val exists: Boolean,
+        val items: List<Skill>,
+    )
 }

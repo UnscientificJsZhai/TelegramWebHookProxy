@@ -4,12 +4,13 @@ import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.SetChatIdRequest
-import io.ktor.client.statement.*
+import com.unscientificjszhai.tgp.models.validateProxySettings
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -31,10 +32,26 @@ fun Application.apiModule(appComponent: AppComponent) {
                 call.respond(settingsRepository.settingsFlow.value)
             }
             post("/settings") {
-                val newSettings = call.receive<AppSettings>()
+                val newSettings = try {
+                    call.receive<AppSettings>()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    call.respond(HttpStatusCode.BadRequest, "设置请求格式不合法。")
+                    return@post
+                }
                 val oldSettings = settingsRepository.settingsFlow.value
                 val settingsToSave = newSettings.clearSelectedModelWhenProviderOrApiKeyChanges(oldSettings)
-                settingsRepository.saveSettings(settingsToSave)
+                try {
+                    validateProxySettings(settingsToSave.proxy)
+                    settingsRepository.saveSettings(settingsToSave)
+                } catch (e: IllegalArgumentException) {
+                    call.respond(HttpStatusCode.BadRequest, e.message ?: "代理设置不合法。")
+                    return@post
+                } catch (e: IllegalStateException) {
+                    call.respond(HttpStatusCode.Conflict, e.message ?: "设置存储需要恢复后重试。")
+                    return@post
+                }
 
                 if (settingsToSave.telegramToken != oldSettings.telegramToken ||
                     settingsToSave.ai?.agentEnabled != oldSettings.ai?.agentEnabled
@@ -53,10 +70,26 @@ fun Application.apiModule(appComponent: AppComponent) {
                 call.respond(HttpStatusCode.OK)
             }
             post("/settings/chat") {
-                val request = call.receive<SetChatIdRequest>()
+                val request = try {
+                    call.receive<SetChatIdRequest>()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    call.respond(HttpStatusCode.BadRequest, "聊天设置请求格式不合法。")
+                    return@post
+                }
                 val currentSettings = settingsRepository.settingsFlow.value
                 val newSettings = currentSettings.copy(chatId = request.chatId)
-                settingsRepository.saveSettings(newSettings)
+                try {
+                    validateProxySettings(newSettings.proxy)
+                    settingsRepository.saveSettings(newSettings)
+                } catch (e: IllegalArgumentException) {
+                    call.respond(HttpStatusCode.BadRequest, e.message ?: "代理设置不合法。")
+                    return@post
+                } catch (e: IllegalStateException) {
+                    call.respond(HttpStatusCode.Conflict, e.message ?: "设置存储需要恢复后重试。")
+                    return@post
+                }
                 call.respond(HttpStatusCode.OK)
             }
             post("/send-message") {
@@ -97,7 +130,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                         return@post
                     }
                     val response = telegramService.sendMessage(chatId, requestText)
-                    call.respond(response.status, response.bodyAsText())
+                    call.respond(response.status, response.body)
                 } catch (e: Exception) {
                     call.respond(HttpStatusCode.InternalServerError, e.message ?: "An error occurred")
                 }

@@ -31,10 +31,18 @@ fun main() {
 /**
  * 配置应用的序列化、依赖注入、业务路由和静态资源路由。
  *
+ * 此方法会注册一次 [ApplicationStopped] 监听器，以关闭 [TelegramService][com.unscientificjszhai.tgp.service.TelegramService]；
+ * 应由应用生命周期只调用一次。
+ *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
  */
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
+    val telegramService = appComponent.telegramService
+
+    monitor.subscribe(ApplicationStopped) {
+        telegramService.close()
+    }
 
     install(ContentNegotiation) {
         json(
