@@ -142,6 +142,49 @@ class TaskSchedulerServiceTest {
         assertEquals(0, service.listTasks().size, "ONCE task should be removed after execution")
     }
 
+    /** 验证定时任务长结果按完整带前缀文本分块，片段失败会停止后续尽力投递。 */
+    @Test
+    fun `long task result is chunked and stops after a rejected chunk`() = runTest {
+        service.createTask("long result", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val sent = mutableListOf<String>()
+        coEvery { agentService.sendMessage(any()) } returns "x".repeat(10_000)
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } coAnswers {
+            sent += args[2] as String
+            if (sent.size == 2) {
+                TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
+            } else {
+                successfulTelegramResponse()
+            }
+        }
+
+        service.scanAndExecute()
+
+        assertEquals(2, sent.size)
+        assertTrue(sent.all { it.length == 4096 })
+        assertTrue(sent.first().startsWith("⏰ 定时任务执行结果：\n\n"))
+        coVerify(exactly = 2) { telegramService.sendMessageForToken(BOT_A_TOKEN, "12345", any(), any()) }
+    }
+
+    /** 验证长任务第一片段完成后 token 轮换会阻止使用旧 token 发送后续片段。 */
+    @Test
+    fun `long task result stops after token rotation between chunks`() = runTest {
+        service.createTask("rotating result", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        var sends = 0
+        coEvery { agentService.sendMessage(any()) } returns "x".repeat(10_000)
+        coEvery { telegramService.sendMessageForToken(BOT_A_TOKEN, "12345", any(), any()) } coAnswers {
+            sends++
+            if (sends == 1) {
+                settingsRepository.saveSettings(enabledSettings(BOT_B_TOKEN, "chat-b"))
+            }
+            successfulTelegramResponse()
+        }
+
+        service.scanAndExecute()
+
+        assertEquals(1, sends)
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(BOT_B_TOKEN, any(), any(), any()) }
+    }
+
     /**
      * 验证实际任务执行日志不记录 instruction，也不会通过 Telegram 网络异常保留 token 或 Throwable。
      */
@@ -677,10 +720,10 @@ class TaskSchedulerServiceTest {
     }
 
     /**
-     * 验证租约内捕获的 token 会用于已开始回合的投递，即使回合期间切换了活动 Bot。
+     * 验证任务回合开始后 token 轮换会阻止尚未开始的结果投递。
      */
     @Test
-    fun `in flight task delivery uses the token captured by its execution lease`() = runTest {
+    fun `in flight task delivery stops when captured token rotates`() = runTest {
         settingsRepository.saveSettings(enabledSettings(BOT_A_TOKEN, "chat-a"))
         service.createTask("task", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "chat-a")
         val agentStarted = CompletableDeferred<Unit>()
@@ -698,7 +741,7 @@ class TaskSchedulerServiceTest {
         allowAgentToFinish.complete(Unit)
         execution.await()
 
-        coVerify(exactly = 1) { telegramService.sendMessageForToken(BOT_A_TOKEN, "chat-a", any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(BOT_A_TOKEN, "chat-a", any(), any()) }
         coVerify(exactly = 0) { telegramService.sendMessageForToken(BOT_B_TOKEN, any(), any(), any()) }
     }
 
@@ -749,8 +792,8 @@ class TaskSchedulerServiceTest {
     fun `revoked task authorization deletes once hourly and legacy tasks without side effects`() = runTest {
         val dueTime = System.currentTimeMillis() - 1_000
 
-        service.createTask("mismatched owner", dueTime, LoopMode.ONCE, "task-owner")
-        settingsRepository.saveSettings(enabledSettings(agentChatId = "other-owner"))
+        service.createTask("mismatched chat", dueTime, LoopMode.ONCE, "task-chat")
+        settingsRepository.saveSettings(enabledSettings(agentChatId = "other-chat"))
         service.scanAndExecute()
         assertTrue(service.listTasks().isEmpty())
 
@@ -826,7 +869,7 @@ class TaskSchedulerServiceTest {
         val primaryBefore = scheduleFile.readText()
         service.close()
         service = newService(scheduleFile, primaryReplaceFailingOperations())
-        settingsRepository.saveSettings(enabledSettings(agentChatId = "different-owner"))
+        settingsRepository.saveSettings(enabledSettings(agentChatId = "different-chat"))
 
         service.scanAndExecute()
 

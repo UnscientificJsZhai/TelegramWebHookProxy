@@ -18,6 +18,7 @@ import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.TelegramTextChunks
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -518,7 +519,9 @@ class TaskSchedulerService private constructor(
     /**
      * 尽力向 Telegram 投递已完成代理回合的结果。
      *
-     * 非取消失败和 API 非成功响应只记录日志，避免因投递问题重复执行可能带外部副作用的代理回合。
+     * 非取消失败和 API 非成功响应只记录日志，避免因投递问题重复执行可能带外部副作用的代理回合。完整结果
+     * （含前缀）会按 Telegram 文本上限分块；每块发送前均重新确认 token，任一确认或发送失败
+     * 都停止后续片段。该投递仍是既有的 at-most-once 尽力语义，并不持久化为通用 scheduler outbox。
      *
      * @param task 已完成代理回合的任务。
      * @param token 在任务执行租约中捕获的 Telegram Bot token。
@@ -527,13 +530,17 @@ class TaskSchedulerService private constructor(
      */
     private suspend fun deliverTaskResult(task: ScheduledTask, token: String, result: String) {
         try {
-            val response = telegramService.sendMessageForToken(
-                token,
-                task.agentChatId,
-                "⏰ 定时任务执行结果：\n\n$result",
-            )
-            if (!response.isTelegramOk()) {
-                logger.warn("Telegram did not accept task result for {}", task.id)
+            val fullText = "⏰ 定时任务执行结果：\n\n$result"
+            for (chunk in TelegramTextChunks.split(fullText)) {
+                if (!isTaskResultTokenCurrent(token)) {
+                    logger.info("Stopping task result delivery for {} because its bot token changed", task.id)
+                    return
+                }
+                val response = telegramService.sendMessageForToken(token, task.agentChatId, chunk)
+                if (!response.isTelegramOk()) {
+                    logger.warn("Telegram did not accept task result chunk for {}", task.id)
+                    return
+                }
             }
         } catch (e: CancellationException) {
             throw e
@@ -543,6 +550,15 @@ class TaskSchedulerService private constructor(
                 task.id,
                 SafeLogging.failureCategory(e).wireName,
             )
+        }
+    }
+
+    /** 在每个任务结果片段前短暂确认当前设置仍使用本次执行捕获的 token。 */
+    private fun isTaskResultTokenCurrent(token: String): Boolean {
+        return try {
+            settingsRepository.withActiveTelegramBotLease { lease -> lease.token == token }
+        } catch (_: ActiveTelegramBotUnavailableException) {
+            false
         }
     }
 
@@ -774,6 +790,7 @@ private fun resolveLocalExecutionTime(
             ZonedDateTime.ofLocal(localDateTime, zoneId, transition.offsetBefore)
         }
     }
+
 }
 
 private const val MILLIS_PER_DAY = 24 * 60 * 60 * 1000
