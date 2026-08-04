@@ -45,9 +45,10 @@ data class UpdatesData(
 /**
  * 一项由轮询器持久化保护的 Agent 回合。
  *
- * 回合在任何模型、工具或外部调用前先写入 `IN_PROGRESS`。仅当 Agent 返回结果（包括空回复）后才会转为
- * `FINAL`；进程重启后遇到没有本地 owner 的进行中回合，调用方必须降级为固定失败回复而不能重放 Agent。
- * 该记录保留回复目标，保证最终状态即使跨重启也能原子写入 outbox 与更新偏移量。
+ * 回合在任何模型、工具或外部调用前先写入 [AgentTurnJournalStatus.IN_PROGRESS]。仅当 Agent 返回结果（包括空回复）后才会转为
+ * [AgentTurnJournalStatus.FINAL]；进程重启后遇到没有本地 owner 的进行中回合，调用方必须静默确认其偏移量并删除该记录，不能
+ * 重放 Agent、创建 FINAL 或创建 outbox。该记录保留回复目标，保证已成为最终状态的记录即使跨重启也能
+ * 原子写入 outbox 与更新偏移量。
  *
  * @property updateId 该回合所属的 Telegram 更新标识；必须为非负数，且同一机器人内唯一。
  * @property chatId 最终回复目标聊天标识；不能为空。
@@ -82,7 +83,7 @@ internal sealed interface AgentTurnClaim {
     /** 回合已有最终结果，调用方只能重试提交该结果，不能再进入 Agent。 */
     data class FINAL(val entry: AgentTurnJournalEntry) : AgentTurnClaim
 
-    /** 记录来自失联进程或已结束 owner；调用方必须先降级为失败结果。 */
+    /** 已有不可重放的进行中记录；有本地 owner 时等待重试，无 owner 时静默确认偏移量。 */
     data class InProgress(val entry: AgentTurnJournalEntry) : AgentTurnClaim
 
     /** 更新偏移量已确认，调用方不再执行或提交该回合。 */
@@ -372,7 +373,7 @@ class UpdatesRepository private constructor(
      * 在调用 Agent 前持久化占有一项回合，或返回其已有的不可重放状态。
      *
      * 该方法是同一仓储实例内的原子读改写操作。它绝不会把已有的 [AgentTurnJournalStatus.IN_PROGRESS]
-     * 直接交给 Agent 重放；调用方必须结合本地 owner 判定该回合是否仍在运行，并将失联回合降级为失败。
+     * 直接交给 Agent 重放；调用方必须结合本地 owner 判定该回合是否仍在运行，并对失联回合静默确认偏移量。
      * 已确认更新的残留 FINAL 账本会在本次调用中安全回收。
      *
      * @param botId token 冒号前的非空机器人标识。
@@ -481,10 +482,10 @@ class UpdatesRepository private constructor(
     }
 
     /**
-     * 将失联的进行中 Agent 回合原子降级为固定失败回复。
+     * 将当前本地 owner 已明确失败的进行中 Agent 回合原子降级为固定失败回复。
      *
-     * 调用方只可在不存在本地 owner 时调用；该规则使崩溃、Agent 异常和 FINAL 写入失败都 fail-closed，
-     * 不会自动重放任何模型或工具副作用。
+     * 调用方只可在仍持有本地 owner 且已捕获 Agent 异常时调用；失联 owner 则应使用
+     * [confirmInProgressAgentTurnWithoutReply] 静默确认。两条路径都不会自动重放模型或工具副作用。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param updateId 要降级的 Telegram 更新标识；必须为非负数。
@@ -502,6 +503,45 @@ class UpdatesRepository private constructor(
     ): AgentTurnJournalEntry? {
         require(failureReply.isNotBlank()) { "failureReply must not be blank." }
         return finalizeAgentTurn(botId, updateId, failureReply)
+    }
+
+    /**
+     * 静默确认一项没有本地 owner 的进行中 Agent 回合。
+     *
+     * 仅当指定账本记录仍为 [AgentTurnJournalStatus.IN_PROGRESS] 时，才会在同一次文件提交中删除该记录并将
+     * [UpdatesData.lastUpdateId] 至少推进到 [updateId]。该路径绝不创建回复、outbox 或 FINAL 记录，供调用方在
+     * 授权租约失效或进程失联后安全跳过不可重放的回合。记录不存在、状态已改变或 bot 无效时不写入文件。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要静默确认的 Telegram 更新标识；必须为非负数。
+     * @return 仅当进行中记录被删除且偏移量已在同一次提交中确认时为 `true`；其他情况为 `false`。
+     * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出；内存状态不变。
+     * @throws Exception 当状态无法原子写入时抛出；内存状态不变。
+     */
+    @Synchronized
+    internal fun confirmInProgressAgentTurnWithoutReply(
+        botId: String,
+        updateId: Long,
+    ): Boolean {
+        require(updateId >= 0) { "updateId must not be negative." }
+        if (!botId.isValidBotId()) {
+            return false
+        }
+        ensureStorageValidatedBeforeMutation()
+        migrateLegacyDataIfNeeded(botId)
+        val current = state.bots[botId] ?: return false
+        val entry = current.agentTurnJournal.singleOrNull { it.updateId == updateId } ?: return false
+        validateAgentTurnJournalEntry(entry, updateId)
+        if (entry.status != AgentTurnJournalStatus.IN_PROGRESS) {
+            return false
+        }
+        val updated = current.copy(
+            lastUpdateId = maxOf(current.lastUpdateId, updateId),
+            agentTurnJournal = current.agentTurnJournal.filterNot { it.updateId == updateId },
+        )
+        saveState(state.copy(bots = state.bots + (botId to updated)))
+        return true
     }
 
     /**

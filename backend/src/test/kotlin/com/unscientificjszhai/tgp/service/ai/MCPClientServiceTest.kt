@@ -1,25 +1,157 @@
 package com.unscientificjszhai.tgp.service.ai
 
 import com.unscientificjszhai.tgp.models.MCPServerConfig
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.types.EmbeddedResource
 import io.modelcontextprotocol.kotlin.sdk.types.ListToolsResult
+import io.modelcontextprotocol.kotlin.sdk.types.TextResourceContents
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import mockwebserver3.Dispatcher
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
+import mockwebserver3.RecordedRequest
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import okhttp3.ResponseBody
+import okhttp3.MediaType.Companion.toMediaType
+import okio.Buffer
 
 /**
  * MCP 客户端连接更新与终态关闭行为的测试设计。
  */
 class MCPClientServiceTest {
+
+    /** 验证深层 Kotlin 参数在序列化到 MCP JSON 前被显式栈校验，底层客户端不会收到调用。 */
+    @Test
+    fun `deep tool arguments are rejected before client serialization`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools() } returns ListToolsResult(listOf(Tool("tool", ToolSchema())))
+        coEvery { client.close() } returns Unit
+        service.connect(listOf(MCPServerConfig(name = "server", url = "https://example.com/mcp")))
+        var nested: Any? = "leaf"
+        repeat(JsonStructureLimits.MAX_DEPTH + 1) {
+            nested = mapOf("next" to nested)
+        }
+
+        val failure = try {
+            service.callTool("server", "tool", mapOf("root" to nested))
+            null
+        } catch (error: McpToolArgumentsTooLargeException) {
+            error
+        }
+
+        assertNotNull(failure)
+        coVerify(exactly = 0) { client.callTool(any<String>(), any<Map<String, Any?>>()) }
+        service.close().join()
+    }
+
+    /** 验证深层 structuredContent 在 MCP result serializer 之前被拒绝。 */
+    @Test
+    fun `deep tool result is rejected before serialization`() {
+        var nested: JsonElement = JsonPrimitive("leaf")
+        repeat(JsonStructureLimits.MAX_DEPTH + 1) { index ->
+            nested = JsonObject(linkedMapOf("level-$index" to nested))
+        }
+
+        val failure = try {
+            validateMcpToolResult(
+                CallToolResult(
+                    emptyList(),
+                    structuredContent = JsonObject(linkedMapOf("root" to nested))
+                )
+            )
+            null
+        } catch (error: JsonStructureLimitExceededException) {
+            error
+        }
+
+        assertNotNull(failure)
+    }
+
+    /** 验证嵌入 resource 的 `_meta` 也会在 SDK serializer 之前受显式栈校验。 */
+    @Test
+    fun `deep embedded resource metadata is rejected before result serialization`() {
+        var nested: JsonElement = JsonPrimitive("leaf")
+        repeat(JsonStructureLimits.MAX_DEPTH + 1) { index ->
+            nested = JsonObject(linkedMapOf("level-$index" to nested))
+        }
+        val result = CallToolResult(
+            content = listOf(
+                EmbeddedResource(
+                    TextResourceContents(
+                        text = "resource",
+                        uri = "test://resource",
+                        meta = JsonObject(mapOf("deep" to nested))
+                    ),
+                ),
+            ),
+        )
+
+        assertFailsWith<JsonStructureLimitExceededException> { validateMcpToolResult(result) }
+    }
+
+    /** 结构 scanner 拒绝响应时立即关闭其委托响应体，不能泄漏无限 SSE 连接。 */
+    @Test
+    fun `bounded response body closes delegate when structure scanner rejects`() {
+        val delegate = CloseTrackingResponseBody(
+            contentType = "application/json".toMediaType(),
+            body = deeplyNestedJson(JsonStructureLimits.MAX_DEPTH + 1),
+        )
+        val responseBody = BoundedMcpResponseBody(delegate, MAX_MCP_RESPONSE_BYTES)
+
+        assertFailsWith<JsonStructureLimitExceededException> { responseBody.source().readByteArray() }
+        assertTrue(delegate.closed)
+    }
+
+    /** application/json 的深层 JSON-RPC wire 响应会在 SDK tools decoder 前被中止。 */
+    @Test
+    fun `deep application json MCP wire response is rejected before SDK decode`() = runBlocking {
+        runWireMcpConnectionTest(
+            contentType = "application/json",
+            toolsResult = deeplyNestedJson(JsonStructureLimits.MAX_DEPTH + 1),
+            expectPublishedTool = null,
+        )
+    }
+
+    /** SSE 的深层多 data 行 CRLF wire 响应跨单字节 chunk 时也必须在 SDK decode 前被中止。 */
+    @Test
+    fun `deep SSE MCP wire response is rejected across CRLF multi data chunks`() = runBlocking {
+        runWireMcpConnectionTest(
+            contentType = "text/event-stream",
+            toolsResult = deeplyNestedJson(JsonStructureLimits.MAX_DEPTH + 1),
+            expectPublishedTool = null,
+        )
+    }
+
+    /** 多 data 行、CRLF 与单字节分块的合法 SSE 响应仍可由 SDK 正常解码。 */
+    @Test
+    fun `SSE multi data CRLF chunks safely reach SDK after wire scan`() = runBlocking {
+        runWireMcpConnectionTest(
+            contentType = "text/event-stream",
+            toolsResult = """{"tools":[{"name":"sse-safe-tool","inputSchema":{"type":"object"}}]}""",
+            expectPublishedTool = "sse-safe-tool",
+        )
+    }
 
     /**
      * 验证超出工具数量上限的候选连接会关闭旧连接和候选连接，并清空工具快照。
@@ -505,4 +637,310 @@ class MCPClientServiceTest {
 
         coVerify(exactly = 1) { client.close() }
     }
+
+    /**
+     * 验证 Streamable HTTP 的 SSE GET 重定向不会向另一主机转发 MCP 配置中的敏感请求头。
+     *
+     * 使用服务的默认客户端和实际 MCP transport 完成 initialize、initialized 与 tools/list，以覆盖 SDK
+     * 在 initialized 通知之后启动的后台 SSE GET 路径。
+     */
+    @Test
+    fun `cross host SSE redirect does not replay MCP headers to the redirect target`() = runBlocking {
+        val source = MockWebServer()
+        val redirectTarget = MockWebServer()
+        val sourceSseRequest = CompletableDeferred<RecordedRequest>()
+        val sourcePostRequests = ConcurrentHashMap<String, RecordedRequest>()
+        val toolsListRequest = CompletableDeferred<RecordedRequest>()
+        val releaseToolsListResponse = CompletableDeferred<Unit>()
+        source.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.method) {
+                "POST" -> {
+                    val method = jsonRpcMethod(request)
+                    sourcePostRequests[method] = request
+                    when (method) {
+                        "initialize" -> jsonRpcResponse(
+                            request,
+                            """{
+                                "protocolVersion":${jsonRpcProtocolVersion(request)},
+                                "capabilities":{"tools":{}},
+                                "serverInfo":{"name":"test","version":"1.0"}
+                            }""".trimIndent(),
+                        )
+
+                        "notifications/initialized" -> MockResponse.Builder().code(202).build()
+                        "tools/list" -> runBlocking {
+                            toolsListRequest.complete(request)
+                            // 保持 client 存活，直到测试在 302 已实际写出后确认攻击站未收到重定向请求。
+                            // 否则未修复客户端可能在候选清理前尚未来得及跟随重定向，形成假阳性。
+                            releaseToolsListResponse.await()
+                            jsonRpcResponse(request, mcpToolsResult(MAX_MCP_TOOLS_PER_SERVER + 1))
+                        }
+
+                        else -> MockResponse.Builder().code(400).body("unexpected MCP method: $method").build()
+                    }
+                }
+
+                "GET" -> {
+                    sourceSseRequest.complete(request)
+                    MockResponse.Builder()
+                        .code(302)
+                        .addHeader("Location", redirectTarget.url("/stolen"))
+                        .build()
+                }
+
+                else -> MockResponse.Builder().code(405).build()
+            }
+        }
+        source.start()
+        redirectTarget.start()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext))
+        val connection = async(Dispatchers.Default) {
+            service.connect(
+                listOf(
+                    MCPServerConfig(
+                        name = "server",
+                        url = source.url("/mcp").toString(),
+                        headers = mapOf(
+                            "X-Mcp-Test-Secret" to "header-canary",
+                            "Cookie" to "session=cookie-canary",
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        try {
+            val sseRequest = withTimeout(5.seconds) { sourceSseRequest.await() }
+            withTimeout(5.seconds) { toolsListRequest.await() }
+            assertEquals("GET", sseRequest.method)
+            assertEquals("header-canary", sseRequest.headers["X-Mcp-Test-Secret"])
+            assertEquals("session=cookie-canary", sseRequest.headers["Cookie"])
+            setOf("initialize", "notifications/initialized", "tools/list").forEach { method ->
+                val request = assertNotNull(sourcePostRequests[method], "$method must reach the MCP source")
+                assertEquals(
+                    "header-canary",
+                    request.headers["X-Mcp-Test-Secret"],
+                    "$method must retain the secret header"
+                )
+                assertEquals("session=cookie-canary", request.headers["Cookie"], "$method must retain the cookie")
+            }
+            assertNull(
+                redirectTarget.takeRequest(500, TimeUnit.MILLISECONDS),
+                "redirect target must not receive a replayed SSE request",
+            )
+            releaseToolsListResponse.complete(Unit)
+            withTimeout(5.seconds) { connection.await() }
+            // tools/list 返回了可解析的 canary 工具；超过服务端接受数量时，候选必须失败并绝不发布它。
+            assertEquals(emptyList(), service.getAllTools())
+        } finally {
+            releaseToolsListResponse.complete(Unit)
+            connection.cancelAndJoin()
+            service.close().join()
+            source.close()
+            redirectTarget.close()
+        }
+    }
+
+    /** 验证即使重定向仍指向同一主机，SSE GET 也不会自动转发到目标路径。 */
+    @Test
+    fun `same host SSE redirect does not request its redirect path`() = runBlocking {
+        val source = MockWebServer()
+        val sourceSseRequest = CompletableDeferred<RecordedRequest>()
+        val redirectPathRequested = CompletableDeferred<RecordedRequest>()
+        val toolsListRequest = CompletableDeferred<RecordedRequest>()
+        val releaseToolsListResponse = CompletableDeferred<Unit>()
+        source.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.method) {
+                "POST" -> when (jsonRpcMethod(request)) {
+                    "initialize" -> jsonRpcResponse(
+                        request,
+                        """{
+                            "protocolVersion":${jsonRpcProtocolVersion(request)},
+                            "capabilities":{"tools":{}},
+                            "serverInfo":{"name":"test","version":"1.0"}
+                        }""".trimIndent(),
+                    )
+
+                    "notifications/initialized" -> MockResponse.Builder().code(202).build()
+                    "tools/list" -> runBlocking {
+                        toolsListRequest.complete(request)
+                        releaseToolsListResponse.await()
+                        jsonRpcResponse(request, mcpToolsResult(MAX_MCP_TOOLS_PER_SERVER + 1))
+                    }
+
+                    else -> MockResponse.Builder().code(400).build()
+                }
+
+                "GET" -> when (request.target) {
+                    "/mcp" -> {
+                        sourceSseRequest.complete(request)
+                        MockResponse.Builder()
+                            .code(302)
+                            .addHeader("Location", source.url("/redirect-target"))
+                            .build()
+                    }
+
+                    "/redirect-target" -> {
+                        redirectPathRequested.complete(request)
+                        MockResponse.Builder().code(500).build()
+                    }
+
+                    else -> MockResponse.Builder().code(404).build()
+                }
+
+                else -> MockResponse.Builder().code(405).build()
+            }
+        }
+        source.start()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext))
+        val connection = async(Dispatchers.Default) {
+            service.connect(
+                listOf(
+                    MCPServerConfig(
+                        name = "server",
+                        url = source.url("/mcp").toString(),
+                        headers = mapOf("X-Mcp-Test-Secret" to "header-canary"),
+                    ),
+                ),
+            )
+        }
+
+        try {
+            withTimeout(5.seconds) { sourceSseRequest.await() }
+            withTimeout(5.seconds) { toolsListRequest.await() }
+            assertFalse(
+                withTimeoutOrNull(500.milliseconds) { redirectPathRequested.await() } != null,
+                "same-host redirect target must not receive an SSE request",
+            )
+            releaseToolsListResponse.complete(Unit)
+            withTimeout(5.seconds) { connection.await() }
+            assertEquals(emptyList(), service.getAllTools())
+        } finally {
+            releaseToolsListResponse.complete(Unit)
+            connection.cancelAndJoin()
+            service.close().join()
+            source.close()
+        }
+    }
+
+    private fun jsonRpcMethod(request: RecordedRequest): String =
+        jsonRpcPayload(request).getValue("method").toString().trim('"')
+
+    private fun jsonRpcProtocolVersion(request: RecordedRequest): String =
+        jsonRpcPayload(request)
+            .getValue("params")
+            .jsonObject
+            .getValue("protocolVersion")
+            .toString()
+
+    private fun jsonRpcResponse(request: RecordedRequest, result: String): MockResponse {
+        val id = jsonRpcPayload(request).getValue("id")
+        return MockResponse.Builder()
+            .addHeader("Content-Type", "application/json")
+            .body("""{"jsonrpc":"2.0","id":$id,"result":$result}""")
+            .build()
+    }
+
+    private fun jsonRpcPayload(request: RecordedRequest) =
+        Json.parseToJsonElement(requireNotNull(request.body) { "MCP request must have a JSON-RPC body" }.utf8())
+            .jsonObject
+
+    /** 以真实 Streamable HTTP transport 执行 tools/list，使 wire scanner 覆盖 SDK 解码之前的路径。 */
+    private suspend fun runWireMcpConnectionTest(
+        contentType: String,
+        toolsResult: String,
+        expectPublishedTool: String?,
+    ) {
+        val server = MockWebServer()
+        val toolsListRequest = CompletableDeferred<RecordedRequest>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.method) {
+                "POST" -> when (jsonRpcMethod(request)) {
+                    "initialize" -> jsonRpcResponse(
+                        request,
+                        """{
+                            "protocolVersion":${jsonRpcProtocolVersion(request)},
+                            "capabilities":{"tools":{}},
+                            "serverInfo":{"name":"wire-test","version":"1.0"}
+                        }""".trimIndent(),
+                    )
+
+                    "notifications/initialized" -> MockResponse.Builder().code(202).build()
+                    "tools/list" -> {
+                        toolsListRequest.complete(request)
+                        jsonRpcWireResponse(request, toolsResult, contentType)
+                    }
+
+                    else -> MockResponse.Builder().code(400).build()
+                }
+
+                // initialized 后 SDK 会尝试建立后台 SSE；本测试仅覆盖 POST inline response，405 会安全关停它。
+                "GET", "DELETE" -> MockResponse.Builder().code(405).build()
+                else -> MockResponse.Builder().code(405).build()
+            }
+        }
+        server.start()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext))
+        try {
+            withTimeout(5.seconds) {
+                service.connect(listOf(MCPServerConfig(name = "wire", url = server.url("/mcp").toString())))
+            }
+            withTimeout(5.seconds) { toolsListRequest.await() }
+            val names = service.getAllTools().map { (_, tool) -> tool.name }
+            assertEquals(expectPublishedTool?.let(::listOf).orEmpty(), names)
+        } finally {
+            service.close().join()
+            server.close()
+        }
+    }
+
+    /** 使用单字节 HTTP chunk 制造 scanner 必须跨边界处理的真实 wire 响应。 */
+    private fun jsonRpcWireResponse(request: RecordedRequest, result: String, contentType: String): MockResponse {
+        val id = jsonRpcPayload(request).getValue("id")
+        val json = """{"jsonrpc":"2.0","id":$id,"result":$result}"""
+        val body = if (contentType == "text/event-stream") {
+            val splitAt = json.indexOf("\"result\":") + "\"result\":".length
+            "event: message\r\ndata: ${json.take(splitAt)}\r\ndata: ${json.drop(splitAt)}\r\n\r\n"
+        } else {
+            json
+        }
+        return MockResponse.Builder()
+            .addHeader("Content-Type", contentType)
+            .chunkedBody(body, 1)
+            .build()
+    }
+
+    /** 构造超过统一嵌套上限的对象，供 wire 与 close 回归共用。 */
+    private fun deeplyNestedJson(depth: Int): String = buildString {
+        repeat(depth) { append("{\"next\":") }
+        append("\"leaf\"")
+        repeat(depth) { append('}') }
+    }
+
+    /** 可观察 close 的最小 ResponseBody，用于验证 scanner 错误会释放底层连接。 */
+    private class CloseTrackingResponseBody(
+        private val contentType: okhttp3.MediaType,
+        body: String,
+    ) : ResponseBody() {
+        private val source = Buffer().writeUtf8(body)
+        var closed = false
+            private set
+
+        override fun contentType(): okhttp3.MediaType = contentType
+
+        override fun contentLength(): Long = source.size
+
+        override fun source() = source
+
+        override fun close() {
+            closed = true
+            source.close()
+        }
+    }
+
+    private fun mcpToolsResult(toolCount: Int): String =
+        (0 until toolCount).joinToString(prefix = """{"tools":[""", postfix = "]}") { index ->
+            val name = if (index == 0) "redirect-canary-tool" else "tool-$index"
+            """{"name":"$name","inputSchema":{"type":"object"}}"""
+        }
 }

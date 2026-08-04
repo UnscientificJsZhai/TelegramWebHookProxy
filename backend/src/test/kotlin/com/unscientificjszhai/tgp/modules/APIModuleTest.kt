@@ -32,7 +32,6 @@ import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import java.io.File
-import java.io.IOException
 import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
@@ -183,6 +182,31 @@ class APIModuleTest {
             assertEquals(original, repository.settingsFlow.value)
             assertEquals(originalContent, configFile.readText())
         }
+
+    /** 深层设置 JSON 必须在 DTO 解码前返回受控 400，且不能改变已有设置。 */
+    @Test
+    fun `settings API rejects deep raw JSON before DTO decode`() = withTestApi { repository, _, configFile ->
+        val original = AppSettings(telegramToken = "100:original")
+        repository.saveSettings(original)
+        val originalContent = configFile.readText()
+        val deepJson = buildString {
+            repeat(65) { append("{\"next\":") }
+            append("\"leaf\"")
+            repeat(65) { append('}') }
+        }
+
+        client.put("/api/settings") {
+            header(HttpHeaders.IfMatch, currentSettingsETag())
+            contentType(ContentType.Application.Json)
+            setBody(deepJson)
+        }.apply {
+            assertEquals(HttpStatusCode.BadRequest, status)
+            assertSafeErrorBody(bodyAsText())
+        }
+
+        assertEquals(original, repository.settingsFlow.value)
+        assertEquals(originalContent, configFile.readText())
+    }
 
     /**
      * 验证设置 API 的读写设计。

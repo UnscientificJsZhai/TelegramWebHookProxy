@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.*
@@ -339,7 +340,7 @@ class TelegramService private constructor(
                 timeout?.let { parameter("timeout", it) }
                 parameter("limit", 10)
             }
-            telegramJson.decodeFromString(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
+            decodeTelegramJson(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES))
         }
     }
 
@@ -364,8 +365,14 @@ class TelegramService private constructor(
             val response = client.get(url) {
                 parameter("file_id", fileId)
             }
-            telegramJson.decodeFromString(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
+            decodeTelegramJson(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES))
         }
+    }
+
+    /** 在 Kotlin serialization 递归解码 Telegram DTO 前先限定不可信 JSON 的结构。 */
+    private inline fun <reified T> decodeTelegramJson(bytes: ByteArray): T {
+        JsonStructureLimits.validateUtf8(bytes)
+        return telegramJson.decodeFromString(bytes.decodeToString())
     }
 
     /**

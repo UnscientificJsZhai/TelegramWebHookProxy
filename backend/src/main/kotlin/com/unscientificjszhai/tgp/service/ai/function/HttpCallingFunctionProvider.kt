@@ -12,6 +12,7 @@ import com.unscientificjszhai.tgp.models.parseExactHttpToolCidr
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
@@ -151,10 +152,12 @@ class HttpCallingFunctionProvider private constructor(
         if (arguments.body != null && arguments.body.toByteArray(Charsets.UTF_8).size > MAX_REQUEST_BODY_BYTES) {
             return error(ERROR_INVALID_ARGUMENTS)
         }
-        if (target.method == HttpToolMethod.POST && arguments.body != null &&
-            runCatching { Json.parseToJsonElement(arguments.body) }.isFailure
-        ) {
-            return error(ERROR_INVALID_ARGUMENTS)
+        if (target.method == HttpToolMethod.POST && arguments.body != null) {
+            try {
+                JsonStructureLimits.parseToJsonElement(Json, arguments.body)
+            } catch (_: Exception) {
+                return error(ERROR_INVALID_ARGUMENTS)
+            }
         }
 
         val semaphore = semaphores.computeIfAbsent(settings.maxConcurrentRequests, ::Semaphore)
@@ -218,7 +221,14 @@ class HttpCallingFunctionProvider private constructor(
 
     private fun currentSettingsOrNull(): HttpToolSettings? {
         val settings = settingsRepository.settingsFlow.value.ai?.httpToolSettings ?: return null
-        return settings.takeIf { runCatching { validateHttpToolSettings(it) }.isSuccess }
+        return try {
+            settings.takeIf {
+                validateHttpToolSettings(it)
+                true
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun createClient(settings: HttpToolSettings, target: HttpCallTarget): HttpClient =

@@ -9,6 +9,7 @@ import com.unscientificjszhai.tgp.repository.SettingsRevisionMismatchException
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdateResult
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.*
@@ -322,7 +323,7 @@ private fun String.utf8Size(): Long = toByteArray(StandardCharsets.UTF_8).size.t
 
 /** 读取并严格解析设置请求的原始 JSON 对象；不会使用应用全局的宽松 JSON 配置。 */
 private suspend fun ApplicationCall.readSettingsJsonObject(): JsonObject? = try {
-    strictSettingsJson.parseToJsonElement(receiveText()) as? JsonObject
+    JsonStructureLimits.parseToJsonElement(strictSettingsJson, receiveText()) as? JsonObject
         ?: throw IllegalArgumentException("Settings request root must be a JSON object.")
 } catch (e: CancellationException) {
     throw e
@@ -389,9 +390,9 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
 ): SettingsUpdateResult? {
     val update = try {
         settingsRepository.updateSettings(
-            expectedRevision,
-            replacesHistoricalInvalidMcpServers,
-            replacesHistoricalInvalidOpenAiBaseUrl,
+            expectedRevision = expectedRevision,
+            replacesHistoricalInvalidMcpServers = replacesHistoricalInvalidMcpServers,
+            replacesHistoricalInvalidOpenAiBaseUrl = replacesHistoricalInvalidOpenAiBaseUrl,
         ) { current ->
             transform(current).clearSelectedModelWhenProviderOrApiKeyChanges(current)
         }

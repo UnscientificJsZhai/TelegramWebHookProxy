@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.SettingsGenerationMismatchException
 import com.unscientificjszhai.tgp.repository.PendingTelegramReply
 import com.unscientificjszhai.tgp.repository.TelegramReplyDeliveryStage
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
@@ -13,6 +14,7 @@ import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.*
@@ -182,11 +184,12 @@ class MessagePoller @Inject constructor(
         val botId: String,
         val generation: Long,
         val scope: CoroutineScope,
-        val updateChannel: Channel<QueuedUpdate>,
+        val updateChannel: Channel<QueuedWork>,
         val consumerResume: Channel<Unit>,
         val outboxSignal: Channel<Unit>,
         var pollJob: Job? = null,
         var consumerJob: Job? = null,
+        var consumerRestartedAfterError: Boolean = false,
         var outboxJob: Job? = null,
         var lastAiReplyAtMillis: Long? = null,
         var consecutivePollingFailures: Int = 0,
@@ -238,11 +241,66 @@ class MessagePoller @Inject constructor(
         NOT_CURRENT,
     }
 
-    private data class QueuedUpdate(
-        val update: Update,
-        val entryTime: Long,
-        val completion: CompletableDeferred<UpdateCompletion>,
+    /**
+     * 已授权更新绑定的不可变设置租约。
+     *
+     * 票据只在共享模型屏障已放行时创建。消费者在每个会产生副作用的步骤前都必须确认 [generation] 和
+     * [agentChatId] 仍与当前设置相符；不相符的排队工作会被静默确认，绝不能在新身份下执行。
+     */
+    private data class AdmissionTicket(
+        val agentChatId: String,
+        val generation: Long,
     )
+
+    /** 保留 Telegram 原消息中的授权事实，以便每个副作用在屏障内复核私聊和发送者身份。 */
+    private data class AuthorizedMessageContext(
+        val chatId: String,
+        val chatType: String,
+        val fromId: String?,
+        val messageId: Long,
+    ) {
+        /** 仅当当前 AI 设置仍授权原消息的私聊、聊天和发送者时返回 `true`。 */
+        fun matches(aiSettings: AISettings): Boolean =
+            chatType == "private" &&
+                    chatId == aiSettings.agentChatId &&
+                    fromId == aiSettings.agentChatId
+    }
+
+    /**
+     * 当前轮询会话待结算的一项队列工作。
+     *
+     * 新授权消息使用 [Authorized]；journal 回放以 [DurableFinal] 或 [DurableInProgress] 表示，避免依赖
+     * 当前授权或重新进入 Agent。三种工作均携带原更新与完成信号，以保证同一批次的偏移量按顺序结算。
+     */
+    private sealed interface QueuedWork {
+        val update: Update
+        val entryTime: Long
+        val completion: CompletableDeferred<UpdateCompletion>
+
+        /** 已通过当前设置授权、但每个副作用前仍须复核 [ticket] 的新消息。 */
+        data class Authorized(
+            override val update: Update,
+            override val entryTime: Long,
+            override val completion: CompletableDeferred<UpdateCompletion>,
+            val ticket: AdmissionTicket,
+        ) : QueuedWork
+
+        /** 已持久化最终回复的回放；只能提交 outbox 和偏移量。 */
+        data class DurableFinal(
+            override val update: Update,
+            override val entryTime: Long,
+            override val completion: CompletableDeferred<UpdateCompletion>,
+            val entry: AgentTurnJournalEntry,
+        ) : QueuedWork
+
+        /** 已无从安全重放的进行中回放；只能在没有本地 owner 时静默确认。 */
+        data class DurableInProgress(
+            override val update: Update,
+            override val entryTime: Long,
+            override val completion: CompletableDeferred<UpdateCompletion>,
+            val entry: AgentTurnJournalEntry,
+        ) : QueuedWork
+    }
 
     /** 同一进程内唯一标识一个已经由消费者占有的 Agent 回合。 */
     private data class AgentTurnKey(
@@ -286,7 +344,10 @@ class MessagePoller @Inject constructor(
         data class Enqueued(val completion: CompletableDeferred<UpdateCompletion>) : BarrierAdmission
 
         /** 当前会话的消费者队列已满，等待在屏障外发送 Telegram 提示。 */
-        data class QueueFull(val chatId: String, val messageId: Long) : BarrierAdmission
+        data class QueueFull(
+            val authorization: AuthorizedMessageContext,
+            val ticket: AdmissionTicket,
+        ) : BarrierAdmission
     }
 
     /** 在 token 生命周期与会话锁内提交队列的结果。 */
@@ -411,6 +472,10 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /** 仅供回归测试在 `/model` 已完成票据复核、但尚未执行仓储 CAS 时构造确定性竞争。 */
+    @Volatile
+    internal var beforeModelSelectionPersistForTesting: (() -> Unit)? = null
+
     /**
      * 在 token 生命周期锁和会话锁内安装尚未启动的轮询会话。
      *
@@ -468,7 +533,7 @@ class MessagePoller @Inject constructor(
                 SafeLogging.failureCategory(e).wireName,
             )
         }
-        session.consumerJob = session.scope.launch { consumeQueue(session) }
+        startQueueConsumer(session)
         session.outboxJob = session.scope.launch { consumeOutbox(session) }
         session.pollJob = session.scope.launch { runPolling(session) }
         logger.info("Started polling session for bot {} at generation {}", botId, generation)
@@ -911,37 +976,137 @@ class MessagePoller @Inject constructor(
         val isOwner: Boolean,
     )
 
-    private suspend fun consumeQueue(session: PollingSession) {
-        while (currentCoroutineContext().isActive) {
-            val queuedUpdate = session.updateChannel.receiveCatching().getOrNull() ?: return
-            val deadline = queuedUpdate.entryTime + processingTimeout.inWholeMilliseconds
-            val remaining = (deadline - System.currentTimeMillis()).coerceAtLeast(0)
-            val completion = try {
-                withTimeout(remaining.milliseconds) {
-                    processUpdate(session, queuedUpdate.update)
-                }
-            } catch (_: TimeoutCancellationException) {
-                handleProcessingTimeout(session, queuedUpdate.update)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
+    /**
+     * 启动当前会话唯一的队列消费者，并在允许的栈溢出错误后至多恢复一次。
+     *
+     * 消费者退出前会把当前和排队的 completion 全部标记为 [UpdateCompletion.Retry]。恢复只针对已知会由
+     * 不可信深层输入触发、且本身不会损坏进程状态的错误；其他 Error 保持终止语义，绝不在同一会话盲目
+     * 重启。
+     */
+    private fun startQueueConsumer(session: PollingSession) {
+        // SupervisorJob 不会把子协程错误传播给 session scope；提供局部 handler 使已经在 finally 中结算并
+        // 经 completion callback 决定恢复策略的错误不会泄漏为测试框架或进程级“未捕获异常”。
+        val consumer = session.scope.launch(CoroutineExceptionHandler { _, cause ->
+            logger.error(
+                "Queue consumer exited after completing retry signals for bot {}; type={}",
+                session.botId,
+                cause::class.qualifiedName,
+            )
+        }) { consumeQueue(session) }
+        session.consumerJob = consumer
+        consumer.invokeOnCompletion { cause ->
+            if (cause == null || cause is CancellationException) {
+                return@invokeOnCompletion
+            }
+            if (!isRecoverableQueueConsumerFailure(cause)) {
+                terminateFatalQueueConsumerSession(session, consumer)
                 logger.error(
-                    "Error processing update {}; category={}",
-                    queuedUpdate.update.updateId,
-                    SafeLogging.failureCategory(e).wireName,
+                    "Queue consumer stopped with a fatal error for bot {}; the session was terminated and will not restart; type={}",
+                    session.botId,
+                    cause::class.qualifiedName,
                 )
-                UpdateCompletion.Retry
+                return@invokeOnCompletion
             }
-
-            currentCoroutineContext().ensureActive()
-            if (isCurrent(session)) {
-                queuedUpdate.completion.complete(completion)
-                if (completion == UpdateCompletion.Retry) {
-                    // 本批更高 update 不得越过失败回合写入 offset；全部退回下次从失败 update 开始的轮询。
-                    drainQueuedUpdatesAsRetry(session)
-                    session.consumerResume.receiveCatching().getOrNull() ?: return
+            session.scope.launch {
+                val shouldRestart = sessionLock.withLock {
+                    if (
+                        closed ||
+                        currentSession !== session ||
+                        session.consumerJob !== consumer ||
+                        session.consumerRestartedAfterError
+                    ) {
+                        false
+                    } else {
+                        session.consumerRestartedAfterError = true
+                        true
+                    }
+                }
+                if (shouldRestart && isCurrent(session)) {
+                    logger.warn(
+                        "Queue consumer hit a recoverable error for bot {}; restarting it once after queue retry completion.",
+                        session.botId,
+                    )
+                    startQueueConsumer(session)
                 }
             }
+        }
+    }
+
+    /** 深层 JSON 的历史故障会抛出 StackOverflowError；内存、链接等真正致命错误绝不恢复。 */
+    private fun isRecoverableQueueConsumerFailure(cause: Throwable): Boolean = cause is StackOverflowError
+
+    /**
+     * 原子摘除因 fatal Error 失去消费者的会话，并结算可能恰好在消费者 finally 之后入队的工作。
+     *
+     * 先在 [sessionLock] 内关闭准入和通道，之后才取消 polling scope；这样轮询协程不会继续向无人消费的
+     * channel 投递 completion 并永远等待。已在 finally 前入队的工作仍以 Retry 结算，保持 offset 重拉语义。
+     */
+    private fun terminateFatalQueueConsumerSession(session: PollingSession, consumer: Job) {
+        val shouldTerminate = sessionLock.withLock {
+            if (closed || currentSession !== session || session.consumerJob !== consumer) {
+                false
+            } else {
+                currentSession = null
+                session.updateChannel.close()
+                session.consumerResume.close()
+                session.outboxSignal.close()
+                true
+            }
+        }
+        if (shouldTerminate) {
+            // `consumeQueue.finally` 已完成当时可见项目；此处覆盖它结束与 completion callback 之间的竞态。
+            drainQueuedUpdatesAsRetry(session)
+            session.pollJob?.cancel(CancellationException("Queue consumer stopped after fatal error."))
+            session.scope.cancel(CancellationException("Queue consumer stopped after fatal error."))
+        }
+    }
+
+    /**
+     * 串行消费队列，并保证任何异常（包括 Error）都不会遗留未完成的批次 deferred。
+     *
+     * 所有退出路径都会先把正在处理和仍排队的更新标为 Retry，再将原异常重新抛出。因此 fatal 错误不会被
+     * 误当普通业务失败吞掉，StackOverflowError 则可由 [startQueueConsumer] 的受控恢复路径观察到。
+     */
+    private suspend fun consumeQueue(session: PollingSession) {
+        var currentWork: QueuedWork? = null
+        try {
+            while (currentCoroutineContext().isActive) {
+                val queuedWork = session.updateChannel.receiveCatching().getOrNull() ?: return
+                currentWork = queuedWork
+                val deadline = queuedWork.entryTime + processingTimeout.inWholeMilliseconds
+                val remaining = (deadline - System.currentTimeMillis()).coerceAtLeast(0)
+                val completion = try {
+                    withTimeout(remaining.milliseconds) {
+                        processQueuedWork(session, queuedWork)
+                    }
+                } catch (_: TimeoutCancellationException) {
+                    handleProcessingTimeout(session, queuedWork)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.error(
+                        "Error processing update {}; category={}",
+                        queuedWork.update.updateId,
+                        SafeLogging.failureCategory(e).wireName,
+                    )
+                    UpdateCompletion.Retry
+                }
+
+                currentCoroutineContext().ensureActive()
+                if (isCurrent(session)) {
+                    queuedWork.completion.complete(completion)
+                    currentWork = null
+                    if (completion == UpdateCompletion.Retry) {
+                        // 本批更高 update 不得越过失败回合写入 offset；全部退回下次从失败 update 开始的轮询。
+                        drainQueuedUpdatesAsRetry(session)
+                        session.consumerResume.receiveCatching().getOrNull() ?: return
+                    }
+                }
+            }
+        } finally {
+            // CompletableDeferred.complete 是幂等的；即使异常恰好发生在成功结算之后，也不会覆盖既有结果。
+            currentWork?.completion?.complete(UpdateCompletion.Retry)
+            drainQueuedUpdatesAsRetry(session)
         }
     }
 
@@ -1148,20 +1313,31 @@ class MessagePoller @Inject constructor(
         return if (removed) OutboxDelivery.DELIVERED else OutboxDelivery.RETRY
     }
 
-    private suspend fun processUpdate(
+    /** 按不可变队列工作结算更新；durable 回放绝不依赖当前授权或重新进入 Agent。 */
+    private suspend fun processQueuedWork(
+        session: PollingSession,
+        work: QueuedWork,
+    ): UpdateCompletion = when (work) {
+        is QueuedWork.DurableFinal -> completeFinalAgentTurn(session, work.entry)
+        is QueuedWork.DurableInProgress -> confirmDurableInProgressTurn(session, work.entry)
+        is QueuedWork.Authorized -> processAuthorizedUpdate(session, work.update, work.ticket)
+    }
+
+    /** 处理持有当前授权票据的新消息；不产生副作用的分支可直接静默确认。 */
+    private suspend fun processAuthorizedUpdate(
         session: PollingSession,
         update: Update,
+        ticket: AdmissionTicket,
     ): UpdateCompletion {
         val message = update.message ?: return UpdateCompletion.Confirmed
-        val chatId = message.chat.id.toString()
+        val authorization = message.toAuthorizedMessageContext()
         return when {
             message.text?.startsWith("/") == true -> {
-                handleCommand(session, chatId, message.text, message.messageId)
-                UpdateCompletion.Confirmed
+                handleAuthorizedCommand(session, ticket, authorization, message.text)
             }
 
-            message.voice != null -> completeVoiceAgentUpdate(session, update.updateId, chatId, message)
-            message.text != null -> completeTextAgentUpdate(session, update.updateId, chatId, message)
+            message.voice != null -> completeVoiceAgentUpdate(session, ticket, update.updateId, authorization, message)
+            message.text != null -> completeTextAgentUpdate(session, ticket, update.updateId, authorization, message)
             else -> UpdateCompletion.Confirmed
         }
     }
@@ -1169,28 +1345,84 @@ class MessagePoller @Inject constructor(
     /**
      * 处理消费者超时。
      *
-     * 已进入生产 Agent 状态机的文本或语音更新只会把已有 IN_PROGRESS 原子降级为固定 FINAL 并提交 outbox；
-     * 绝不绕过账本即时发送第二条超时消息。未完成 claim 的更新保留偏移量重试，非 Agent 或测试专用更新则
-     * 保留既有的即时超时提示。
+     * Durable FINAL 始终提交 outbox；没有本地 owner 的 IN_PROGRESS 则静默确认偏移量，绝不重放 Agent
+     * 或创建回复。尚未 claim 的持票据消息会重新验证授权后发送超时提示并确认；授权失效则直接静默确认。
      */
     private suspend fun handleProcessingTimeout(
         session: PollingSession,
-        update: Update,
+        work: QueuedWork,
+    ): UpdateCompletion = when (work) {
+        is QueuedWork.DurableFinal -> completeFinalAgentTurn(session, work.entry)
+        is QueuedWork.DurableInProgress -> confirmDurableInProgressTurn(session, work.entry)
+        is QueuedWork.Authorized -> handleAuthorizedProcessingTimeout(session, work)
+    }
+
+    /**
+     * 结算持票据工作超时。
+     *
+     * 已有 durable 记录时按其终态结算；尚未 claim 的文本或语音消息则必须重新验证票据后发送一次超时
+     * 提示并确认偏移量。否则队列等待本身耗尽超时时间的更新会永远以没有 journal 的状态重试。
+     */
+    private suspend fun handleAuthorizedProcessingTimeout(
+        session: PollingSession,
+        work: QueuedWork.Authorized,
     ): UpdateCompletion {
+        val update = work.update
         val message = update.message ?: return UpdateCompletion.Retry
+        val authorization = message.toAuthorizedMessageContext()
         if (
             !message.text.orEmpty().startsWith("/") &&
             (message.text != null || message.voice != null)
         ) {
-            return finalizeTimedOutDurableAgentTurn(session, update.updateId)
+            return finalizeTimedOutDurableAgentTurn(session, work.ticket, authorization, update.updateId)
         }
         logger.warn("Non-durable update {} processing timed out.", update.updateId)
-        try {
-            sendMessageForSession(
+        return sendAuthorizedTimeoutNotification(session, work.ticket, authorization)
+    }
+
+    /**
+     * 结算超时的生产回合。
+     *
+     * 若已建立 journal，则遵循 durable FINAL / IN_PROGRESS 规则；若尚未 claim，则在发送超时提示的同一
+     * 票据检查中确认更新。配置已变化时 [sendAuthorizedTimeoutNotification] 不会产生副作用而直接确认。
+     */
+    private suspend fun finalizeTimedOutDurableAgentTurn(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        updateId: Long,
+    ): UpdateCompletion = try {
+        val entry = withContext(NonCancellable) {
+            updatesRepository.getData(session.botId).agentTurnJournal.singleOrNull { it.updateId == updateId }
+        } ?: return sendAuthorizedTimeoutNotification(session, ticket, authorization)
+        when (entry.status) {
+            AgentTurnJournalStatus.FINAL -> completeFinalAgentTurn(session, entry)
+            AgentTurnJournalStatus.IN_PROGRESS -> confirmDurableInProgressTurn(session, entry)
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        logger.warn(
+            "Timed out Agent turn {} could not finalize safely; category={}",
+            updateId,
+            SafeLogging.failureCategory(e).wireName,
+        )
+        UpdateCompletion.Retry
+    }
+
+    /** 在仍持有效票据时发送超时提示；Telegram 明确接受后才确认尚未 claim 的更新。 */
+    private suspend fun sendAuthorizedTimeoutNotification(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+    ): UpdateCompletion {
+        val notification = try {
+            sendAuthorizedMessage(
                 session,
-                message.chat.id.toString(),
+                ticket,
+                authorization,
                 "抱歉，该消息处理超时（超过10分钟）。",
-                ReplyParameters(messageId = message.messageId),
+                ReplyParameters(messageId = authorization.messageId),
             )
         } catch (e: CancellationException) {
             throw e
@@ -1199,34 +1431,14 @@ class MessagePoller @Inject constructor(
                 "Failed to send timeout notification; category={}",
                 SafeLogging.failureCategory(e).wireName,
             )
+            return UpdateCompletion.Retry
         }
-        return UpdateCompletion.Retry
+        return when (notification) {
+            AuthorizedEffect.Confirmed -> UpdateCompletion.Confirmed
+            is AuthorizedEffect.Executed ->
+                if (notification.value?.isTelegramAccepted() == true) UpdateCompletion.Confirmed else UpdateCompletion.Retry
+        }
     }
-
-    /** 将已安全 claim 但超时的生产回合改为固定失败 FINAL；未 claim 时仅保留偏移量。 */
-    private suspend fun finalizeTimedOutDurableAgentTurn(session: PollingSession, updateId: Long): UpdateCompletion =
-        try {
-            val entry = withContext(NonCancellable) {
-                updatesRepository.getData(session.botId).agentTurnJournal.singleOrNull { it.updateId == updateId }
-            } ?: return UpdateCompletion.Retry
-            val final = when (entry.status) {
-                AgentTurnJournalStatus.FINAL -> entry
-                AgentTurnJournalStatus.IN_PROGRESS ->
-                    withContext(NonCancellable) {
-                        updatesRepository.failInProgressAgentTurn(session.botId, updateId, AGENT_TURN_FAILURE_REPLY)
-                    } ?: return UpdateCompletion.Retry
-            }
-            completeFinalAgentTurn(session, final)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.warn(
-                "Timed out Agent turn {} could not finalize safely; category={}",
-                updateId,
-                SafeLogging.failureCategory(e).wireName,
-            )
-            UpdateCompletion.Retry
-        }
 
     /**
      * 将一条更新加入当前活跃会话的处理队列。
@@ -1257,6 +1469,46 @@ class MessagePoller @Inject constructor(
         activeSession()?.let { enqueueUpdate(it, update) }
     }
 
+    /**
+     * 仅供测试使用完整 Telegram 更新执行命令。
+     *
+     * 该入口与生产入队一致地在屏障内验证私聊、发送者、当前 AI 设置和可用性，并创建不可伪造的内部票据；
+     * 它只是不经过队列，便于测试 `/reset` 对已有队列工作的结算语义。
+     */
+    internal suspend fun handleCommandForTesting(update: Update) {
+        val session = activeSession() ?: return
+        val message = update.message ?: return
+        val text = message.text?.takeIf { it.startsWith("/") } ?: return
+        val authorization = message.toAuthorizedMessageContext()
+        val ticket = modelSwitchBarrier.runWhenReady {
+            if (!isCurrent(session)) {
+                return@runWhenReady null
+            }
+            val snapshot = settingsRepository.currentSettingsSnapshot()
+            val aiSettings = snapshot.settings.ai ?: return@runWhenReady null
+            if (
+                !aiSettings.agentEnabled ||
+                aiSettings.requiredApiKey().isBlank() ||
+                !authorization.matches(aiSettings)
+            ) {
+                return@runWhenReady null
+            }
+            val available = try {
+                agentService.isAiFeatureEnabled(aiSettings)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                false
+            }
+            if (!available) {
+                null
+            } else {
+                AdmissionTicket(aiSettings.agentChatId, snapshot.generation)
+            }
+        } ?: return
+        handleAuthorizedCommand(session, ticket, authorization, text)
+    }
+
     private suspend fun enqueueUpdate(
         session: PollingSession,
         update: Update,
@@ -1268,7 +1520,7 @@ class MessagePoller @Inject constructor(
         if (message.text == null && message.voice == null) {
             return UpdateAdmission.Confirmed
         }
-        val chatId = message.chat.id.toString()
+        val authorization = message.toAuthorizedMessageContext()
         val existingTurn = try {
             updatesRepository.findAgentTurn(session.botId, update.updateId)
         } catch (e: CancellationException) {
@@ -1283,10 +1535,25 @@ class MessagePoller @Inject constructor(
         }
         if (existingTurn != null) {
             val completion = CompletableDeferred<UpdateCompletion>()
+            val work = when (existingTurn.status) {
+                AgentTurnJournalStatus.FINAL -> QueuedWork.DurableFinal(
+                    update = update,
+                    entryTime = System.currentTimeMillis(),
+                    completion = completion,
+                    entry = existingTurn,
+                )
+
+                AgentTurnJournalStatus.IN_PROGRESS -> QueuedWork.DurableInProgress(
+                    update = update,
+                    entryTime = System.currentTimeMillis(),
+                    completion = completion,
+                    entry = existingTurn,
+                )
+            }
             return when (
                 offerUpdateForCurrent(
                     session,
-                    QueuedUpdate(update, System.currentTimeMillis(), completion),
+                    work,
                 )
             ) {
                 QueueOfferResult.ENQUEUED -> UpdateAdmission.Enqueued(completion)
@@ -1300,14 +1567,13 @@ class MessagePoller @Inject constructor(
                 return@runWhenReady BarrierAdmission.Confirmed
             }
 
-            val aiSettings = settingsRepository.currentSettingsSnapshot().settings.ai
+            val snapshot = settingsRepository.currentSettingsSnapshot()
+            val aiSettings = snapshot.settings.ai
                 ?: return@runWhenReady BarrierAdmission.Confirmed
             if (
                 !aiSettings.agentEnabled ||
                 aiSettings.requiredApiKey().isBlank() ||
-                message.chat.type != "private" ||
-                chatId != aiSettings.agentChatId ||
-                message.from?.id?.toString() != aiSettings.agentChatId
+                !authorization.matches(aiSettings)
             ) {
                 return@runWhenReady BarrierAdmission.Confirmed
             }
@@ -1332,15 +1598,24 @@ class MessagePoller @Inject constructor(
                 return@runWhenReady BarrierAdmission.Retry
             }
 
+            val ticket = AdmissionTicket(
+                agentChatId = aiSettings.agentChatId,
+                generation = snapshot.generation,
+            )
             val completion = CompletableDeferred<UpdateCompletion>()
             when (
                 offerUpdateForCurrent(
                     session,
-                    QueuedUpdate(update, System.currentTimeMillis(), completion),
+                    QueuedWork.Authorized(
+                        update = update,
+                        entryTime = System.currentTimeMillis(),
+                        completion = completion,
+                        ticket = ticket,
+                    ),
                 )
             ) {
                 QueueOfferResult.ENQUEUED -> BarrierAdmission.Enqueued(completion)
-                QueueOfferResult.FULL -> BarrierAdmission.QueueFull(chatId, message.messageId)
+                QueueOfferResult.FULL -> BarrierAdmission.QueueFull(authorization, ticket)
                 QueueOfferResult.NOT_CURRENT -> BarrierAdmission.Confirmed
             }
         }
@@ -1348,12 +1623,8 @@ class MessagePoller @Inject constructor(
             BarrierAdmission.Confirmed -> UpdateAdmission.Confirmed
             BarrierAdmission.Retry -> UpdateAdmission.Retry
             is BarrierAdmission.Enqueued -> UpdateAdmission.Enqueued(admission.completion)
-            is BarrierAdmission.QueueFull -> notifyQueueFull(
-                session,
-                update.updateId,
-                admission.chatId,
-                admission.messageId
-            )
+            is BarrierAdmission.QueueFull ->
+                notifyQueueFull(session, update.updateId, admission.authorization, admission.ticket)
         }
     }
 
@@ -1365,33 +1636,33 @@ class MessagePoller @Inject constructor(
      */
     private suspend fun completeTextAgentUpdate(
         session: PollingSession,
+        ticket: AdmissionTicket,
         updateId: Long,
-        chatId: String,
+        authorization: AuthorizedMessageContext,
         message: Message,
     ): UpdateCompletion {
         val text = checkNotNull(message.text)
-        if (updatesRepository.findAgentTurn(session.botId, updateId) != null) {
-            return reconcileExistingDurableAgentTurn(
-                session,
-                updateId,
-                chatId,
-                ReplyParameters(messageId = message.messageId)
-            )
-        }
         if (!isWithinAgentTextLimit(text)) {
             logger.warn("Text input for update {} exceeds the local pre-claim limit.", updateId)
             return UpdateCompletion.Retry
         }
         return try {
-            cleanContextIfNeeded(session, chatId)
-            sendChatActionForSession(session, chatId, "typing")
+            if (!cleanContextIfNeeded(session, ticket, authorization)) {
+                return UpdateCompletion.Confirmed
+            }
+            when (sendAuthorizedChatAction(session, ticket, authorization, "typing")) {
+                AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                is AuthorizedEffect.Executed -> Unit
+            }
             coroutineScope {
-                val typingJob = typingJob(session, chatId)
+                val typingJob = typingJob(session, ticket, authorization)
                 try {
                     runDurableAgentTurn(
                         session = session,
+                        ticket = ticket,
                         updateId = updateId,
-                        chatId = chatId,
+                        authorization = authorization,
+                        chatId = authorization.chatId,
                         replyParameters = ReplyParameters(messageId = message.messageId),
                     ) {
                         agentService.sendMessage(text)
@@ -1415,20 +1686,12 @@ class MessagePoller @Inject constructor(
     /** 完成一条语音 Agent 回合，并把成功生成的回复原子写入 outbox 与偏移量。 */
     private suspend fun completeVoiceAgentUpdate(
         session: PollingSession,
+        ticket: AdmissionTicket,
         updateId: Long,
-        chatId: String,
+        authorization: AuthorizedMessageContext,
         message: Message,
     ): UpdateCompletion {
         val voice = checkNotNull(message.voice)
-        if (updatesRepository.findAgentTurn(session.botId, updateId) != null) {
-            // 已有 FINAL 或失联 IN_PROGRESS 不依赖可能已过期的 Telegram 文件；直接按账本完成或降级。
-            return reconcileExistingDurableAgentTurn(
-                session,
-                updateId,
-                chatId,
-                ReplyParameters(messageId = message.messageId)
-            )
-        }
         if (!isWithinAgentTextLimit(message.caption)) {
             logger.warn("Voice caption for update {} exceeds the local pre-claim limit.", updateId)
             return UpdateCompletion.Retry
@@ -1436,10 +1699,20 @@ class MessagePoller @Inject constructor(
         val audioData = try {
             // 下载和本地输入校验必须在 claim 前完成：文件不可用时既不会进入 Agent，也不会留下一个
             // 会阻止用户重传的进行中账本记录。
-            val filePath = telegramService.getFileForToken(session.token, voice.fileId).result?.filePath
+            val fileResponse = when (val result = runWhenAuthorized(session, ticket, authorization) {
+                telegramService.getFileForToken(session.token, voice.fileId)
+            }) {
+                AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                is AuthorizedEffect.Executed -> result.value
+            }
+            val filePath = fileResponse.result?.filePath
                 ?: throw IllegalStateException("Failed to get file path for voice message")
-            ensureCurrent(session)
-            telegramService.downloadFileForToken(session.token, filePath)
+            when (val result = runWhenAuthorized(session, ticket, authorization) {
+                telegramService.downloadFileForToken(session.token, filePath)
+            }) {
+                AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                is AuthorizedEffect.Executed -> result.value
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1455,15 +1728,22 @@ class MessagePoller @Inject constructor(
             return UpdateCompletion.Retry
         }
         return try {
-            cleanContextIfNeeded(session, chatId)
-            sendChatActionForSession(session, chatId, "typing")
+            if (!cleanContextIfNeeded(session, ticket, authorization)) {
+                return UpdateCompletion.Confirmed
+            }
+            when (sendAuthorizedChatAction(session, ticket, authorization, "typing")) {
+                AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                is AuthorizedEffect.Executed -> Unit
+            }
             coroutineScope {
-                val typingJob = typingJob(session, chatId)
+                val typingJob = typingJob(session, ticket, authorization)
                 try {
                     runDurableAgentTurn(
                         session = session,
+                        ticket = ticket,
                         updateId = updateId,
-                        chatId = chatId,
+                        authorization = authorization,
+                        chatId = authorization.chatId,
                         replyParameters = ReplyParameters(messageId = message.messageId),
                     ) {
                         agentService.sendMessage(
@@ -1490,11 +1770,14 @@ class MessagePoller @Inject constructor(
     /**
      * 执行生产 Agent 回合的不可重放持久状态机。
      *
-     * [send] 仅在成功落盘的新 IN_PROGRESS claim 后调用一次。任何没有本地 owner 的进行中记录均被降级为
-     * 固定失败 FINAL；因此重启、会话轮换、模型异常和 FINAL 写入失败都不会自动重放模型或工具副作用。
+     * [send] 仅在成功落盘的新 IN_PROGRESS claim 后调用一次。本进程 owner 捕获到 Agent 异常时会将其显式
+     * 固化为失败 FINAL；任何没有本地 owner 的进行中记录则会由 durable 回放路径静默确认。因此重启和会话
+     * 轮换不会自动重放模型或工具副作用，同时正常运行中的用户请求仍会获得既有失败反馈。
      */
     private suspend fun runDurableAgentTurn(
         session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
         updateId: Long,
         chatId: String,
         replyParameters: ReplyParameters,
@@ -1503,18 +1786,26 @@ class MessagePoller @Inject constructor(
         val key = AgentTurnKey(session.botId, updateId)
         val owner = acquireAgentTurnOwner(key) ?: return UpdateCompletion.Retry
         try {
-            val claim = withContext(NonCancellable) {
-                updatesRepository.claimAgentTurn(session.botId, updateId, chatId, replyParameters)
+            val claim = when (val result = runWhenAuthorized(session, ticket, authorization) {
+                withContext(NonCancellable) {
+                    updatesRepository.claimAgentTurn(session.botId, updateId, chatId, replyParameters)
+                }
+            }) {
+                AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                is AuthorizedEffect.Executed -> result.value
             }
             return when (claim) {
                 AgentTurnClaim.CLAIMED -> {
                     val finalized = try {
-                        val reply = send().takeIf { it.isNotBlank() }
+                        val reply = when (val result = runWhenAuthorized(session, ticket, authorization) { send() }) {
+                            AuthorizedEffect.Confirmed -> return UpdateCompletion.Retry
+                            is AuthorizedEffect.Executed -> result.value
+                        }.takeIf { it.isNotBlank() }
                         withContext(NonCancellable) {
                             updatesRepository.finalizeAgentTurn(session.botId, updateId, reply)
                         }
                     } catch (e: CancellationException) {
-                        // 取消时结果不确定；留下 IN_PROGRESS 使下一次无 owner 重投安全降级，而不是猜测重放。
+                        // 取消时结果不确定；留下 IN_PROGRESS 使下一次无 owner 静默确认，而不是猜测重放。
                         throw e
                     } catch (e: Exception) {
                         logger.warn(
@@ -1530,12 +1821,7 @@ class MessagePoller @Inject constructor(
                 }
 
                 is AgentTurnClaim.FINAL -> completeFinalAgentTurn(session, claim.entry)
-                is AgentTurnClaim.InProgress -> {
-                    val failed = withContext(NonCancellable) {
-                        updatesRepository.failInProgressAgentTurn(session.botId, updateId, AGENT_TURN_FAILURE_REPLY)
-                    }
-                    failed?.let { completeFinalAgentTurn(session, it) } ?: UpdateCompletion.Retry
-                }
+                is AgentTurnClaim.InProgress -> UpdateCompletion.Retry
 
                 AgentTurnClaim.AlreadyConfirmed -> UpdateCompletion.Confirmed
             }
@@ -1553,14 +1839,31 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    /** 调和已有 durable 回合；传入的 lambda 是防御断言，既有账本绝不能再次进入 Agent。 */
-    private suspend fun reconcileExistingDurableAgentTurn(
+    /** 静默结算不存在本地 owner 的 durable IN_PROGRESS；绝不降级为 outbox 回复或重放 Agent。 */
+    private suspend fun confirmDurableInProgressTurn(
         session: PollingSession,
-        updateId: Long,
-        chatId: String,
-        replyParameters: ReplyParameters,
-    ): UpdateCompletion = runDurableAgentTurn(session, updateId, chatId, replyParameters) {
-        error("Existing durable Agent turn must not invoke Agent.")
+        entry: AgentTurnJournalEntry,
+    ): UpdateCompletion {
+        val key = AgentTurnKey(session.botId, entry.updateId)
+        val hasActiveOwner = sessionLock.withLock { agentTurnOwners[key]?.isCompleted == false }
+        if (hasActiveOwner) {
+            return UpdateCompletion.Retry
+        }
+        return try {
+            val confirmed = withContext(NonCancellable) {
+                updatesRepository.confirmInProgressAgentTurnWithoutReply(session.botId, entry.updateId)
+            }
+            if (confirmed) UpdateCompletion.Persisted else UpdateCompletion.Retry
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn(
+                "In-progress Agent turn {} could not be silently confirmed; category={}",
+                entry.updateId,
+                SafeLogging.failureCategory(e).wireName,
+            )
+            UpdateCompletion.Retry
+        }
     }
 
     /** 将已持久化 FINAL 结果写入 outbox 和更新偏移量，成功后尽力清理账本残留。 */
@@ -1640,17 +1943,18 @@ class MessagePoller @Inject constructor(
     private suspend fun notifyQueueFull(
         session: PollingSession,
         updateId: Long,
-        chatId: String,
-        messageId: Long,
+        authorization: AuthorizedMessageContext,
+        ticket: AdmissionTicket,
     ): UpdateAdmission {
         logger.warn("Update {} rejected: queue is full.", updateId)
-        val notificationAccepted = try {
-            sendMessageForSession(
+        val notification = try {
+            sendAuthorizedMessage(
                 session,
-                chatId,
+                ticket,
+                authorization,
                 "抱歉，当前处理队列已满（最多同时排队10条消息），请稍后再试。",
-                ReplyParameters(messageId = messageId),
-            ).isTelegramAccepted()
+                ReplyParameters(messageId = authorization.messageId),
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1659,8 +1963,12 @@ class MessagePoller @Inject constructor(
                 updateId,
                 SafeLogging.failureCategory(e).wireName,
             )
-            false
+            return UpdateAdmission.Retry
         }
+        if (notification is AuthorizedEffect.Confirmed) {
+            return UpdateAdmission.Confirmed
+        }
+        val notificationAccepted = (notification as AuthorizedEffect.Executed).value?.isTelegramAccepted() == true
         if (notificationAccepted) {
             logger.info("Queue full notification accepted for update {}; confirming update.", updateId)
             return UpdateAdmission.Confirmed
@@ -1675,13 +1983,13 @@ class MessagePoller @Inject constructor(
      * 此短临界区把 token 代次、会话身份和非阻塞 [Channel.trySend] 线性化；切换后的已关闭队列不能被
      * 误判为队满，从而不会对旧 bot 发送队满提示。
      */
-    private fun offerUpdateForCurrent(session: PollingSession, queuedUpdate: QueuedUpdate): QueueOfferResult =
+    private fun offerUpdateForCurrent(session: PollingSession, queuedWork: QueuedWork): QueueOfferResult =
         settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (closed || currentSession !== session || !isTokenGenerationCurrent(session)) {
                     QueueOfferResult.NOT_CURRENT
                 } else {
-                    val result = session.updateChannel.trySend(queuedUpdate)
+                    val result = session.updateChannel.trySend(queuedWork)
                     when {
                         result.isSuccess -> QueueOfferResult.ENQUEUED
                         result.isClosed -> QueueOfferResult.NOT_CURRENT
@@ -1697,13 +2005,21 @@ class MessagePoller @Inject constructor(
         AIProvider.OPENAI -> openAiApiKey
     }
 
+    /** 从不可变 Telegram 更新提取后续副作用需要复核的授权上下文。 */
+    private fun Message.toAuthorizedMessageContext(): AuthorizedMessageContext = AuthorizedMessageContext(
+        chatId = chat.id.toString(),
+        chatType = chat.type,
+        fromId = from?.id?.toString(),
+        messageId = messageId,
+    )
+
     private fun confirmedSignal(): CompletableDeferred<UpdateCompletion> =
         CompletableDeferred<UpdateCompletion>().also { it.complete(UpdateCompletion.Confirmed) }
 
     /** 判断 Telegram 响应是否同时具有成功 HTTP 状态和 API `ok: true` 标记。 */
     private fun TelegramApiResponse.isTelegramAccepted(): Boolean {
         return status.isSuccess() && try {
-            Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
+            JsonStructureLimits.parseToJsonElement(Json, body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
         } catch (_: Exception) {
             false
         }
@@ -1712,7 +2028,7 @@ class MessagePoller @Inject constructor(
     /** 返回该响应是否明确表明 Telegram 以非限流的永久 `4xx` 拒绝了请求。 */
     private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean {
         return status.value in 400..499 && status.value != 429 || try {
-            Json.parseToJsonElement(body)
+            JsonStructureLimits.parseToJsonElement(Json, body)
                 .jsonObject["error_code"]
                 ?.jsonPrimitive
                 ?.intOrNull
@@ -1750,137 +2066,160 @@ class MessagePoller @Inject constructor(
         return if (permanentRejectionCount == 0) this else copy(permanentRejectionCount = 0)
     }
 
-    /**
-     * 使用当前活跃会话处理 AI 聊天命令。
-     *
-     * 当前没有有效会话时不会产生副作用。`/reset` 仅在代理重置任务正常完成且会话仍有效时，才清空当前
-     * 会话的队列并清除自动清理计时。重置失败时会保留这些状态并发送失败提示，不会影响其他机器人的队列。
-     *
-     * @param chatId 发送命令的聊天标识，不能为空。
-     * @param text 完整命令文本；首个空白分隔字段作为命令。
-     * @param messageId 原始 Telegram 消息标识，用于关联回复。
-     */
-    suspend fun handleCommand(chatId: String, text: String, messageId: Long) {
-        activeSession()?.let { handleCommand(it, chatId, text, messageId) }
-    }
-
-    private suspend fun handleCommand(session: PollingSession, chatId: String, text: String, messageId: Long) {
+    /** 使用入队时获取的授权票据执行命令；测试必须通过完整 [Update] 进入同一准入路径。 */
+    private suspend fun handleAuthorizedCommand(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        text: String,
+    ): UpdateCompletion {
         val parts = text.split(Regex("\\s+"), 2)
-        when (parts[0]) {
+        return when (parts[0]) {
             "/keep" -> {
-                if (isCurrent(session)) {
+                when (runWhenAuthorized(session, ticket, authorization) {
                     session.lastAiReplyAtMillis = System.currentTimeMillis()
                     logger.info("Auto-clean context timer refreshed by keep command for bot {}", session.botId)
+                }) {
+                    AuthorizedEffect.Confirmed -> UpdateCompletion.Confirmed
+                    is AuthorizedEffect.Executed -> UpdateCompletion.Confirmed
                 }
             }
 
             "/reset" -> {
-                ensureCurrent(session)
-                if (!awaitSuccessfulAgentReset()) {
-                    ensureCurrent(session)
-                    sendMessageForSession(session, chatId, "会话重置失败，请稍后重试。", ReplyParameters(messageId))
-                    logger.warn("Session reset failed by command for bot {}", session.botId)
-                    return
+                val reset = when (val result =
+                    runWhenAuthorized(session, ticket, authorization) { awaitSuccessfulAgentReset() }) {
+                    AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                    is AuthorizedEffect.Executed -> result.value
                 }
-                ensureCurrent(session)
-                clearQueue(session)
-                ensureCurrent(session)
-                session.lastAiReplyAtMillis = null
-                sendMessageForSession(session, chatId, "会话已重置，待处理消息已清空。", ReplyParameters(messageId))
+                if (!reset) {
+                    logger.warn("Session reset failed by command for bot {}", session.botId)
+                    return sendAuthorizedCommandReply(
+                        session,
+                        ticket,
+                        authorization,
+                        "会话重置失败，请稍后重试。",
+                    )
+                }
+                when (runWhenAuthorized(session, ticket, authorization) { clearQueue(session) }) {
+                    AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                    is AuthorizedEffect.Executed -> Unit
+                }
+                when (runWhenAuthorized(session, ticket, authorization) { session.lastAiReplyAtMillis = null }) {
+                    AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                    is AuthorizedEffect.Executed -> Unit
+                }
                 logger.info("Session reset and queue cleared by command for bot {}", session.botId)
+                sendAuthorizedCommandReply(session, ticket, authorization, "会话已重置，待处理消息已清空。")
             }
 
             "/model" -> {
                 if (parts.size > 1) {
                     val requestedModel = parts[1].trim()
                     try {
-                        val settingsBeforeSelection = settingsRepository.currentSettingsSnapshot().settings
-                        val selectedModel = agentService.availableModels.firstOrNull { model ->
-                            model == requestedModel ||
-                                    model.removePrefix("models/") == requestedModel.removePrefix("models/")
+                        val selectedModel = when (val result = runWhenAuthorized(session, ticket, authorization) {
+                            agentService.availableModels.firstOrNull { model ->
+                                model == requestedModel ||
+                                        model.removePrefix("models/") == requestedModel.removePrefix("models/")
+                            }
+                        }) {
+                            AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                            is AuthorizedEffect.Executed -> result.value
                         } ?: throw IllegalArgumentException("Unsupported model: $requestedModel")
-                        if (!persistSelectedModel(selectedModel, settingsBeforeSelection)) {
-                            throw IllegalStateException("AI configuration changed while selecting a model")
+                        val update = when (val result = runWhenAuthorized(session, ticket, authorization) {
+                            beforeModelSelectionPersistForTesting?.invoke()
+                            persistSelectedModel(selectedModel, ticket.generation)
+                        }) {
+                            AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                            is AuthorizedEffect.Executed -> result.value
                         }
-                        if (isCurrent(session)) {
+                        val successorAi = update.current.settings.ai ?: return UpdateCompletion.Confirmed
+                        val successorTicket = AdmissionTicket(successorAi.agentChatId, update.current.generation)
+                        when (runWhenAuthorized(session, successorTicket, authorization) {
                             session.lastAiReplyAtMillis = null
+                        }) {
+                            AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                            is AuthorizedEffect.Executed -> Unit
                         }
-                        sendMessageForSession(
+                        sendAuthorizedCommandReply(
                             session,
-                            chatId,
+                            successorTicket,
+                            authorization,
                             "已保存模型选择，正在切换模型并重置会话：$selectedModel",
-                            ReplyParameters(messageId),
                         )
                     } catch (e: CancellationException) {
                         throw e
+                    } catch (_: SettingsGenerationMismatchException) {
+                        UpdateCompletion.Confirmed
                     } catch (_: Exception) {
-                        sendMessageForSession(
+                        sendAuthorizedCommandReply(
                             session,
-                            chatId,
+                            ticket,
+                            authorization,
                             "不支持的模型：$requestedModel\n使用 /model 查看可用列表。",
-                            ReplyParameters(messageId),
                         )
                     }
                 } else {
-                    val modelSnapshot = agentService.updateModel()
+                    val modelSnapshot = when (val result =
+                        runWhenAuthorized(session, ticket, authorization) { agentService.updateModel() }) {
+                        AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
+                        is AuthorizedEffect.Executed -> result.value
+                    }
                     if (modelSnapshot == null) {
-                        sendMessageForSession(
+                        return sendAuthorizedCommandReply(
                             session,
-                            chatId,
+                            ticket,
+                            authorization,
                             "获取可用模型列表失败，请稍后重试。",
-                            ReplyParameters(messageId)
                         )
-                        return
                     }
                     val list = modelSnapshot.availableModels.joinToString("\n") { model ->
                         if (model == modelSnapshot.currentModel) "✅ $model" else "      $model"
                     }
-                    sendMessageForSession(
+                    sendAuthorizedCommandReply(
                         session,
-                        chatId,
+                        ticket,
+                        authorization,
                         "当前可用模型列表：\n$list\n\n使用 `/model <模型名称>` 切换模型。",
-                        ReplyParameters(messageId),
                     )
                 }
             }
+
+            else -> UpdateCompletion.Confirmed
         }
     }
 
-    private fun persistSelectedModel(selectedModel: String, expectedSettings: AppSettings): Boolean {
-        var persisted = false
-        settingsRepository.updateSettings { settings ->
-            val aiSettings = settings.ai ?: return@updateSettings settings
-            if (!settings.hasSameModelServiceConfiguration(expectedSettings)) {
-                settings
-            } else {
-                persisted = true
-                settings.copy(ai = aiSettings.copy(selectedModel = selectedModel))
-            }
+    /** 以授权票据代次执行模型选择 CAS；成功提交后由调用方离开旧屏障再用 successor 票据通知用户。 */
+    private fun persistSelectedModel(selectedModel: String, expectedGeneration: Long) =
+        settingsRepository.updateSettings(expectedGeneration = expectedGeneration) { settings ->
+            val aiSettings = checkNotNull(settings.ai) { "AI configuration is unavailable." }
+            settings.copy(ai = aiSettings.copy(selectedModel = selectedModel))
         }
-        return persisted
+
+    /** 在仍持有匹配授权票据时发送命令回复；失配时静默确认命令。 */
+    private suspend fun sendAuthorizedCommandReply(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        text: String,
+    ): UpdateCompletion = when (
+        sendAuthorizedMessage(session, ticket, authorization, text, ReplyParameters(authorization.messageId))
+    ) {
+        AuthorizedEffect.Confirmed -> UpdateCompletion.Confirmed
+        is AuthorizedEffect.Executed -> UpdateCompletion.Confirmed
     }
 
-    private fun AppSettings.hasSameModelServiceConfiguration(expected: AppSettings): Boolean {
-        val currentAi = ai ?: return false
-        val expectedAi = expected.ai ?: return false
-        return currentAi.provider == expectedAi.provider &&
-                currentAi.agentEnabled == expectedAi.agentEnabled &&
-                currentAi.selectedModel == expectedAi.selectedModel &&
-                proxy == expected.proxy &&
-                currentAi.httpToolSettings == expectedAi.httpToolSettings &&
-                currentAi.mcpServers == expectedAi.mcpServers && when (currentAi.provider) {
-            AIProvider.GEMINI -> currentAi.geminiApiKey == expectedAi.geminiApiKey
-            AIProvider.OPENAI ->
-                currentAi.openAiApiKey == expectedAi.openAiApiKey &&
-                        currentAi.openAiBaseUrl == expectedAi.openAiBaseUrl
-        }
-    }
-
-    private fun typingJob(session: PollingSession, chatId: String): Job = session.scope.launch {
+    private fun typingJob(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+    ): Job = session.scope.launch {
         while (isActive) {
             delay(4000.milliseconds)
             try {
-                sendChatActionForSession(session, chatId, "typing")
+                when (sendAuthorizedChatAction(session, ticket, authorization, "typing")) {
+                    AuthorizedEffect.Confirmed -> return@launch
+                    is AuthorizedEffect.Executed -> Unit
+                }
             } catch (_: CancellationException) {
                 return@launch
             } catch (e: Exception) {
@@ -1892,32 +2231,62 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    private suspend fun cleanContextIfNeeded(session: PollingSession, chatId: String) {
-        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return
-        val intervalMinutes = aiSettings.autoCleanContextIntervalMinutes
-        val lastReplyAt = session.lastAiReplyAtMillis ?: return
-        if (intervalMinutes <= 0 || System.currentTimeMillis() - lastReplyAt < intervalMinutes.minutes.inWholeMilliseconds) {
-            return
-        }
-        ensureCurrent(session)
-        if (!awaitSuccessfulAgentReset()) {
-            ensureCurrent(session)
+    private data class ContextCleanupResult(
+        val intervalMinutes: Int,
+        val silent: Boolean,
+        val resetSucceeded: Boolean,
+    )
+
+    /** 在每次清理、重置和通知前复核票据；`false` 表示授权已失效，调用方应静默确认原消息。 */
+    private suspend fun cleanContextIfNeeded(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+    ): Boolean {
+        val outcome = when (val result = runWhenAuthorized(session, ticket, authorization) { settings ->
+            val aiSettings = checkNotNull(settings.ai)
+            val intervalMinutes = aiSettings.autoCleanContextIntervalMinutes
+            val lastReplyAt = session.lastAiReplyAtMillis
+            if (
+                lastReplyAt == null ||
+                intervalMinutes <= 0 ||
+                System.currentTimeMillis() - lastReplyAt < intervalMinutes.minutes.inWholeMilliseconds
+            ) {
+                null
+            } else {
+                ContextCleanupResult(intervalMinutes, aiSettings.silentContextCleanup, awaitSuccessfulAgentReset())
+            }
+        }) {
+            AuthorizedEffect.Confirmed -> return false
+            is AuthorizedEffect.Executed -> result.value
+        } ?: return true
+
+        if (!outcome.resetSucceeded) {
             logger.warn(
                 "Failed to auto-clean AI context after {} minutes without a successful AI reply.",
-                intervalMinutes
+                outcome.intervalMinutes
             )
-            return
+            return true
         }
-        ensureCurrent(session)
-        session.lastAiReplyAtMillis = null
-        if (!aiSettings.silentContextCleanup) {
-            sendMessageForSession(
-                session,
-                chatId,
-                "检测到距离上次对话已超过 $intervalMinutes 分钟，已自动清理上下文。",
-            )
+        when (runWhenAuthorized(session, ticket, authorization) { session.lastAiReplyAtMillis = null }) {
+            AuthorizedEffect.Confirmed -> return false
+            is AuthorizedEffect.Executed -> Unit
         }
-        logger.info("Auto-cleaned AI context after {} minutes without a successful AI reply.", intervalMinutes)
+        if (!outcome.silent) {
+            when (
+                sendAuthorizedMessage(
+                    session,
+                    ticket,
+                    authorization,
+                    "检测到距离上次对话已超过 ${outcome.intervalMinutes} 分钟，已自动清理上下文。",
+                )
+            ) {
+                AuthorizedEffect.Confirmed -> return false
+                is AuthorizedEffect.Executed -> Unit
+            }
+        }
+        logger.info("Auto-cleaned AI context after {} minutes without a successful AI reply.", outcome.intervalMinutes)
+        return true
     }
 
     /**
@@ -1943,11 +2312,16 @@ class MessagePoller @Inject constructor(
         return !resetJob.isCancelled
     }
 
-    private fun clearQueue(session: PollingSession) {
+    private suspend fun clearQueue(session: PollingSession) {
         var count = 0
         while (true) {
-            val queuedUpdate = session.updateChannel.tryReceive().getOrNull() ?: break
-            queuedUpdate.completion.complete(UpdateCompletion.Confirmed)
+            val queuedWork = session.updateChannel.tryReceive().getOrNull() ?: break
+            val completion = when (queuedWork) {
+                is QueuedWork.Authorized -> UpdateCompletion.Confirmed
+                is QueuedWork.DurableFinal -> completeFinalAgentTurn(session, queuedWork.entry)
+                is QueuedWork.DurableInProgress -> confirmDurableInProgressTurn(session, queuedWork.entry)
+            }
+            queuedWork.completion.complete(completion)
             count++
         }
         if (count > 0) {
@@ -1955,23 +2329,63 @@ class MessagePoller @Inject constructor(
         }
     }
 
-    private suspend fun sendMessageForSession(
-        session: PollingSession,
-        chatId: String,
-        text: String,
-        replyParameters: ReplyParameters? = null,
-    ): TelegramApiResponse {
-        ensureCurrent(session)
-        return telegramService.sendMessageForToken(session.token, chatId, text, replyParameters)
+    /** 票据受当前设置、当前会话和共享模型屏障共同保护的执行结果。 */
+    private sealed interface AuthorizedEffect<out T> {
+        /** 授权票据或会话已失效；调用方必须静默确认，不得执行副作用。 */
+        data object Confirmed : AuthorizedEffect<Nothing>
+
+        /** 在同一屏障准入内复核通过并已执行 [value] 对应操作。 */
+        data class Executed<T>(val value: T) : AuthorizedEffect<T>
     }
 
-    private suspend fun sendChatActionForSession(
+    /**
+     * 在共享模型屏障内同时复核票据、当前设置和会话后执行一项副作用。
+     *
+     * 配置 generation、AI 代理身份、原始消息的私聊/聊天/发送者身份、会话或 token 生命周期任一失配时均不调用 [action]，而返回
+     * [AuthorizedEffect.Confirmed]。调用方不得把检查移出此方法后在屏障外执行副作用。
+     */
+    private suspend fun <T> runWhenAuthorized(
         session: PollingSession,
-        chatId: String,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        action: suspend (AppSettings) -> T,
+    ): AuthorizedEffect<T> = modelSwitchBarrier.runWhenReady {
+        val snapshot = settingsRepository.currentSettingsSnapshot()
+        val aiSettings = snapshot.settings.ai
+        if (
+            snapshot.generation != ticket.generation ||
+            aiSettings == null ||
+            !aiSettings.agentEnabled ||
+            aiSettings.requiredApiKey().isBlank() ||
+            aiSettings.agentChatId != ticket.agentChatId ||
+            !authorization.matches(aiSettings) ||
+            !isCurrent(session)
+        ) {
+            AuthorizedEffect.Confirmed
+        } else {
+            AuthorizedEffect.Executed(action(snapshot.settings))
+        }
+    }
+
+    /** 在授权仍有效时发送 Telegram 回复。 */
+    private suspend fun sendAuthorizedMessage(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        text: String,
+        replyParameters: ReplyParameters? = null,
+    ): AuthorizedEffect<TelegramApiResponse?> = runWhenAuthorized(session, ticket, authorization) {
+        telegramService.sendMessageForToken(session.token, authorization.chatId, text, replyParameters)
+    }
+
+    /** 在授权仍有效时向 Telegram 发送聊天动作。 */
+    private suspend fun sendAuthorizedChatAction(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
         action: String,
-    ): TelegramApiResponse {
-        ensureCurrent(session)
-        return telegramService.sendChatActionForToken(session.token, chatId, action)
+    ): AuthorizedEffect<TelegramApiResponse?> = runWhenAuthorized(session, ticket, authorization) {
+        telegramService.sendChatActionForToken(session.token, authorization.chatId, action)
     }
 
     private fun activeSession(): PollingSession? = sessionLock.withLock {

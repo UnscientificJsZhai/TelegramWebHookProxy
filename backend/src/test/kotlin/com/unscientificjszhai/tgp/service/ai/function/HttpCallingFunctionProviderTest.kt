@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.HttpCallTarget
 import com.unscientificjszhai.tgp.models.HttpToolMethod
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
@@ -213,6 +214,24 @@ class HttpCallingFunctionProviderTest {
         assertEquals("HTTP_TOOL_INVALID_ARGUMENTS", oversized["error"]?.toString()?.trim('"'))
         assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
         provider.close()
+    }
+
+    /** 验证小于字节上限但过深的 JSON 正文不会进入 HTTP 客户端或递归 JSON 解析器。 */
+    @Test
+    fun `deep POST JSON body is rejected before parsing`() = runBlocking {
+        val provider = providerWith(enabledSettings(HttpToolMethod.POST))
+        val deepBody = "[".repeat(JsonStructureLimits.MAX_DEPTH + 1) +
+                "0" +
+                "]".repeat(JsonStructureLimits.MAX_DEPTH + 1)
+
+        try {
+            val result = provider.execute("call_http_api", mapOf("targetId" to "fixed", "body" to deepBody))
+
+            assertEquals("HTTP_TOOL_INVALID_ARGUMENTS", result["error"]?.toString()?.trim('"'))
+            assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+        } finally {
+            provider.close()
+        }
     }
 
     /**

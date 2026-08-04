@@ -54,7 +54,7 @@ class SettingsRepositoryConcurrencyTest {
      * 验证过期 CAS 与相同值变换都不会产生持久化或发布副作用。
      */
     @Test
-    fun `stale revision and no-op do not write or publish`() {
+    fun `stale revision generation and no-op do not write or publish`() {
         val directory = createTempDirectory("settings-revision-test").toFile()
         try {
             val operations = CountingFileOperations()
@@ -64,7 +64,8 @@ class SettingsRepositoryConcurrencyTest {
                 barrier,
                 operations,
             )
-            val staleRevision = repository.currentSettingsSnapshot().revision
+            val staleSnapshot = repository.currentSettingsSnapshot()
+            val staleRevision = staleSnapshot.revision
             repository.updateSettings { it.copy(chatId = "current-chat") }
             val committed = repository.currentSettingsSnapshot()
             val writesAfterCommit = operations.writeCount
@@ -74,9 +75,15 @@ class SettingsRepositoryConcurrencyTest {
             assertFailsWith<SettingsRevisionMismatchException> {
                 repository.updateSettings(staleRevision) { it.copy(telegramToken = "should-not-save") }
             }
+            assertFailsWith<SettingsGenerationMismatchException> {
+                repository.updateSettings(expectedGeneration = staleSnapshot.generation) {
+                    it.copy(telegramToken = "should-not-save")
+                }
+            }
             val noOp = repository.updateSettings { it.copy() }
 
             assertNotEquals(staleRevision, committed.revision)
+            assertEquals(staleSnapshot.generation + 1, committed.generation)
             assertEquals(committed, noOp.previous)
             assertEquals(committed, noOp.current)
             assertEquals(writesAfterCommit, operations.writeCount)

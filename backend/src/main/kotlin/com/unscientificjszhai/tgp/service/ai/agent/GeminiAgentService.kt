@@ -18,6 +18,7 @@ import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
@@ -50,6 +51,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.nio.charset.StandardCharsets
 import java.time.Duration
+import java.util.ArrayDeque
 import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
@@ -996,8 +998,12 @@ class GeminiAgentService @Inject internal constructor(
         candidate.indexOfLast { it.isNormalGeminiUserTurnStart() }.takeIf { it >= 0 }
             ?: throw AgentTurnFailedException("AI 会话历史缺少当前用户消息。")
 
-    private fun rawGeminiHistoryBytes(history: List<JsonObject>): Int =
-        wireJson.encodeToString(JsonArray(history)).toByteArray(StandardCharsets.UTF_8).size
+    private fun rawGeminiHistoryBytes(history: List<JsonObject>): Int {
+        val array = JsonArray(history)
+        JsonStructureLimits.validateElement(array)
+        return wireJson.encodeToString(array).also(JsonStructureLimits::validateJsonString)
+            .toByteArray(StandardCharsets.UTF_8).size
+    }
 
     /** 复制已提交的 SDK 历史，并在创建候选 Chat 前按完整回合预留空间。 */
     private fun prepareSdkGeminiHistory(history: List<Content>): List<Content> {
@@ -1067,15 +1073,18 @@ class GeminiAgentService @Inject internal constructor(
             put("contents", JsonArray(contents))
             session.config.forEach { (key, value) -> put(key, value) }
         }
+        JsonStructureLimits.validateElement(requestBody)
+        val encodedBody = wireJson.encodeToString(JsonObject.serializer(), requestBody)
+        JsonStructureLimits.validateJsonString(encodedBody)
         val response = transport.execute(
             Request.Builder()
                 .url(url)
                 .header("Content-Type", "application/json")
-                .post(wireJson.encodeToString(JsonObject.serializer(), requestBody).toRequestBodyJson())
+                .post(encodedBody.toRequestBodyJson())
                 .build(),
         )
         requireGeminiSuccess(response)
-        val root = wireJson.parseToJsonElement(response.body).jsonObject
+        val root = JsonStructureLimits.parseToJsonElement(wireJson, response.body).jsonObject
         return root["candidates"]?.jsonArray
             ?.firstOrNull()
             ?.jsonObject
@@ -1151,36 +1160,113 @@ class GeminiAgentService @Inject internal constructor(
         declaration.response().getOrNull()?.let { put("response", geminiSchemaJson(it)) }
     }
 
+    /** 将 Gemini schema 显式转换为 JSON 时使用的非递归后序工作项。 */
+    private sealed interface GeminiSchemaWork {
+        data class Visit(
+            val schema: Schema,
+            val depth: Int,
+            val sink: (JsonObject) -> Unit,
+        ) : GeminiSchemaWork
+
+        class Finish(
+            val fields: LinkedHashMap<String, JsonElement>,
+            val anyOf: List<JsonObject?>,
+            val items: Array<JsonObject?>,
+            val properties: LinkedHashMap<String, JsonObject?>,
+            val sink: (JsonObject) -> Unit,
+        ) : GeminiSchemaWork
+    }
+
     /** 显式转换 Gemini 工具 JSON Schema，完整保留 SDK 已公开的约束、组合和展示字段。 */
-    private fun geminiSchemaJson(schema: Schema): JsonObject = buildJsonObject {
-        schema.anyOf().getOrNull()?.let { variants -> put("anyOf", JsonArray(variants.map(::geminiSchemaJson))) }
-        schema.default_().getOrNull()?.let { put("default", geminiSchemaValueJson(it)) }
-        schema.type().getOrNull()?.let { put("type", it.toString()) }
-        schema.description().getOrNull()?.let { put("description", it) }
-        schema.example().getOrNull()?.let { put("example", geminiSchemaValueJson(it)) }
-        schema.format().getOrNull()?.let { put("format", it) }
-        schema.maxItems().getOrNull()?.let { put("maxItems", it) }
-        schema.maxLength().getOrNull()?.let { put("maxLength", it) }
-        schema.maxProperties().getOrNull()?.let { put("maxProperties", it) }
-        schema.maximum().getOrNull()?.let { put("maximum", it) }
-        schema.minItems().getOrNull()?.let { put("minItems", it) }
-        schema.minLength().getOrNull()?.let { put("minLength", it) }
-        schema.minProperties().getOrNull()?.let { put("minProperties", it) }
-        schema.minimum().getOrNull()?.let { put("minimum", it) }
-        schema.nullable().getOrNull()?.let { put("nullable", it) }
-        schema.pattern().getOrNull()?.let { put("pattern", it) }
-        schema.propertyOrdering().getOrNull()?.let { ordering ->
-            put("propertyOrdering", JsonArray(ordering.map(::JsonPrimitive)))
+    private fun geminiSchemaJson(schema: Schema): JsonObject {
+        var result: JsonObject? = null
+        val work = ArrayDeque<GeminiSchemaWork>()
+        work.addLast(GeminiSchemaWork.Visit(schema, 1) { result = it })
+        var nodes = 0
+        while (work.isNotEmpty()) {
+            when (val item = work.removeLast()) {
+                is GeminiSchemaWork.Visit -> {
+                    if (++nodes > JsonStructureLimits.MAX_NODES || item.depth > JsonStructureLimits.MAX_DEPTH) {
+                        throw IllegalArgumentException("Gemini 函数 schema 超出 JSON 结构限制。")
+                    }
+                    val fields = LinkedHashMap<String, JsonElement>()
+                    item.schema.default_().getOrNull()?.let { fields["default"] = geminiSchemaValueJson(it) }
+                    item.schema.type().getOrNull()?.let { fields["type"] = JsonPrimitive(it.toString()) }
+                    item.schema.description().getOrNull()?.let { fields["description"] = JsonPrimitive(it) }
+                    item.schema.example().getOrNull()?.let { fields["example"] = geminiSchemaValueJson(it) }
+                    item.schema.format().getOrNull()?.let { fields["format"] = JsonPrimitive(it) }
+                    item.schema.maxItems().getOrNull()?.let { fields["maxItems"] = JsonPrimitive(it) }
+                    item.schema.maxLength().getOrNull()?.let { fields["maxLength"] = JsonPrimitive(it) }
+                    item.schema.maxProperties().getOrNull()?.let { fields["maxProperties"] = JsonPrimitive(it) }
+                    item.schema.maximum().getOrNull()?.let { fields["maximum"] = JsonPrimitive(it) }
+                    item.schema.minItems().getOrNull()?.let { fields["minItems"] = JsonPrimitive(it) }
+                    item.schema.minLength().getOrNull()?.let { fields["minLength"] = JsonPrimitive(it) }
+                    item.schema.minProperties().getOrNull()?.let { fields["minProperties"] = JsonPrimitive(it) }
+                    item.schema.minimum().getOrNull()?.let { fields["minimum"] = JsonPrimitive(it) }
+                    item.schema.nullable().getOrNull()?.let { fields["nullable"] = JsonPrimitive(it) }
+                    item.schema.pattern().getOrNull()?.let { fields["pattern"] = JsonPrimitive(it) }
+                    item.schema.propertyOrdering().getOrNull()?.let { ordering ->
+                        ensureSchemaCollectionFitsBudget(ordering.size, nodes)
+                        fields["propertyOrdering"] = JsonArray(ordering.map(::JsonPrimitive))
+                    }
+                    item.schema.required().getOrNull()?.let { required ->
+                        ensureSchemaCollectionFitsBudget(required.size, nodes)
+                        fields["required"] = JsonArray(required.map(::JsonPrimitive))
+                    }
+                    item.schema.enum_().getOrNull()?.let { values ->
+                        ensureSchemaCollectionFitsBudget(values.size, nodes)
+                        fields["enum"] = JsonArray(values.map(::JsonPrimitive))
+                    }
+                    item.schema.title().getOrNull()?.let { fields["title"] = JsonPrimitive(it) }
+
+                    val variants = item.schema.anyOf().getOrNull().orEmpty()
+                    ensureSchemaCollectionFitsBudget(variants.size, nodes)
+                    val anyOf = MutableList<JsonObject?>(variants.size) { null }
+                    val itemSchema = arrayOfNulls<JsonObject>(1)
+                    val properties = LinkedHashMap<String, JsonObject?>()
+                    val itemChild = item.schema.items().getOrNull()
+                    val propertyChildren = item.schema.properties().getOrNull().orEmpty()
+                    ensureSchemaCollectionFitsBudget(propertyChildren.size, nodes)
+                    work.addLast(GeminiSchemaWork.Finish(fields, anyOf, itemSchema, properties, item.sink))
+                    if (itemChild != null) {
+                        work.addLast(GeminiSchemaWork.Visit(itemChild, item.depth + 1) { itemSchema[0] = it })
+                    }
+                    propertyChildren.forEach { (name, child) ->
+                        work.addLast(GeminiSchemaWork.Visit(child, item.depth + 1) { properties[name] = it })
+                    }
+                    variants.indices.forEach { index ->
+                        work.addLast(GeminiSchemaWork.Visit(variants[index], item.depth + 1) { anyOf[index] = it })
+                    }
+                }
+
+                is GeminiSchemaWork.Finish -> {
+                    if (item.anyOf.isNotEmpty()) item.fields["anyOf"] =
+                        JsonArray(item.anyOf.map { it ?: error("Missing schema variant") })
+                    item.items[0]?.let { item.fields["items"] = it }
+                    if (item.properties.isNotEmpty()) {
+                        item.fields["properties"] = JsonObject(
+                            LinkedHashMap<String, JsonElement>().apply {
+                                item.properties.forEach { (name, child) ->
+                                    put(
+                                        name,
+                                        child ?: error("Missing schema property")
+                                    )
+                                }
+                            },
+                        )
+                    }
+                    item.sink(JsonObject(item.fields))
+                }
+            }
         }
-        schema.required().getOrNull()?.let { required -> put("required", JsonArray(required.map(::JsonPrimitive))) }
-        schema.enum_().getOrNull()?.let { values -> put("enum", JsonArray(values.map(::JsonPrimitive))) }
-        schema.items().getOrNull()?.let { put("items", geminiSchemaJson(it)) }
-        schema.properties().getOrNull()?.let { properties ->
-            put("properties", buildJsonObject {
-                properties.forEach { (name, property) -> put(name, geminiSchemaJson(property)) }
-            })
+        return requireNotNull(result).also(JsonStructureLimits::validateElement)
+    }
+
+    /** 在复制 SDK schema 集合为 JSON 容器前限制其大小，避免超大浅层 schema 先耗尽堆。 */
+    private fun ensureSchemaCollectionFitsBudget(size: Int, nodesUsed: Int) {
+        if (size < 0 || size > JsonStructureLimits.MAX_NODES - nodesUsed) {
+            throw IllegalArgumentException("Gemini 函数 schema 超出 JSON 结构限制。")
         }
-        schema.title().getOrNull()?.let { put("title", it) }
     }
 
     /**
@@ -1190,7 +1276,7 @@ class GeminiAgentService @Inject internal constructor(
         when (value) {
             is JsonElement -> value
             else -> try {
-                wireJson.parseToJsonElement(JsonSerializable.toJsonString(value))
+                JsonStructureLimits.parseToJsonElement(wireJson, JsonSerializable.toJsonString(value))
             } catch (e: Exception) {
                 throw IllegalArgumentException("Gemini Schema value cannot be represented as JSON.", e)
             }
@@ -1207,7 +1293,7 @@ class GeminiAgentService @Inject internal constructor(
                 .build(),
         )
         requireGeminiSuccess(response)
-        return wireJson.parseToJsonElement(response.body).jsonObject["models"]?.jsonArray
+        return JsonStructureLimits.parseToJsonElement(wireJson, response.body).jsonObject["models"]?.jsonArray
             ?.mapNotNull { it.jsonObject["name"]?.jsonPrimitive?.contentOrNull }
             .orEmpty()
     }

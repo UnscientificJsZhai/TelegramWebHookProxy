@@ -5,7 +5,9 @@ import com.google.genai.types.Schema
 import com.google.genai.types.Type
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.McpToolResultTooLargeException
+import com.unscientificjszhai.tgp.service.ai.validateMcpToolResult
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
@@ -13,6 +15,8 @@ import org.slf4j.LoggerFactory
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.Collections
+import java.util.ArrayDeque
+import java.util.IdentityHashMap
 
 /**
  * 为 MCP 服务器工具生成模型可见安全别名的策略。
@@ -60,6 +64,13 @@ class McpFunctionProvider(
         val declarations: List<FunctionDeclaration>,
         val bindings: Map<String, ToolBinding>,
     )
+
+    /** 将 JSON schema 节点转换为 Gemini 格式时使用的显式后序工作项。 */
+    private sealed interface SchemaConversionWork {
+        data class Visit(val value: JsonElement, val parentKey: String?) : SchemaConversionWork
+        data class BuildObject(val value: JsonObject) : SchemaConversionWork
+        data class BuildArray(val value: JsonArray) : SchemaConversionWork
+    }
 
     @Volatile
     private var toolSnapshot = ToolSnapshot(emptyList(), emptyMap())
@@ -120,14 +131,16 @@ class McpFunctionProvider(
     private suspend fun executeBinding(binding: ToolBinding, args: Map<String, Any?>): JsonObject {
         return try {
             val result = mcpClientService.callTool(binding.serverName, binding.toolName, args)
+            // 测试替身可绕过 MCPClientService 的入站校验；在序列化结果前再次确认其 JSON 内容仍在边界内。
+            validateMcpToolResult(result)
             buildJsonObject {
-                put("result", json.encodeToJsonElement(result))
+                put("result", json.encodeToJsonElement(result).also(JsonStructureLimits::validateElement))
             }
         } catch (e: CancellationException) {
             throw e
         } catch (_: McpToolResultTooLargeException) {
             toolResultTooLargeError()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             logger.warn("MCP tool execution failed with a safe local error category.")
             unavailableToolError()
         }
@@ -143,23 +156,27 @@ class McpFunctionProvider(
 
     private fun createSnapshot(mcpTools: List<Pair<String, Tool>>): ToolSnapshot {
         val candidates = mcpTools.mapNotNull { (serverName, mcpTool) ->
-            val schemaJson =
-                buildJsonObject {
-                    put("type", "OBJECT")
+            val inputProperties = mcpTool.inputSchema.properties ?: JsonObject(emptyMap())
+            JsonStructureLimits.validateElement(inputProperties)
+            mcpTool.inputSchema.defs?.let(JsonStructureLimits::validateElement)
+            val schemaJsonElement = buildJsonObject {
+                put("type", "OBJECT")
+                put(
+                    "properties",
+                    inputProperties.toGeminiSchemaJson(),
+                )
+                val required = mcpTool.inputSchema.required ?: emptyList()
+                if (required.isNotEmpty()) {
                     put(
-                        "properties",
-                        (mcpTool.inputSchema.properties ?: JsonObject(emptyMap())).toGeminiSchemaJson(),
+                        "required",
+                        buildJsonArray {
+                            required.forEach { add(it) }
+                        },
                     )
-                    val required = mcpTool.inputSchema.required ?: emptyList()
-                    if (required.isNotEmpty()) {
-                        put(
-                            "required",
-                            buildJsonArray {
-                                required.forEach { add(it) }
-                            },
-                        )
-                    }
-                }.toString()
+                }
+            }
+            JsonStructureLimits.validateElement(schemaJsonElement)
+            val schemaJson = schemaJsonElement.toString().also(JsonStructureLimits::validateJsonString)
             val schema = Schema.fromJson(schemaJson) ?: Schema.builder().type(Type(Type.Known.OBJECT)).build()
             val functionName = try {
                 toolAliasGenerator.alias(serverName, mcpTool.name)
@@ -211,30 +228,54 @@ class McpFunctionProvider(
     /**
      * 将 MCP 的 JSON Schema 转换为 Gemini 兼容的格式（主要是 Type 大写）。
      */
-    private fun JsonElement.toGeminiSchemaJson(): JsonElement =
-        when (this) {
-            is JsonObject -> {
-                buildJsonObject {
-                    forEach { (key, value) ->
-                        if (key == "type" && value is JsonPrimitive && value.isString) {
-                            put(key, value.content.uppercase())
-                        } else {
-                            put(key, value.toGeminiSchemaJson())
+    private fun JsonElement.toGeminiSchemaJson(): JsonElement {
+        JsonStructureLimits.validateElement(this)
+        val converted = IdentityHashMap<JsonElement, JsonElement>()
+        val work = ArrayDeque<SchemaConversionWork>()
+        work.addLast(SchemaConversionWork.Visit(this, null))
+        while (work.isNotEmpty()) {
+            when (val item = work.removeLast()) {
+                is SchemaConversionWork.Visit -> when (val value = item.value) {
+                    is JsonObject -> {
+                        work.addLast(SchemaConversionWork.BuildObject(value))
+                        value.forEach { (key, child) ->
+                            work.addLast(SchemaConversionWork.Visit(child, key))
                         }
                     }
-                }
-            }
 
-            is JsonArray -> {
-                buildJsonArray {
-                    forEach { add(it.toGeminiSchemaJson()) }
-                }
-            }
+                    is JsonArray -> {
+                        work.addLast(SchemaConversionWork.BuildArray(value))
+                        for (child in value) {
+                            work.addLast(SchemaConversionWork.Visit(child, null))
+                        }
+                    }
 
-            else -> {
-                this
+                    is JsonPrimitive -> {
+                        converted[value] = if (item.parentKey == "type" && value.isString) {
+                            JsonPrimitive(value.content.uppercase())
+                        } else {
+                            value
+                        }
+                    }
+
+                    JsonNull -> converted[value] = value
+                }
+
+                is SchemaConversionWork.BuildObject -> {
+                    converted[item.value] = JsonObject(
+                        LinkedHashMap<String, JsonElement>().apply {
+                            item.value.forEach { (key, child) -> put(key, converted.getValue(child)) }
+                        },
+                    )
+                }
+
+                is SchemaConversionWork.BuildArray -> {
+                    converted[item.value] = JsonArray(item.value.map { child -> converted.getValue(child) })
+                }
             }
         }
+        return converted.getValue(this).also(JsonStructureLimits::validateElement)
+    }
 
     private companion object {
         const val MCP_TOOL_UNAVAILABLE = "mcp_tool_unavailable"

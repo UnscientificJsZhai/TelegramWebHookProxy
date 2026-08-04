@@ -16,6 +16,7 @@ import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
@@ -678,7 +679,7 @@ class OpenAIAgentService @Inject internal constructor(
                 logger.warn("OpenAI transcription request failed with HTTP {}.", response.statusCode)
                 throw AudioTranscriptionFailedException()
             }
-            val text = (json.parseToJsonElement(response.body) as? JsonObject)
+            val text = (JsonStructureLimits.parseToJsonElement(json, response.body) as? JsonObject)
                 ?.get("text")
                 ?.let { it as? JsonPrimitive }
                 ?.takeIf(JsonPrimitive::isString)
@@ -752,8 +753,11 @@ class OpenAIAgentService @Inject internal constructor(
             ?: throw AgentTurnFailedException("AI 会话历史缺少当前用户消息。")
 
     private fun openAiHistoryBytes(candidate: List<ChatCompletionMessageParam>): Int =
-        runCatching { jsonMapper().writeValueAsBytes(candidate).size }
-            .getOrElse { throw AgentTurnFailedException("AI 会话历史无法安全编码。", it) }
+        try {
+            jsonMapper().writeValueAsBytes(candidate).size
+        } catch (error: Exception) {
+            throw AgentTurnFailedException("AI 会话历史无法安全编码。", error)
+        }
 
     private fun String.normalizedMimeType(): String = substringBefore(';').trim().lowercase(Locale.ROOT)
 
@@ -890,13 +894,17 @@ class OpenAIAgentService @Inject internal constructor(
      * @param result 要回传给模型的 JSON 对象。
      * @return 与 [toolCallId] 对应的工具消息参数。
      */
-    private fun createToolMessage(toolCallId: String, result: JsonObject): ChatCompletionMessageParam =
-        ChatCompletionMessageParam.ofTool(
+    private fun createToolMessage(toolCallId: String, result: JsonObject): ChatCompletionMessageParam {
+        JsonStructureLimits.validateElement(result)
+        val encodedResult = json.encodeToString(result)
+        JsonStructureLimits.validateJsonString(encodedResult)
+        return ChatCompletionMessageParam.ofTool(
             ChatCompletionToolMessageParam.builder()
                 .toolCallId(toolCallId)
-                .content(json.encodeToString(result))
+                .content(encodedResult)
                 .build()
         )
+    }
 
     /**
      * 为一个 OpenAI 工具调用生成可回传给模型的 JSON 结果。
@@ -952,7 +960,7 @@ class OpenAIAgentService @Inject internal constructor(
     private fun parseToolArguments(arguments: String): Map<String, Any?>? {
         if (arguments.toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_ARGUMENT_BYTES) return null
         return try {
-            (json.parseToJsonElement(arguments) as? JsonObject)?.toMap()
+            (JsonStructureLimits.parseToJsonElement(json, arguments) as? JsonObject)?.toMap()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1036,6 +1044,7 @@ class OpenAIAgentService @Inject internal constructor(
             .build()
         val response = transport.execute(request)
         requireOpenAISuccess(response)
+        JsonStructureLimits.validateJsonString(response.body)
         return mapper.readValue(response.body, ChatCompletion::class.java)
     }
 
@@ -1044,6 +1053,7 @@ class OpenAIAgentService @Inject internal constructor(
         val response = transport.execute(rawOpenAIRequestBuilder("models").get().build())
         requireOpenAISuccess(response)
         val mapper = jsonMapper()
+        JsonStructureLimits.validateJsonString(response.body)
         val root = mapper.readTree(response.body)
         val data = root.path("data")
         if (!data.isArray) {

@@ -37,8 +37,10 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import mockwebserver3.RecordedRequest
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -594,6 +596,74 @@ class OpenAIAgentServiceTest {
                 server.close()
             }
         }
+    }
+
+    /** 原生 OpenAI `/models` 响应须在 Jackson readTree 前拒绝超过结构上限的 JSON。 */
+    @Test
+    fun `raw OpenAI models response is structure limited before Jackson decode`() = runBlocking {
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.target) {
+                "/v1/models" -> MockResponse.Builder().body(deeplyNestedJson(65)).build()
+                else -> MockResponse.Builder().code(404).build()
+            }
+        }
+        server.start()
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
+                    agentEnabled = true,
+                ),
+            ),
+        )
+        val rawService = newService()
+        try {
+            withTimeout(5.seconds) { assertNotNull(rawService.initializationJob()).join() }
+            assertTrue(assertNotNull(rawService.initializationJob()).isCancelled)
+        } finally {
+            rawService.close().join()
+            server.close()
+        }
+    }
+
+    /** 原生 OpenAI chat 响应须在 Jackson readValue 前拒绝超过结构上限的 JSON。 */
+    @Test
+    fun `raw OpenAI chat response is structure limited before Jackson decode`() = runBlocking {
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.target) {
+                "/v1/models" -> MockResponse.Builder().body(
+                    """{"object":"list","data":[{"id":"gpt-5.6-luna","object":"model","created":0,"owned_by":"test"}]}""",
+                ).build()
+
+                "/v1/chat/completions" -> MockResponse.Builder().body(deeplyNestedJson(65)).build()
+                else -> MockResponse.Builder().code(404).build()
+            }
+        }
+        server.start()
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
+                    agentEnabled = true,
+                ),
+            ),
+        )
+        val rawService = newService()
+        try {
+            withTimeout(5.seconds) { assertNotNull(rawService.initializationJob()).join() }
+            assertFalse(assertNotNull(rawService.initializationJob()).isCancelled)
+            assertFailsWith<AgentTurnFailedException> { rawService.sendMessage("deep response") }
+        } finally {
+            rawService.close().join()
+            server.close()
+        }
+        Unit
     }
 
     /**
@@ -1751,6 +1821,13 @@ class OpenAIAgentServiceTest {
             .refusal(null)
             .build()
         return completionResponse(message, finishReason)
+    }
+
+    /** 构造恰好超过统一限制的深 JSON，让回归覆盖 Jackson 之前的 preflight。 */
+    private fun deeplyNestedJson(depth: Int): String = buildString {
+        repeat(depth) { append("{\"next\":") }
+        append("\"leaf\"")
+        repeat(depth) { append('}') }
     }
 
 }

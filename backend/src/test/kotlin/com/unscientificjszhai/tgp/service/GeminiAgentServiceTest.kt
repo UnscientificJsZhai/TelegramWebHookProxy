@@ -21,6 +21,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
+import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
@@ -292,6 +293,137 @@ class GeminiAgentServiceTest {
                 candidate.close().join()
                 server.close()
             }
+        }
+    }
+
+    /** 原生 Gemini `/models` 响应须在读取模型字段前拒绝超过结构上限的 JSON。 */
+    @Test
+    fun `raw Gemini models response is structure limited before decoding`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val server = MockWebServer()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val releaseConnection = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        server.start()
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.GEMINI,
+                    geminiApiKey = "test-key",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            releaseConnection.await()
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val rawService = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        try {
+            withTimeout(5.seconds) { connectionStarted.await() }
+            setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}],"ignored":${deeplyNestedJson(65)}}""",
+                ).build(),
+            )
+            releaseConnection.complete(Unit)
+
+            val readiness = assertNotNull(rawService.initializationJob())
+            withTimeout(5.seconds) { readiness.join() }
+
+            assertTrue(readiness.isCancelled)
+            assertTrue(
+                assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).target
+                    .startsWith("/v1beta/models?key=test-key"),
+            )
+        } finally {
+            releaseConnection.complete(Unit)
+            rawService.close().join()
+            server.close()
+        }
+    }
+
+    /** 原生 Gemini `generateContent` 响应须在读取候选内容前拒绝超过结构上限的 JSON。 */
+    @Test
+    fun `raw Gemini generate content response is structure limited before decoding`() = runBlocking {
+        val mcpClientService = mockk<MCPClientService>()
+        val server = MockWebServer()
+        val connectionStarted = CompletableDeferred<Unit>()
+        val releaseConnection = CompletableDeferred<Unit>()
+        val mcpServers = listOf(MCPServerConfig(name = "test", url = "https://example.com/mcp"))
+        server.start()
+        settingsRepository.saveSettings(
+            AppSettings(
+                ai = AISettings(
+                    provider = AIProvider.GEMINI,
+                    geminiApiKey = "test-key",
+                    agentEnabled = true,
+                    mcpServers = mcpServers,
+                ),
+            ),
+        )
+        coEvery { mcpClientService.connect(mcpServers) } coAnswers {
+            connectionStarted.complete(Unit)
+            releaseConnection.await()
+        }
+        every { mcpClientService.getAllTools() } returns emptyList()
+        every { mcpClientService.close() } returns Job().apply { complete() }
+        val rawService = GeminiAgentService(
+            CoroutineScope(EmptyCoroutineContext),
+            settingsRepository,
+            skillRepository,
+            mcpClientService,
+        ) { mockk() }
+
+        try {
+            withTimeout(5.seconds) { connectionStarted.await() }
+            setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}]}""",
+                ).build(),
+            )
+            releaseConnection.complete(Unit)
+
+            val readiness = assertNotNull(rawService.initializationJob())
+            withTimeout(5.seconds) { readiness.join() }
+            assertFalse(readiness.isCancelled)
+            assertTrue(
+                assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).target
+                    .startsWith("/v1beta/models?key=test-key"),
+            )
+
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"candidates":[{"content":{"role":"model","parts":[{"text":"would be accepted without the limit"}]}}],"ignored":${
+                        deeplyNestedJson(
+                            65
+                        )
+                    }}""",
+                ).build(),
+            )
+
+            assertFailsWith<JsonStructureLimitExceededException> {
+                rawService.sendMessage("deep response")
+            }
+            assertTrue(
+                assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).target
+                    .startsWith("/v1beta/models/gemini-3.5-flash-lite:generateContent?key=test-key"),
+            )
+        } finally {
+            releaseConnection.complete(Unit)
+            rawService.close().join()
+            server.close()
         }
     }
 
@@ -1292,6 +1424,13 @@ class GeminiAgentServiceTest {
 
     private fun setPrivateField(target: GeminiAgentService, name: String, value: Any?) {
         GeminiAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(target, value)
+    }
+
+    /** 构造恰好超过统一限制的深 JSON，让原生 Gemini 响应在字段读取前被拒绝。 */
+    private fun deeplyNestedJson(depth: Int): String = buildString {
+        repeat(depth) { append("{\"next\":") }
+        append("\"leaf\"")
+        repeat(depth) { append('}') }
     }
 
 }

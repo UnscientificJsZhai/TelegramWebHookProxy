@@ -9,6 +9,7 @@ package com.unscientificjszhai.tgp.service.ai
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.client.*
 import io.ktor.client.engine.okhttp.*
@@ -18,6 +19,7 @@ import io.ktor.client.request.*
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.types.EmbeddedResource
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.*
@@ -29,7 +31,6 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
 import org.slf4j.LoggerFactory
 import okhttp3.Interceptor
 import okhttp3.ResponseBody
@@ -37,7 +38,10 @@ import okio.Buffer
 import okio.ForwardingSource
 import okio.buffer
 import java.io.IOException
+import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
+import java.util.ArrayDeque
+import java.util.IdentityHashMap
 import javax.inject.Inject
 
 /**
@@ -84,6 +88,9 @@ class MCPClientService internal constructor(
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient =
         HttpClient(OkHttp) {
+            // MCP 配置可包含凭据，且 Streamable HTTP 会将其请求头用于 POST、SSE GET 和 DELETE；共享客户端
+            // 的所有请求均不得自动跟随重定向，以免向重定向目标重放这些请求头。
+            followRedirects = false
             engine {
                 config {
                     addInterceptor(Interceptor { chain ->
@@ -595,20 +602,50 @@ internal class McpToolArgumentsTooLargeException : IllegalArgumentException("MCP
 /** MCP 工具结果超过可安全放入模型上下文的上限。 */
 internal class McpToolResultTooLargeException : IllegalStateException("MCP 工具结果超过限制。")
 
-private class BoundedMcpResponseBody(
+/** 将不可信函数参数转换为 JSON 时使用的显式后序工作项。 */
+private sealed interface McpArgumentWork {
+    data class Visit(val value: Any?, val depth: Int) : McpArgumentWork
+    data class BuildMap(val source: Any, val entries: List<Pair<String, Any?>>) : McpArgumentWork
+    data class BuildArray(val source: Any, val values: List<Any?>) : McpArgumentWork
+}
+
+internal class BoundedMcpResponseBody(
     private val delegate: ResponseBody,
     private val limit: Long,
 ) : ResponseBody() {
+    private val structureScanner: McpWireStructureScanner? = when {
+        delegate.contentType().isMcpJson() -> JsonWireStructureScanner()
+        delegate.contentType().isMcpSse() -> SseWireStructureScanner()
+        else -> null
+    }
     private val boundedSource = object : ForwardingSource(delegate.source()) {
         private var total = 0L
+        private var reachedEnd = false
 
         override fun read(sink: Buffer, byteCount: Long): Long {
+            val previousSize = sink.size
             val read = super.read(sink, byteCount)
             if (read > 0) {
                 total += read
                 if (total > limit) {
                     close()
                     throw McpResponseTooLargeException()
+                }
+                val copied = sink.clone().apply { skip(previousSize) }.readByteArray(read)
+                try {
+                    structureScanner?.consume(copied)
+                } catch (error: Throwable) {
+                    // SSE 可无限期保持连接；结构限制命中时不能等待 SDK 或 GC 关闭底层 socket。
+                    this@BoundedMcpResponseBody.close()
+                    throw error
+                }
+            } else if (read < 0 && !reachedEnd) {
+                reachedEnd = true
+                try {
+                    structureScanner?.finish()
+                } catch (error: Throwable) {
+                    this@BoundedMcpResponseBody.close()
+                    throw error
                 }
             }
             return read
@@ -624,6 +661,84 @@ private class BoundedMcpResponseBody(
     override fun close() = delegate.close()
 }
 
+/** 流式 MCP 响应在交给 SDK 解码前进行的结构校验。 */
+private interface McpWireStructureScanner {
+    fun consume(bytes: ByteArray)
+
+    fun finish()
+}
+
+/** 对 application/json 响应全量但分 chunk 进行 JSON 结构预检查。 */
+private class JsonWireStructureScanner : McpWireStructureScanner {
+    private val delegate = JsonStructureLimits.newUtf8Scanner()
+
+    override fun consume(bytes: ByteArray) = delegate.consume(bytes)
+
+    override fun finish() = delegate.finish()
+}
+
+/**
+ * 对 text/event-stream 的 data 字段逐事件进行 JSON 结构预检查。
+ *
+ * SSE 行和 CRLF 均可横跨网络 chunk；同一事件的多个 data 行按 SSE 规则以换行拼接后再继续扫描。
+ */
+private class SseWireStructureScanner : McpWireStructureScanner {
+    private val currentLine = ByteArrayOutputStream()
+    private var jsonScanner: JsonStructureLimits.Utf8Scanner? = null
+    private var eventHasData = false
+
+    override fun consume(bytes: ByteArray) {
+        bytes.forEach { byte ->
+            if (byte.toInt() == '\n'.code) {
+                consumeLine(currentLine.toByteArray().stripTrailingCarriageReturn())
+                currentLine.reset()
+            } else {
+                currentLine.write(byte.toInt())
+            }
+        }
+    }
+
+    override fun finish() {
+        if (currentLine.size() > 0) {
+            consumeLine(currentLine.toByteArray().stripTrailingCarriageReturn())
+            currentLine.reset()
+        }
+        finishEvent()
+    }
+
+    private fun consumeLine(line: ByteArray) {
+        if (line.isEmpty()) {
+            finishEvent()
+            return
+        }
+        if (!line.startsWithAscii("data:")) return
+        val payloadStart = if (line.size > 5 && line[5].toInt() == ' '.code) 6 else 5
+        val scanner = jsonScanner ?: JsonStructureLimits.newUtf8Scanner().also { jsonScanner = it }
+        if (eventHasData) scanner.consume(byteArrayOf('\n'.code.toByte()))
+        scanner.consume(line, payloadStart, line.size - payloadStart)
+        eventHasData = true
+    }
+
+    private fun finishEvent() {
+        if (eventHasData) {
+            jsonScanner?.finish()
+        }
+        jsonScanner = null
+        eventHasData = false
+    }
+}
+
+private fun ByteArray.stripTrailingCarriageReturn(): ByteArray =
+    if (isNotEmpty() && last().toInt() == '\r'.code) copyOf(size - 1) else this
+
+private fun ByteArray.startsWithAscii(prefix: String): Boolean =
+    size >= prefix.length && prefix.indices.all { index -> this[index].toInt() == prefix[index].code }
+
+private fun okhttp3.MediaType?.isMcpJson(): Boolean =
+    this?.type == "application" && (subtype == "json" || subtype.endsWith("+json"))
+
+private fun okhttp3.MediaType?.isMcpSse(): Boolean = this?.type == "text" && subtype == "event-stream"
+
 private fun validateDiscoveredTools(tools: List<Tool>, existingCount: Int) {
     require(tools.size <= MAX_MCP_TOOLS_PER_SERVER) {
         "单个 MCP 服务器工具不能超过 $MAX_MCP_TOOLS_PER_SERVER 个。"
@@ -632,12 +747,18 @@ private fun validateDiscoveredTools(tools: List<Tool>, existingCount: Int) {
         "MCP 工具总数不能超过 $MAX_MCP_TOOLS_TOTAL 个。"
     }
     tools.forEach { tool ->
+        tool.inputSchema.properties?.let(JsonStructureLimits::validateElement)
+        tool.inputSchema.defs?.let(JsonStructureLimits::validateElement)
+        tool.outputSchema?.properties?.let(JsonStructureLimits::validateElement)
+        tool.outputSchema?.defs?.let(JsonStructureLimits::validateElement)
+        tool.meta?.let(JsonStructureLimits::validateElement)
         require(tool.name.toByteArray(StandardCharsets.UTF_8).size in 1..MAX_MCP_TOOL_NAME_BYTES) {
             "MCP 工具名称长度不合法。"
         }
         require((tool.description ?: "").toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_DESCRIPTION_BYTES) {
             "MCP 工具描述超过限制。"
         }
+        // 结构已经先受显式栈校验，之后才允许 SDK 进行可能递归的 schema 序列化。
         require(tool.inputSchema.toString().toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_SCHEMA_BYTES) {
             "MCP 工具输入架构超过限制。"
         }
@@ -645,37 +766,130 @@ private fun validateDiscoveredTools(tools: List<Tool>, existingCount: Int) {
 }
 
 private fun validateMcpArguments(args: Map<String, Any?>) {
-    val encoded = runCatching {
-        Json.encodeToString(JsonObject.serializer(), buildJsonObject {
-            args.forEach { (name, value) -> put(name, value.toMcpJsonElement()) }
-        })
+    val objectValue = try {
+        args.toMcpJsonObject()
+    } catch (_: Exception) {
+        throw McpToolArgumentsTooLargeException()
     }
-        .getOrElse { throw McpToolArgumentsTooLargeException() }
+    val encoded = try {
+        JsonStructureLimits.validateElement(objectValue)
+        Json.encodeToString(JsonObject.serializer(), objectValue).also(JsonStructureLimits::validateJsonString)
+    } catch (_: Exception) {
+        throw McpToolArgumentsTooLargeException()
+    }
     if (encoded.toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_ARGUMENT_BYTES) {
         throw McpToolArgumentsTooLargeException()
     }
 }
 
-private fun Any?.toMcpJsonElement(): JsonElement = when (this) {
-    null -> JsonNull
-    is JsonElement -> this
-    is String -> JsonPrimitive(this)
-    is Boolean -> JsonPrimitive(this)
-    is Byte, is Short, is Int, is Long, is Float, is Double -> JsonPrimitive(this as Number)
-    is Map<*, *> -> buildJsonObject {
-        this@toMcpJsonElement.forEach { (key, value) ->
-            val name = key as? String ?: throw IllegalArgumentException("MCP 参数对象键必须是字符串。")
-            put(name, value.toMcpJsonElement())
-        }
-    }
+private fun Map<String, Any?>.toMcpJsonObject(): JsonObject =
+    toMcpJsonElementIteratively(this) as JsonObject
 
-    is Iterable<*> -> JsonArray(map { it.toMcpJsonElement() })
-    is Array<*> -> JsonArray(map { it.toMcpJsonElement() })
-    else -> throw IllegalArgumentException("MCP 参数包含不支持的值类型。")
+/** 在构造参数 JSON 中间列表前以剩余节点预算有界复制一个不可信 Iterable。 */
+private fun Iterable<*>.copyWithinRemainingMcpNodeBudget(nodesUsed: Int): List<Any?> {
+    val remaining = JsonStructureLimits.MAX_NODES - nodesUsed
+    if (remaining <= 0) throw McpToolArgumentsTooLargeException()
+    val values = ArrayList<Any?>()
+    for (value in this) {
+        if (values.size >= remaining) throw McpToolArgumentsTooLargeException()
+        values += value
+    }
+    return values
 }
 
-private fun validateMcpToolResult(result: CallToolResult) {
+/**
+ * 将参数值转换为 JSON，不依赖 Kotlin 容器的递归遍历。
+ *
+ * `Map`、数组与 Iterable 都会受统一深度/节点预算和路径循环检查，避免模型或调用方构造的嵌套参数在
+ * 编码前触发 StackOverflowError。
+ */
+private fun toMcpJsonElementIteratively(root: Any?): JsonElement {
+    val converted = IdentityHashMap<Any, JsonElement>()
+    val ancestors = IdentityHashMap<Any, Boolean>()
+    val work = ArrayDeque<McpArgumentWork>()
+    work.addLast(McpArgumentWork.Visit(root, 0))
+    var nodes = 0
+    while (work.isNotEmpty()) {
+        when (val item = work.removeLast()) {
+            is McpArgumentWork.Visit -> {
+                if (++nodes > JsonStructureLimits.MAX_NODES || item.depth > JsonStructureLimits.MAX_DEPTH) {
+                    throw McpToolArgumentsTooLargeException()
+                }
+                when (val value = item.value) {
+                    null -> Unit
+                    is JsonElement -> {
+                        JsonStructureLimits.validateElement(value)
+                        converted[value] = value
+                    }
+
+                    is String -> converted[value] = JsonPrimitive(value)
+                    is Boolean -> converted[value] = JsonPrimitive(value)
+                    is Byte, is Short, is Int, is Long, is Float, is Double ->
+                        converted[value] = JsonPrimitive(value as Number)
+
+                    is Map<*, *> -> {
+                        if (ancestors.put(value, true) != null) throw McpToolArgumentsTooLargeException()
+                        val entries = ArrayList<Pair<String, Any?>>()
+                        for ((key, child) in value) {
+                            if (entries.size >= JsonStructureLimits.MAX_NODES - nodes) {
+                                throw McpToolArgumentsTooLargeException()
+                            }
+                            entries += (key as? String
+                                ?: throw IllegalArgumentException("MCP 参数对象键必须是字符串。")) to child
+                        }
+                        work.addLast(McpArgumentWork.BuildMap(value, entries))
+                        entries.forEach { (_, child) ->
+                            work.addLast(McpArgumentWork.Visit(child, item.depth + 1))
+                        }
+                    }
+
+                    is Iterable<*> -> {
+                        if (ancestors.put(value, true) != null) throw McpToolArgumentsTooLargeException()
+                        val values = value.copyWithinRemainingMcpNodeBudget(nodes)
+                        work.addLast(McpArgumentWork.BuildArray(value, values))
+                        values.forEach { child -> work.addLast(McpArgumentWork.Visit(child, item.depth + 1)) }
+                    }
+
+                    is Array<*> -> {
+                        if (ancestors.put(value, true) != null) throw McpToolArgumentsTooLargeException()
+                        val values = value.asIterable().copyWithinRemainingMcpNodeBudget(nodes)
+                        work.addLast(McpArgumentWork.BuildArray(value, values))
+                        values.forEach { child -> work.addLast(McpArgumentWork.Visit(child, item.depth + 1)) }
+                    }
+
+                    else -> throw IllegalArgumentException("MCP 参数包含不支持的值类型。")
+                }
+            }
+
+            is McpArgumentWork.BuildMap -> {
+                converted[item.source] = JsonObject(LinkedHashMap<String, JsonElement>().apply {
+                    item.entries.forEach { (name, child) -> put(name, converted[child] ?: JsonNull) }
+                })
+                ancestors.remove(item.source)
+            }
+
+            is McpArgumentWork.BuildArray -> {
+                converted[item.source] = JsonArray(item.values.map { child -> converted[child] ?: JsonNull })
+                ancestors.remove(item.source)
+            }
+        }
+    }
+    return when (root) {
+        null -> JsonNull
+        is JsonElement -> converted[root] ?: root
+        else -> converted[root] ?: throw McpToolArgumentsTooLargeException()
+    }
+}
+
+internal fun validateMcpToolResult(result: CallToolResult) {
+    result.structuredContent?.let(JsonStructureLimits::validateElement)
+    result.meta?.let(JsonStructureLimits::validateElement)
+    result.content.forEach { content ->
+        content.meta?.let(JsonStructureLimits::validateElement)
+        if (content is EmbeddedResource) content.resource.meta?.let(JsonStructureLimits::validateElement)
+    }
     val encoded = Json.encodeToString(CallToolResult.serializer(), result)
+    JsonStructureLimits.validateJsonString(encoded)
     if (encoded.toByteArray(StandardCharsets.UTF_8).size > MAX_MCP_TOOL_RESULT_BYTES) {
         throw McpToolResultTooLargeException()
     }

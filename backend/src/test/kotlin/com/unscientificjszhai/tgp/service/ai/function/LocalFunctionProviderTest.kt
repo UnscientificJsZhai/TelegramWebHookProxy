@@ -2,11 +2,13 @@ package com.unscientificjszhai.tgp.service.ai.function
 
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import org.junit.Test
 import kotlin.jvm.optionals.getOrNull
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
@@ -73,5 +75,47 @@ class LocalFunctionProviderTest {
         assertTrue(paramsString.contains("string"), "Params should contain 'string'")
         assertTrue(paramsString.contains("The city and state"), "Params should contain description")
         assertTrue(paramsString.contains("required"), "Params should contain 'required'")
+    }
+
+    /** 迭代转换超过深度上限的 Gemini Schema 时必须拒绝，而不是递归耗尽调用栈。 */
+    @Test
+    fun `deep Gemini schema conversion to OpenAI is rejected`() {
+        val error = assertFailsWith<IllegalArgumentException> {
+            providerFor(nestedGeminiSchema(JsonStructureLimits.MAX_DEPTH + 1)).providedOpenAIFunctions
+        }
+
+        assertEquals("函数 schema 超出 JSON 结构限制。", error.message)
+    }
+
+    /** 深度恰好位于结构上限内的 Gemini Schema 必须仍可迭代转换为 OpenAI 定义。 */
+    @Test
+    fun `Gemini schema at depth limit converts to OpenAI`() {
+        val functions = providerFor(nestedGeminiSchema(JsonStructureLimits.MAX_DEPTH)).providedOpenAIFunctions
+
+        assertEquals(1, functions.size)
+        assertEquals("deep_schema", functions.single().name())
+    }
+
+    private fun nestedGeminiSchema(depth: Int): Schema {
+        require(depth > 0)
+        var schema = Schema.builder().type("STRING").build()
+        repeat(depth - 1) {
+            schema = Schema.builder()
+                .type("OBJECT")
+                .properties(mapOf("next" to schema))
+                .build()
+        }
+        return schema
+    }
+
+    private fun providerFor(schema: Schema): LocalFunctionProvider = object : LocalFunctionProvider() {
+        override val providedFunctions = listOf(
+            FunctionDeclaration.builder()
+                .name("deep_schema")
+                .parameters(schema)
+                .build(),
+        )
+
+        override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject = buildJsonObject {}
     }
 }

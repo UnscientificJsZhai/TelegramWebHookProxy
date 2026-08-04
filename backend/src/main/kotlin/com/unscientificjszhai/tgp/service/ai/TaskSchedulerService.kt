@@ -15,6 +15,7 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.isSuccess
@@ -211,6 +212,7 @@ class TaskSchedulerService private constructor(
         if (content.isBlank()) {
             throw IllegalArgumentException("Scheduled tasks data must not be blank")
         }
+        JsonStructureLimits.validateUtf8(bytes)
         return ConfigJson.decodeFromString(content)
     }
 
@@ -552,7 +554,7 @@ class TaskSchedulerService private constructor(
      */
     private fun TelegramApiResponse.isTelegramOk(): Boolean {
         return status.isSuccess() && try {
-            Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
+            JsonStructureLimits.parseToJsonElement(Json, body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
         } catch (_: Exception) {
             false
         }

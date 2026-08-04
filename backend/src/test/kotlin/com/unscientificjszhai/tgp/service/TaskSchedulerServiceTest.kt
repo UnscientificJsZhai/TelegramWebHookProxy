@@ -718,6 +718,30 @@ class TaskSchedulerServiceTest {
         assertEquals(listOf(taskId), service.listTasks().map { it.id })
     }
 
+    /** 深层调度文件必须在 DTO 解码前被标记为损坏，且不会被后续写入覆盖。 */
+    @Test
+    fun `deep schedule JSON is rejected before task DTO decode`() {
+        val deepJson = buildString {
+            repeat(65) { append("{\"next\":") }
+            append("\"leaf\"")
+            repeat(65) { append('}') }
+        }
+        service.close()
+        scheduleFile.writeText(deepJson)
+        service = TaskSchedulerService(
+            CoroutineScope(EmptyCoroutineContext),
+            telegramService,
+            Provider { agentService },
+            settingsRepository,
+            scheduleFile,
+        )
+
+        assertFailsWith<IllegalStateException> {
+            service.createTask("must not overwrite", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
+        }
+        assertEquals(deepJson, scheduleFile.readText())
+    }
+
     /**
      * 验证当前 AI 授权撤销时，到期任务会在任何模型或 Telegram 副作用前删除；循环任务不会被推进。
      */

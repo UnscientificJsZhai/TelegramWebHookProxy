@@ -438,9 +438,9 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证持久化 Agent 回合超时仅经 journal/outbox 固定降级，不会直发第二条超时消息。 */
+    /** 验证持久化 Agent 回合超时只会静默确认进行中 journal，不会直发或创建 outbox 回复。 */
     @Test
-    fun `durable processing timeout becomes one outbox fallback`() = runBlocking {
+    fun `durable processing timeout silently confirms in progress journal`() = runBlocking {
         val fixture = fixture(processingTimeout = 50.milliseconds)
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         val repollRequested = CompletableDeferred<Unit>()
@@ -461,21 +461,9 @@ class MessagePollerTest {
             delay(1.seconds)
             "late"
         }
-        coEvery {
-            fixture.telegram.sendMessageForToken("100:A", "123", "抱歉，该消息未能处理。", ReplyParameters(1))
-        } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
-
         fixture.poller.start()
         try {
             eventually {
-                coVerify {
-                    fixture.telegram.sendMessageForToken(
-                        "100:A",
-                        "123",
-                        "抱歉，该消息未能处理。",
-                        ReplyParameters(1),
-                    )
-                }
                 coVerify(exactly = 0) {
                     fixture.telegram.sendMessageForToken(
                         "100:A",
@@ -485,10 +473,114 @@ class MessagePollerTest {
                     )
                 }
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
+                assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                 coVerify(exactly = 1) { fixture.agent.sendMessage("slow") }
             }
             withTimeout(3.seconds) { repollRequested.await() }
             coVerify(exactly = 1) { fixture.agent.sendMessage("slow") }
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证排队等待时耗尽时限、尚未 claim 的消息会在授权仍有效时提示一次并确认偏移量。 */
+    @Test
+    fun `pre claim queue timeout sends feedback and confirms authorized update`() = runBlocking {
+        val fixture = fixture(processingTimeout = 50.milliseconds)
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(
+                Update(11, message = authorizedMessage(1, chat, text = "block")),
+                Update(12, message = authorizedMessage(2, chat, text = "timed out in queue")),
+            ),
+        ) andThen GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendChatActionForToken("100:A", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            delay(1.seconds)
+            "late"
+        }
+        coEvery {
+            fixture.telegram.sendMessageForToken(
+                "100:A",
+                "123",
+                "抱歉，该消息处理超时（超过10分钟）。",
+                ReplyParameters(2),
+            )
+        } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+
+        fixture.poller.start()
+        try {
+            eventually {
+                assertEquals(12, fixture.updates.getData("100").lastUpdateId)
+                assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                coVerify(exactly = 1) { fixture.agent.sendMessage("block") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("timed out in queue") }
+                coVerify(exactly = 1) {
+                    fixture.telegram.sendMessageForToken(
+                        "100:A",
+                        "123",
+                        "抱歉，该消息处理超时（超过10分钟）。",
+                        ReplyParameters(2),
+                    )
+                }
+            }
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证尚未 claim 的排队超时消息在票据失效后既不提示也不会因缺少 journal 永久重试。 */
+    @Test
+    fun `pre claim queue timeout silently confirms stale ticket`() = runBlocking {
+        val fixture = fixture(processingTimeout = 50.milliseconds)
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        val agentStarted = CompletableDeferred<Unit>()
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(
+                Update(11, message = authorizedMessage(1, chat, text = "block")),
+                Update(12, message = authorizedMessage(2, chat, text = "stale timeout")),
+            ),
+        ) andThen GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendChatActionForToken("100:A", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            agentStarted.complete(Unit)
+            delay(1.seconds)
+            "late"
+        }
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { agentStarted.await() }
+            fixture.saveSettings(
+                AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "456")),
+            )
+
+            eventually {
+                assertEquals(12, fixture.updates.getData("100").lastUpdateId)
+                assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                coVerify(exactly = 1) { fixture.agent.sendMessage("block") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("stale timeout") }
+                coVerify(exactly = 0) {
+                    fixture.telegram.sendMessageForToken(
+                        "100:A",
+                        "123",
+                        "抱歉，该消息处理超时（超过10分钟）。",
+                        any(),
+                    )
+                }
+            }
         } finally {
             fixture.poller.close()
         }
@@ -645,6 +737,122 @@ class MessagePollerTest {
     }
 
     /**
+     * 验证等待中的旧聊天工作在授权切换后会静默确认：文本、语音和命令都不得在新聊天身份下产生副作用，
+     * 但其连续偏移量仍会推进。
+     */
+    @Test
+    fun `queued work is silently confirmed after agent chat changes`() = runBlocking {
+        val fixture = fixture()
+        val alice = Chat(id = 123L, type = "private", firstName = "Alice")
+        val agentStarted = CompletableDeferred<Unit>()
+        val releaseAgent = CompletableDeferred<Unit>()
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(agentEnabled = true, agentChatId = "123")
+            )
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(
+                Update(11, message = authorizedMessage(1, alice, text = "block")),
+                Update(12, message = authorizedMessage(2, alice, text = "stale text")),
+                Update(13, message = authorizedMessage(3, alice, voice = Voice("stale-voice", "unique", duration = 1))),
+                Update(14, message = authorizedMessage(4, alice, text = "/reset")),
+                Update(15, message = authorizedMessage(5, alice, text = "/model stale-model")),
+            ),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 16, 30) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            agentStarted.complete(Unit)
+            releaseAgent.await()
+            ""
+        }
+        every { fixture.agent.availableModels } returns listOf("stale-model")
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { agentStarted.await() }
+            eventually { verify(atLeast = 5) { fixture.agent.isAiFeatureEnabled(any()) } }
+
+            fixture.saveSettings(
+                AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "456")),
+            )
+            releaseAgent.complete(Unit)
+
+            eventually {
+                assertEquals(15, fixture.updates.getData("100").lastUpdateId)
+                coVerify(exactly = 1) { fixture.agent.sendMessage("block") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("stale text") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage(any(), any()) }
+                coVerify(exactly = 0) { fixture.telegram.getFileForToken(any(), "stale-voice") }
+                coVerify(exactly = 0) { fixture.telegram.downloadFileForToken(any(), any()) }
+                verify(exactly = 0) { fixture.agent.resetSession() }
+                verify(exactly = 0) { fixture.agent.availableModels }
+                coVerify(exactly = 1) { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") }
+                coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
+            }
+        } finally {
+            releaseAgent.complete(Unit)
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证 `A → B → A` 恢复同一聊天标识时，旧票据仍因 generation 不同而被丢弃。 */
+    @Test
+    fun `queued work remains rejected when agent chat changes away and back`() = runBlocking {
+        val fixture = fixture()
+        val alice = Chat(id = 123L, type = "private", firstName = "Alice")
+        val agentStarted = CompletableDeferred<Unit>()
+        val releaseAgent = CompletableDeferred<Unit>()
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(agentEnabled = true, agentChatId = "123")
+            )
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(
+                Update(11, message = authorizedMessage(1, alice, text = "block")),
+                Update(12, message = authorizedMessage(2, alice, text = "stale after restore")),
+            ),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 13, 30) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            agentStarted.complete(Unit)
+            releaseAgent.await()
+            ""
+        }
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { agentStarted.await() }
+            eventually { verify(atLeast = 2) { fixture.agent.isAiFeatureEnabled(any()) } }
+            fixture.saveSettings(
+                AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "456")),
+            )
+            fixture.saveSettings(
+                AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+            )
+            releaseAgent.complete(Unit)
+
+            eventually {
+                assertEquals(12, fixture.updates.getData("100").lastUpdateId)
+                coVerify(exactly = 1) { fixture.agent.sendMessage("block") }
+                coVerify(exactly = 0) { fixture.agent.sendMessage("stale after restore") }
+            }
+        } finally {
+            releaseAgent.complete(Unit)
+            fixture.poller.close()
+        }
+    }
+
+    /**
      * 验证模型选择不会通过复制带有未知历史代理的设置而静默删除该代理配置。
      */
     @Test
@@ -652,7 +860,7 @@ class MessagePollerTest {
         val configFile = tempDirectory.resolve("historical-proxy-model.json")
         val originalContent =
             """
-            {"telegramToken":"100:token","proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"},"ai":{"agentEnabled":true,"selectedModel":""}}
+            {"telegramToken":"100:token","proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"},"ai":{"geminiApiKey":"test-key","agentEnabled":true,"agentChatId":"123","selectedModel":""}}
             """.trimIndent()
         configFile.writeText(originalContent)
         val barrier = ModelSwitchBarrier()
@@ -662,6 +870,7 @@ class MessagePollerTest {
         val agent = mockk<AgentService>(relaxed = true)
         val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
         every { agent.availableModels } returns listOf("model")
+        every { agent.isAiFeatureEnabled(any()) } returns true
         coEvery { telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
         coEvery {
             telegram.sendMessageForToken(
@@ -675,7 +884,9 @@ class MessagePollerTest {
         poller.start()
         try {
             eventually { coVerify(atLeast = 1) { telegram.getUpdatesForToken("100:token", any(), any()) } }
-            poller.handleCommand("123", "/model model", 1)
+            poller.handleCommandForTesting(
+                Update(1, message = authorizedMessage(1, Chat(123L, "private"), text = "/model model")),
+            )
 
             assertEquals("", settings.settingsFlow.value.ai?.selectedModel)
             assertTrue(settings.hasHistoricalInvalidProxy)
@@ -697,6 +908,7 @@ class MessagePollerTest {
                 provider = AIProvider.GEMINI,
                 geminiApiKey = "gemini-key",
                 agentEnabled = true,
+                agentChatId = "123",
             ),
         )
         fixture.saveSettings(geminiSettings)
@@ -712,6 +924,7 @@ class MessagePollerTest {
                     ),
                 )
             }
+            fixture.barrier.completeSettingsThrough(fixture.settings.settingsUpdateFlow.value.switchGeneration)
             listOf("models/gemini-old")
         }
 
@@ -720,11 +933,54 @@ class MessagePollerTest {
             eventually {
                 coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:token", any(), any()) }
             }
-            fixture.poller.handleCommand("123", "/model models/gemini-old", 1)
+            fixture.poller.handleCommandForTesting(
+                Update(1, message = authorizedMessage(1, Chat(123L, "private"), text = "/model models/gemini-old")),
+            )
 
             assertEquals(AIProvider.OPENAI, fixture.settings.settingsFlow.value.ai?.provider)
             assertEquals("", fixture.settings.settingsFlow.value.ai?.selectedModel)
         } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证 `/model` 在票据复验后、仓储写入前发生设置竞争时使用 generation CAS，不会覆盖并发设置。
+     */
+    @Test
+    fun `model selection generation CAS rejects a change after ticket validation`() = runBlocking {
+        val fixture = fixture()
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(agentEnabled = true, agentChatId = "123", selectedModel = ""),
+            ),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
+        every { fixture.agent.availableModels } returns listOf("chosen-model")
+        fixture.poller.beforeModelSelectionPersistForTesting = {
+            fixture.settings.updateSettings { current ->
+                current.copy(
+                    ai = current.ai!!.copy(autoCleanContextIntervalMinutes = 17),
+                )
+            }
+            fixture.barrier.completeSettingsThrough(fixture.settings.settingsUpdateFlow.value.switchGeneration)
+        }
+
+        fixture.poller.start()
+        try {
+            eventually {
+                coVerify(atLeast = 1) { fixture.telegram.getUpdatesForToken("100:token", any(), any()) }
+            }
+            fixture.poller.handleCommandForTesting(
+                Update(1, message = authorizedMessage(1, Chat(123L, "private"), text = "/model chosen-model")),
+            )
+
+            assertEquals("", fixture.settings.settingsFlow.value.ai?.selectedModel)
+            assertEquals(17, fixture.settings.settingsFlow.value.ai?.autoCleanContextIntervalMinutes)
+            coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
+        } finally {
+            fixture.poller.beforeModelSelectionPersistForTesting = null
             fixture.poller.close()
         }
     }
@@ -885,9 +1141,9 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证正常 FINAL 连续写失败时留下 IN_PROGRESS，恢复后只可降级失败，绝不重放 Agent。 */
+    /** 验证正常 FINAL 连续写失败留下孤儿 IN_PROGRESS，恢复后静默确认且绝不重放 Agent 或创建 outbox。 */
     @Test
-    fun `failed final journal writes retry as fallback without reentering agent`() = runBlocking {
+    fun `failed final journal writes silently confirm orphan without reentering agent`() = runBlocking {
         val file = tempDirectory.resolve("failed-final-agent-turn.json")
         var rejectFinalWrites = 2
         val updates = UpdatesRepository(file) { state ->
@@ -921,12 +1177,93 @@ class MessagePollerTest {
             eventually {
                 assertEquals(0, rejectFinalWrites)
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
-                fixture.updates.getPendingTelegramReplies("100").single().let { reply ->
-                    assertEquals("抱歉，该消息未能处理。", reply.text)
-                    assertEquals(ReplyParameters(1), reply.replyParameters)
-                }
+                assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                 coVerify(exactly = 1) { fixture.agent.sendMessage("once-final") }
+                coVerify(exactly = 0) {
+                    fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，该消息未能处理。", ReplyParameters(1))
+                }
             }
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证深层输入引发的 StackOverflowError 不会遗留等待 completion 的批次。
+     *
+     * 消费者必须把当前 work 退回 Retry、只重启一次；重投会看到 durable IN_PROGRESS 并静默确认，绝不
+     * 第二次调用 Agent 或创建失败回复。
+     */
+    @Test
+    fun `stack overflow retries queue once then silently settles durable turn`() = runBlocking {
+        val fixture = fixture(retryDelay = {})
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(agentEnabled = true, agentChatId = "123")
+            )
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(Update(11, message = authorizedMessage(1, chat, text = "overflow"))),
+        ) andThen GetUpdatesResponse(
+            ok = true,
+            result = listOf(Update(11, message = authorizedMessage(1, chat, text = "overflow"))),
+        ) andThen GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("overflow") } throws StackOverflowError("injected deeply nested JSON")
+
+        fixture.poller.start()
+        try {
+            eventually {
+                assertEquals(11, fixture.updates.getData("100").lastUpdateId)
+                assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                coVerify(exactly = 1) { fixture.agent.sendMessage("overflow") }
+            }
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /** 非白名单 Error 必须摘除会话，不能保留无人消费的 channel 让 polling completion 永久等待。 */
+    @Test
+    fun `fatal queue consumer error terminates session and rejects later offers`() = runBlocking {
+        val fixture = fixture(retryDelay = {})
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(agentEnabled = true, agentChatId = "123")
+            )
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(Update(11, message = authorizedMessage(1, chat, text = "fatal"))),
+        )
+        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("fatal") } throws Error("injected fatal queue failure")
+
+        fixture.poller.start()
+        try {
+            eventually {
+                assertNull(currentSessionOrNull(fixture.poller))
+                coVerify(exactly = 1) { fixture.agent.sendMessage("fatal") }
+            }
+            fixture.poller.enqueueUpdateForTesting(
+                Update(
+                    12,
+                    message = authorizedMessage(2, chat, text = "must-not-queue")
+                )
+            )
+            delay(100)
+            coVerify(exactly = 1) { fixture.agent.sendMessage("fatal") }
+            coVerify(exactly = 0) { fixture.agent.sendMessage("must-not-queue") }
+            coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:token", 11, 30) }
         } finally {
             fixture.poller.close()
         }
@@ -989,9 +1326,9 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证重启后无本地 owner 的 IN_PROGRESS 只能降级为失败回复，不能自动重放 Agent。 */
+    /** 验证重启后无本地 owner 的 IN_PROGRESS 只会静默确认偏移量，不能自动重放 Agent 或创建回复。 */
     @Test
-    fun `restarted stale in progress turn becomes fallback without agent replay`() = runBlocking {
+    fun `restarted stale in progress turn is silently confirmed without agent replay`() = runBlocking {
         val file = tempDirectory.resolve("stale-agent-turn.json")
         UpdatesRepository(file).apply {
             saveLastUpdateId("100", 10)
@@ -1009,30 +1346,23 @@ class MessagePollerTest {
             ok = true,
             result = listOf(Update(11, message = authorizedMessage(1, chat, text = "must-not-run"))),
         ) andThen GetUpdatesResponse(ok = true)
-        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
-        coEvery {
-            fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，该消息未能处理。", ReplyParameters(1))
-        } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
-
         fixture.poller.start()
         try {
             eventually {
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
-                fixture.updates.getPendingTelegramReplies("100").single().let { reply ->
-                    assertEquals(11, reply.updateId)
-                    assertEquals("抱歉，该消息未能处理。", reply.text)
-                    assertEquals(ReplyParameters(1), reply.replyParameters)
-                }
+                assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                 coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
+                coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
             }
         } finally {
             fixture.poller.close()
         }
     }
 
-    /** 验证 AI 已禁用或密钥缺失时仍会优先将遗留 IN_PROGRESS 降级并提交，绝不重放 Agent。 */
+    /** 验证 AI 已禁用或密钥缺失时仍会优先静默确认遗留 IN_PROGRESS，绝不重放 Agent 或创建 outbox。 */
     @Test
-    fun `unavailable agent still finalizes existing in progress journal without replay`() = runBlocking {
+    fun `unavailable agent still silently confirms existing in progress journal without replay`() = runBlocking {
         val configurations = listOf(
             "disabled" to AppSettings(telegramToken = "100:disabled"),
             "missing-key" to AppSettings(
@@ -1055,24 +1385,14 @@ class MessagePollerTest {
                 ok = true,
                 result = listOf(Update(11, message = authorizedMessage(1, chat, text = "must-not-run"))),
             ) andThen GetUpdatesResponse(ok = true)
-            coEvery {
-                fixture.telegram.sendMessageForToken(
-                    settings.telegramToken,
-                    "123",
-                    "抱歉，该消息未能处理。",
-                    ReplyParameters(1),
-                )
-            } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
-
             fixture.poller.start()
             try {
                 eventually {
                     assertEquals(11, fixture.updates.getData("100").lastUpdateId)
-                    fixture.updates.getPendingTelegramReplies("100").single().let { reply ->
-                        assertEquals("抱歉，该消息未能处理。", reply.text)
-                        assertEquals(ReplyParameters(1), reply.replyParameters)
-                    }
+                    assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+                    assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                     coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
+                    coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
                 }
             } finally {
                 fixture.poller.close()
@@ -2000,7 +2320,9 @@ class MessagePollerTest {
             session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }
                 .set(session, lastReplyAt)
 
-            fixture.poller.handleCommand("123", "/reset", 99)
+            fixture.poller.handleCommandForTesting(
+                Update(103, message = authorizedMessage(99, chat, text = "/reset")),
+            )
 
             assertEquals(lastReplyAt, session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply {
                 isAccessible = true
@@ -2050,7 +2372,9 @@ class MessagePollerTest {
             val session = currentSession(fixture.poller)
             session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }.set(session, 1234L)
 
-            fixture.poller.handleCommand("123", "/reset", 99)
+            fixture.poller.handleCommandForTesting(
+                Update(103, message = authorizedMessage(99, chat, text = "/reset")),
+            )
 
             assertNull(session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }
                 .get(session))
@@ -2058,6 +2382,55 @@ class MessagePollerTest {
             coVerify {
                 fixture.telegram.sendMessageForToken("100:token", "123", "会话已重置，待处理消息已清空。", any())
             }
+        } finally {
+            keepProcessing.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证 `/reset` 清队列时不会吞掉已持久化的 FINAL，而是先将其写入 outbox 与偏移量。 */
+    @Test
+    fun `reset queue clearing completes queued durable final`() = runBlocking {
+        val fixture = fixture()
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        val processingStarted = CompletableDeferred<Unit>()
+        val keepProcessing = CompletableDeferred<Unit>()
+        fixture.updates.saveLastUpdateId("100", 9)
+        assertEquals(AgentTurnClaim.CLAIMED, fixture.updates.claimAgentTurn("100", 11, "123", ReplyParameters(2)))
+        assertNotNull(fixture.updates.finalizeAgentTurn("100", 11, "saved-final"))
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+        )
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("block") } coAnswers {
+            processingStarted.complete(Unit)
+            keepProcessing.await()
+            ""
+        }
+        coEvery { fixture.telegram.sendMessageForToken("100:token", "123", "saved-final", ReplyParameters(2)) } returns
+                TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
+
+        fixture.poller.start()
+        try {
+            eventually { currentSession(fixture.poller) }
+            fixture.poller.enqueueUpdateForTesting(Update(10, message = authorizedMessage(1, chat, text = "block")))
+            withTimeout(2.seconds) { processingStarted.await() }
+            fixture.poller.enqueueUpdateForTesting(
+                Update(
+                    11,
+                    message = authorizedMessage(2, chat, text = "must-not-run")
+                )
+            )
+
+            fixture.poller.handleCommandForTesting(Update(12, message = authorizedMessage(3, chat, text = "/reset")))
+
+            assertEquals(11, fixture.updates.getData("100").lastUpdateId)
+            fixture.updates.getPendingTelegramReplies("100").single().let { pending ->
+                assertEquals("saved-final", pending.text)
+                assertEquals(ReplyParameters(2), pending.replyParameters)
+            }
+            coVerify(exactly = 0) { fixture.agent.sendMessage("must-not-run") }
         } finally {
             keepProcessing.cancel()
             fixture.poller.close()

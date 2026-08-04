@@ -278,6 +278,30 @@ class UpdatesRepositoryTest {
         assertTrue(UpdatesRepository(file).getData("100").agentTurnJournal.isEmpty())
     }
 
+    /** 验证失联的进行中回合只会在一次提交中静默删除并推进偏移量，绝不创建 outbox。 */
+    @Test
+    fun `in progress journal can be silently confirmed without reply or outbox`() {
+        val file = tempDirectory.resolve("silent-in-progress-confirmation.json")
+        val repository = UpdatesRepository(file)
+        assertEquals(
+            AgentTurnClaim.CLAIMED,
+            repository.claimAgentTurn("100", 11, "chat", ReplyParameters(1)),
+        )
+
+        assertTrue(repository.confirmInProgressAgentTurnWithoutReply("100", 11))
+        val data = UpdatesRepository(file).getData("100")
+        assertEquals(11, data.lastUpdateId)
+        assertTrue(data.agentTurnJournal.isEmpty())
+        assertTrue(data.pendingTelegramReplies.isEmpty())
+        assertFalse(repository.confirmInProgressAgentTurnWithoutReply("100", 11))
+
+        assertEquals(AgentTurnClaim.CLAIMED, repository.claimAgentTurn("100", 12, "chat", ReplyParameters(2)))
+        assertNotNull(repository.finalizeAgentTurn("100", 12, "reply"))
+        assertFalse(repository.confirmInProgressAgentTurnWithoutReply("100", 12))
+        assertEquals(11, repository.getData("100").lastUpdateId)
+        assertEquals(AgentTurnJournalStatus.FINAL, repository.getData("100").agentTurnJournal.single().status)
+    }
+
     /** 验证损坏的 Agent 回合账本无法 claim，避免在不可信状态下重放 Agent 或工具。 */
     @Test
     fun `corrupt agent turn journal fails closed before claim`() {

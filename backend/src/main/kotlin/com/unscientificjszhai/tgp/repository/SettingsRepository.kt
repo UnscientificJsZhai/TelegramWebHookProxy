@@ -324,7 +324,11 @@ class SettingsRepository private constructor(
      */
     @Synchronized
     fun currentSettingsSnapshot(): SettingsSnapshot =
-        SettingsSnapshot(settings = _settingsFlow.value, revision = settingsRevision)
+        SettingsSnapshot(
+            settings = _settingsFlow.value,
+            revision = settingsRevision,
+            generation = settingsVersion,
+        )
 
     /**
      * 在同一同步临界区内基于最新设置执行变换并持久化结果。
@@ -335,6 +339,8 @@ class SettingsRepository private constructor(
      *
      * @param expectedRevision 期望的当前修订值；`null` 表示局部变换不执行 CAS，非空值必须是此前
      * [currentSettingsSnapshot] 返回的 64 位小写十六进制 SHA-256。
+     * @param expectedGeneration 期望的当前设置代次；`null` 表示局部变换不执行代次 CAS，非空值必须是此前
+     * [currentSettingsSnapshot] 返回的非负单调代次。与 [expectedRevision] 同时指定时两者都必须匹配。
      * @param replacesHistoricalInvalidMcpServers 此次变换是否明确替换历史非法 MCP 服务器列表；仅当
      * 该列表由请求或调用方显式提供时可传入 `true`，避免无关保存覆盖原始非法配置。
      * @param replacesHistoricalInvalidOpenAiBaseUrl 此次变换是否明确替换历史非法 OpenAI 基础地址；仅当
@@ -344,6 +350,8 @@ class SettingsRepository private constructor(
      * 同步方法，也不得执行长时间阻塞操作。
      * @return 提交前和提交后的原子快照；无操作时两个快照相等。
      * @throws SettingsRevisionMismatchException [expectedRevision] 与锁内当前修订值不一致时抛出；
+     * 不调用 [transform]，也不改变文件、屏障或任何设置流。
+     * @throws SettingsGenerationMismatchException [expectedGeneration] 与锁内当前设置代次不一致时抛出；
      * 不调用 [transform]，也不改变文件、屏障或任何设置流。
      * @throws HistoricalInvalidMcpConfigurationException 历史非法 MCP 列表尚未由本次变换显式替换时抛出；
      * 不会改变屏障、文件或任何设置流。
@@ -358,13 +366,17 @@ class SettingsRepository private constructor(
         expectedRevision: String? = null,
         replacesHistoricalInvalidMcpServers: Boolean = false,
         replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
+        expectedGeneration: Long? = null,
         transform: (AppSettings) -> AppSettings,
     ): SettingsUpdateResult {
         ensureStorageValidatedBeforeWrite()
         val previousSettings = _settingsFlow.value
-        val previousSnapshot = SettingsSnapshot(previousSettings, settingsRevision)
+        val previousSnapshot = SettingsSnapshot(previousSettings, settingsRevision, settingsVersion)
         if (expectedRevision != null && expectedRevision != settingsRevision) {
             throw SettingsRevisionMismatchException()
+        }
+        if (expectedGeneration != null && expectedGeneration != settingsVersion) {
+            throw SettingsGenerationMismatchException()
         }
 
         val settings = transform(previousSettings)
@@ -438,7 +450,7 @@ class SettingsRepository private constructor(
         }
         return SettingsUpdateResult(
             previous = previousSnapshot,
-            current = SettingsSnapshot(settings, settingsRevision),
+            current = SettingsSnapshot(settings, settingsRevision, settingsVersion),
         )
     }
 
@@ -513,10 +525,13 @@ class SettingsRepository private constructor(
  *
  * @property settings 完整不可变应用设置。
  * @property revision 由 [settings] 的规范 JSON 计算的 64 位小写十六进制 SHA-256。
+ * @property generation 从 `0` 开始、仅在设置实际变更时递增的单调代次；与 [settings] 和 [revision]
+ * 在同一仓储锁内读取，可用于条件写入和授权租约失效判定。
  */
 data class SettingsSnapshot(
     val settings: AppSettings,
     val revision: String,
+    val generation: Long,
 )
 
 /**
@@ -536,6 +551,13 @@ data class SettingsUpdateResult(
  * 异常表示写入未执行，调用方应重新读取设置并由用户决定如何合并。
  */
 class SettingsRevisionMismatchException : IllegalStateException("设置修订值已变更。")
+
+/**
+ * 条件设置写入使用了过期设置代次。
+ *
+ * 异常表示写入未执行，调用方应重新读取 [SettingsSnapshot]，不得把旧授权或选择结果写入新配置。
+ */
+class SettingsGenerationMismatchException : IllegalStateException("设置代次已变更。")
 
 /**
  * 尝试保存设置时未显式替换历史非法 MCP 服务器列表。

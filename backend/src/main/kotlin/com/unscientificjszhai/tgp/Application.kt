@@ -25,12 +25,26 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
 /**
- * 启动监听 `0.0.0.0:10178` 的 Netty HTTP 服务器。
+ * 启动监听 `0.0.0.0:10178` 的仅 HTTP/1 Netty 服务器。
  *
+ * 入站连接数、请求并发数、HTTP 编码大小及读取阶段均受限，以避免慢速连接长期耗用服务资源。
+ * 一段时间内没有任何入站字节的连接会被关闭，包括已完成请求后保持 keep-alive 的连接。
  * 此方法会阻塞当前线程，直至服务器停止。
  */
 fun main() {
-    embeddedServer(Netty, port = 10178, host = "0.0.0.0", module = Application::module)
+    embeddedServer(
+        factory = Netty,
+        rootConfig = serverConfig {
+            module { module() }
+        },
+        configure = {
+            connector {
+                host = "0.0.0.0"
+                port = 10178
+            }
+            configureHttpIngressProtection()
+        },
+    )
         .start(wait = true)
 }
 
@@ -61,6 +75,7 @@ fun Application.module() {
         )
     }
     installApiErrorPages()
+    installProtocolUpgradeRejection()
 
     apiModule(appComponent)
     skillAPIModule(appComponent)

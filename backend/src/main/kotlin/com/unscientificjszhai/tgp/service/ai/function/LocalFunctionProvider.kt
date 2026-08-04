@@ -5,7 +5,9 @@ import com.google.genai.types.Schema
 import com.openai.core.JsonValue
 import com.openai.models.FunctionDefinition
 import com.openai.models.FunctionParameters
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import kotlinx.serialization.json.*
+import java.util.ArrayDeque
 import kotlin.jvm.optionals.getOrNull
 
 /**
@@ -76,84 +78,76 @@ abstract class LocalFunctionProvider {
      */
     companion object {
         /**
-         * 将 JSON 对象递归转换为 Kotlin 参数映射。
+         * 将 JSON 对象转换为 Kotlin 参数映射。
          *
          * @receiver 要转换的 JSON 对象。
          * @return 键与原 JSON 对象一致的映射；JSON `null` 转换为 Kotlin `null`，数组和嵌套对象
          * 分别转换为列表和嵌套映射。
          */
-        fun JsonObject.toMap(): Map<String, Any?> =
-            this.mapValues { (_, value) ->
-                value.toAny()
-            }
-
-        private fun JsonElement.toAny(): Any? =
-            when (this) {
-                is JsonNull -> null
-                is JsonPrimitive ->
-                    if (this.isString) {
-                        this.content
-                    } else if (this.booleanOrNull != null) {
-                        this.boolean
-                    } else if (this.intOrNull != null) {
-                        this.int
-                    } else if (this.longOrNull != null) {
-                        this.long
-                    } else if (this.doubleOrNull != null) {
-                        this.double
-                    } else {
-                        this.content
-                    }
-
-                is JsonArray -> this.map { it.toAny() }
-                is JsonObject -> this.toMap()
-            }
+        fun JsonObject.toMap(): Map<String, Any?> = JsonStructureLimits.toKotlinMap(this)
 
         internal fun convertGeminiSchemaToOpenAI(geminiSchema: Schema): FunctionParameters {
-            val schemaMap = recursiveConvertSchema(geminiSchema)
+            val schemaMap = convertGeminiSchemaToOpenAiMap(geminiSchema)
             return FunctionParameters.builder()
                 .putAllAdditionalProperties(schemaMap.mapValues { JsonValue.from(it.value) })
                 .build()
         }
 
-        private fun recursiveConvertSchema(geminiSchema: Schema): Map<String, Any?> {
-            val map = mutableMapOf<String, Any?>()
+        /** 迭代转换 SDK Schema，避免不可信 MCP schema 通过递归耗尽调用栈。 */
+        private fun convertGeminiSchemaToOpenAiMap(geminiSchema: Schema): Map<String, Any?> {
+            data class Pending(
+                val schema: Schema,
+                val output: MutableMap<String, Any?>,
+                val depth: Int,
+            )
 
-            val type = geminiSchema.type()?.getOrNull()?.toString()
-            if (type != null) {
-                map["type"] = when (type.uppercase()) {
-                    "OBJECT" -> "object"
-                    "ARRAY" -> "array"
-                    "STRING" -> "string"
-                    "NUMBER" -> "number"
-                    "INTEGER" -> "integer"
-                    "BOOLEAN" -> "boolean"
-                    else -> "string"
+            val root = LinkedHashMap<String, Any?>()
+            val pending = ArrayDeque<Pending>()
+            pending.addLast(Pending(geminiSchema, root, 1))
+            var nodes = 0
+            while (pending.isNotEmpty()) {
+                val (schema, map, depth) = pending.removeLast()
+                if (++nodes > JsonStructureLimits.MAX_NODES || depth > JsonStructureLimits.MAX_DEPTH) {
+                    throw JsonStructureLimitsExceededSchemaException()
+                }
+                schema.type()?.getOrNull()?.toString()?.let { type ->
+                    map["type"] = when (type.uppercase()) {
+                        "OBJECT" -> "object"
+                        "ARRAY" -> "array"
+                        "STRING" -> "string"
+                        "NUMBER" -> "number"
+                        "INTEGER" -> "integer"
+                        "BOOLEAN" -> "boolean"
+                        else -> "string"
+                    }
+                }
+                schema.description()?.ifPresent { map["description"] = it }
+                schema.pattern()?.ifPresent { map["pattern"] = it }
+                schema.minLength()?.ifPresent { map["minLength"] = it }
+                schema.maxLength()?.ifPresent { map["maxLength"] = it }
+                schema.required()?.ifPresent { map["required"] = it }
+                schema.items()?.getOrNull()?.let { items ->
+                    val itemsMap = LinkedHashMap<String, Any?>()
+                    map["items"] = itemsMap
+                    pending.addLast(Pending(items, itemsMap, depth + 1))
+                }
+                schema.properties()?.getOrNull()?.let { properties ->
+                    if (properties.size > JsonStructureLimits.MAX_NODES - nodes) {
+                        throw JsonStructureLimitsExceededSchemaException()
+                    }
+                    val propertiesMap = LinkedHashMap<String, Any?>()
+                    map["properties"] = propertiesMap
+                    properties.forEach { (name, child) ->
+                        val childMap = LinkedHashMap<String, Any?>()
+                        propertiesMap[name] = childMap
+                        pending.addLast(Pending(child, childMap, depth + 1))
+                    }
                 }
             }
-
-            geminiSchema.description()?.ifPresent { map["description"] = it }
-            geminiSchema.pattern()?.ifPresent { map["pattern"] = it }
-            geminiSchema.minLength()?.ifPresent { map["minLength"] = it }
-            geminiSchema.maxLength()?.ifPresent { map["maxLength"] = it }
-
-            geminiSchema.properties()?.ifPresent { props ->
-                val propertiesMap = mutableMapOf<String, Any?>()
-                props.forEach { (name, schema) ->
-                    propertiesMap[name] = recursiveConvertSchema(schema)
-                }
-                map["properties"] = propertiesMap
-            }
-
-            geminiSchema.required()?.ifPresent { required ->
-                map["required"] = required
-            }
-
-            geminiSchema.items()?.ifPresent { items ->
-                map["items"] = recursiveConvertSchema(items)
-            }
-
-            return map
+            return root
         }
     }
 }
+
+/** 本地函数声明的 schema 超出 JSON 结构边界时拒绝转换。 */
+private class JsonStructureLimitsExceededSchemaException : IllegalArgumentException("函数 schema 超出 JSON 结构限制。")

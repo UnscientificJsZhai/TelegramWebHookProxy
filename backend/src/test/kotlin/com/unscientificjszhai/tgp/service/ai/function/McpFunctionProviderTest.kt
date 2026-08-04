@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service.ai.function
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -16,6 +17,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -135,6 +139,23 @@ class McpFunctionProviderTest {
         )
 
         assertEquals(listOf("safe_alias"), provider.providedFunctions.map { it.name().get() })
+    }
+
+    /** 验证恶意深层 MCP schema 在递归 SDK 转换前被拒绝，且不会阻断其他刷新路径。 */
+    @Test
+    fun `deep MCP schema is rejected without stack overflow`() = runTest {
+        var nested: JsonElement = JsonPrimitive("leaf")
+        repeat(JsonStructureLimits.MAX_DEPTH + 1) { index ->
+            nested = JsonObject(linkedMapOf("level-$index" to nested))
+        }
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.getAllTools() } returns listOf(
+            "server" to Tool("deep", ToolSchema(properties = JsonObject(linkedMapOf("nested" to nested)))),
+        )
+        val provider = McpFunctionProvider(mcpClientService)
+
+        assertTrue(provider.providedFunctions.isEmpty())
+        coVerify(exactly = 0) { mcpClientService.callTool(any(), any(), any()) }
     }
 
     /**

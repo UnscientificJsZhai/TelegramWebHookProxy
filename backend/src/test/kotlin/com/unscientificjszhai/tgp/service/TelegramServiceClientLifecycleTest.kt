@@ -7,6 +7,7 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.ConfigJson
+import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
 import io.ktor.client.*
 import io.ktor.client.engine.mock.*
 import io.ktor.client.plugins.contentnegotiation.*
@@ -21,6 +22,7 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -96,6 +98,41 @@ class TelegramServiceClientLifecycleTest {
         } finally {
             service.close()
         }
+    }
+
+    /** Telegram DTO 解码前会拒绝深层原始响应，避免 kotlinx serialization 递归耗尽调用栈。 */
+    @Test
+    fun `deep Telegram get updates response is rejected before DTO decode`() = runBlocking {
+        val settings = SettingsRepository.forTesting(
+            temporaryDirectory.resolve("deep-response-settings.json"),
+            ModelSwitchBarrier()
+        )
+        val service = TelegramService(
+            scope,
+            settings,
+            UpdatesRepository(temporaryDirectory.resolve("deep-response-updates.json"))
+        ) {
+            newClient {
+                respond(
+                    content = buildString {
+                        repeat(65) { append("{\"next\":") }
+                        append("\"leaf\"")
+                        repeat(65) { append('}') }
+                    },
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                )
+            }
+        }
+
+        try {
+            assertFailsWith<JsonStructureLimitExceededException> {
+                service.getUpdatesForToken("100:token", offset = 1, timeout = 0)
+            }
+        } finally {
+            service.close()
+        }
+        Unit
     }
 
     /**
