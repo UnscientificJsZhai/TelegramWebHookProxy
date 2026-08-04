@@ -32,7 +32,14 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
-import java.util.Calendar
+import java.time.Clock
+import java.time.DateTimeException
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZonedDateTime
 import java.util.UUID
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
@@ -46,17 +53,26 @@ import kotlin.time.Duration.Companion.minutes
  *
  * 服务在创建时从 `config/schedule.json` 恢复任务并启动后台扫描；任务执行结果会发送到
  * 对应的 Telegram 会话。调用 [close] 会停止后续扫描；[start] 与 [close] 应在同一生命周期
- * 控制路径中调用。任务执行完成后的状态只有在持久化成功后才会从内存移除或推进，因此发生
- * 存储故障时保留任务并按至少一次语义重试，而非承诺 exactly-once。
- * 代理未完成或抛出普通异常时也会保留任务供后续扫描重试。代理正常返回后，结果投递仅作尽力而为
- * 处理：Telegram 请求抛错或返回非成功结果只会记录日志，不会再次调用代理，也不保证跨重启投递。
- * 扫描在 token 生命周期锁内获取短执行租约；租约取得后的在途 AI 回合可继续完成，
- * 并始终使用捕获 token 投递结果。
+ * 控制路径中调用。每次执行会先在状态锁内重新确认任务内容仍等于扫描快照且仍到期，随后
+ * 原子持久化删除单次任务或推进循环任务，最后才调用代理和 Telegram。该预消费提交成功后，即使代理、投递、
+ * 协程取消或进程崩溃发生在副作用完成前，也绝不会恢复或重试该次；这刻意提供 at-most-once，而非
+ * exactly-once，代价是提交与副作用之间崩溃或取消可能遗漏一次执行。预提交失败、任务被取消或替换、
+ * 或已经不再到期时不会调用代理。
+ * 调度的服务器时间和日历时区分别由 [Clock] 与 [ZoneId] 决定。错过的循环周期只预消费一次并跳到下一次
+ * 未来执行，不逐期追赶；小时任务保持 Unix epoch 相位，日/周任务保持服务器时区中的本地日历锚点。DST
+ * gap 解析到首个有效本地时间，overlap 使用较早偏移量；日/周任务会持久化创建时的本地时刻锚点，所以 gap
+ * 当次的延后时刻不会漂移到之后的日期或周。无法表示未来时刻或存在无效日历锚点时同样预消费删除并记录警告，
+ * 避免永久重复。
+ * 扫描会在 [AgentService.withReadyService] 的同一次模型切换屏障准入中捕获短暂的 Bot token 租约、预消费
+ * 任务、完成 Agent 回合并投递结果。因此切换已发生时旧任务不会调用旧 Agent 或旧 token；任务已准入时，
+ * 对应的 Agent 切换会等待完整回合和投递结束，投递始终使用所捕获的旧 token。
  *
  * @param parentScope 后台扫描任务所属的协程作用域；取消该作用域会停止扫描。
  * @param telegramService 用于投递任务执行结果的 Telegram 服务。
  * @param agentService 用于取得执行任务指令的 AI 代理服务的提供者。
  * @param settingsRepository 用于在线性化 token 生命周期内捕获执行租约的仓储。
+ * @param clock 提供服务器当前时间的时钟。
+ * @param zoneId 日/周循环任务使用的服务器日历时区。
  */
 @Singleton
 class TaskSchedulerService private constructor(
@@ -66,6 +82,8 @@ class TaskSchedulerService private constructor(
     private val settingsRepository: SettingsRepository,
     private val storage: AtomicJsonStorage,
     startImmediately: Boolean,
+    private val clock: Clock,
+    private val zoneId: ZoneId,
 ) : AutoCloseable {
 
     /**
@@ -90,9 +108,23 @@ class TaskSchedulerService private constructor(
         settingsRepository,
         AtomicJsonStorage(File("config/schedule.json").toPath(), ResourceLimits.SCHEDULE_BYTES),
         startImmediately = true,
+        clock = Clock.systemDefaultZone(),
+        zoneId = ZoneId.systemDefault(),
     )
 
-    /** 为临时配置文件和故障注入测试创建不自动扫描的调度服务。 */
+    /**
+     * 为临时配置文件、故障注入和确定性时钟测试创建调度服务。
+     *
+     * @param parentScope 后台扫描任务所属的协程作用域。
+     * @param telegramService 用于投递任务结果的 Telegram 服务。
+     * @param agentService 用于取得 AI 代理的提供者。
+     * @param settingsRepository 用于确认任务 Bot 所有者并捕获 token 的仓储。
+     * @param scheduleFile 测试或本地调度文件。
+     * @param fileOperations 原子 JSON 存储使用的文件操作。
+     * @param startImmediately 为 `true` 时构造后立即启动每分钟扫描。
+     * @param clock 提供服务器当前时间的时钟。
+     * @param zoneId 日/周循环任务使用的服务器日历时区。
+     */
     internal constructor(
         parentScope: CoroutineScope,
         telegramService: TelegramService,
@@ -101,6 +133,8 @@ class TaskSchedulerService private constructor(
         scheduleFile: File,
         fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
         startImmediately: Boolean = false,
+        clock: Clock = Clock.systemDefaultZone(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
     ) : this(
         parentScope,
         telegramService,
@@ -108,6 +142,8 @@ class TaskSchedulerService private constructor(
         settingsRepository,
         AtomicJsonStorage(scheduleFile.toPath(), ResourceLimits.SCHEDULE_BYTES, fileOperations),
         startImmediately,
+        clock,
+        zoneId,
     )
 
     private val logger = LoggerFactory.getLogger(TaskSchedulerService::class.java)
@@ -230,15 +266,20 @@ class TaskSchedulerService private constructor(
     /**
      * 扫描并依次执行所有执行时间已到的任务。
      *
-     * 候选任务会在短临界区内声明执行权；并发扫描不会重复执行同一任务。代理调用和 Telegram
-     * I/O 永远不在状态锁内运行。存储可恢复性未决时会在短锁内重新验证并重载任务；验证失败
-     * 时本轮不执行任务，后续扫描会重试。无论本批任务正常结束、失败或取消，已声明但尚未执行的
-     * 任务都会释放执行权，供后续扫描重试。
+     * 候选任务会在短临界区内声明执行权；并发扫描不会重复执行同一任务。每个候选进入 Agent 就绪屏障后，
+     * 会重新确认扫描快照和到期状态，并在任何 Agent 或 Telegram 副作用前原子持久化预消费状态。
+     * 因而预提交成功后的失败、取消和进程重启都不会重放该次，提交失败则不会调用 Agent 且会在后续扫描保留
+     * 任务。代理调用与 Telegram I/O 永远不在状态锁或 token 租约内运行。
      *
-     * @throws CancellationException 扫描或任务执行被取消时抛出；被取消的任务不会推进或删除。
+     * @throws CancellationException 扫描被取消时原样抛出；若任务已经预提交，取消也不会恢复该次。
      */
     suspend fun scanAndExecute() {
-        val currentTime = System.currentTimeMillis()
+        val currentTime = try {
+            clock.millis()
+        } catch (e: ArithmeticException) {
+            logger.warn("Scheduler clock cannot be represented as epoch milliseconds; skipping this scan", e)
+            return
+        }
         val tasksToExecute = stateLock.withLock {
             try {
                 ensureStorageValidatedBeforeMutation()
@@ -261,42 +302,109 @@ class TaskSchedulerService private constructor(
     }
 
     /**
-     * 执行一个已声明执行权的任务，并仅在代理正常返回后推进其持久化状态。
+     * 在单次 Agent 就绪屏障准入中预消费并执行一个已声明执行权的任务。
      *
-     * Telegram 结果投递为尽力而为操作；其失败不重跑代理。代理失败会保留任务以供下一轮扫描重试，
-     * 取消会向上传播且不会推进任务。
+     * token 租约只用于短暂捕获投递 token；状态锁只用于重新验证扫描快照、以 fresh now 预消费并持久化。
+     * 二者都会在副作用前释放。预消费成功后，代理失败、普通异常、取消以及 Telegram 失败或取消均不会恢复
+     * 或重试任务；这在崩溃或取消落在提交和副作用之间时可能遗漏一次执行，但避免重复外部副作用。
      *
      * @param task 已到期且已被当前扫描声明执行权的任务。
-     * @throws CancellationException 当代理调用、Telegram 调用或当前协程被取消时抛出。
+     * @throws CancellationException 当 Agent、Telegram 调用或当前协程被取消时原样抛出；已预消费状态不回滚。
      */
     private suspend fun executeTask(task: ScheduledTask) {
-        val executionLease = try {
-            settingsRepository.withActiveTelegramBotLease { botLease ->
-                TaskExecutionLease(botLease, agentService.get())
+        agentService.get().withReadyService { readyAgent ->
+            val preparedTask = prepareTaskForExecution(task) ?: return@withReadyService
+            logger.info("Executing precommitted task {}: {}", preparedTask.task.id, preparedTask.task.instruction)
+            try {
+                val result = readyAgent.sendMessage(
+                    "以下是一个定时任务指令：\n${preparedTask.task.instruction}\n\n请直接执行并返回结果。",
+                )
+                if (result.isNotBlank()) {
+                    deliverTaskResult(preparedTask.task, preparedTask.botLease.token, result)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: AgentTurnFailedException) {
+                logger.warn("Precommitted task {} agent turn did not complete; it will not be retried", task.id, e)
+            } catch (e: Exception) {
+                logger.error("Precommitted task {} agent execution failed; it will not be retried", task.id, e)
             }
-        } catch (e: ActiveTelegramBotUnavailableException) {
-            logger.warn("Skipping task {} because no valid active Telegram Bot is available", task.id)
-            return
         }
-        logger.info("Executing task: {} - {}", task.id, task.instruction)
-        var agentTurnCompleted = false
-        try {
-            val result = executionLease.agentService
-                .sendMessage("以下是一个定时任务指令：\n${task.instruction}\n\n请直接执行并返回结果。")
-            if (result.isNotBlank()) {
-                deliverTaskResult(task, executionLease.botLease.token, result)
+    }
+
+    /**
+     * 在副作用前确认 token 和扫描快照，并原子持久化本次预消费状态。
+     *
+     * @param task 扫描时声明执行权的不可变任务快照。
+     * @return 已提交且可安全执行的任务与 token 快照；token、快照、到期或持久化验证不满足时返回 `null`。
+     * @throws CancellationException 当调用协程在存储操作期间被取消时原样抛出。
+     */
+    private fun prepareTaskForExecution(task: ScheduledTask): PreparedTask? {
+        val botLease = try {
+            settingsRepository.withActiveTelegramBotLease { it }
+        } catch (_: ActiveTelegramBotUnavailableException) {
+            logger.warn("Skipping task {} because no valid active Telegram Bot is available", task.id)
+            return null
+        }
+
+        return try {
+            stateLock.withLock {
+                ensureStorageValidatedBeforeMutation()
+                val index = tasks.indexOfFirst { current ->
+                    current.id == task.id && current == task
+                }
+                if (index == -1) {
+                    logger.info("Skipping task {} because it was cancelled or replaced before admission", task.id)
+                    return@withLock null
+                }
+                val currentTask = tasks[index]
+                val currentTime = clock.millis()
+                if (currentTask.executionTime > currentTime) {
+                    logger.info("Skipping task {} because it is no longer due", task.id)
+                    return@withLock null
+                }
+
+                val calendarAnchorTimeMillis = currentTask.calendarAnchorTimeMillisOrLegacy(zoneId)
+                val hasInvalidCalendarAnchor = currentTask.requiresCalendarAnchor() &&
+                        currentTask.calendarAnchorTimeMillis != null && calendarAnchorTimeMillis == null
+                if (hasInvalidCalendarAnchor) {
+                    logger.warn("Removing task {} because its persisted calendar anchor is invalid", task.id)
+                    val candidate = tasks.toMutableList().apply { removeAt(index) }
+                    persistTasks(candidate)
+                    tasks.clear()
+                    tasks.addAll(candidate)
+                    return@withLock null
+                }
+                val nextExecutionTime = calculateNextExecutionTime(
+                    currentTask.executionTime,
+                    currentTask.loopMode,
+                    Instant.ofEpochMilli(currentTime),
+                    zoneId,
+                    calendarAnchorTimeMillis,
+                )
+                if (currentTask.loopMode != LoopMode.ONCE && nextExecutionTime == null) {
+                    logger.warn("Removing task {} because no future execution time can be represented", task.id)
+                }
+                val candidate = tasks.toMutableList().also { candidateTasks ->
+                    if (nextExecutionTime == null) {
+                        candidateTasks.removeAt(index)
+                    } else {
+                        candidateTasks[index] = currentTask.copy(
+                            executionTime = nextExecutionTime,
+                            calendarAnchorTimeMillis = calendarAnchorTimeMillis,
+                        )
+                    }
+                }
+                persistTasks(candidate)
+                tasks.clear()
+                tasks.addAll(candidate)
+                PreparedTask(currentTask, botLease)
             }
-            agentTurnCompleted = true
         } catch (e: CancellationException) {
             throw e
-        } catch (e: AgentTurnFailedException) {
-            logger.warn("Agent turn for task {} was not completed; it will be retried", task.id, e)
         } catch (e: Exception) {
-            logger.error("Agent execution for task {} failed; it will be retried", task.id, e)
-        } finally {
-            if (agentTurnCompleted) {
-                updateTaskAfterExecution(task)
-            }
+            logger.error("Failed to precommit task {}; it will remain eligible for a later scan", task.id, e)
+            null
         }
     }
 
@@ -336,57 +444,9 @@ class TaskSchedulerService private constructor(
     private fun TelegramApiResponse.isTelegramOk(): Boolean {
         return status.isSuccess() && try {
             Json.parseToJsonElement(body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             false
         }
-    }
-
-    private fun updateTaskAfterExecution(task: ScheduledTask) {
-        stateLock.withLock {
-            try {
-                ensureStorageValidatedBeforeMutation()
-            } catch (e: Exception) {
-                logger.error("Failed to revalidate task storage after execution; task will be retried", e)
-                return
-            }
-            val index = tasks.indexOfFirst { it.id == task.id }
-            if (index == -1) {
-                return
-            }
-            val currentTask = tasks[index]
-            val candidate = tasks.toMutableList()
-            val nextExecutionTime = calculateNextExecutionTime(currentTask.executionTime, currentTask.loopMode)
-            if (nextExecutionTime == null) {
-                candidate.removeAt(index)
-            } else {
-                candidate[index] = currentTask.copy(executionTime = nextExecutionTime)
-            }
-
-            try {
-                persistTasks(candidate)
-            } catch (e: Exception) {
-                logger.error("Failed to persist post-execution state for task {}; task will be retried", task.id, e)
-                return
-            }
-            tasks.clear()
-            tasks.addAll(candidate)
-        }
-    }
-
-    private fun calculateNextExecutionTime(lastExecutionTime: Long, loopMode: LoopMode): Long? {
-        val calendar = Calendar.getInstance().apply { timeInMillis = lastExecutionTime }
-        val currentTime = System.currentTimeMillis()
-
-        do {
-            when (loopMode) {
-                LoopMode.ONCE -> return null
-                LoopMode.HOURLY -> calendar.add(Calendar.HOUR_OF_DAY, 1)
-                LoopMode.DAILY -> calendar.add(Calendar.DAY_OF_YEAR, 1)
-                LoopMode.WEEKLY -> calendar.add(Calendar.WEEK_OF_YEAR, 1)
-            }
-        } while (calendar.timeInMillis <= currentTime)
-
-        return calendar.timeInMillis
     }
 
     /**
@@ -404,7 +464,14 @@ class TaskSchedulerService private constructor(
      */
     fun createTask(instruction: String, executionTime: Long, loopMode: LoopMode, agentChatId: String): String {
         val id = UUID.randomUUID().toString().substring(0, 8)
-        val newTask = ScheduledTask(id, instruction, executionTime, loopMode, agentChatId)
+        val newTask = ScheduledTask(
+            id,
+            instruction,
+            executionTime,
+            loopMode,
+            agentChatId,
+            executionTime.calendarAnchorTimeMillisFor(loopMode, zoneId),
+        )
         return stateLock.withLock {
             ensureStorageValidatedBeforeMutation()
             val candidate = tasks + newTask
@@ -456,8 +523,152 @@ class TaskSchedulerService private constructor(
         logger.info("Task scheduler stopped.")
     }
 
-    private data class TaskExecutionLease(
+    private fun ScheduledTask.requiresCalendarAnchor(): Boolean =
+        loopMode == LoopMode.DAILY || loopMode == LoopMode.WEEKLY
+
+    /** 返回已验证锚点，或为兼容旧任务从当前执行时间推导锚点。 */
+    private fun ScheduledTask.calendarAnchorTimeMillisOrLegacy(zoneId: ZoneId): Int? = when {
+        !requiresCalendarAnchor() -> null
+        calendarAnchorTimeMillis == null -> executionTime.calendarAnchorTimeMillisFor(loopMode, zoneId)
+        calendarAnchorTimeMillis.toCalendarAnchorTimeOrNull() != null -> calendarAnchorTimeMillis
+        else -> null
+    }
+
+    private data class PreparedTask(
+        val task: ScheduledTask,
         val botLease: TelegramBotLease,
-        val agentService: AgentService,
     )
 }
+
+/**
+ * 计算循环任务在 [now] 之后的首个可表示执行时刻。
+ *
+ * 小时模式按 Unix epoch 的固定一小时相位计算；日和周模式使用 [zoneId] 中 [lastExecutionTime] 的本地
+ * 日期/星期和时分秒作为锚点。错过任意数量的周期都只计算一个未来时刻，不逐期补跑。DST gap 取跳变后的
+ * 第一个有效本地时间，overlap 明确使用跳变前（较早）的 offset。`Long`、日历或 Instant 转换溢出时返回
+ * `null`，调用方应将其作为不可继续调度处理。
+ *
+ * @param lastExecutionTime 最近一次已到期实例的 Unix 时间戳，单位为毫秒。
+ * @param loopMode 循环方式；[LoopMode.ONCE] 没有下一次执行，返回 `null`。
+ * @param now 当前绝对时刻；成功返回值严格晚于该时刻。
+ * @param zoneId 日和周循环解释本地日历锚点的服务器时区。
+ * @param calendarAnchorTimeMillis 日/周任务原始本地时刻距当天 `00:00` 的毫秒数，必须在 `0..86399999`；为
+ * `null` 时从 [lastExecutionTime] 兼容推导，非空越界值返回 `null` 供调度器安全删除任务。
+ * @return 首个严格晚于 [now] 的 Unix 时间戳，单位为毫秒；无需循环或无法表示未来时刻时为 `null`。
+ */
+internal fun calculateNextExecutionTime(
+    lastExecutionTime: Long,
+    loopMode: LoopMode,
+    now: Instant,
+    zoneId: ZoneId,
+    calendarAnchorTimeMillis: Int? = null,
+): Long? = try {
+    when (loopMode) {
+        LoopMode.ONCE -> null
+        LoopMode.HOURLY -> nextHourlyExecutionTime(lastExecutionTime, now)
+        LoopMode.DAILY -> nextCalendarExecutionTime(
+            lastExecutionTime,
+            now,
+            zoneId,
+            daysPerPeriod = 1,
+            calendarAnchorTimeMillis,
+        )
+
+        LoopMode.WEEKLY -> nextCalendarExecutionTime(
+            lastExecutionTime,
+            now,
+            zoneId,
+            daysPerPeriod = 7,
+            calendarAnchorTimeMillis,
+        )
+    }
+} catch (_: ArithmeticException) {
+    null
+} catch (_: DateTimeException) {
+    null
+}
+
+private const val HOUR_MILLIS = 60L * 60L * 1000L
+
+private fun nextHourlyExecutionTime(lastExecutionTime: Long, now: Instant): Long {
+    val nowMillis = now.toEpochMilli()
+    if (lastExecutionTime > nowMillis) {
+        return lastExecutionTime
+    }
+    val elapsed = Math.subtractExact(nowMillis, lastExecutionTime)
+    val missedPeriods = Math.floorDiv(elapsed, HOUR_MILLIS)
+    val periodsToAdvance = Math.addExact(missedPeriods, 1L)
+    return Math.addExact(lastExecutionTime, Math.multiplyExact(periodsToAdvance, HOUR_MILLIS))
+}
+
+private fun nextCalendarExecutionTime(
+    lastExecutionTime: Long,
+    now: Instant,
+    zoneId: ZoneId,
+    daysPerPeriod: Long,
+    calendarAnchorTimeMillis: Int?,
+): Long? {
+    val anchor = Instant.ofEpochMilli(lastExecutionTime).atZone(zoneId)
+    if (anchor.toInstant().isAfter(now)) {
+        return lastExecutionTime
+    }
+
+    val anchorTime = when (calendarAnchorTimeMillis) {
+        null -> anchor.toLocalTime()
+        else -> calendarAnchorTimeMillis.toCalendarAnchorTimeOrNull() ?: return null
+    }
+    val nowDate = now.atZone(zoneId).toLocalDate()
+    val targetDate = if (daysPerPeriod == 1L) {
+        nowDate
+    } else {
+        nextDateWithDayOfWeek(nowDate, anchor.dayOfWeek.value)
+    }
+    var candidate = resolveLocalExecutionTime(targetDate, anchorTime, zoneId)
+    if (!candidate.toInstant().isAfter(now)) {
+        candidate = resolveLocalExecutionTime(targetDate.plusDays(daysPerPeriod), anchorTime, zoneId)
+    }
+    return candidate.toInstant().toEpochMilli()
+}
+
+private fun nextDateWithDayOfWeek(date: LocalDate, targetDayOfWeek: Int): LocalDate {
+    val daysUntilTarget = Math.floorMod(targetDayOfWeek - date.dayOfWeek.value, 7)
+    return date.plusDays(daysUntilTarget.toLong())
+}
+
+private fun resolveLocalExecutionTime(
+    date: LocalDate,
+    time: LocalTime,
+    zoneId: ZoneId,
+): ZonedDateTime {
+    val localDateTime = LocalDateTime.of(date, time)
+    val rules = zoneId.rules
+    val validOffsets = rules.getValidOffsets(localDateTime)
+    return when (validOffsets.size) {
+        0 -> {
+            val transition = requireNotNull(rules.getTransition(localDateTime))
+            ZonedDateTime.ofLocal(transition.dateTimeAfter, zoneId, transition.offsetAfter)
+        }
+
+        1 -> ZonedDateTime.ofLocal(localDateTime, zoneId, validOffsets.single())
+        else -> {
+            val transition = requireNotNull(rules.getTransition(localDateTime))
+            ZonedDateTime.ofLocal(localDateTime, zoneId, transition.offsetBefore)
+        }
+    }
+}
+
+private const val MILLIS_PER_DAY = 24 * 60 * 60 * 1000
+
+private fun Long.calendarAnchorTimeMillisFor(loopMode: LoopMode, zoneId: ZoneId): Int? =
+    when (loopMode) {
+        LoopMode.DAILY,
+        LoopMode.WEEKLY,
+            -> (Instant.ofEpochMilli(this).atZone(zoneId).toLocalTime().toNanoOfDay() / 1_000_000L).toInt()
+
+        LoopMode.ONCE,
+        LoopMode.HOURLY,
+            -> null
+    }
+
+private fun Int.toCalendarAnchorTimeOrNull(): LocalTime? =
+    takeIf { it in 0..<MILLIS_PER_DAY }?.let { LocalTime.ofNanoOfDay(it.toLong() * 1_000_000L) }

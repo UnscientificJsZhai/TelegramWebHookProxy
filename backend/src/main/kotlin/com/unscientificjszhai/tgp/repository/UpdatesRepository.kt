@@ -18,6 +18,9 @@ import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/** 回退 Telegram 回复在进程崩溃语义下允许持久化登记的最大投递次数。 */
+internal const val MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS = 3
+
 /**
  * 单个 Telegram 机器人的已持久化更新处理状态。
  *
@@ -28,24 +31,80 @@ import javax.inject.Singleton
  * @property lastUpdateId 最后已处理的更新标识；`0` 表示尚未初始化。
  * @property pendingTelegramReplies 已持久化但尚未被 Telegram 确认接受的回复，按 [PendingTelegramReply.updateId]
  * 升序且在同一更新标识下唯一；旧文件缺少该字段时默认为空列表。
+ * @property agentTurnJournal 按更新标识隔离的 Agent 回合账本；旧文件缺少该字段时默认为空列表。
  */
 @Serializable
 data class UpdatesData(
     val chats: List<ChatInfo> = emptyList(),
     val lastUpdateId: Long = 0,
     val pendingTelegramReplies: List<PendingTelegramReply> = emptyList(),
+    val agentTurnJournal: List<AgentTurnJournalEntry> = emptyList(),
 )
+
+/**
+ * 一项由轮询器持久化保护的 Agent 回合。
+ *
+ * 回合在任何模型、工具或外部调用前先写入 [AgentTurnJournalStatus.IN_PROGRESS]。仅当 Agent 返回结果
+ * （包括空回复）后才会转为 [AgentTurnJournalStatus.FINAL]；进程重启后遇到没有本地 owner 的进行中回合，
+ * 调用方必须降级为固定失败回复而不能重放 Agent。
+ * 该记录保留回复目标，保证最终状态即使跨重启也能原子写入 outbox 与更新偏移量。
+ *
+ * @property updateId 该回合所属的 Telegram 更新标识；必须为非负数，且同一机器人内唯一。
+ * @property chatId 最终回复目标聊天标识；不能为空。
+ * @property replyParameters 回复原消息的可选参数；可以为 `null`。
+ * @property status 回合状态；只能从 [AgentTurnJournalStatus.IN_PROGRESS] 迁移到 [AgentTurnJournalStatus.FINAL]。
+ * @property reply 最终 Agent 回复；仅在 [AgentTurnJournalStatus.FINAL] 时有意义，`null` 表示成功但无需回复。
+ */
+@Serializable
+data class AgentTurnJournalEntry(
+    val updateId: Long,
+    val chatId: String,
+    val replyParameters: ReplyParameters? = null,
+    val status: AgentTurnJournalStatus,
+    val reply: String? = null,
+)
+
+/** Agent 回合持久化账本的状态。 */
+@Serializable
+enum class AgentTurnJournalStatus {
+    /** 已安全占有回合，但尚未允许重放 Agent 或其工具调用。 */
+    IN_PROGRESS,
+
+    /** 回合结果已经持久化，可仅重试 outbox 与偏移量提交。 */
+    FINAL,
+}
+
+/** 一次持久化 Agent 回合占有的结果。 */
+internal sealed interface AgentTurnClaim {
+    /** 当前调用方已持久化占有一个新回合，可以紧邻地调用一次 Agent。 */
+    data object CLAIMED : AgentTurnClaim
+
+    /** 回合已有最终结果，调用方只能重试提交该结果，不能再进入 Agent。 */
+    data class FINAL(val entry: AgentTurnJournalEntry) : AgentTurnClaim
+
+    /** 记录来自失联进程或已结束 owner；调用方必须先降级为失败结果。 */
+    data class InProgress(val entry: AgentTurnJournalEntry) : AgentTurnClaim
+
+    /** 更新偏移量已确认，调用方不再执行或提交该回合。 */
+    data object AlreadyConfirmed : AgentTurnClaim
+}
 
 /**
  * 已由 Agent 生成、等待 Telegram 接受的回复。
  *
  * 每个机器人内同一 [updateId] 最多保留一项。回复以至少一次语义投递：网络结果不确定或 Telegram
- * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。
+ * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。每次网络投递前都会先持久化
+ * [deliveryAttempts]，因此进程在请求中断后可能少于该次数实际发送，但绝不会突破回退消息的投递上限。
  *
  * @property updateId 生成该回复的 Telegram 更新标识；必须为非负数，且在同一机器人 outbox 中唯一。
  * @property chatId 回复目标聊天标识；不能为空。
  * @property text 要投递的非空回复文本。
  * @property replyParameters 可选的原消息回复参数；为 `null` 时发送独立消息。
+ * @property deliveryStage 当前投递阶段；旧文件缺少该字段时默认为 [TelegramReplyDeliveryStage.ORIGINAL]。
+ * @property deliveryAttempts 当前 [deliveryStage] 已持久化的投递次数；必须为非负数，切换阶段时归零。
+ * @property permanentRejectionCount 原文阶段连续出现的永久 `4xx` 拒绝次数；仅
+ * [TelegramReplyDeliveryStage.ORIGINAL] 使用且取值只能为 `0` 或 `1`。任一可重试失败都会将其清零，
+ * 旧文件缺少该字段时默认为 `0`。
  */
 @Serializable
 data class PendingTelegramReply(
@@ -53,7 +112,25 @@ data class PendingTelegramReply(
     val chatId: String,
     val text: String,
     val replyParameters: ReplyParameters? = null,
+    val deliveryStage: TelegramReplyDeliveryStage = TelegramReplyDeliveryStage.ORIGINAL,
+    val deliveryAttempts: Int = 0,
+    val permanentRejectionCount: Int = 0,
 )
+
+/**
+ * 等待投递的 Telegram 回复所处的阶段。
+ *
+ * 原文收到两次连续的永久 `4xx` 拒绝后会切换到 [FALLBACK]；可重试失败会清除原文的连续拒绝计数。回退消息
+ * 始终作为不引用原消息的独立消息发送。
+ */
+@Serializable
+enum class TelegramReplyDeliveryStage {
+    /** 投递 Agent 生成的原始回复；连续永久拒绝计数最多为 `1`。 */
+    ORIGINAL,
+
+    /** 投递说明原始回复未能发送的固定回退消息。 */
+    FALLBACK,
+}
 
 /**
  * 所有机器人的更新处理状态。
@@ -253,9 +330,7 @@ class UpdatesRepository private constructor(
     ): UpdatesData {
         require(updateId >= 0) { "updateId must not be negative." }
         reply?.let {
-            require(it.updateId == updateId) { "reply updateId must match updateId." }
-            require(it.chatId.isNotBlank()) { "reply chatId must not be blank." }
-            require(it.text.isNotBlank()) { "reply text must not be blank." }
+            validatePendingTelegramReply(it, updateId)
         }
         return updateData(botId) { current ->
             val replies = when {
@@ -268,6 +343,195 @@ class UpdatesRepository private constructor(
                 pendingTelegramReplies = replies,
             )
         }
+    }
+
+    /**
+     * 只读获取一项 Agent 回合账本记录。
+     *
+     * 该方法不会迁移旧格式或清理记录，便于轮询器在 AI 可用性、授权等接纳判断之前优先调和已持久化的
+     * FINAL 或 IN_PROGRESS，避免后续偏移量确认覆盖尚未提交的回合。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要查询的 Telegram 更新标识；必须为非负数。
+     * @return 对应账本记录的不可变快照；不存在或 bot 无效时返回 `null`。
+     * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
+     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     */
+    @Synchronized
+    internal fun findAgentTurn(botId: String, updateId: Long): AgentTurnJournalEntry? {
+        require(updateId >= 0) { "updateId must not be negative." }
+        if (!botId.isValidBotId()) {
+            return null
+        }
+        ensureStorageValidatedBeforeMutation()
+        val entry = state.bots[botId]?.agentTurnJournal?.singleOrNull { it.updateId == updateId }
+        entry?.let(::validateAgentTurnJournalEntry)
+        return entry
+    }
+
+    /**
+     * 在调用 Agent 前持久化占有一项回合，或返回其已有的不可重放状态。
+     *
+     * 该方法是同一仓储实例内的原子读改写操作。它绝不会把已有的 [AgentTurnJournalStatus.IN_PROGRESS]
+     * 直接交给 Agent 重放；调用方必须结合本地 owner 判定该回合是否仍在运行，并将失联回合降级为失败。
+     * 已确认更新的残留 FINAL 账本会在本次调用中安全回收。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要占有的 Telegram 更新标识；必须为非负数。
+     * @param chatId 最终回复的聊天标识；不能为空。
+     * @param replyParameters 可选的原消息回复参数；可以为 `null`。
+     * @return 新占有的 [AgentTurnClaim.CLAIMED]、已有 FINAL 或 IN_PROGRESS 状态；偏移量已确认时返回
+     * [AgentTurnClaim.AlreadyConfirmed]。
+     * @throws IllegalArgumentException 当输入不满足账本约束时抛出。
+     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws Exception 当状态无法原子写入时抛出；调用方不得进入 Agent。
+     */
+    @Synchronized
+    internal fun claimAgentTurn(
+        botId: String,
+        updateId: Long,
+        chatId: String,
+        replyParameters: ReplyParameters?,
+    ): AgentTurnClaim {
+        require(updateId >= 0) { "updateId must not be negative." }
+        require(chatId.isNotBlank()) { "chatId must not be blank." }
+        if (!botId.isValidBotId()) {
+            return AgentTurnClaim.AlreadyConfirmed
+        }
+        ensureStorageValidatedBeforeMutation()
+        migrateLegacyDataIfNeeded(botId)
+        val current = state.bots[botId] ?: UpdatesData()
+        val existing = current.agentTurnJournal.singleOrNull { it.updateId == updateId }
+        if (existing != null) {
+            validateAgentTurnJournalEntry(existing, updateId)
+            if (existing.status == AgentTurnJournalStatus.FINAL && updateId <= current.lastUpdateId) {
+                saveState(
+                    state.copy(
+                        bots = state.bots + (
+                                botId to current.copy(
+                                    agentTurnJournal = current.agentTurnJournal.filterNot { it.updateId == updateId },
+                                )
+                                ),
+                    ),
+                )
+                return AgentTurnClaim.AlreadyConfirmed
+            }
+            return when (existing.status) {
+                AgentTurnJournalStatus.IN_PROGRESS -> AgentTurnClaim.InProgress(existing)
+                AgentTurnJournalStatus.FINAL -> AgentTurnClaim.FINAL(existing)
+            }
+        }
+        if (updateId <= current.lastUpdateId) {
+            return AgentTurnClaim.AlreadyConfirmed
+        }
+        val claimed = AgentTurnJournalEntry(
+            updateId = updateId,
+            chatId = chatId,
+            replyParameters = replyParameters,
+            status = AgentTurnJournalStatus.IN_PROGRESS,
+        )
+        saveState(
+            state.copy(
+                bots = state.bots + (botId to current.copy(agentTurnJournal = current.agentTurnJournal + claimed)),
+            ),
+        )
+        return AgentTurnClaim.CLAIMED
+    }
+
+    /**
+     * 将已占有的 Agent 回合原子转为最终结果。
+     *
+     * 只有完全匹配的进行中记录才能转为 FINAL，防止迟到 owner 覆盖已降级或已完成的结果。成功返回后，
+     * 调用方可以重试 [completeAgentUpdate]，而绝不能再次调用 Agent。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要完成的 Telegram 更新标识；必须为非负数。
+     * @param reply 最终 Agent 回复；`null` 表示无需发送回复。
+     * @return 写入后的 FINAL 记录；记录不存在、已完成或 bot 无效时返回 `null`。
+     * @throws IllegalArgumentException 当更新标识或回复不满足账本约束时抛出。
+     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws Exception 当状态无法原子写入时抛出。
+     */
+    @Synchronized
+    internal fun finalizeAgentTurn(
+        botId: String,
+        updateId: Long,
+        reply: String?,
+    ): AgentTurnJournalEntry? {
+        require(updateId >= 0) { "updateId must not be negative." }
+        validateAgentTurnReply(reply)
+        if (!botId.isValidBotId()) {
+            return null
+        }
+        ensureStorageValidatedBeforeMutation()
+        migrateLegacyDataIfNeeded(botId)
+        val current = state.bots[botId] ?: return null
+        val entryIndex = current.agentTurnJournal.indexOfFirst { it.updateId == updateId }
+        if (entryIndex < 0) {
+            return null
+        }
+        val existing = current.agentTurnJournal[entryIndex]
+        validateAgentTurnJournalEntry(existing, updateId)
+        if (existing.status != AgentTurnJournalStatus.IN_PROGRESS) {
+            return null
+        }
+        val finalized = existing.copy(status = AgentTurnJournalStatus.FINAL, reply = reply)
+        val journal = current.agentTurnJournal.toMutableList().also { it[entryIndex] = finalized }
+        saveState(state.copy(bots = state.bots + (botId to current.copy(agentTurnJournal = journal))))
+        return finalized
+    }
+
+    /**
+     * 将失联的进行中 Agent 回合原子降级为固定失败回复。
+     *
+     * 调用方只可在不存在本地 owner 时调用；该规则使崩溃、Agent 异常和 FINAL 写入失败都 fail-closed，
+     * 不会自动重放任何模型或工具副作用。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要降级的 Telegram 更新标识；必须为非负数。
+     * @param failureReply 用于最终 outbox 的固定非空失败回复。
+     * @return 已持久化的 FINAL 记录；记录不存在、已不是进行中状态或 bot 无效时返回 `null`。
+     * @throws IllegalArgumentException 当输入不满足账本约束时抛出。
+     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws Exception 当状态无法原子写入时抛出。
+     */
+    @Synchronized
+    internal fun failInProgressAgentTurn(
+        botId: String,
+        updateId: Long,
+        failureReply: String,
+    ): AgentTurnJournalEntry? {
+        require(failureReply.isNotBlank()) { "failureReply must not be blank." }
+        return finalizeAgentTurn(botId, updateId, failureReply)
+    }
+
+    /**
+     * 删除已由偏移量确认的 FINAL Agent 回合残留。
+     *
+     * 删除失败不改变已确认更新或 outbox；后续会话可再次调用本方法安全回收。进行中记录永远不会被此方法删除。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @return 本次删除的记录数量；bot 无效或没有可回收记录时返回 `0`。
+     * @throws IllegalStateException 当更新状态文件不能安全读取或恢复时抛出。
+     * @throws Exception 当状态无法原子写入时抛出。
+     */
+    @Synchronized
+    internal fun cleanupConfirmedAgentTurns(botId: String): Int {
+        if (!botId.isValidBotId()) {
+            return 0
+        }
+        ensureStorageValidatedBeforeMutation()
+        migrateLegacyDataIfNeeded(botId)
+        val current = state.bots[botId] ?: return 0
+        val remaining = current.agentTurnJournal.filterNot { entry ->
+            validateAgentTurnJournalEntry(entry)
+            entry.status == AgentTurnJournalStatus.FINAL && entry.updateId <= current.lastUpdateId
+        }
+        val removed = current.agentTurnJournal.size - remaining.size
+        if (removed > 0) {
+            saveState(state.copy(bots = state.bots + (botId to current.copy(agentTurnJournal = remaining))))
+        }
+        return removed
     }
 
     /**
@@ -287,6 +551,96 @@ class UpdatesRepository private constructor(
             .filter { it.updateId <= data.lastUpdateId }
             .sortedBy { it.updateId }
             .toList()
+    }
+
+    /**
+     * 为一项待投递回复持久化登记下一次网络投递。
+     *
+     * 登记与读取、修改和文件提交在同一仓储锁内完成；文件提交失败时不会返回可发送记录。处于回退阶段且
+     * 已登记三次投递的记录会在本次调用中删除，并返回 `null`，使调用方可以继续处理下一项回复。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param updateId 要登记投递的回复所属更新标识；必须为非负数。
+     * @return 已把 [PendingTelegramReply.deliveryAttempts] 加一并持久化的回复；不存在记录、bot 无效或回退次数
+     * 耗尽并已删除时返回 `null`。
+     * @throws IllegalArgumentException 当 [updateId] 为负数，或存储中的目标回复违反投递阶段约束时抛出。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
+     */
+    @Synchronized
+    internal fun preparePendingTelegramReplyDelivery(botId: String, updateId: Long): PendingTelegramReply? {
+        require(updateId >= 0) { "updateId must not be negative." }
+        if (!botId.isValidBotId()) {
+            return null
+        }
+        ensureStorageValidatedBeforeMutation()
+        migrateLegacyDataIfNeeded(botId)
+
+        val current = state.bots[botId] ?: return null
+        val replyIndex = current.pendingTelegramReplies.indexOfFirst { it.updateId == updateId }
+        if (replyIndex < 0) {
+            return null
+        }
+        val reply = current.pendingTelegramReplies[replyIndex]
+        validatePendingTelegramReply(reply, updateId)
+        if (reply.deliveryStage == TelegramReplyDeliveryStage.FALLBACK &&
+            reply.deliveryAttempts >= MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
+        ) {
+            saveState(
+                state.copy(
+                    bots = state.bots + (
+                            botId to current.copy(
+                                pendingTelegramReplies = current.pendingTelegramReplies.filterNot { it.updateId == updateId },
+                            )
+                            ),
+                ),
+            )
+            return null
+        }
+        require(reply.deliveryAttempts < Int.MAX_VALUE) { "reply deliveryAttempts must be below Int.MAX_VALUE." }
+        val prepared = reply.copy(deliveryAttempts = reply.deliveryAttempts + 1)
+        val replies = current.pendingTelegramReplies.toMutableList().also { it[replyIndex] = prepared }
+        saveState(state.copy(bots = state.bots + (botId to current.copy(pendingTelegramReplies = replies))))
+        return prepared
+    }
+
+    /**
+     * 以匹配的现有快照原子替换一项待投递回复。
+     *
+     * 只有当前记录与 [expected] 完全相等时才提交 [replacement]，从而不会以迟到网络响应覆盖已被其他会话
+     * 更新的投递阶段或次数。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param expected 网络请求前已持久化的回复快照；其更新标识必须非负数。
+     * @param replacement 要替换为的回复；其更新标识、聊天标识和阶段计数约束必须与 [expected] 一致。
+     * @return 仅当匹配并已持久化替换时为 `true`；bot 无效或记录已变化、不存在时为 `false`。
+     * @throws IllegalArgumentException 当 [expected] 或 [replacement] 违反回复约束，或更新标识不一致时抛出。
+     * @throws IllegalStateException 配置文件、备份不可安全恢复或暂不可读取时抛出；内存状态不变。
+     * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
+     */
+    @Synchronized
+    internal fun replacePendingTelegramReply(
+        botId: String,
+        expected: PendingTelegramReply,
+        replacement: PendingTelegramReply,
+    ): Boolean {
+        validatePendingTelegramReply(expected)
+        validatePendingTelegramReply(replacement, expected.updateId)
+        require(replacement.chatId == expected.chatId) { "replacement chatId must match expected reply." }
+        if (!botId.isValidBotId()) {
+            return false
+        }
+        ensureStorageValidatedBeforeMutation()
+        migrateLegacyDataIfNeeded(botId)
+
+        val current = state.bots[botId] ?: return false
+        val replyIndex = current.pendingTelegramReplies.indexOfFirst { it == expected }
+        if (replyIndex < 0) {
+            return false
+        }
+        val replies = current.pendingTelegramReplies.toMutableList().also { it[replyIndex] = replacement }
+        saveState(state.copy(bots = state.bots + (botId to current.copy(pendingTelegramReplies = replies))))
+        return true
     }
 
     /**
@@ -347,6 +701,43 @@ class UpdatesRepository private constructor(
         beforeSaveForTesting(newState)
         storage.commit(ConfigJson.encodeToString(newState).toByteArray(StandardCharsets.UTF_8))
         state = newState
+    }
+
+    private fun validatePendingTelegramReply(reply: PendingTelegramReply, expectedUpdateId: Long? = null) {
+        expectedUpdateId?.let { require(reply.updateId == it) { "reply updateId must match updateId." } }
+        require(reply.updateId >= 0) { "reply updateId must not be negative." }
+        require(reply.chatId.isNotBlank()) { "reply chatId must not be blank." }
+        require(reply.text.isNotBlank()) { "reply text must not be blank." }
+        require(reply.deliveryAttempts >= 0) { "reply deliveryAttempts must not be negative." }
+        require(reply.permanentRejectionCount >= 0) { "reply permanentRejectionCount must not be negative." }
+        when (reply.deliveryStage) {
+            TelegramReplyDeliveryStage.ORIGINAL -> {
+                require(reply.permanentRejectionCount <= 1) {
+                    "original reply permanentRejectionCount must not exceed one."
+                }
+            }
+
+            TelegramReplyDeliveryStage.FALLBACK -> {
+                require(reply.replyParameters == null) { "fallback reply must not use replyParameters." }
+                require(reply.permanentRejectionCount == 0) {
+                    "fallback reply permanentRejectionCount must be zero."
+                }
+            }
+        }
+    }
+
+    private fun validateAgentTurnJournalEntry(entry: AgentTurnJournalEntry, expectedUpdateId: Long? = null) {
+        expectedUpdateId?.let { require(entry.updateId == it) { "agent turn updateId must match updateId." } }
+        require(entry.updateId >= 0) { "agent turn updateId must not be negative." }
+        require(entry.chatId.isNotBlank()) { "agent turn chatId must not be blank." }
+        validateAgentTurnReply(entry.reply)
+        when (entry.status) {
+            AgentTurnJournalStatus.IN_PROGRESS -> {
+                require(entry.reply == null) { "in-progress agent turn must not contain a reply." }
+            }
+
+            AgentTurnJournalStatus.FINAL -> Unit
+        }
     }
 
     internal data class LoadedUpdates(
@@ -428,10 +819,10 @@ class UpdatesRepository private constructor(
             if (content.isBlank()) {
                 throw IllegalArgumentException("Updates data must not be blank")
             }
-            return when (val root = ConfigJson.parseToJsonElement(content)) {
+            val decoded = when (val root = ConfigJson.parseToJsonElement(content)) {
                 is JsonArray -> LoadedUpdates(
                     BotUpdatesData(),
-                    UpdatesData(chats = ConfigJson.decodeFromString<List<ChatInfo>>(content)),
+                    UpdatesData(chats = ConfigJson.decodeFromString(content)),
                 )
 
                 is JsonObject -> {
@@ -446,6 +837,27 @@ class UpdatesRepository private constructor(
 
                 else -> throw IllegalArgumentException("Unsupported updates data format")
             }
+            decoded.state.bots.forEach { (_, updates) -> validateAgentTurnJournal(updates.agentTurnJournal) }
+            decoded.legacyData?.let { legacy -> validateAgentTurnJournal(legacy.agentTurnJournal) }
+            return decoded
+        }
+    }
+}
+
+private fun validateAgentTurnReply(reply: String?) {
+    require(reply == null || reply.isNotBlank()) { "agent turn reply must not be blank when present." }
+}
+
+private fun validateAgentTurnJournal(entries: List<AgentTurnJournalEntry>) {
+    require(entries.map { it.updateId }.distinct().size == entries.size) {
+        "agent turn journal update IDs must be unique."
+    }
+    entries.forEach { entry ->
+        require(entry.updateId >= 0) { "agent turn updateId must not be negative." }
+        require(entry.chatId.isNotBlank()) { "agent turn chatId must not be blank." }
+        validateAgentTurnReply(entry.reply)
+        if (entry.status == AgentTurnJournalStatus.IN_PROGRESS) {
+            require(entry.reply == null) { "in-progress agent turn must not contain a reply." }
         }
     }
 }

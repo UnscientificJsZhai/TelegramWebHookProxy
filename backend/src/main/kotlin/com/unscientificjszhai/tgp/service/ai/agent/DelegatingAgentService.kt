@@ -407,6 +407,20 @@ class DelegatingAgentService @Inject constructor(
     }
 
     /**
+     * 在唯一一次模型切换屏障准入中，将当前底层服务交给调用方完成完整操作。
+     *
+     * [block] 只能在本次同步作用域内使用传入服务，不得将服务逸出到后台任务、返回值或字段，也不得再次
+     * 对该服务调用 [withReadyService]。这样切换会一直等待 [block] 完成，且不会因嵌套屏障而死锁。
+     *
+     * @param T [block] 的返回类型。
+     * @param block 在屏障已准入时使用当前底层服务的挂起代码块。
+     * @return [block] 的返回值。
+     */
+    override suspend fun <T> withReadyService(block: suspend (AgentService) -> T): T {
+        return modelSwitchBarrier.runWhenReady { block(currentService) }
+    }
+
+    /**
      * 等待模型切换完成后，将消息转发给当前底层代理。
      *
      * @param text 可选的配文或指令内容；为 `null` 时仅发送 [mediaData]。
@@ -421,9 +435,7 @@ class DelegatingAgentService @Inject constructor(
      * @throws CancellationException 当模型切换屏障、当前代理或调用协程被取消时原样抛出。
      */
     override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String {
-        return modelSwitchBarrier.runWhenReady {
-            currentService.sendMessage(text, mediaData)
-        }
+        return withReadyService { readyService -> readyService.sendMessage(text, mediaData) }
     }
 
     /**

@@ -18,6 +18,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -191,6 +192,51 @@ class UpdatesRepositoryTest {
         assertTrue(UpdatesRepository(aheadFile).getPendingTelegramReplies("100").isEmpty())
     }
 
+    /** 验证旧 outbox JSON 的回复默认使用原文阶段和零次投递，并在重启后保留新的投递状态。 */
+    @Test
+    fun `legacy outbox reply defaults delivery state and persists it across restart`() {
+        val file = tempDirectory.resolve("legacy-outbox-delivery-state.json")
+        file.writeText(
+            """
+            {
+              "bots": {
+                "100": {
+                  "chats": [],
+                  "lastUpdateId": 11,
+                  "pendingTelegramReplies": [
+                    {
+                      "updateId": 11,
+                      "chatId": "chat",
+                      "text": "original",
+                      "replyParameters": { "message_id": 1 }
+                    }
+                  ]
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+        val repository = UpdatesRepository(file)
+
+        val legacyReply = repository.getPendingTelegramReplies("100").single()
+        assertEquals(TelegramReplyDeliveryStage.ORIGINAL, legacyReply.deliveryStage)
+        assertEquals(0, legacyReply.deliveryAttempts)
+        assertEquals(0, legacyReply.permanentRejectionCount)
+
+        val prepared = requireNotNull(repository.preparePendingTelegramReplyDelivery("100", 11))
+        assertEquals(1, prepared.deliveryAttempts)
+        val fallback = prepared.copy(
+            text = "抱歉，上一条回复未能发送。",
+            replyParameters = null,
+            deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
+            deliveryAttempts = 0,
+            permanentRejectionCount = 0,
+        )
+        assertTrue(repository.replacePendingTelegramReply("100", prepared, fallback))
+
+        assertEquals(fallback, UpdatesRepository(file).getPendingTelegramReplies("100").single())
+    }
+
     /** 验证 outbox 原子提交失败时不会污染内存状态或错误推进偏移量。 */
     @Test
     fun `failed outbox completion leaves in memory state unchanged`() {
@@ -203,6 +249,78 @@ class UpdatesRepositoryTest {
 
         assertEquals(0, repository.getData("100").lastUpdateId)
         assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
+    }
+
+    /** 验证 Agent 回合账本跨重载保留状态，并只在偏移量确认后删除 FINAL 残留。 */
+    @Test
+    fun `agent turn journal persists final state and cleans it after confirmed offset`() {
+        val file = tempDirectory.resolve("agent-turn-journal.json")
+        val repository = UpdatesRepository(file)
+
+        assertEquals(
+            AgentTurnClaim.CLAIMED,
+            repository.claimAgentTurn("100", 11, "chat", ReplyParameters(1)),
+        )
+        assertEquals(
+            AgentTurnClaim.InProgress(
+                AgentTurnJournalEntry(11, "chat", ReplyParameters(1), AgentTurnJournalStatus.IN_PROGRESS),
+            ),
+            UpdatesRepository(file).claimAgentTurn("100", 11, "chat", ReplyParameters(1)),
+        )
+
+        val final = assertNotNull(repository.finalizeAgentTurn("100", 11, "reply"))
+        assertEquals(AgentTurnJournalStatus.FINAL, final.status)
+        assertEquals("reply", final.reply)
+        assertEquals(final, UpdatesRepository(file).getData("100").agentTurnJournal.single())
+
+        repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", "reply", ReplyParameters(1)))
+        assertEquals(1, repository.cleanupConfirmedAgentTurns("100"))
+        assertTrue(UpdatesRepository(file).getData("100").agentTurnJournal.isEmpty())
+    }
+
+    /** 验证损坏的 Agent 回合账本无法 claim，避免在不可信状态下重放 Agent 或工具。 */
+    @Test
+    fun `corrupt agent turn journal fails closed before claim`() {
+        val file = tempDirectory.resolve("corrupt-agent-turn-journal.json")
+        file.writeText(
+            """
+            {
+              "bots": {
+                "100": {
+                  "chats": [],
+                  "lastUpdateId": 0,
+                  "pendingTelegramReplies": [],
+                  "agentTurnJournal": [
+                    {
+                      "updateId": 11,
+                      "chatId": "chat",
+                      "status": "IN_PROGRESS",
+                      "reply": "must-not-exist"
+                    }
+                  ]
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+        val repository = UpdatesRepository(file)
+
+        assertFailsWith<IllegalStateException> {
+            repository.claimAgentTurn("100", 12, "chat", ReplyParameters(2))
+        }
+        assertTrue(file.readText().contains("must-not-exist"))
+    }
+
+    /** 验证 claim 原子写失败时不遗留进行中账本，也不会错误允许调用方进入 Agent。 */
+    @Test
+    fun `agent turn claim write failure leaves no journal state`() {
+        val file = tempDirectory.resolve("failed-agent-turn-claim.json")
+        val repository = UpdatesRepository(file) { throw IOException("injected journal write failure") }
+
+        assertFailsWith<IOException> {
+            repository.claimAgentTurn("100", 11, "chat", ReplyParameters(1))
+        }
+        assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
     }
 
     /**

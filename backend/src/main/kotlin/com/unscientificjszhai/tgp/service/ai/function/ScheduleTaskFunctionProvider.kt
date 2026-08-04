@@ -18,7 +18,10 @@ import javax.inject.Provider
 /**
  * 提供创建、查询和取消 AI 定时任务的模型函数。
  *
- * 所有任务操作均委托给 [TaskSchedulerService]。创建任务时使用当前 AI 设置中的代理会话标识。
+ * 所有任务操作均委托给 [TaskSchedulerService]。创建任务时使用当前 AI 设置中的代理会话标识。到期实例由调度器在
+ * Agent 与 Telegram 副作用前原子预消费：单次任务删除，循环任务推进到一个未来时刻；因此崩溃、失败或取消
+ * 不会重放该次，但提交与副作用之间中断可能遗漏一次执行。绝对时间和日/周循环均解释为服务器时区，错过的
+ * 循环周期不会逐期追赶。
  *
  * @param taskSchedulerService 延迟提供定时任务调度服务，以避免初始化循环依赖。
  * @param settingsRepository 提供创建任务所需代理会话标识的设置仓库。

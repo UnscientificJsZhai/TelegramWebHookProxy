@@ -193,6 +193,20 @@ abstract class AgentService {
     abstract suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String
 
     /**
+     * 在当前可安全使用的服务实例上执行一个完整的挂起操作。
+     *
+     * 默认实现将当前服务实例传给 [block]。委派实现会在其模型切换屏障内选择当前底层服务，因而调用方可将
+     * 一个需要与服务选择保持一致的完整操作放入同一个作用域。`block` 只能在同步作用域内使用传入的服务，
+     * 不得将它逸出到返回值、字段、后台协程或其他延后执行的位置，也不得对传入服务递归委派本方法；否则
+     * 会破坏实现提供的就绪和生命周期保证。
+     *
+     * @param T [block] 的返回类型。
+     * @param block 使用本次选定服务完成操作的挂起代码块；不得逸出或递归委派传入的服务。
+     * @return [block] 的返回值。
+     */
+    internal open suspend fun <T> withReadyService(block: suspend (AgentService) -> T): T = block(this)
+
+    /**
      * 异步关闭服务并释放资源。
      *
      * @return 有异步清理工作时返回对应任务；无需清理时返回 `null`。调用方可等待该任务作为服务重建屏障。

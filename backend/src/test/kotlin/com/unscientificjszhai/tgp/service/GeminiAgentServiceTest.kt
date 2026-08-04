@@ -17,6 +17,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
 import io.mockk.coEvery
 import io.mockk.every
@@ -26,6 +27,7 @@ import io.mockk.verify
 import kotlinx.coroutines.*
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.put
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -684,6 +686,53 @@ class GeminiAgentServiceTest {
         assertEquals(listOf("missing_one", "missing_two"), functionResponses.map { it.name().get() })
         assertEquals("Function missing_one not found", functionResponses[0].response().get()["error"])
         assertEquals("Function missing_two not found", functionResponses[1].response().get()["error"])
+    }
+
+    /** 验证工具成功但后续 Gemini 模型请求失败时，外部副作用已发生而会话历史不会提交。 */
+    @Test
+    fun `Gemini model failure after successful tool keeps side effect and prior history`() = runTest {
+        val activeChat = mockk<Chat>()
+        val firstCandidate = mockk<Chat>()
+        val secondCandidate = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val providerCalls = mutableListOf<String>()
+        val provider = object : LocalFunctionProvider() {
+            override val providedFunctions: List<FunctionDeclaration> = listOf(
+                FunctionDeclaration.builder()
+                    .name("observable_side_effect")
+                    .parameters(Schema.fromJson("""{"type":"OBJECT"}"""))
+                    .build(),
+            )
+
+            override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
+                providerCalls += functionName
+                return buildJsonObject { put("status", "created") }
+            }
+        }
+        val functionCall = FunctionCall.builder()
+            .id("side-effect-call")
+            .name("observable_side_effect")
+            .args(emptyMap())
+            .build()
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany listOf(
+            firstCandidate,
+            secondCandidate
+        )
+        every { firstCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.builder().functionCall(functionCall).build(),
+        )
+        every { secondCandidate.sendMessage(any<List<Content>>()) } throws IllegalStateException("upstream failure")
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("localFunctionProviders", listOf(provider))
+        setPrivateField("chatFunctionRouteSnapshot", LocalFunctionRouter(listOf(provider)).refresh())
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
+
+        assertFailsWith<IllegalStateException> { service.sendMessage("执行副作用") }
+        assertEquals(listOf("observable_side_effect"), providerCalls)
+        assertSame(activeChat, privateField("chat"))
+        assertEquals(emptyList<Content>(), privateField("savedHistory"))
     }
 
     /**

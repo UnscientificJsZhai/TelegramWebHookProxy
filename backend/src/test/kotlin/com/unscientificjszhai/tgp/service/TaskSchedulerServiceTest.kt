@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.calculateNextExecutionTime
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -23,6 +24,10 @@ import kotlinx.coroutines.test.runTest
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
+import java.time.Clock
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
 import javax.inject.Provider
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.io.path.createTempDirectory
@@ -44,6 +49,7 @@ class TaskSchedulerServiceTest {
     fun setup() {
         telegramService = mockk()
         agentService = mockk()
+        allowReadyServiceScope(agentService)
 
         val agentProvider = Provider { agentService }
         val testScope = CoroutineScope(EmptyCoroutineContext)
@@ -179,10 +185,10 @@ class TaskSchedulerServiceTest {
     }
 
     /**
-     * 验证任务已经执行但后续保存失败时仍留在内存中以便至少一次重试。
+     * 验证副作用前的预提交失败不会调用代理，恢复存储后才会执行一次。
      */
     @Test
-    fun `post execution persistence failure retains task for retry`() = runTest {
+    fun `precommit failure retains task without calling agent until storage recovers`() = runTest {
         val taskId = service.createTask("due", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         service.close()
         service = TaskSchedulerService(
@@ -198,8 +204,167 @@ class TaskSchedulerServiceTest {
 
         service.scanAndExecute()
 
-        coVerify { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
         assertEquals(listOf(taskId), service.listTasks().map { it.id })
+
+        service.close()
+        service = newService(scheduleFile)
+        service.scanAndExecute()
+
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+        assertTrue(service.listTasks().isEmpty())
+    }
+
+    /**
+     * 验证一次性任务在预消费后即使 Agent 回合失败并重启服务，也不会被重新调用。
+     */
+    @Test
+    fun `restarting after a precommitted failed turn does not replay the task`() = runTest {
+        service.createTask("no replay after restart", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        coEvery { agentService.sendMessage(any()) } throws AgentTurnFailedException("failed after commit")
+
+        service.scanAndExecute()
+        service.close()
+        service = newService(scheduleFile)
+
+        service.scanAndExecute()
+
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+        assertTrue(service.listTasks().isEmpty())
+    }
+
+    /**
+     * 验证历史周期跳过、DST 解析和不可表示的时间都使用有界且确定的下一次计算。
+     */
+    @Test
+    fun `next execution calculation skips history and resolves DST deterministically`() {
+        val newYork = ZoneId.of("America/New_York")
+        val hourlyNow = Instant.parse("2025-01-01T00:00:00Z")
+        val millionHoursAgo = hourlyNow.minusSeconds(1_000_000L * 60L * 60L)
+        val hourlyNext = requireNotNull(
+            calculateNextExecutionTime(millionHoursAgo.toEpochMilli(), LoopMode.HOURLY, hourlyNow, newYork),
+        )
+        assertEquals(hourlyNow.toEpochMilli() + 60L * 60L * 1000L, hourlyNext)
+
+        val gapLast = LocalDateTime.of(2024, 3, 9, 2, 30).atZone(newYork).toInstant()
+        val gapNow = Instant.parse("2024-03-10T06:30:00Z")
+        val gapNext = Instant.ofEpochMilli(
+            requireNotNull(calculateNextExecutionTime(gapLast.toEpochMilli(), LoopMode.DAILY, gapNow, newYork)),
+        )
+        assertEquals(Instant.parse("2024-03-10T07:00:00Z"), gapNext)
+
+        val overlapLast = LocalDateTime.of(2024, 11, 2, 1, 30).atZone(newYork).toInstant()
+        val overlapNow = Instant.parse("2024-11-03T04:00:00Z")
+        val overlapNext = Instant.ofEpochMilli(
+            requireNotNull(calculateNextExecutionTime(overlapLast.toEpochMilli(), LoopMode.DAILY, overlapNow, newYork)),
+        )
+        assertEquals(Instant.parse("2024-11-03T05:30:00Z"), overlapNext)
+
+        val weeklyLast = LocalDateTime.of(2024, 1, 1, 9, 0).atZone(newYork).toInstant()
+        val weeklyNow = Instant.parse("2024-01-14T15:00:00Z")
+        val weeklyNext = Instant.ofEpochMilli(
+            requireNotNull(calculateNextExecutionTime(weeklyLast.toEpochMilli(), LoopMode.WEEKLY, weeklyNow, newYork)),
+        )
+        assertEquals(Instant.parse("2024-01-15T14:00:00Z"), weeklyNext)
+
+        assertEquals(null, calculateNextExecutionTime(Long.MIN_VALUE, LoopMode.HOURLY, hourlyNow, newYork))
+    }
+
+    /**
+     * 验证每日任务跨 spring gap 后会在下一日恢复创建时的本地锚点，且重启不会丢失该锚点。
+     */
+    @Test
+    fun `daily spring gap keeps its calendar anchor across restart`() = runTest {
+        val newYork = ZoneId.of("America/New_York")
+        val beforeGap = Clock.fixed(Instant.parse("2024-03-10T06:00:00Z"), newYork)
+        val afterGap = Clock.fixed(Instant.parse("2024-03-10T08:00:00Z"), newYork)
+        service.close()
+        service = newService(scheduleFile, clock = beforeGap, zoneId = newYork)
+        service.createTask(
+            "daily gap",
+            LocalDateTime.of(2024, 3, 9, 2, 30).atZone(newYork).toInstant().toEpochMilli(),
+            LoopMode.DAILY,
+            "12345",
+        )
+        coEvery { agentService.sendMessage(any()) } returns "done"
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
+
+        service.scanAndExecute()
+
+        val gapTask = service.listTasks().single()
+        assertEquals(Instant.parse("2024-03-10T07:00:00Z").toEpochMilli(), gapTask.executionTime)
+        assertEquals(2 * 60 * 60 * 1000 + 30 * 60 * 1000, gapTask.calendarAnchorTimeMillis)
+
+        service.close()
+        service = newService(scheduleFile, clock = afterGap, zoneId = newYork)
+        service.scanAndExecute()
+
+        val nextDayTask = service.listTasks().single()
+        assertEquals(Instant.parse("2024-03-11T06:30:00Z").toEpochMilli(), nextDayTask.executionTime)
+        assertEquals(gapTask.calendarAnchorTimeMillis, nextDayTask.calendarAnchorTimeMillis)
+    }
+
+    /**
+     * 验证缺少日历锚点的旧版 DAILY JSON 会在首次预消费时安全迁移并跨重启恢复原本地时刻。
+     */
+    @Test
+    fun `legacy daily JSON persists inferred calendar anchor across spring gap`() = runTest {
+        val newYork = ZoneId.of("America/New_York")
+        val beforeGap = Clock.fixed(Instant.parse("2024-03-10T06:00:00Z"), newYork)
+        val afterGap = Clock.fixed(Instant.parse("2024-03-10T08:00:00Z"), newYork)
+        val legacyExecutionTime = LocalDateTime.of(2024, 3, 9, 2, 30).atZone(newYork).toInstant().toEpochMilli()
+        service.close()
+        scheduleFile.writeText(
+            """[{"id":"legacy-daily","instruction":"legacy daily gap","executionTime":$legacyExecutionTime,"loopMode":"DAILY","agentChatId":"12345"}]""",
+        )
+        service = newService(scheduleFile, clock = beforeGap, zoneId = newYork)
+        coEvery { agentService.sendMessage(any()) } returns "done"
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
+
+        service.scanAndExecute()
+
+        val persistedGapTask = ConfigJson.decodeFromString<List<ScheduledTask>>(scheduleFile.readText()).single()
+        assertEquals(Instant.parse("2024-03-10T07:00:00Z").toEpochMilli(), persistedGapTask.executionTime)
+        assertEquals(2 * 60 * 60 * 1000 + 30 * 60 * 1000, persistedGapTask.calendarAnchorTimeMillis)
+
+        service.close()
+        service = newService(scheduleFile, clock = afterGap, zoneId = newYork)
+        service.scanAndExecute()
+
+        val nextDayTask = service.listTasks().single()
+        assertEquals(Instant.parse("2024-03-11T06:30:00Z").toEpochMilli(), nextDayTask.executionTime)
+        assertEquals(persistedGapTask.calendarAnchorTimeMillis, nextDayTask.calendarAnchorTimeMillis)
+    }
+
+    /**
+     * 验证每周任务跨 spring gap 后会在下一周恢复创建时的本地锚点。
+     */
+    @Test
+    fun `weekly spring gap keeps its calendar anchor for the next week`() = runTest {
+        val newYork = ZoneId.of("America/New_York")
+        val beforeGap = Clock.fixed(Instant.parse("2024-03-10T06:00:00Z"), newYork)
+        val afterGap = Clock.fixed(Instant.parse("2024-03-10T08:00:00Z"), newYork)
+        service.close()
+        service = newService(scheduleFile, clock = beforeGap, zoneId = newYork)
+        service.createTask(
+            "weekly gap",
+            LocalDateTime.of(2024, 3, 3, 2, 30).atZone(newYork).toInstant().toEpochMilli(),
+            LoopMode.WEEKLY,
+            "12345",
+        )
+        coEvery { agentService.sendMessage(any()) } returns "done"
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
+
+        service.scanAndExecute()
+        assertEquals(Instant.parse("2024-03-10T07:00:00Z").toEpochMilli(), service.listTasks().single().executionTime)
+
+        service.close()
+        service = newService(scheduleFile, clock = afterGap, zoneId = newYork)
+        service.scanAndExecute()
+
+        val nextWeekTask = service.listTasks().single()
+        assertEquals(Instant.parse("2024-03-17T06:30:00Z").toEpochMilli(), nextWeekTask.executionTime)
+        assertEquals(2 * 60 * 60 * 1000 + 30 * 60 * 1000, nextWeekTask.calendarAnchorTimeMillis)
     }
 
     /**
@@ -326,23 +491,27 @@ class TaskSchedulerServiceTest {
     }
 
     /**
-     * 验证未完成代理回合和普通代理异常都会保留一次性任务，以便后续扫描至少一次重试。
+     * 验证预消费后的 Agent 失败和普通异常不会重放一次性任务。
      */
     @Test
-    fun `failed agent turns keep one shot tasks for retry`() = runTest {
+    fun `failed agent turns and ordinary failures do not replay preconsumed tasks`() = runTest {
         val incompleteTask =
             service.createTask("incomplete", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } throws AgentTurnFailedException("未完成")
 
         service.scanAndExecute()
 
-        assertEquals(listOf(incompleteTask), service.listTasks().map { it.id })
+        assertTrue(service.listTasks().isEmpty())
         coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
 
+        service.scanAndExecute()
+        coVerify(exactly = 1) { agentService.sendMessage(match { it.contains(incompleteTask) || it.contains("incomplete") }) }
+
+        service.createTask("ordinary", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } throws IllegalStateException("ordinary failure")
         service.scanAndExecute()
 
-        assertEquals(listOf(incompleteTask), service.listTasks().map { it.id })
+        assertTrue(service.listTasks().isEmpty())
         coVerify(exactly = 2) { agentService.sendMessage(any()) }
     }
 
@@ -402,11 +571,11 @@ class TaskSchedulerServiceTest {
     }
 
     /**
-     * 验证结果投递期间的取消会向上传播，且不会推进已经完成的代理回合。
+     * 验证结果投递期间的取消会向上传播，但已经预消费的任务不会恢复。
      */
     @Test
-    fun `cancelled result delivery keeps one shot task for retry`() = runTest {
-        val taskId = service.createTask("delivery cancel", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+    fun `cancelled result delivery does not restore preconsumed one shot task`() = runTest {
+        service.createTask("delivery cancel", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } returns "done"
         coEvery {
             telegramService.sendMessageForToken(
@@ -419,20 +588,20 @@ class TaskSchedulerServiceTest {
 
         assertFailsWith<CancellationException> { service.scanAndExecute() }
 
-        assertEquals(listOf(taskId), service.listTasks().map { it.id })
+        assertTrue(service.listTasks().isEmpty())
     }
 
     /**
-     * 验证取消执行时会传播取消，且一次性任务不会被删除或推进。
+     * 验证取消执行时会传播取消，但一次性任务已经预消费且不会重试。
      */
     @Test
-    fun `cancelled task execution keeps one shot task for retry`() = runTest {
-        val taskId = service.createTask("cancel", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+    fun `cancelled task execution does not restore preconsumed one shot task`() = runTest {
+        service.createTask("cancel", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
         coEvery { agentService.sendMessage(any()) } throws CancellationException("cancelled")
 
         assertFailsWith<CancellationException> { service.scanAndExecute() }
 
-        assertEquals(listOf(taskId), service.listTasks().map { it.id })
+        assertTrue(service.listTasks().isEmpty())
     }
 
     /**
@@ -525,6 +694,8 @@ class TaskSchedulerServiceTest {
     private fun newService(
         file: File,
         fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
+        clock: Clock = Clock.systemDefaultZone(),
+        zoneId: ZoneId = ZoneId.systemDefault(),
     ): TaskSchedulerService = TaskSchedulerService(
         CoroutineScope(EmptyCoroutineContext),
         telegramService,
@@ -532,6 +703,8 @@ class TaskSchedulerServiceTest {
         settingsRepository,
         file,
         fileOperations,
+        clock = clock,
+        zoneId = zoneId,
     )
 
     private fun primaryReplaceFailingOperations(targetFile: File = scheduleFile): AtomicJsonFileOperations =
@@ -546,6 +719,13 @@ class TaskSchedulerServiceTest {
 
     private fun successfulTelegramResponse(): TelegramApiResponse =
         TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+
+    /** 让普通 Mock Agent 模拟 [AgentService] 默认的同步就绪作用域。 */
+    private fun allowReadyServiceScope(agent: AgentService) {
+        coEvery { agent.withReadyService<Any?>(any()) } coAnswers {
+            firstArg<suspend (AgentService) -> Any?>().invoke(agent)
+        }
+    }
 }
 
 private const val BOT_A_TOKEN = "100:token-a"
