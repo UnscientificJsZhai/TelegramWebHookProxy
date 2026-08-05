@@ -15,6 +15,7 @@ import com.unscientificjszhai.tgp.repository.RetryCheckpointCommitResult
 import com.unscientificjszhai.tgp.repository.RetryCheckpointGapResult
 import com.unscientificjszhai.tgp.repository.RetryCheckpointRecordResult
 import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
+import com.unscientificjszhai.tgp.repository.isPersistableTelegramUpdateId
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -611,7 +612,7 @@ class MessagePoller @Inject constructor(
     /**
      * 执行一次初始化或正常长轮询；每轮都从持久化快照决定唯一请求偏移量。
      *
-     * 尚未解决的 [RetryCheckpoint] 优先于 `lastUpdateId + 1`。检查点存在时禁止 `-1` 初始化，并且只有
+     * 尚未解决的 [RetryCheckpoint] 优先于经检查加一的 `lastUpdateId + 1`。检查点存在时禁止 `-1` 初始化，并且只有
      * 成功确认其精确目标、durable 调和或已审计的 Telegram gap 才能在同一次文件提交中清除它。
      */
     private suspend fun pollOnce(session: PollingSession): PollingAttempt {
@@ -630,6 +631,13 @@ class MessagePoller @Inject constructor(
             if (!initialResponse.ok) {
                 return PollingAttempt.ApiFailure(initialResponse)
             }
+            if (initialResponse.result.any { !isPersistableTelegramUpdateId(it.updateId) }) {
+                logger.error(
+                    "Initial Telegram response for bot {} contains an update ID outside the persistable offset range; retrying without a checkpoint.",
+                    session.botId,
+                )
+                return PollingAttempt.LocalRetry
+            }
             if (initialResponse.result.isNotEmpty()) {
                 lastStoredId = initialResponse.result.maxOf { it.updateId }
                 val initialized = writeForCurrent(session) {
@@ -644,7 +652,7 @@ class MessagePoller @Inject constructor(
             return PollingAttempt.Succeeded
         }
 
-        val targetUpdateId = initialRetryCheckpoint?.targetUpdateId ?: (lastStoredId + 1)
+        val targetUpdateId = initialRetryCheckpoint?.targetUpdateId ?: Math.addExact(lastStoredId, 1L)
         val response = telegramService.getUpdatesForToken(
             session.token,
             offset = targetUpdateId,
@@ -655,6 +663,13 @@ class MessagePoller @Inject constructor(
         }
         if (!response.ok) {
             return PollingAttempt.ApiFailure(response)
+        }
+        if (response.result.any { !isPersistableTelegramUpdateId(it.updateId) }) {
+            logger.error(
+                "Telegram response for bot {} contains an update ID outside the persistable offset range; retrying without a checkpoint.",
+                session.botId,
+            )
+            return PollingAttempt.LocalRetry
         }
         // 本轮长轮询期间，消费者或公开入口可能已写入一个检查点或推进 offset。必须以响应后的持久化
         // 快照重新决定是否可处理本批响应，不能让较早的请求快照覆盖新事实。

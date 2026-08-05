@@ -915,6 +915,142 @@ class UpdatesRepositoryTest {
         assertEquals(damagedBackup, backup.readText())
     }
 
+    /** 验证最大可持久化更新标识仍可用于检查点、账本和 outbox 的完整提交。 */
+    @Test
+    fun `largest persistable update id survives checkpoint journal and outbox commit`() {
+        val file = tempDirectory.resolve("largest-persistable-update-id.json")
+        val repository = UpdatesRepository(file)
+        val updateId = Long.MAX_VALUE - 1
+        repository.saveLastUpdateId("100", updateId - 1)
+        assertEquals(
+            RetryCheckpointRecordResult.Recorded(RetryCheckpoint(updateId, 100, 1)),
+            repository.recordRetryCheckpoint("100", updateId, expectedTargetUpdateId = null, nowMillis = 100),
+        )
+        assertEquals(AgentTurnClaim.CLAIMED, repository.claimAgentTurn("100", updateId, "chat", ReplyParameters(1)))
+        assertNotNull(repository.finalizeAgentTurn("100", updateId, "reply"))
+        assertEquals(
+            RetryCheckpointCommitResult.Committed,
+            repository.completeAgentUpdateAtRetryCheckpoint(
+                "100",
+                updateId,
+                PendingTelegramReply(updateId, "chat", "reply", ReplyParameters(1)),
+                expectedRetryTarget = updateId,
+            ),
+        )
+
+        val reloaded = UpdatesRepository(file).getData("100")
+        assertEquals(updateId, reloaded.lastUpdateId)
+        assertEquals(updateId, reloaded.pendingTelegramReplies.single().updateId)
+        assertNull(reloaded.retryCheckpoint)
+    }
+
+    /** 验证任何会持久化或推进更新标识的入口都不能写入 Long.MAX_VALUE。 */
+    @Test
+    fun `unpersistable update id is rejected before every state advancing entry writes`() {
+        val file = tempDirectory.resolve("unpersistable-update-id-entry-guard.json")
+        val repository = UpdatesRepository(file)
+        repository.saveLastUpdateId("100", 10)
+        val before = file.readText()
+
+        assertFailsWith<IllegalArgumentException> { repository.saveLastUpdateId("100", Long.MAX_VALUE) }
+        assertFailsWith<IllegalArgumentException> {
+            repository.recordRetryCheckpoint("100", Long.MAX_VALUE, expectedTargetUpdateId = null, nowMillis = 100)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.confirmProcessedUpdate("100", Long.MAX_VALUE, expectedRetryTarget = null)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.confirmRetryCheckpointTarget("100", Long.MAX_VALUE)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.skipRetryCheckpointGap(
+                "100",
+                expectedTargetUpdateId = 11,
+                observedFirstUpdateId = Long.MAX_VALUE
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.completeAgentUpdate("100", Long.MAX_VALUE, PendingTelegramReply(Long.MAX_VALUE, "chat", "reply"))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.completeAgentUpdateAtRetryCheckpoint(
+                "100",
+                Long.MAX_VALUE,
+                PendingTelegramReply(Long.MAX_VALUE, "chat", "reply"),
+                expectedRetryTarget = Long.MAX_VALUE,
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.claimAgentTurn("100", Long.MAX_VALUE, "chat", ReplyParameters(1))
+        }
+        assertFailsWith<IllegalArgumentException> { repository.finalizeAgentTurn("100", Long.MAX_VALUE, "reply") }
+        assertFailsWith<IllegalArgumentException> {
+            repository.confirmInProgressAgentTurnWithoutReply("100", Long.MAX_VALUE)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.preparePendingTelegramReplyDelivery("100", Long.MAX_VALUE)
+        }
+        assertFailsWith<IllegalArgumentException> { repository.deletePendingTelegramReply("100", Long.MAX_VALUE) }
+        assertFailsWith<IllegalArgumentException> {
+            repository.updateData("100") { current -> current.copy(lastUpdateId = Long.MAX_VALUE) }
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.updateData("100") {
+                it.copy(retryCheckpoint = RetryCheckpoint(Long.MAX_VALUE, 100, 1))
+            }
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.updateData("100") {
+                it.copy(
+                    agentTurnJournal = listOf(
+                        AgentTurnJournalEntry(Long.MAX_VALUE, "chat", status = AgentTurnJournalStatus.IN_PROGRESS),
+                    ),
+                )
+            }
+        }
+        assertFailsWith<IllegalArgumentException> {
+            repository.updateData("100") {
+                it.copy(pendingTelegramReplies = listOf(PendingTelegramReply(Long.MAX_VALUE, "chat", "reply")))
+            }
+        }
+
+        assertEquals(before, file.readText())
+        assertEquals(10, repository.getData("100").lastUpdateId)
+        assertNull(repository.getData("100").retryCheckpoint)
+        assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
+        assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
+    }
+
+    /** 验证任一持久化更新标识字段越界都会在加载前 fail-closed 且原文件不被改写。 */
+    @Test
+    fun `corrupt persisted maximum update ids fail closed for every storage path`() {
+        val corruptedStates = listOf(
+            "last-update-id" to UpdatesData(lastUpdateId = Long.MAX_VALUE),
+            "retry-checkpoint" to UpdatesData(
+                lastUpdateId = Long.MAX_VALUE - 1,
+                retryCheckpoint = RetryCheckpoint(Long.MAX_VALUE, 100, 1),
+            ),
+            "agent-turn-journal" to UpdatesData(
+                agentTurnJournal = listOf(
+                    AgentTurnJournalEntry(Long.MAX_VALUE, "chat", status = AgentTurnJournalStatus.IN_PROGRESS),
+                ),
+            ),
+            "pending-reply" to UpdatesData(
+                lastUpdateId = Long.MAX_VALUE - 1,
+                pendingTelegramReplies = listOf(PendingTelegramReply(Long.MAX_VALUE, "chat", "reply")),
+            ),
+        )
+
+        corruptedStates.forEach { (name, data) ->
+            val file = tempDirectory.resolve("corrupt-maximum-update-id-$name.json")
+            val original = ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to data)))
+            file.writeText(original)
+
+            assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
+            assertEquals(original, file.readText())
+        }
+    }
+
     /** 验证旧 JSON 缺少重试字段时保持兼容，检查点重试计数跨重载递增且饱和。 */
     @Test
     fun `retry checkpoint is backward compatible persistent and saturating`() {

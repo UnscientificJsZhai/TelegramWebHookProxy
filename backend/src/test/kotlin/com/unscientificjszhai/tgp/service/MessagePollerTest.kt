@@ -2914,6 +2914,90 @@ class MessagePollerTest {
         }
     }
 
+    /** 验证最大安全持久化 offset 仍会请求 Long.MAX_VALUE，而不会有符号回绕。 */
+    @Test
+    fun `largest persisted offset requests Long MAX without wrapping`() = runBlocking {
+        val requestStarted = CompletableDeferred<Unit>()
+        val holdRequest = CompletableDeferred<Unit>()
+        val fixture = fixture()
+        fixture.updates.saveLastUpdateId("100", Long.MAX_VALUE - 1)
+        fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", Long.MAX_VALUE, 30) } coAnswers {
+            requestStarted.complete(Unit)
+            holdRequest.await()
+            GetUpdatesResponse(ok = true)
+        }
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { requestStarted.await() }
+            coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:token", Long.MAX_VALUE, 30) }
+            coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:token", Long.MIN_VALUE, 30) }
+        } finally {
+            holdRequest.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证初始化响应中的不可持久化更新不会推进 offset 或留下重试检查点。 */
+    @Test
+    fun `initial response rejects Long MAX update without writing state`() = runBlocking {
+        val retryStarted = CompletableDeferred<Unit>()
+        val holdRetry = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = {
+                retryStarted.complete(Unit)
+                holdRetry.await()
+            },
+        )
+        fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", -1, 0) } returns
+                GetUpdatesResponse(ok = true, result = listOf(Update(Long.MAX_VALUE)))
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { retryStarted.await() }
+            assertEquals(0, fixture.updates.getData("100").lastUpdateId)
+            assertNull(fixture.updates.getData("100").retryCheckpoint)
+            assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+            assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+            coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:token", 1, 30) }
+        } finally {
+            holdRetry.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证常规长轮询响应中的不可持久化更新不会创建检查点、账本或负 offset 请求。 */
+    @Test
+    fun `normal response rejects Long MAX update without checkpoint or overflow request`() = runBlocking {
+        val retryStarted = CompletableDeferred<Unit>()
+        val holdRetry = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            retryDelay = {
+                retryStarted.complete(Unit)
+                holdRetry.await()
+            },
+        )
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } returns
+                GetUpdatesResponse(ok = true, result = listOf(Update(Long.MAX_VALUE)))
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { retryStarted.await() }
+            assertEquals(10, fixture.updates.getData("100").lastUpdateId)
+            assertNull(fixture.updates.getData("100").retryCheckpoint)
+            assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
+            assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+            coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:token", Long.MIN_VALUE, 30) }
+        } finally {
+            holdRetry.cancel()
+            fixture.poller.close()
+        }
+    }
+
     /**
      * 验证失败响应使用一次退避，遵循 `retry_after`、指数增长和成功后的计数重置规则。
      */

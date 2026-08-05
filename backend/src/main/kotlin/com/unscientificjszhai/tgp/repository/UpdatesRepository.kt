@@ -41,6 +41,9 @@ internal const val MAX_DISCOVERED_CHATS_PER_BOT = 64
 /** 所有 Telegram bot 合计最多保留的已发现聊天数。 */
 internal const val MAX_DISCOVERED_CHATS = 256
 
+/** 可安全持久化且仍可加一作为 Telegram 轮询 offset 的最大更新标识。 */
+internal const val MAX_PERSISTED_TELEGRAM_UPDATE_ID = Long.MAX_VALUE - 1
+
 /**
  * 单个 Telegram 机器人的已持久化更新处理状态。
  *
@@ -48,7 +51,7 @@ internal const val MAX_DISCOVERED_CHATS = 256
  * 初始化该机器人的轮询偏移量。
  *
  * @property chats 已发现的聊天信息列表；没有已保存聊天时为空列表。
- * @property lastUpdateId 最后已处理的更新标识；`0` 表示尚未初始化。
+ * @property lastUpdateId 最后已处理的更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，`0` 表示尚未初始化。
  * @property pendingTelegramReplies 已持久化但尚未被 Telegram 确认接受的回复，按 [PendingTelegramReply.updateId]
  * 升序且在同一更新标识下唯一；旧文件缺少该字段时默认为空列表。
  * @property agentTurnJournal 按更新标识隔离的 Agent 回合账本；旧文件缺少该字段时默认为空列表。
@@ -70,7 +73,7 @@ data class UpdatesData(
  * 轮询器在无法安全确认一项更新时先原子写入该记录；只要记录存在，后续请求必须从 [targetUpdateId] 开始，
  * 直到同一次提交确认或明确跳过该目标。计数使用饱和递增，因而不会在长时间故障后回绕。
  *
- * @property targetUpdateId 必须重新取得或明确跳过的 Telegram 更新标识；必须为非负数。
+ * @property targetUpdateId 必须重新取得或明确跳过的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
  * @property firstRetryAtMillis 首次记录该目标重试的 Unix 时间戳，单位为毫秒；必须为非负数。
  * @property retryCount 已持久化记录该目标重试的次数；必须为正数，到 [Long.MAX_VALUE] 后保持饱和。
  */
@@ -116,7 +119,7 @@ internal sealed interface RetryCheckpointGapResult {
  * 重放 Agent、创建 FINAL 或创建 outbox。该记录保留回复目标，保证已成为最终状态的记录即使跨重启也能
  * 原子写入 outbox 与更新偏移量。
  *
- * @property updateId 该回合所属的 Telegram 更新标识；必须为非负数，且同一机器人内唯一。
+ * @property updateId 该回合所属的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，且同一机器人内唯一。
  * @property chatId 最终回复目标聊天标识；不能为空。
  * @property replyParameters 回复原消息的可选参数；可以为 `null`。
  * @property status 回合状态；只能从 [AgentTurnJournalStatus.IN_PROGRESS] 迁移到 [AgentTurnJournalStatus.FINAL]。
@@ -163,7 +166,7 @@ internal sealed interface AgentTurnClaim {
  * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。每次网络投递前都会先持久化
  * [deliveryAttempts]，因此进程在请求中断后可能少于该次数实际发送，但绝不会突破回退消息的投递上限。
  *
- * @property updateId 生成该回复的 Telegram 更新标识；必须为非负数，且在同一机器人 outbox 中唯一。
+ * @property updateId 生成该回复的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，且在同一机器人 outbox 中唯一。
  * @property chatId 回复目标聊天标识；不能为空。
  * @property text 要投递的非空原始回复文本；投递回退消息不会覆盖该值。
  * @property replyParameters 可选的原消息回复参数；仅原文的首个片段使用，为 `null` 时发送独立消息。
@@ -309,7 +312,8 @@ class UpdatesRepository private constructor(
      *
      * [transform] 在仓储锁内执行，不能调用回本仓储或执行长时间阻塞操作。传入无效 bot 标识
      * 时不会写文件，也不会调用 [transform]。变换结果必须保持所有持久化不变量；尤其是存在
-     * [RetryCheckpoint] 时，其目标必须严格大于 `lastUpdateId`，否则会在写入前被拒绝。
+     * [RetryCheckpoint] 时，其目标必须严格大于 `lastUpdateId`，否则会在写入前被拒绝。所有持久化 Telegram
+     * 更新标识均必须在 `0..Long.MAX_VALUE - 1` 内，避免轮询 offset 加一时溢出。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param transform 基于当前完整状态生成新状态的纯变换函数。
@@ -382,15 +386,15 @@ class UpdatesRepository private constructor(
      * API 完成该目标。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param lastUpdateId 要确认的更新标识；必须为非负数，`0` 表示未初始化。
+     * @param lastUpdateId 要确认的更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，`0` 表示未初始化。
      * @return 成功写入后的完整机器人状态；[botId] 无效时返回空状态。存在重试检查点时返回未写入的原快照。
-     * @throws IllegalArgumentException 当 [lastUpdateId] 小于 `0` 时抛出。
+     * @throws IllegalArgumentException 当 [lastUpdateId] 不在可持久化 Telegram 更新标识范围内时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     @Synchronized
     fun saveLastUpdateId(botId: String, lastUpdateId: Long): UpdatesData {
-        require(lastUpdateId >= 0) { "lastUpdateId must not be negative." }
+        requirePersistableTelegramUpdateId(lastUpdateId, "lastUpdateId")
         if (!botId.isValidBotId()) {
             return UpdatesData()
         }
@@ -411,8 +415,9 @@ class UpdatesRepository private constructor(
      * 调用清除时不会写入任何数据。相同目标仅增加饱和计数并保留第一次重试时间，首次失败则创建新记录。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param targetUpdateId 本次无法安全确认的更新标识；必须为非负数。
-     * @param expectedTargetUpdateId 读取快照中的检查点目标；为 `null` 表示调用方要求当前没有检查点。
+     * @param targetUpdateId 本次无法安全确认的更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
+     * @param expectedTargetUpdateId 读取快照中的检查点目标；为 `null` 表示调用方要求当前没有检查点，非空时取值范围为
+     * `0..Long.MAX_VALUE - 1`。
      * @param nowMillis 记录本次失败的 Unix 时间戳，单位为毫秒；必须为非负数。
      * @return 成功提交时返回 [RetryCheckpointRecordResult.Recorded]；快照已失效或 bot 无效时返回
      * [RetryCheckpointRecordResult.Stale]，且不会写文件。
@@ -427,10 +432,8 @@ class UpdatesRepository private constructor(
         expectedTargetUpdateId: Long?,
         nowMillis: Long,
     ): RetryCheckpointRecordResult {
-        require(targetUpdateId >= 0) { "targetUpdateId must not be negative." }
-        require(expectedTargetUpdateId == null || expectedTargetUpdateId >= 0) {
-            "expectedTargetUpdateId must not be negative."
-        }
+        requirePersistableTelegramUpdateId(targetUpdateId, "targetUpdateId")
+        expectedTargetUpdateId?.let { requirePersistableTelegramUpdateId(it, "expectedTargetUpdateId") }
         require(expectedTargetUpdateId == null || expectedTargetUpdateId == targetUpdateId) {
             "targetUpdateId must match expectedTargetUpdateId when a checkpoint exists."
         }
@@ -460,8 +463,9 @@ class UpdatesRepository private constructor(
      * 完全一致。因而迟到轮询绝不能绕过一个较早的重试目标推进偏移量。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 已成功完成的 Telegram 更新标识；必须为非负数。
-     * @param expectedRetryTarget 读取快照中的重试目标；为 `null` 表示调用方要求当前没有检查点。
+     * @param updateId 已成功完成的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
+     * @param expectedRetryTarget 读取快照中的重试目标；为 `null` 表示调用方要求当前没有检查点，非空时取值范围为
+     * `0..Long.MAX_VALUE - 1`。
      * @return 成功提交时返回 [RetryCheckpointCommitResult.Committed]；快照已失效或 bot 无效时返回
      * [RetryCheckpointCommitResult.Stale]，且不会写文件。
      * @throws IllegalArgumentException 当更新标识或期望目标不满足约束时抛出。
@@ -474,12 +478,41 @@ class UpdatesRepository private constructor(
         updateId: Long,
         expectedRetryTarget: Long?,
     ): RetryCheckpointCommitResult {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
+        expectedRetryTarget?.let { requirePersistableTelegramUpdateId(it, "expectedRetryTarget") }
         require(expectedRetryTarget == null || expectedRetryTarget == updateId) {
             "expectedRetryTarget must match updateId when present."
         }
         return updateExpectedRetryCheckpoint(botId, expectedRetryTarget) { current ->
             current.copy(lastUpdateId = maxOf(current.lastUpdateId, updateId), retryCheckpoint = null)
+        }
+    }
+
+    /**
+     * 条件确认当前重试检查点的目标更新。
+     *
+     * 该操作只用于已通过其他路径完成的目标；偏移量推进到 [expectedTargetUpdateId] 且清除检查点在同一次
+     * 文件提交中完成。检查点已改变时不会写入数据。
+     *
+     * @param botId token 冒号前的非空机器人标识。
+     * @param expectedTargetUpdateId 读取快照中的检查点目标；取值范围为 `0..Long.MAX_VALUE - 1`。
+     * @return 成功提交时返回 [RetryCheckpointCommitResult.Committed]；检查点已改变或 bot 无效时返回
+     * [RetryCheckpointCommitResult.Stale]。
+     * @throws IllegalArgumentException 当目标标识不在可持久化 Telegram 更新标识范围内时抛出。
+     * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出；内存状态不变。
+     * @throws Exception 当状态无法原子写入时抛出；内存状态不变。
+     */
+    @Synchronized
+    internal fun confirmRetryCheckpointTarget(
+        botId: String,
+        expectedTargetUpdateId: Long,
+    ): RetryCheckpointCommitResult {
+        requirePersistableTelegramUpdateId(expectedTargetUpdateId, "expectedTargetUpdateId")
+        return updateExpectedRetryCheckpoint(botId, expectedTargetUpdateId) { current ->
+            current.copy(
+                lastUpdateId = maxOf(current.lastUpdateId, expectedTargetUpdateId),
+                retryCheckpoint = null,
+            )
         }
     }
 
@@ -490,8 +523,8 @@ class UpdatesRepository private constructor(
      * 触发此操作。偏移量只推进到检查点目标而非观测到的更高标识，随后轮询会从下一个标识重新请求。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param expectedTargetUpdateId 读取快照中的检查点目标；必须为非负数。
-     * @param observedFirstUpdateId 本次成功响应中最小的更新标识；必须严格大于期望目标。
+     * @param expectedTargetUpdateId 读取快照中的检查点目标；取值范围为 `0..Long.MAX_VALUE - 1`。
+     * @param observedFirstUpdateId 本次成功响应中最小的更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，且必须严格大于期望目标。
      * @return 成功跳过时返回 [RetryCheckpointGapResult.Skipped] 及原检查点；检查点已改变或 bot 无效时返回
      * [RetryCheckpointGapResult.Stale]，且不会写文件。
      * @throws IllegalArgumentException 当标识不满足严格大于关系时抛出。
@@ -504,7 +537,8 @@ class UpdatesRepository private constructor(
         expectedTargetUpdateId: Long,
         observedFirstUpdateId: Long,
     ): RetryCheckpointGapResult {
-        require(expectedTargetUpdateId >= 0) { "expectedTargetUpdateId must not be negative." }
+        requirePersistableTelegramUpdateId(expectedTargetUpdateId, "expectedTargetUpdateId")
+        requirePersistableTelegramUpdateId(observedFirstUpdateId, "observedFirstUpdateId")
         require(observedFirstUpdateId > expectedTargetUpdateId) {
             "observedFirstUpdateId must be greater than expectedTargetUpdateId."
         }
@@ -540,10 +574,11 @@ class UpdatesRepository private constructor(
      * [completeAgentUpdateAtRetryCheckpoint] 进行条件确认。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 已成功完成的 Telegram 更新标识；必须为非负数。
+     * @param updateId 已成功完成的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @param reply 要投递的 Agent 回复；为 `null` 表示成功但无回复。
      * @return 成功写入后的完整机器人状态；[botId] 无效时返回空状态。存在重试检查点时返回未写入的原快照。
-     * @throws IllegalArgumentException 当 [updateId] 为负数，或 [reply] 与 [updateId]、文本约束不一致时抛出。
+     * @throws IllegalArgumentException 当 [updateId] 不在可持久化 Telegram 更新标识范围内，或 [reply] 与
+     * [updateId]、文本约束不一致时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
@@ -553,7 +588,7 @@ class UpdatesRepository private constructor(
         updateId: Long,
         reply: PendingTelegramReply? = null,
     ): UpdatesData {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
         reply?.let {
             validatePendingTelegramReply(it, updateId)
         }
@@ -586,9 +621,10 @@ class UpdatesRepository private constructor(
      * 同时写入 outbox、偏移量并清除该检查点。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 已成功完成的 Telegram 更新标识；必须为非负数。
+     * @param updateId 已成功完成的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @param reply 要投递的 Agent 回复；为 `null` 表示成功但无回复。
-     * @param expectedRetryTarget 读取快照中的重试目标；为 `null` 表示调用方要求当前没有检查点。
+     * @param expectedRetryTarget 读取快照中的重试目标；为 `null` 表示调用方要求当前没有检查点，非空时取值范围为
+     * `0..Long.MAX_VALUE - 1`。
      * @return 成功提交时返回 [RetryCheckpointCommitResult.Committed]；检查点已改变或 bot 无效时返回
      * [RetryCheckpointCommitResult.Stale]，且不会写文件。
      * @throws IllegalArgumentException 当标识、回复或期望目标不满足约束时抛出。
@@ -602,7 +638,8 @@ class UpdatesRepository private constructor(
         reply: PendingTelegramReply?,
         expectedRetryTarget: Long?,
     ): RetryCheckpointCommitResult {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
+        expectedRetryTarget?.let { requirePersistableTelegramUpdateId(it, "expectedRetryTarget") }
         require(expectedRetryTarget == null || expectedRetryTarget == updateId) {
             "expectedRetryTarget must match updateId when present."
         }
@@ -628,14 +665,14 @@ class UpdatesRepository private constructor(
      * FINAL 或 IN_PROGRESS，避免后续偏移量确认覆盖尚未提交的回合。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要查询的 Telegram 更新标识；必须为非负数。
+     * @param updateId 要查询的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @return 对应账本记录的不可变快照；不存在或 bot 无效时返回 `null`。
-     * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
+     * @throws IllegalArgumentException 当 [updateId] 不在可持久化 Telegram 更新标识范围内时抛出。
      * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出。
      */
     @Synchronized
     internal fun findAgentTurn(botId: String, updateId: Long): AgentTurnJournalEntry? {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
         if (!botId.isValidBotId()) {
             return null
         }
@@ -652,7 +689,7 @@ class UpdatesRepository private constructor(
      * 已确认更新的残留 FINAL 账本会在本次调用中安全回收。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要占有的 Telegram 更新标识；必须为非负数。
+     * @param updateId 要占有的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @param chatId 最终回复的聊天标识；不能为空。
      * @param replyParameters 可选的原消息回复参数；可以为 `null`。
      * @return 新占有的 [AgentTurnClaim.CLAIMED]、已有 FINAL 或 IN_PROGRESS 状态；偏移量已确认时返回
@@ -668,7 +705,7 @@ class UpdatesRepository private constructor(
         chatId: String,
         replyParameters: ReplyParameters?,
     ): AgentTurnClaim {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
         require(chatId.isNotBlank()) { "chatId must not be blank." }
         if (!botId.isValidBotId()) {
             return AgentTurnClaim.AlreadyConfirmed
@@ -719,7 +756,7 @@ class UpdatesRepository private constructor(
      * 调用方可以重试 [completeAgentUpdate]，而绝不能再次调用 Agent。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要完成的 Telegram 更新标识；必须为非负数。
+     * @param updateId 要完成的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @param reply 最终 Agent 回复；`null` 表示无需发送回复。
      * @return 写入后的 FINAL 记录；记录不存在、已完成或 bot 无效时返回 `null`。
      * @throws IllegalArgumentException 当更新标识或回复不满足账本约束时抛出。
@@ -732,7 +769,7 @@ class UpdatesRepository private constructor(
         updateId: Long,
         reply: String?,
     ): AgentTurnJournalEntry? {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
         validateAgentTurnReply(reply)
         if (!botId.isValidBotId()) {
             return null
@@ -761,7 +798,7 @@ class UpdatesRepository private constructor(
      * [confirmInProgressAgentTurnWithoutReply] 静默确认。两条路径都不会自动重放模型或工具副作用。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要降级的 Telegram 更新标识；必须为非负数。
+     * @param updateId 要降级的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @param failureReply 用于最终 outbox 的固定非空失败回复。
      * @return 已持久化的 FINAL 记录；记录不存在、已不是进行中状态或 bot 无效时返回 `null`。
      * @throws IllegalArgumentException 当输入不满足账本约束时抛出。
@@ -786,11 +823,11 @@ class UpdatesRepository private constructor(
      * 授权租约失效或进程失联后安全跳过不可重放的回合。记录不存在、状态已改变或 bot 无效时不写入文件。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要静默确认的 Telegram 更新标识；必须为非负数。
-     * @param expectedRetryTarget 读取快照中的重试目标；为 `null` 时要求当前没有检查点，非空时必须等于
-     * [updateId]。不匹配时不会写入文件。
+     * @param updateId 要静默确认的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
+     * @param expectedRetryTarget 读取快照中的重试目标；为 `null` 时要求当前没有检查点，非空时取值范围为
+     * `0..Long.MAX_VALUE - 1` 且必须等于 [updateId]。不匹配时不会写入文件。
      * @return 仅当进行中记录被删除且偏移量已在同一次提交中确认时为 `true`；其他情况为 `false`。
-     * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
+     * @throws IllegalArgumentException 当 [updateId] 或 [expectedRetryTarget] 不在可持久化 Telegram 更新标识范围内时抛出。
      * @throws IllegalStateException 当更新状态文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 当状态无法原子写入时抛出；内存状态不变。
      */
@@ -800,7 +837,8 @@ class UpdatesRepository private constructor(
         updateId: Long,
         expectedRetryTarget: Long? = null,
     ): Boolean {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
+        expectedRetryTarget?.let { requirePersistableTelegramUpdateId(it, "expectedRetryTarget") }
         require(expectedRetryTarget == null || expectedRetryTarget == updateId) {
             "expectedRetryTarget must match updateId when present."
         }
@@ -881,16 +919,17 @@ class UpdatesRepository private constructor(
      * 次调用中继续投递。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要登记投递的回复所属更新标识；必须为非负数。
+     * @param updateId 要登记投递的回复所属更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @return 已把 [PendingTelegramReply.deliveryAttempts] 加一并持久化的当前片段快照；不存在记录、bot 无效或
      * 回退片段耗尽并已跳过时返回 `null`。
-     * @throws IllegalArgumentException 当 [updateId] 为负数，或存储中的目标回复违反投递阶段约束时抛出。
+     * @throws IllegalArgumentException 当 [updateId] 不在可持久化 Telegram 更新标识范围内，或存储中的目标回复违反
+     * 投递阶段约束时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     @Synchronized
     internal fun preparePendingTelegramReplyDelivery(botId: String, updateId: Long): PendingTelegramReply? {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
         if (!botId.isValidBotId()) {
             return null
         }
@@ -923,7 +962,7 @@ class UpdatesRepository private constructor(
      * 更新的投递阶段或次数。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param expected 网络请求前已持久化的回复快照；其更新标识必须非负数。
+     * @param expected 网络请求前已持久化的回复快照；其更新标识取值范围为 `0..Long.MAX_VALUE - 1`。
      * @param replacement 要替换为的回复；其更新标识、聊天标识和阶段计数约束必须与 [expected] 一致。
      * @return 仅当匹配并已持久化替换时为 `true`；bot 无效或记录已变化、不存在时为 `false`。
      * @throws IllegalArgumentException 当 [expected] 或 [replacement] 违反回复约束，或更新标识不一致时抛出。
@@ -1044,14 +1083,14 @@ class UpdatesRepository private constructor(
      * 其他回复和聊天、偏移量。
      *
      * @param botId token 冒号前的非空机器人标识。
-     * @param updateId 要删除的回复所属更新标识；必须为非负数。
+     * @param updateId 要删除的回复所属更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @return 写入后的完整机器人状态；[botId] 无效时返回空状态。
-     * @throws IllegalArgumentException 当 [updateId] 为负数时抛出。
+     * @throws IllegalArgumentException 当 [updateId] 不在可持久化 Telegram 更新标识范围内时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
      */
     fun deletePendingTelegramReply(botId: String, updateId: Long): UpdatesData {
-        require(updateId >= 0) { "updateId must not be negative." }
+        requirePersistableTelegramUpdateId(updateId, "updateId")
         return updateData(botId) { current ->
             current.copy(pendingTelegramReplies = current.pendingTelegramReplies.filterNot { it.updateId == updateId })
         }
@@ -1390,7 +1429,7 @@ class UpdatesRepository private constructor(
 
     private fun validateAgentTurnJournalEntry(entry: AgentTurnJournalEntry, expectedUpdateId: Long? = null) {
         expectedUpdateId?.let { require(entry.updateId == it) { "agent turn updateId must match updateId." } }
-        require(entry.updateId >= 0) { "agent turn updateId must not be negative." }
+        requirePersistableTelegramUpdateId(entry.updateId, "agent turn updateId")
         require(entry.chatId.isNotBlank()) { "agent turn chatId must not be blank." }
         validateAgentTurnReply(entry.reply)
         when (entry.status) {
@@ -1499,6 +1538,7 @@ private fun validateAgentTurnReply(reply: String?) {
 
 /** 验证一项机器人更新状态可被持久化，不允许任意读改写绕过重试检查点与偏移量的不变量。 */
 private fun validatePersistedUpdatesData(updates: UpdatesData) {
+    requirePersistableTelegramUpdateId(updates.lastUpdateId, "lastUpdateId")
     validatePendingTelegramReplies(updates.pendingTelegramReplies, updates.lastUpdateId)
     validateAgentTurnJournal(updates.agentTurnJournal)
     validateRetryCheckpoint(updates.retryCheckpoint, updates.lastUpdateId)
@@ -1525,7 +1565,7 @@ private fun validatePendingTelegramReplies(replies: List<PendingTelegramReply>, 
 /** 验证一项 outbox 回复的源文本、稳定 cursor 与当前片段投递状态。 */
 private fun validatePendingTelegramReply(reply: PendingTelegramReply, expectedUpdateId: Long? = null) {
     expectedUpdateId?.let { require(reply.updateId == it) { "reply updateId must match updateId." } }
-    require(reply.updateId >= 0) { "reply updateId must not be negative." }
+    requirePersistableTelegramUpdateId(reply.updateId, "reply updateId")
     require(reply.chatId.isNotBlank()) { "reply chatId must not be blank." }
     require(reply.text.isNotBlank()) { "reply text must not be blank." }
     require(TelegramTextChunks.isChunkStart(reply.text, reply.nextChunkStart)) {
@@ -1554,7 +1594,7 @@ private fun validateAgentTurnJournal(entries: List<AgentTurnJournalEntry>) {
         "agent turn journal update IDs must be unique."
     }
     entries.forEach { entry ->
-        require(entry.updateId >= 0) { "agent turn updateId must not be negative." }
+        requirePersistableTelegramUpdateId(entry.updateId, "agent turn updateId")
         require(entry.chatId.isNotBlank()) { "agent turn chatId must not be blank." }
         validateAgentTurnReply(entry.reply)
         if (entry.status == AgentTurnJournalStatus.IN_PROGRESS) {
@@ -1565,7 +1605,7 @@ private fun validateAgentTurnJournal(entries: List<AgentTurnJournalEntry>) {
 
 private fun validateRetryCheckpoint(checkpoint: RetryCheckpoint?, lastUpdateId: Long) {
     checkpoint ?: return
-    require(checkpoint.targetUpdateId >= 0) { "retry checkpoint targetUpdateId must not be negative." }
+    requirePersistableTelegramUpdateId(checkpoint.targetUpdateId, "retry checkpoint targetUpdateId")
     require(checkpoint.targetUpdateId > lastUpdateId) {
         "retry checkpoint targetUpdateId must be ahead of lastUpdateId."
     }
@@ -1574,6 +1614,16 @@ private fun validateRetryCheckpoint(checkpoint: RetryCheckpoint?, lastUpdateId: 
 }
 
 private fun Long.saturatingIncrement(): Long = if (this == Long.MAX_VALUE) Long.MAX_VALUE else this + 1
+
+/** 判断更新标识是否可被持久化，且之后仍可安全加一作为 Telegram 轮询 offset。 */
+internal fun isPersistableTelegramUpdateId(updateId: Long): Boolean =
+    updateId in 0..MAX_PERSISTED_TELEGRAM_UPDATE_ID
+
+private fun requirePersistableTelegramUpdateId(updateId: Long, parameterName: String) {
+    require(isPersistableTelegramUpdateId(updateId)) {
+        "$parameterName must be in 0..$MAX_PERSISTED_TELEGRAM_UPDATE_ID."
+    }
+}
 
 /**
  * 从 Telegram token 提取用于持久化隔离的 bot 标识。
