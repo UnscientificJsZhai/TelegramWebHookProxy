@@ -12,6 +12,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
+import com.unscientificjszhai.tgp.utils.JsonStorageDurabilityUnknownException
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import java.io.File
 import java.io.IOException
@@ -326,17 +327,17 @@ class SettingsRepositoryBarrierTest {
         assertEquals(originalContent, configFile.readText())
     }
 
-    /** 验证主文件和解码后字段超限均 fail-closed，且不会读取遗留 `.bak`。 */
+    /** 验证主文件和解码后字段超限均中断构造，且不会读取遗留 `.bak`。 */
     @Test
-    fun `oversized persisted settings fail closed without accessing legacy bak`() {
+    fun `oversized persisted settings abort construction without accessing legacy bak`() {
         val oversizedCandidates = listOf(
             "primary-bytes" to "x".repeat(ResourceLimits.SETTINGS_BYTES + 1),
             "telegram-token" to ConfigJson.encodeToString(AppSettings(telegramToken = "密".repeat(86))),
             "global-context" to ConfigJson.encodeToString(
                 AppSettings(ai = AISettings(globalContext = "密".repeat(21_846))),
             ),
-            "unknown-proxy-credentials" to
-                    """{"proxy":{"host":"proxy.example.com","port":8080,"type":"UNKNOWN","username":"${"u".repeat(513)}","password":"pass"}}""",
+            "oversized-proxy-credentials" to
+                    """{"proxy":{"host":"proxy.example.com","port":8080,"type":"HTTP","username":"${"u".repeat(513)}","password":"pass"}}""",
         )
 
         oversizedCandidates.forEach { (name, primaryContent) ->
@@ -346,11 +347,8 @@ class SettingsRepositoryBarrierTest {
             configFile.writeText(primaryContent)
             sidecarFile.writeText(sidecarContent)
 
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
-
-            assertEquals(AppSettings(), repository.settingsFlow.value)
             assertFailsWith<IllegalStateException> {
-                repository.saveSettings(AppSettings(telegramToken = "200:blocked"))
+                SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
             }
             assertEquals(primaryContent, configFile.readText())
             assertEquals(sidecarContent, sidecarFile.readText())
@@ -369,10 +367,9 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText("{ damaged")
         sidecarFile.writeText(historicalContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
-
-        assertFalse(repository.hasHistoricalInvalidOpenAiBaseUrl)
-        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+        }
         assertEquals("{ damaged", configFile.readText())
         assertEquals(historicalContent, sidecarFile.readText())
     }
@@ -476,11 +473,9 @@ class SettingsRepositoryBarrierTest {
         assertFalse(barrier.isSwitching)
     }
 
-    /**
-     * 验证未知历史代理类型不会丢弃其他设置，也不会重写原始配置文件。
-     */
+    /** 验证代理的必填枚举值损坏时中断构造，且不重写现场文件。 */
     @Test
-    fun `unknown historical proxy type preserves the remaining settings without rewriting the file`() {
+    fun `unknown required proxy type aborts construction without rewriting the file`() {
         val configFile = File(tempDirectory, "unknown-proxy-type.json")
         val originalContent =
             """
@@ -488,14 +483,55 @@ class SettingsRepositoryBarrierTest {
             """.trimIndent()
         configFile.writeText(originalContent)
 
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        }
+        assertEquals(originalContent, configFile.readText())
+    }
+
+    /** 验证旧代理缺失 `type` 时在内存中幂等迁移为 HTTP，下次保存写入当前 schema。 */
+    @Test
+    fun `legacy proxy without type migrates to HTTP through schema storage`() {
+        val configFile = File(tempDirectory, "legacy-proxy-without-type.json")
+        val originalContent =
+            """
+            {"telegramToken":"100:token","chatId":"chat","proxy":{"host":"proxy.example.com","port":8080},"ai":{"provider":"GEMINI","geminiApiKey":"key"}}
+            """.trimIndent()
+        configFile.writeText(originalContent)
+
         val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
 
-        assertEquals("100:token", repository.settingsFlow.value.telegramToken)
-        assertEquals("chat", repository.settingsFlow.value.chatId)
-        assertEquals(AIProvider.OPENAI, repository.settingsFlow.value.ai?.provider)
-        assertEquals("key", repository.settingsFlow.value.ai?.openAiApiKey)
-        assertEquals(null, repository.settingsFlow.value.proxy)
-        assertTrue(repository.hasHistoricalInvalidProxy)
+        assertEquals(
+            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP),
+            repository.settingsFlow.value.proxy,
+        )
+        assertFalse(repository.hasHistoricalInvalidProxy)
+        assertEquals(originalContent, configFile.readText())
+
+        repository.updateSettings { current -> current.copy(chatId = "migrated") }
+
+        val persisted = ConfigJson.decodeFromString<AppSettings>(configFile.readText())
+        assertEquals(ProxyType.HTTP, persisted.proxy?.type)
+        assertEquals("migrated", persisted.chatId)
+    }
+
+    /** 验证类型或枚举值损坏的可选字段使用 data class 默认值，而其他合法字段保留。 */
+    @Test
+    fun `invalid optional fields use schema defaults without rewriting the file`() {
+        val configFile = File(tempDirectory, "optional-field-defaults.json")
+        val originalContent =
+            """
+            {"telegramToken":42,"chatId":"kept","ai":{"provider":"FUTURE","selectedModel":"kept-model","agentEnabled":"yes"}}
+            """.trimIndent()
+        configFile.writeText(originalContent)
+
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+        assertEquals("", repository.settingsFlow.value.telegramToken)
+        assertEquals("kept", repository.settingsFlow.value.chatId)
+        assertEquals(AIProvider.GEMINI, repository.settingsFlow.value.ai?.provider)
+        assertEquals("kept-model", repository.settingsFlow.value.ai?.selectedModel)
+        assertFalse(repository.settingsFlow.value.ai?.agentEnabled ?: true)
         assertEquals(originalContent, configFile.readText())
     }
 
@@ -508,7 +544,7 @@ class SettingsRepositoryBarrierTest {
         val configFile = File(tempDirectory, "historical-proxy-resolution.json")
         val originalContent =
             """
-            {"telegramToken":"100:token","chatId":"chat","proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"},"ai":{"provider":"GEMINI","geminiApiKey":"key"}}
+            {"telegramToken":"100:token","chatId":"chat","proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"},"ai":{"provider":"GEMINI","geminiApiKey":"key"}}
             """.trimIndent()
         configFile.writeText(originalContent)
         val repository = SettingsRepository.forTesting(configFile, barrier)
@@ -625,19 +661,18 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText("{ invalid")
         sidecarFile.writeText(sidecarContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
-
-        assertTrue(repository.settingsFlow.value.ai?.mcpServers.orEmpty().isEmpty())
-        assertFalse(repository.hasHistoricalInvalidMcp)
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+        }
         assertEquals("{ invalid", configFile.readText())
         assertEquals(sidecarContent, sidecarFile.readText())
     }
 
     /**
-     * 验证缺少类型且端口非法的旧代理不会被迁移或改写，并保留其他设置。
+     * 验证缺少类型且端口非法的旧代理会在内存中迁移后语义性 fail-closed，且不改写原文件。
      */
     @Test
-    fun `invalid old proxy without a type remains untouched and preserves the remaining settings`() {
+    fun `invalid old proxy without a type migrates then fails closed without rewriting`() {
         val configFile = File(tempDirectory, "invalid-old-proxy.json")
         val originalContent =
             """
@@ -657,7 +692,7 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证主文件语义损坏时返回安全默认值，且不会读取遗留 `.bak` 文件。
+     * 验证主文件严重损坏时中断构造，且不会读取遗留 `.bak` 文件。
      */
     @Test
     fun `damaged settings primary ignores legacy bak`() {
@@ -666,9 +701,9 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText("{ invalid")
         File(tempDirectory, "recover-settings.json.bak").writeText(backupContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
-
-        assertEquals(AppSettings(), repository.settingsFlow.value)
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+        }
         assertEquals("{ invalid", configFile.readText())
         assertEquals(backupContent, File(tempDirectory, "recover-settings.json.bak").readText())
     }
@@ -711,22 +746,53 @@ class SettingsRepositoryBarrierTest {
         assertFalse(barrier.isSwitching)
     }
 
+    /** 验证替换可见但目录同步失败时，不将未确认耐久的值发布给运行时。 */
+    @Test
+    fun `directory sync uncertainty leaves settings flows and barrier unchanged`() {
+        val configFile = File(tempDirectory, "directory-sync-uncertain.json")
+        val initial = AppSettings(telegramToken = "100:old", chatId = "old-chat")
+        val requested = initial.copy(
+            telegramToken = "200:new",
+            ai = AISettings(agentEnabled = true),
+        )
+        configFile.writeText(ConfigJson.encodeToString(initial))
+        var directorySyncAvailable = true
+        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun forceDirectory(path: Path) {
+                if (!directorySyncAvailable) throw IOException("injected directory sync failure")
+                DefaultAtomicJsonFileOperations.forceDirectory(path)
+            }
+        }
+        val barrier = ModelSwitchBarrier()
+        val repository = SettingsRepository.forTesting(configFile, barrier, fileOperations)
+        val originalSettingsUpdate = repository.settingsUpdateFlow.value
+        val originalTokenUpdate = repository.telegramTokenUpdateFlow.value
+        directorySyncAvailable = false
+
+        assertFailsWith<JsonStorageDurabilityUnknownException> {
+            repository.saveSettings(requested)
+        }
+
+        assertEquals(initial, repository.settingsFlow.value)
+        assertEquals(originalSettingsUpdate, repository.settingsUpdateFlow.value)
+        assertEquals(originalTokenUpdate, repository.telegramTokenUpdateFlow.value)
+        assertEquals(requested, ConfigJson.decodeFromString<AppSettings>(configFile.readText()))
+        assertFalse(barrier.isSwitching)
+    }
+
     /**
-     * 验证损坏主文件后续保存被拒绝，且不会读取遗留 `.bak` 文件。
+     * 验证损坏主文件中断构造，且不会读取遗留 `.bak` 文件。
      */
     @Test
-    fun `damaged settings primary disables later saves without touching legacy bak`() {
+    fun `damaged settings primary aborts construction without touching legacy bak`() {
         val configFile = File(tempDirectory, "settings-recovery-failure.json")
         val backupFile = File(tempDirectory, "settings-recovery-failure.json.bak")
         val damagedPrimary = "{ invalid"
         val validBackup = ConfigJson.encodeToString(AppSettings(telegramToken = "100:backup"))
         configFile.writeText(damagedPrimary)
         backupFile.writeText(validBackup)
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
-
-        assertEquals(AppSettings(), repository.settingsFlow.value)
         assertFailsWith<IllegalStateException> {
-            repository.saveSettings(AppSettings(telegramToken = "200:new"))
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
         }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
@@ -749,11 +815,9 @@ class SettingsRepositoryBarrierTest {
         assertEquals(backupContent, backupFile.readText())
     }
 
-    /**
-     * 验证双坏设置文件只提供安全默认值，后续保存不会覆盖任一现场文件。
-     */
+    /** 验证主文件损坏时构造失败，不会覆盖任一现场文件。 */
     @Test
-    fun `double damaged settings files reject saves without overwriting either file`() {
+    fun `damaged primary aborts construction without overwriting either file`() {
         val configFile = File(tempDirectory, "double-damaged-settings.json")
         val backupFile = File(tempDirectory, "double-damaged-settings.json.bak")
         val damagedPrimary = "{ invalid"
@@ -761,10 +825,9 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText(damagedPrimary)
         backupFile.writeText(damagedBackup)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
-
-        assertEquals(AppSettings(), repository.settingsFlow.value)
-        assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:new")) }
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(damagedBackup, backupFile.readText())
     }
@@ -777,18 +840,18 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText("{ invalid")
         backupFile.writeText("{\"telegramToken\":\"100:ignored\"}")
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
-
-        assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:blocked")) }
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+        }
         assertEquals("{ invalid", configFile.readText())
         assertEquals("{\"telegramToken\":\"100:ignored\"}", backupFile.readText())
     }
 
     /**
-     * 验证首次主文件读取 I/O 失败会阻断默认状态写入；主文件恢复可读但仍损坏时继续拒绝保存。
+     * 验证首次主文件读取 I/O 失败会中断构造；主文件恢复可读但仍损坏时同样中断。
      */
     @Test
-    fun `initial primary read failure is revalidated without reading legacy bak`() {
+    fun `initial primary read failure aborts construction without reading legacy bak`() {
         val configFile = File(tempDirectory, "initial-io-settings.json")
         val backupFile = File(tempDirectory, "initial-io-settings.json.bak")
         val damagedPrimary = "{ invalid"
@@ -806,16 +869,16 @@ class SettingsRepositoryBarrierTest {
             }
         }
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
-        assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:blocked")) }
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+        }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
 
         blockPrimaryRead = false
         assertFailsWith<IllegalStateException> {
-            repository.saveSettings(AppSettings(telegramToken = "200:committed"))
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
         }
-        assertEquals(AppSettings(), repository.settingsFlow.value)
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
     }
@@ -837,12 +900,9 @@ class SettingsRepositoryBarrierTest {
                 return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
             }
         }
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
-        assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:new")) }
-        assertFailsWith<IllegalStateException> { repository.saveSettings(AppSettings(telegramToken = "200:new")) }
-
-        assertEquals(AppSettings(), repository.settingsFlow.value)
-        assertEquals(0, repository.telegramTokenUpdateFlow.value.generation)
+        assertFailsWith<IllegalStateException> {
+            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+        }
         assertEquals("{ invalid", configFile.readText())
         assertEquals(sidecarContent, sidecarFile.readText())
     }

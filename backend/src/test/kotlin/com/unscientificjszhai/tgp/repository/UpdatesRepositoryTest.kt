@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.JsonStorageDurabilityUnknownException
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -128,6 +129,7 @@ class UpdatesRepositoryTest {
         assertEquals(ConfigJson.encodeToString(oldChats), listFile.readText())
         assertEquals(oldChats, listRepository.getChats("100"))
         assertTrue(listRepository.getChats("200").isEmpty())
+        assertEquals(oldChats, UpdatesRepository(listFile).getChats("100"))
 
         val objectFile = tempDirectory.resolve("legacy-object.json")
         objectFile.writeText(ConfigJson.encodeToString(UpdatesData(oldChats, 33)))
@@ -136,6 +138,122 @@ class UpdatesRepositoryTest {
         assertEquals(33, objectRepository.getData("200").lastUpdateId)
         assertEquals(oldChats, objectRepository.getChats("200"))
         assertTrue(objectRepository.getChats("100").isEmpty())
+        assertEquals(33, UpdatesRepository(objectFile).getData("200").lastUpdateId)
+    }
+
+    /** 验证没有当前根标志的对象仍按旧单 bot 格式迁移，而当前根元数据对象不会被误迁移。 */
+    @Test
+    fun `empty legacy object migrates without misclassifying current root metadata`() {
+        val emptyLegacyFile = tempDirectory.resolve("empty-legacy-object.json")
+        emptyLegacyFile.writeText("{}")
+        val emptyLegacyRepository = UpdatesRepository(emptyLegacyFile)
+
+        assertEquals(UpdatesData(), emptyLegacyRepository.getData(" "))
+        assertEquals("{}", emptyLegacyFile.readText())
+        assertEquals(UpdatesData(), emptyLegacyRepository.getData("300"))
+        val migrated = ConfigJson.decodeFromString<BotUpdatesData>(emptyLegacyFile.readText())
+        assertTrue("300" in migrated.bots)
+        assertEquals(UpdatesData(), UpdatesRepository(emptyLegacyFile).getData("300"))
+
+        val unknownOnlyLegacyFile = tempDirectory.resolve("unknown-only-legacy-object.json")
+        unknownOnlyLegacyFile.writeText("""{"futureLegacyField":true}""")
+        val unknownOnlyLegacyRepository = UpdatesRepository(unknownOnlyLegacyFile)
+        assertEquals(UpdatesData(), unknownOnlyLegacyRepository.getData("301"))
+        assertTrue("301" in ConfigJson.decodeFromString<BotUpdatesData>(unknownOnlyLegacyFile.readText()).bots)
+
+        val metadataFile = tempDirectory.resolve("current-root-metadata.json")
+        val metadataContent = """{"chatRecency":{},"chatRecencyClock":7}"""
+        metadataFile.writeText(metadataContent)
+        val metadataRepository = UpdatesRepository(metadataFile)
+
+        assertEquals(UpdatesData(), metadataRepository.getData("400"))
+        assertEquals(metadataContent, metadataFile.readText())
+    }
+
+    /** 验证 schema 中带默认值的损坏字段会按默认值恢复并允许后续规范化提交。 */
+    @Test
+    fun `invalid optional fields use schema defaults`() {
+        val file = tempDirectory.resolve("optional-field-defaults.json")
+        file.writeText(
+            """
+            {
+              "bots": {
+                "100": {
+                  "lastUpdateId": "broken",
+                  "pendingTelegramReplies": [
+                    {
+                      "updateId": 0,
+                      "chatId": "chat",
+                      "text": "reply",
+                      "deliveryStage": "UNKNOWN",
+                      "deliveryAttempts": "broken"
+                    }
+                  ]
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val repository = UpdatesRepository(file)
+        val repaired = repository.getData("100")
+        val reply = repaired.pendingTelegramReplies.single()
+        assertEquals(0, repaired.lastUpdateId)
+        assertEquals(TelegramReplyDeliveryStage.ORIGINAL, reply.deliveryStage)
+        assertEquals(0, reply.deliveryAttempts)
+
+        repository.saveLastUpdateId("100", 1)
+        assertFalse(file.readText().contains("broken"))
+        assertFalse(file.readText().contains("UNKNOWN"))
+    }
+
+    /** 验证根结构或嵌套必填字段损坏会在仓储构造时中止应用初始化。 */
+    @Test
+    fun `structural and required field corruption abort construction`() {
+        val corruptDocuments = listOf(
+            "true",
+            """
+            {
+              "bots": {
+                "100": {
+                  "chats": [{"id": "chat", "title": "Chat"}]
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+
+        corruptDocuments.forEachIndexed { index, document ->
+            val file = tempDirectory.resolve("schema-corrupt-$index.json")
+            file.writeText(document)
+            assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
+            assertEquals(document, file.readText())
+        }
+    }
+
+    /** 验证主文件读取 I/O 失败会在仓储构造时中止应用初始化。 */
+    @Test
+    fun `read failure aborts construction`() {
+        val file = tempDirectory.resolve("unreadable-updates.json")
+        file.writeText(ConfigJson.encodeToString(BotUpdatesData()))
+        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
+                throw IOException("injected updates read failure")
+            }
+        }
+
+        val failure = assertFailsWith<IllegalStateException> { UpdatesRepository(file, operations) }
+        assertTrue(failure.cause is IOException)
+    }
+
+    /** 验证超过 updates 文件字节上限的输入会在构造时拒绝。 */
+    @Test
+    fun `oversized persisted updates abort construction`() {
+        val file = tempDirectory.resolve("oversized-persisted-updates.json")
+        file.writeBytes(ByteArray(ResourceLimits.UPDATES_BYTES + 1) { ' '.code.toByte() })
+
+        assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
+        assertEquals((ResourceLimits.UPDATES_BYTES + 1).toLong(), file.length())
     }
 
     /**
@@ -315,7 +433,11 @@ class UpdatesRepositoryTest {
                 bots[botId] = UpdatesData(chats = listOf(ChatInfo(chatId, "x".repeat(titleLength), "group")))
                 recency[botId] = mapOf(chatId to (index + 1L))
             }
-            return BotUpdatesData(bots = bots, chatRecency = recency, chatRecencyClock = MAX_DISCOVERED_CHATS.toLong())
+            return BotUpdatesData(
+                bots = bots,
+                chatRecency = recency,
+                chatRecencyClock = MAX_DISCOVERED_CHATS.toLong(),
+            )
         }
 
         var lower = 0
@@ -340,6 +462,7 @@ class UpdatesRepositoryTest {
         assertEquals(1, committed.lastUpdateId)
         assertTrue(normalized.bots.values.sumOf { it.chats.size } < MAX_DISCOVERED_CHATS)
         assertTrue(chatDiscoveryFootprintForTest(normalized) <= MAX_DISCOVERED_CHATS_UTF8_BYTES)
+        assertEquals(1, UpdatesRepository(file).getData("bot-0").lastUpdateId)
     }
 
     /** 验证没有发现聊天的业务 bot 不会占用发现缓存预算或驱逐其他 bot 的聊天。 */
@@ -366,7 +489,9 @@ class UpdatesRepositoryTest {
         assertEquals(8, committed.lastUpdateId)
         assertEquals(listOf(ChatInfo("chat", "Chat", "group")), committed.chats)
         assertEquals(4_999, repository.getData("business-4999").lastUpdateId)
-        assertEquals(8, UpdatesRepository(file).getData("chat-bot").lastUpdateId)
+        val reloaded = UpdatesRepository(file)
+        assertEquals(4_999, reloaded.getData("business-4999").lastUpdateId)
+        assertEquals(8, reloaded.getData("chat-bot").lastUpdateId)
     }
 
     /** 验证发现预算无法容纳最后一条聊天时会删光并收敛，随后仍可提交业务字段。 */
@@ -631,9 +756,9 @@ class UpdatesRepositoryTest {
         assertEquals(AgentTurnJournalStatus.FINAL, repository.getData("100").agentTurnJournal.single().status)
     }
 
-    /** 验证损坏的 Agent 回合账本无法 claim，避免在不可信状态下重放 Agent 或工具。 */
+    /** 验证损坏的 Agent 回合账本会中止仓储构造，避免在不可信状态下重放 Agent 或工具。 */
     @Test
-    fun `corrupt agent turn journal fails closed before claim`() {
+    fun `corrupt agent turn journal aborts construction before claim`() {
         val file = tempDirectory.resolve("corrupt-agent-turn-journal.json")
         file.writeText(
             """
@@ -656,10 +781,8 @@ class UpdatesRepositoryTest {
             }
             """.trimIndent(),
         )
-        val repository = UpdatesRepository(file)
-
         assertFailsWith<IllegalStateException> {
-            repository.claimAgentTurn("100", 12, "chat", ReplyParameters(2))
+            UpdatesRepository(file)
         }
         assertTrue(file.readText().contains("must-not-exist"))
     }
@@ -676,9 +799,26 @@ class UpdatesRepositoryTest {
         assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
     }
 
-    /**
-     * 验证损坏主更新状态不会读取遗留 `.bak` 文件，且后续访问安全失败。
-     */
+    /** 验证目录同步失败时未知耐久的 Agent claim 不会放行调用方进入 Agent。 */
+    @Test
+    fun `agent turn claim requires durable directory sync`() {
+        val file = tempDirectory.resolve("unknown-agent-turn-claim.json")
+        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun forceDirectory(path: Path) {
+                throw IOException("injected directory sync failure")
+            }
+        }
+        val repository = UpdatesRepository(file, operations)
+
+        assertFailsWith<JsonStorageDurabilityUnknownException> {
+            repository.claimAgentTurn("100", 11, "chat", ReplyParameters(1))
+        }
+
+        assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
+        assertTrue(file.readText().contains("IN_PROGRESS"))
+    }
+
+    /** 验证损坏主更新状态不会读取遗留 `.bak` 文件，并在构造时安全失败。 */
     @Test
     fun `damaged primary ignores legacy bak`() {
         val file = tempDirectory.resolve("updates-recovery.json")
@@ -687,18 +827,14 @@ class UpdatesRepositoryTest {
         file.writeText("[ invalid")
         file.resolveSibling("updates-recovery.json.bak").writeText(backupContent)
 
-        val repository = UpdatesRepository(file, rejectBakOperations())
-
-        assertFailsWith<IllegalStateException> { repository.getData("100") }
+        assertFailsWith<IllegalStateException> { UpdatesRepository(file, rejectBakOperations()) }
         assertEquals("[ invalid", file.readText())
         assertEquals(backupContent, file.resolveSibling("updates-recovery.json.bak").readText())
     }
 
-    /**
-     * 验证损坏主文件会拒绝后续 mutation，且不会访问遗留 `.bak` 文件。
-     */
+    /** 验证损坏主文件会中止仓储构造，且不会访问遗留 `.bak` 文件。 */
     @Test
-    fun `damaged updates primary disables later mutations without touching legacy bak`() {
+    fun `damaged updates primary aborts construction without touching legacy bak`() {
         val file = tempDirectory.resolve("updates-recovery-failure.json")
         val backup = file.resolveSibling("updates-recovery-failure.json.bak")
         val damagedPrimary = "{ invalid"
@@ -706,9 +842,7 @@ class UpdatesRepositoryTest {
             ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 7))))
         file.writeText(damagedPrimary)
         backup.writeText(validBackup)
-        val repository = UpdatesRepository(file, rejectBakOperations())
-
-        assertFailsWith<IllegalStateException> { repository.saveLastUpdateId("100", 8) }
+        assertFailsWith<IllegalStateException> { UpdatesRepository(file, rejectBakOperations()) }
         assertEquals(damagedPrimary, file.readText())
         assertEquals(validBackup, backup.readText())
     }
@@ -731,11 +865,9 @@ class UpdatesRepositoryTest {
         assertEquals(backupContent, backup.readText())
     }
 
-    /**
-     * 验证主更新状态与备份均损坏时，mutation 被拒绝且两个文件保持原样。
-     */
+    /** 验证主更新状态损坏时构造被拒绝，且主文件与遗留备份均保持原样。 */
     @Test
-    fun `double damaged updates files reject mutations without overwriting either file`() {
+    fun `damaged updates primary aborts construction without overwriting either file`() {
         val file = tempDirectory.resolve("double-damaged-updates.json")
         val backup = file.resolveSibling("double-damaged-updates.json.bak")
         val damagedPrimary = "{ invalid"
@@ -743,9 +875,7 @@ class UpdatesRepositoryTest {
         file.writeText(damagedPrimary)
         backup.writeText(damagedBackup)
 
-        val repository = UpdatesRepository(file)
-
-        assertFailsWith<IllegalStateException> { repository.saveLastUpdateId("100", 1) }
+        assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
         assertEquals(damagedPrimary, file.readText())
         assertEquals(damagedBackup, backup.readText())
     }
@@ -942,8 +1072,7 @@ class UpdatesRepositoryTest {
                 ),
             ),
         )
-        val corrupt = UpdatesRepository(corruptFile)
-        assertFailsWith<IllegalStateException> { corrupt.getData("100") }
+        assertFailsWith<IllegalStateException> { UpdatesRepository(corruptFile) }
     }
 
     /** 验证长回复成功后只以 UTF-16 cursor 推进一个片段，末片段成功才删除 outbox。 */
@@ -1038,9 +1167,9 @@ class UpdatesRepositoryTest {
         }
     }
 
-    /** 验证损坏 JSON 中处于 surrogate pair 内的 cursor 会拒绝加载，且后续写入不会覆盖现场。 */
+    /** 验证损坏 JSON 中处于 surrogate pair 内的 cursor 会中止构造，且不会覆盖现场。 */
     @Test
-    fun `corrupt persisted outbox cursor fails closed without overwrite`() {
+    fun `corrupt persisted outbox cursor aborts construction without overwrite`() {
         val file = tempDirectory.resolve("corrupt-outbox-cursor.json")
         val corrupt = BotUpdatesData(
             bots = mapOf(
@@ -1053,10 +1182,8 @@ class UpdatesRepositoryTest {
         // 直接编码用于模拟历史或手工篡改文件；构造值本身的约束由仓储加载路径负责拒绝。
         file.writeText(ConfigJson.encodeToString(corrupt))
         val originalContent = file.readText()
-        val repository = UpdatesRepository(file)
 
-        assertFailsWith<IllegalStateException> { repository.getData("100") }
-        assertFailsWith<IllegalStateException> { repository.saveLastUpdateId("100", 12) }
+        assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
         assertEquals(originalContent, file.readText())
     }
 

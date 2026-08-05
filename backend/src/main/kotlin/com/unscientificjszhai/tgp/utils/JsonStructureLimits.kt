@@ -31,7 +31,8 @@ internal class JsonStructureLimitExceededException(message: String) : IOExceptio
  *
  * Kotlin serialization 的 JSON 树解析和编码会随嵌套层数递归。所有不可信原始 JSON 必须先经过
  * [validateUtf8]，已构造的 JSON 树在序列化或递归转换前必须经过 [validateElement]。这些校验均使用
- * 显式栈，不会因攻击者提供的深层结构消耗调用栈。
+ * 显式栈，不会因攻击者提供的深层结构消耗调用栈。调用方可为特定存储传入 [Budget]，未指定时
+ * 使用 [DEFAULT_BUDGET]。
  */
 internal object JsonStructureLimits {
     /** 允许的最大 JSON 容器嵌套层数。 */
@@ -39,6 +40,25 @@ internal object JsonStructureLimits {
 
     /** 允许的最大 JSON 令牌节点数，包含对象键，因而比纯值节点计数更保守。 */
     const val MAX_NODES = 4_096
+
+    /**
+     * 一次 JSON 结构校验的资源预算。
+     *
+     * @property maxDepth 允许的最大容器嵌套层数，必须为正数。
+     * @property maxNodes 允许的最大令牌节点数，包含对象键，必须为正数。
+     */
+    data class Budget(
+        val maxDepth: Int = MAX_DEPTH,
+        val maxNodes: Int = MAX_NODES,
+    ) {
+        init {
+            require(maxDepth > 0) { "JSON maximum depth must be positive." }
+            require(maxNodes > 0) { "JSON maximum node count must be positive." }
+        }
+    }
+
+    /** 通用不可信 JSON 输入使用的默认结构预算。 */
+    val DEFAULT_BUDGET = Budget()
 
     /** JSON 树到 Kotlin 容器的显式后序转换工作项。 */
     private sealed interface KotlinConversionWork {
@@ -54,27 +74,33 @@ internal object JsonStructureLimits {
      * [Utf8Scanner.finish]。扫描器只负责结构边界，完整语法和 UTF-8 合法性仍由随后的 JSON 解码器
      * 负责。
      */
-    fun newUtf8Scanner(): Utf8Scanner = Utf8Scanner(MAX_DEPTH, MAX_NODES)
+    fun newUtf8Scanner(budget: Budget = DEFAULT_BUDGET): Utf8Scanner =
+        Utf8Scanner(budget.maxDepth, budget.maxNodes)
 
     /** 在解析前校验一份完整的 UTF-8 JSON 文本的结构边界。 */
-    fun validateUtf8(bytes: ByteArray) {
-        newUtf8Scanner().apply {
+    fun validateUtf8(bytes: ByteArray, budget: Budget = DEFAULT_BUDGET) {
+        newUtf8Scanner(budget).apply {
             consume(bytes)
             finish()
         }
     }
 
     /** 在解析前校验一份完整字符串形式 JSON 的结构边界。 */
-    fun validateJsonString(source: String) = validateUtf8(source.toByteArray(Charsets.UTF_8))
+    fun validateJsonString(source: String, budget: Budget = DEFAULT_BUDGET) =
+        validateUtf8(source.toByteArray(Charsets.UTF_8), budget)
 
     /**
      * 先完成非递归边界校验，再交给 Kotlin serialization 解析。
      *
      * 解析成功后再次校验树，以覆盖解码器的边缘语义，并确保后续编码或转换的输入已受限。
      */
-    fun parseToJsonElement(json: Json, source: String): JsonElement {
-        validateJsonString(source)
-        return json.parseToJsonElement(source).also(::validateElement)
+    fun parseToJsonElement(
+        json: Json,
+        source: String,
+        budget: Budget = DEFAULT_BUDGET,
+    ): JsonElement {
+        validateJsonString(source, budget)
+        return json.parseToJsonElement(source).also { validateElement(it, budget) }
     }
 
     /**
@@ -82,7 +108,7 @@ internal object JsonStructureLimits {
      *
      * 对象键也纳入节点预算，防止少量深层以外的大型对象绕过工作量限制。
      */
-    fun validateElement(root: JsonElement) {
+    fun validateElement(root: JsonElement, budget: Budget = DEFAULT_BUDGET) {
         data class Pending(val value: JsonElement, val depth: Int)
 
         val pending = ArrayDeque<Pending>()
@@ -90,21 +116,21 @@ internal object JsonStructureLimits {
         var nodes = 0
         while (pending.isNotEmpty()) {
             val (value, depth) = pending.removeLast()
-            nodes = checkedNodeCount(nodes)
+            nodes = checkedNodeCount(nodes, budget.maxNodes)
             when (value) {
                 is JsonObject -> {
-                    checkDepth(depth + 1)
+                    checkDepth(depth + 1, budget.maxDepth)
                     // 先计入键的节点预算，再逐项压栈；不得以 `entries.toList()` 复制不可信的大对象。
-                    nodes = checkedNodeCount(nodes, value.size)
+                    nodes = checkedNodeCount(nodes, budget.maxNodes, value.size)
                     for ((_, child) in value) {
                         pending.addLast(Pending(child, depth + 1))
                     }
                 }
 
                 is JsonArray -> {
-                    checkDepth(depth + 1)
+                    checkDepth(depth + 1, budget.maxDepth)
                     // 子值随后才实际计数，但必须在将它们全部压入工作栈前确认预算。
-                    ensureNodeCapacity(nodes, value.size)
+                    ensureNodeCapacity(nodes, value.size, budget.maxNodes)
                     for (child in value) {
                         pending.addLast(Pending(child, depth + 1))
                     }
@@ -123,12 +149,15 @@ internal object JsonStructureLimits {
      * 数字转换规则与原有实现一致：依次尝试布尔、Int、Long、Double，最后保留原始文本。
      */
     @Suppress("UNCHECKED_CAST")
-    fun toKotlinMap(root: JsonObject): Map<String, Any?> =
-        toKotlinValue(root) as? Map<String, Any?> ?: error("JSON object conversion did not produce a map.")
+    fun toKotlinMap(
+        root: JsonObject,
+        budget: Budget = DEFAULT_BUDGET,
+    ): Map<String, Any?> =
+        toKotlinValue(root, budget) as? Map<String, Any?> ?: error("JSON object conversion did not produce a map.")
 
     /** 将任意 JSON 值转换为 Kotlin 容器值，先校验结构并采用显式后序栈。 */
-    fun toKotlinValue(root: JsonElement): Any? {
-        validateElement(root)
+    fun toKotlinValue(root: JsonElement, budget: Budget = DEFAULT_BUDGET): Any? {
+        validateElement(root, budget)
 
         val values = IdentityHashMap<JsonElement, Any?>()
         val work = ArrayDeque<KotlinConversionWork>()
@@ -173,21 +202,21 @@ internal object JsonStructureLimits {
             value.content
         }
 
-    private fun checkedNodeCount(current: Int, increment: Int = 1): Int {
-        ensureNodeCapacity(current, increment)
+    private fun checkedNodeCount(current: Int, maxNodes: Int, increment: Int = 1): Int {
+        ensureNodeCapacity(current, increment, maxNodes)
         return current + increment
     }
 
     /** 在批量压入显式工作栈前验证节点预算，防止超大浅层容器先占用内存。 */
-    private fun ensureNodeCapacity(current: Int, increment: Int) {
-        if (increment < 0 || current > MAX_NODES - increment) {
-            throw JsonStructureLimitExceededException("JSON 节点数超过 $MAX_NODES 限制。")
+    private fun ensureNodeCapacity(current: Int, increment: Int, maxNodes: Int) {
+        if (increment < 0 || current > maxNodes - increment) {
+            throw JsonStructureLimitExceededException("JSON 节点数超过 $maxNodes 限制。")
         }
     }
 
-    private fun checkDepth(depth: Int) {
-        if (depth > MAX_DEPTH) {
-            throw JsonStructureLimitExceededException("JSON 嵌套深度超过 $MAX_DEPTH 限制。")
+    private fun checkDepth(depth: Int, maxDepth: Int) {
+        if (depth > maxDepth) {
+            throw JsonStructureLimitExceededException("JSON 嵌套深度超过 $maxDepth 限制。")
         }
     }
 

@@ -9,6 +9,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
@@ -194,22 +195,156 @@ class AtomicJsonStorageTest {
         assertEquals("ignored", Files.readString(backup))
     }
 
+    /** 验证可见主文件只有在重新同步目录项后才作为有效快照发布，失败可在同一实例中重试。 */
+    @Test
+    fun `validated read confirms visible primary durability before publishing it`() {
+        val target = tempDirectory.resolve("visible-but-unconfirmed.json")
+        Files.writeString(target, "content")
+        var directorySyncAvailable = false
+        var targetDirectoryForces = 0
+        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun forceDirectory(path: Path) {
+                targetDirectoryForces++
+                if (!directorySyncAvailable) throw IOException("injected directory sync failure")
+                DefaultAtomicJsonFileOperations.forceDirectory(path)
+            }
+        }
+        val storage = AtomicJsonStorage(target, 1024 * 1024, operations)
+
+        val uncertain = storage.readValidated { bytes -> bytes.decodeToString() }
+
+        assertIs<AtomicJsonRead.IoFailure>(uncertain)
+        assertEquals(1, targetDirectoryForces)
+
+        directorySyncAvailable = true
+        val confirmed = storage.readValidated { bytes -> bytes.decodeToString() }
+
+        assertEquals(AtomicJsonRead.Valid("content"), confirmed)
+        assertEquals(2, targetDirectoryForces)
+    }
+
+    /** 验证首次提交由原子层准备目标目录，并在任何主文件替换前完成父目录耐久确认。 */
+    @Test
+    fun `new target directory is durably prepared before primary replacement`() {
+        val targetDirectory = tempDirectory.resolve("new-config")
+        val target = targetDirectory.resolve("state.json")
+        val events = mutableListOf<String>()
+        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun prepareDirectoryDurably(path: Path) {
+                events += "prepare-directory"
+                DefaultAtomicJsonFileOperations.prepareDirectoryDurably(path)
+            }
+
+            override fun atomicReplace(source: Path, target: Path) {
+                events += "replace-primary"
+                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
+            }
+
+            override fun forceDirectory(path: Path) {
+                events += "force-target-directory"
+                DefaultAtomicJsonFileOperations.forceDirectory(path)
+            }
+        }
+
+        val result = AtomicJsonStorage(target, 1024 * 1024, operations).commit("content".encodeToByteArray())
+
+        assertEquals(AtomicJsonCommitResult.Durable, result)
+        assertEquals(
+            listOf("prepare-directory", "replace-primary", "force-target-directory"),
+            events,
+        )
+        assertEquals("content", Files.readString(target))
+    }
+
     /**
-     * 验证主文件替换后的目录同步失败不会回报已经完成的逻辑提交失败。
+     * 验证父目录同步失败发生在替换前；即使目录已经可见，重建存储后仍会重新确认目录耐久性再提交。
      */
     @Test
-    fun `commit ignores post primary replacement directory sync failure`() {
+    fun `directory preparation failure prevents replacement and is retried by a new storage instance`() {
+        val targetDirectory = tempDirectory.resolve("uncertain-config")
+        val target = targetDirectory.resolve("state.json")
+        var preparationAvailable = false
+        var preparationCalls = 0
+        var replacementCalls = 0
+        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun prepareDirectoryDurably(path: Path) {
+                preparationCalls++
+                if (!preparationAvailable) {
+                    Files.createDirectories(path)
+                    throw IOException("injected parent directory sync failure")
+                }
+                DefaultAtomicJsonFileOperations.prepareDirectoryDurably(path)
+            }
+
+            override fun atomicReplace(source: Path, target: Path) {
+                replacementCalls++
+                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
+            }
+        }
+
+        assertFailsWith<IOException> {
+            AtomicJsonStorage(target, 1024 * 1024, operations).commit("first".encodeToByteArray())
+        }
+        assertEquals(1, preparationCalls)
+        assertEquals(0, replacementCalls)
+        assertTrue(Files.isDirectory(targetDirectory))
+        assertTrue(Files.notExists(target))
+
+        preparationAvailable = true
+        val result = AtomicJsonStorage(target, 1024 * 1024, operations).commit("second".encodeToByteArray())
+
+        assertEquals(AtomicJsonCommitResult.Durable, result)
+        assertEquals(2, preparationCalls)
+        assertEquals(1, replacementCalls)
+        assertEquals("second", Files.readString(target))
+    }
+
+    /**
+     * 验证主文件替换后的目录同步失败会返回可见但耐久性未知的独立状态。
+     */
+    @Test
+    fun `commit reports unknown durability after post replacement directory sync failure`() {
         val target = tempDirectory.resolve("commit-order.json")
         Files.writeString(target, "old-primary")
         val operations = RecordingFileOperations(failDirectoryForce = true)
 
-        AtomicJsonStorage(target, 1024 * 1024, operations).commit("new-primary".encodeToByteArray())
+        val result = AtomicJsonStorage(target, 1024 * 1024, operations).commit("new-primary".encodeToByteArray())
 
         val primaryReplacement = operations.events.indexOf("replace:commit-order.json")
         val directoryForce = operations.events.indexOf("force-directory")
         assertTrue(primaryReplacement < directoryForce)
         assertEquals(1, operations.events.count { it == "force-directory" })
         assertEquals("new-primary", Files.readString(target))
+        assertTrue(result is AtomicJsonCommitResult.ReplacedDurabilityUnknown)
+        assertFailsWith<JsonStorageDurabilityUnknownException> { result.requireDurable() }
+    }
+
+    /** 验证目录同步成功时提交返回明确的耐久状态。 */
+    @Test
+    fun `commit reports durable after directory sync succeeds`() {
+        val target = tempDirectory.resolve("durable.json")
+
+        val result = AtomicJsonStorage(target, 1024 * 1024).commit("content".encodeToByteArray())
+
+        assertEquals(AtomicJsonCommitResult.Durable, result)
+        assertEquals(AtomicJsonCommitResult.Durable, result.requireDurable())
+    }
+
+    /** 验证文件系统不支持目录同步时同样返回耐久性未知，而不是误报成功。 */
+    @Test
+    fun `commit reports unknown durability when directory sync is unsupported`() {
+        val target = tempDirectory.resolve("unsupported-directory-sync.json")
+        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun forceDirectory(path: Path) {
+                throw UnsupportedOperationException("injected unsupported directory sync")
+            }
+        }
+
+        val result = AtomicJsonStorage(target, 1024 * 1024, operations).commit("content".encodeToByteArray())
+
+        val unknown = assertIs<AtomicJsonCommitResult.ReplacedDurabilityUnknown>(result)
+        assertIs<UnsupportedOperationException>(unknown.cause)
+        assertEquals("content", Files.readString(target))
     }
 
     private enum class FailureStage {

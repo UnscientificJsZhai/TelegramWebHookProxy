@@ -517,7 +517,7 @@ class APIModuleTest {
         }
 
     /**
-     * 验证历史未知代理类型不会在更新默认聊天时被静默覆盖，完整设置可显式修复它。
+     * 验证历史语义非法代理不会在更新默认聊天时被静默覆盖，完整设置可显式修复它。
      */
     @Test
     fun `chat settings rejects historical invalid proxy without rewriting it`() {
@@ -525,7 +525,7 @@ class APIModuleTest {
         try {
             val configFile = temporaryDirectory.resolve("settings.json")
             val historicalContent =
-                """{"telegramToken":"100:token","chatId":"old-chat","proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"}}"""
+                """{"telegramToken":"100:token","chatId":"old-chat","proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"}}"""
             configFile.writeText(historicalContent)
             val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
             val originalContent = configFile.readText()

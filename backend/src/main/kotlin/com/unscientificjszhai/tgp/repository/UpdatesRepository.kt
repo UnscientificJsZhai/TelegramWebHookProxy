@@ -7,13 +7,19 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.JsonElementMigration
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.SchemaValidatedJsonStorage
 import com.unscientificjszhai.tgp.utils.TelegramTextChunks
+import com.unscientificjszhai.tgp.utils.requireDurable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -216,28 +222,29 @@ data class BotUpdatesData(
 /**
  * 持久化按 Telegram bot 标识隔离的聊天信息和更新处理进度。
  *
- * 同一 bot 标识的读取、变更和写入由同一实例锁串行化，因而聊天发现、聊天删除和偏移量
+ * 同一 `botId` 的读取、变更和写入由同一实例锁串行化，因而聊天发现、聊天删除和偏移量
  * 更新不会互相覆盖。旧的单机器人文件在第一个有效 bot 标识访问状态时迁移给该机器人。
+ * 构造仓储时会完整读取、迁移并校验主文件；JSON 结构、必填字段或业务状态严重损坏，或主文件
+ * 无法读取时会抛出异常并中止初始化，不会以空状态继续运行。
  *
- * 通过依赖注入构造时会使用默认配置文件；测试可提供独立的配置文件。
+ * @constructor 创建更新状态仓储并从配置文件加载初始状态。
+ * @throws IllegalStateException `config/updates.json` 严重损坏或无法读取时抛出。
  */
 @Singleton
 class UpdatesRepository private constructor(
-    configFile: File,
     private var state: BotUpdatesData,
     private var legacyData: UpdatesData?,
     private val beforeSaveForTesting: (BotUpdatesData) -> Unit,
-    fileOperations: AtomicJsonFileOperations,
-    private var requiresStorageValidationBeforeWrite: Boolean,
+    private val storage: SchemaValidatedJsonStorage<BotUpdatesData>,
 ) {
     private val logger = LoggerFactory.getLogger(UpdatesRepository::class.java)
-    private val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.UPDATES_BYTES, fileOperations)
 
     /**
      * 创建使用默认配置文件的更新状态仓储。
      *
      * @constructor 创建使用 `config/updates.json` 的仓储；父作用域仅用于保持与现有注入 API 的生命周期一致。
      * @param parentScope 应用父协程作用域；当前仓储不创建后台协程。
+     * @throws IllegalStateException `config/updates.json` 严重损坏或无法读取时抛出。
      */
     @Inject
     constructor(@Suppress("unused") parentScope: CoroutineScope) : this(File("config/updates.json"))
@@ -266,27 +273,17 @@ class UpdatesRepository private constructor(
         configFile: File,
         fileOperations: AtomicJsonFileOperations,
         beforeSaveForTesting: (BotUpdatesData) -> Unit = {},
-    ) : this(configFile, load(configFile, fileOperations), beforeSaveForTesting, fileOperations)
+    ) : this(load(configFile, fileOperations), beforeSaveForTesting)
 
     private constructor(
-        configFile: File,
         loaded: LoadedUpdates,
         beforeSaveForTesting: (BotUpdatesData) -> Unit = {},
-        fileOperations: AtomicJsonFileOperations,
     ) : this(
-        configFile,
         loaded.state,
         loaded.legacyData,
         beforeSaveForTesting,
-        fileOperations,
-        loaded.requiresStorageValidationBeforeWrite,
-    ) {
-        configFile.parentFile?.let { parent ->
-            if (!parent.exists()) {
-                parent.mkdirs()
-            }
-        }
-    }
+        loaded.storage,
+    )
 
     /**
      * 读取指定机器人的当前状态快照。
@@ -303,7 +300,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return UpdatesData()
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         return state.bots[botId] ?: UpdatesData()
     }
@@ -331,7 +327,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return UpdatesData()
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val base = normalizeState(state)
         val current = base.bots[botId] ?: UpdatesData()
@@ -359,7 +354,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return UpdatesData()
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         if (chats.isEmpty()) {
             return state.bots[botId] ?: UpdatesData()
@@ -400,7 +394,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return UpdatesData()
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: UpdatesData()
         if (current.retryCheckpoint != null) {
@@ -445,7 +438,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return RetryCheckpointRecordResult.Stale
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: UpdatesData()
         val existing = current.retryCheckpoint
@@ -519,7 +511,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return RetryCheckpointGapResult.Stale
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return RetryCheckpointGapResult.Stale
         val checkpoint = current.retryCheckpoint
@@ -569,7 +560,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return UpdatesData()
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: UpdatesData()
         if (current.retryCheckpoint != null) {
@@ -649,7 +639,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return null
         }
-        ensureStorageValidatedBeforeMutation()
         val entry = state.bots[botId]?.agentTurnJournal?.singleOrNull { it.updateId == updateId }
         entry?.let(::validateAgentTurnJournalEntry)
         return entry
@@ -684,7 +673,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return AgentTurnClaim.AlreadyConfirmed
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: UpdatesData()
         val existing = current.agentTurnJournal.singleOrNull { it.updateId == updateId }
@@ -749,7 +737,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return null
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return null
         val entryIndex = current.agentTurnJournal.indexOfFirst { it.updateId == updateId }
@@ -820,7 +807,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return false
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return false
         val entry = current.agentTurnJournal.singleOrNull { it.updateId == updateId } ?: return false
@@ -855,7 +841,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return 0
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return 0
         val remaining = current.agentTurnJournal.filterNot { entry ->
@@ -909,7 +894,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return null
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
 
         val current = state.bots[botId] ?: return null
@@ -959,7 +943,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return false
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
 
         val current = state.bots[botId] ?: return false
@@ -991,7 +974,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return false
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return false
         val replyIndex = current.pendingTelegramReplies.indexOfFirst { it == expected }
@@ -1025,7 +1007,6 @@ class UpdatesRepository private constructor(
         ) {
             return false
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return false
         val replyIndex = current.pendingTelegramReplies.indexOfFirst { it == expected }
@@ -1113,18 +1094,16 @@ class UpdatesRepository private constructor(
     }
 
     /**
-     * Canonicalize every chat discovery snapshot before a durable commit.
+     * 在每次耐久提交前规范化聊天发现快照。
      *
-     * The normalizer is deliberately called from the one persistence choke point instead of only from mergeChats:
-     * changing an offset, an outbox or an Agent journal is also the first opportunity to repair a historical file
-     * whose chat metadata was absent. No field is installed in memory until AtomicJsonStorage has committed it.
+     * 规范化集中在唯一持久化入口，使偏移量、outbox 或 Agent 账本变更也能修复缺少聊天元数据的旧文件。只有
+     * 原子替换与父目录同步都确认耐久后，才会把候选状态安装到内存。
      */
     private fun saveState(newState: BotUpdatesData): BotUpdatesData {
-        ensureStorageValidatedBeforeMutation()
         val normalized = normalizeState(newState)
         validatePersistedUpdatesState(normalized)
         beforeSaveForTesting(normalized)
-        storage.commit(ConfigJson.encodeToString(normalized).toByteArray(StandardCharsets.UTF_8))
+        storage.commit(normalized).requireDurable()
         state = normalized
         return normalized
     }
@@ -1138,7 +1117,6 @@ class UpdatesRepository private constructor(
         if (!botId.isValidBotId()) {
             return RetryCheckpointCommitResult.Stale
         }
-        ensureStorageValidatedBeforeMutation()
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: UpdatesData()
         if (current.retryCheckpoint?.targetUpdateId != expectedRetryTarget) {
@@ -1425,86 +1403,78 @@ class UpdatesRepository private constructor(
     }
 
     private data class LoadedUpdates(
+        val storage: SchemaValidatedJsonStorage<BotUpdatesData>,
         val state: BotUpdatesData,
         val legacyData: UpdatesData?,
-        val requiresStorageValidationBeforeWrite: Boolean = false,
     )
 
-    private fun ensureStorageValidatedBeforeMutation() {
-        if (!requiresStorageValidationBeforeWrite) {
-            return
-        }
-        val validated = when (val read = storage.readValidated(::decodeLoadedUpdates)) {
-            AtomicJsonRead.Missing -> LoadedUpdates(BotUpdatesData(), null)
-            is AtomicJsonRead.Valid -> read.value
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException("更新状态文件已损坏，拒绝覆盖现场。", read.cause)
-            is AtomicJsonRead.IoFailure -> throw IllegalStateException(
-                "更新状态文件尚不可读取，拒绝覆盖现场。",
-                read.cause
-            )
-        }
-        state = validated.state
-        legacyData = validated.legacyData
-        requiresStorageValidationBeforeWrite = false
-    }
-
     private companion object {
+        const val LEGACY_BOT_ID = ""
+
+        /** 节点上限不低于文件字节上限，避免原有合法 updates 快照被通用的 4096 节点预算拒绝。 */
+        val UPDATES_JSON_STRUCTURE_BUDGET = JsonStructureLimits.Budget(
+            maxNodes = ResourceLimits.UPDATES_BYTES,
+        )
+        val CURRENT_UPDATES_ROOT_FIELDS = setOf("bots", "chatRecency", "chatRecencyClock")
+
+        val LEGACY_ROOT_MIGRATION = JsonElementMigration("updates-legacy-root-to-bots") { root ->
+            when (root) {
+                is JsonObject -> if (root.keys.any(CURRENT_UPDATES_ROOT_FIELDS::contains)) {
+                    root
+                } else {
+                    // 旧 UpdatesData 的全部字段均有默认值；没有当前根格式标志的对象（包括 `{}`）都属于旧格式。
+                    wrapLegacyUpdates(root)
+                }
+
+                is JsonArray -> wrapLegacyUpdates(
+                    buildJsonObject { put("chats", root) },
+                )
+
+                else -> root
+            }
+        }
+
         fun load(configFile: File, fileOperations: AtomicJsonFileOperations): LoadedUpdates {
-            val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.UPDATES_BYTES, fileOperations)
-            return when (val read = storage.readValidated(::decodeLoadedUpdates)) {
-                AtomicJsonRead.Missing -> LoadedUpdates(BotUpdatesData(), null)
-                is AtomicJsonRead.Valid -> read.value
+            val storage = SchemaValidatedJsonStorage(
+                storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.UPDATES_BYTES, fileOperations),
+                serializer = BotUpdatesData.serializer(),
+                migrations = listOf(LEGACY_ROOT_MIGRATION),
+                validator = ::validatePersistedUpdatesState,
+                structureBudget = UPDATES_JSON_STRUCTURE_BUDGET,
+                logger = LoggerFactory.getLogger(UpdatesRepository::class.java),
+            )
+            return when (val read = storage.read()) {
+                AtomicJsonRead.Missing -> LoadedUpdates(storage, BotUpdatesData(), null)
+                is AtomicJsonRead.Valid -> {
+                    val legacyData = read.value.bots[LEGACY_BOT_ID]
+                    val state = read.value.copy(
+                        bots = read.value.bots - LEGACY_BOT_ID,
+                        chatRecency = read.value.chatRecency - LEGACY_BOT_ID,
+                    )
+                    LoadedUpdates(storage, state, legacyData)
+                }
+
                 is AtomicJsonRead.Corrupt -> {
                     LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Updates file is semantically invalid; preserving it; category={}",
+                        "Updates file is severely damaged; application startup is aborted; category={}",
                         SafeLogging.failureCategory(read.cause).wireName,
                     )
-                    LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
+                    throw IllegalStateException("更新状态文件严重损坏，应用无法安全启动。", read.cause)
                 }
 
                 is AtomicJsonRead.IoFailure -> {
                     LoggerFactory.getLogger(UpdatesRepository::class.java).error(
-                        "Unable to read updates data; delaying writes until it can be revalidated; category={}",
+                        "Unable to read updates data; application startup is aborted; category={}",
                         SafeLogging.failureCategory(read.cause).wireName,
                     )
-                    LoadedUpdates(BotUpdatesData(), null, requiresStorageValidationBeforeWrite = true)
+                    throw IllegalStateException("更新状态文件无法读取，应用无法安全启动。", read.cause)
                 }
 
             }
         }
 
-        fun decodeLoadedUpdates(bytes: ByteArray): LoadedUpdates {
-            val content = bytes.toString(StandardCharsets.UTF_8)
-            if (content.isBlank()) {
-                throw IllegalArgumentException("Updates data must not be blank")
-            }
-            val decoded = when (val root = ConfigJson.parseToJsonElement(content)) {
-                is JsonArray -> LoadedUpdates(
-                    BotUpdatesData(),
-                    UpdatesData(chats = ConfigJson.decodeFromString<List<ChatInfo>>(content)),
-                )
-
-                is JsonObject -> {
-                    // 先检查格式标志。因为 ConfigJson 忽略未知字段，直接尝试旧格式会把
-                    // {"bots": ...} 静默解码成空的 UpdatesData，导致状态丢失。
-                    if (root.containsKey("bots")) {
-                        LoadedUpdates(
-                            state = ConfigJson.decodeFromString(content),
-                            legacyData = null,
-                        )
-                    } else {
-                        LoadedUpdates(
-                            state = BotUpdatesData(),
-                            legacyData = ConfigJson.decodeFromString(content),
-                        )
-                    }
-                }
-
-                else -> throw IllegalArgumentException("Unsupported updates data format")
-            }
-            validatePersistedUpdatesState(decoded.state)
-            decoded.legacyData?.let(::validatePersistedUpdatesData)
-            return decoded
+        fun wrapLegacyUpdates(legacy: JsonElement): JsonObject = buildJsonObject {
+            put("bots", buildJsonObject { put(LEGACY_BOT_ID, legacy) })
         }
     }
 }

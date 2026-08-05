@@ -315,6 +315,84 @@ class TaskSchedulerServiceTest {
     }
 
     /**
+     * 验证目录同步失败产生的未知耐久状态不会放行副作用，后续耐久重提交才执行一次。
+     */
+    @Test
+    fun `unknown precommit durability quarantines side effects until durable retry`() = runTest {
+        val taskId = service.createTask("due", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val operations = ToggleDirectorySyncFileOperations(failDirectorySync = false)
+        service.close()
+        service = newService(scheduleFile, operations)
+        operations.failDirectorySync = true
+        coEvery { agentService.sendMessage(any()) } returns "result"
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
+
+        service.scanAndExecute()
+
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        assertEquals(listOf(taskId), service.listTasks().map { it.id })
+        assertEquals("[]", scheduleFile.readText().trim())
+
+        operations.failDirectorySync = false
+        service.scanAndExecute()
+
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+        coVerify(exactly = 1) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        assertTrue(service.listTasks().isEmpty())
+    }
+
+    /** 验证 unknown 后重启若保留可见的新目录项，任务保持已预消费且不会产生副作用。 */
+    @Test
+    fun `restart after unknown with visible replacement does not execute the task`() = runTest {
+        service.createTask("visible after restart", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val operations = ToggleDirectorySyncFileOperations(failDirectorySync = false)
+        service.close()
+        service = newService(scheduleFile, operations)
+        operations.failDirectorySync = true
+
+        service.scanAndExecute()
+
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        assertEquals("[]", scheduleFile.readText().trim())
+
+        service.close()
+        service = newService(scheduleFile)
+        service.scanAndExecute()
+
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        assertTrue(service.listTasks().isEmpty())
+    }
+
+    /** 验证 unknown 后重启若恢复旧目录项，因此前未放行副作用，恢复的任务至多执行一次。 */
+    @Test
+    fun `restart after unknown with rolled back replacement executes at most once`() = runTest {
+        service.createTask("rolled back after restart", System.currentTimeMillis() - 1_000, LoopMode.ONCE, "12345")
+        val oldDirectoryEntry = scheduleFile.readText()
+        val operations = ToggleDirectorySyncFileOperations(failDirectorySync = false)
+        service.close()
+        service = newService(scheduleFile, operations)
+        operations.failDirectorySync = true
+        coEvery { agentService.sendMessage(any()) } returns "result"
+        coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
+
+        service.scanAndExecute()
+
+        coVerify(exactly = 0) { agentService.sendMessage(any()) }
+        scheduleFile.writeText(oldDirectoryEntry)
+
+        service.close()
+        service = newService(scheduleFile)
+        service.scanAndExecute()
+        service.scanAndExecute()
+
+        coVerify(exactly = 1) { agentService.sendMessage(any()) }
+        coVerify(exactly = 1) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        assertTrue(service.listTasks().isEmpty())
+    }
+
+    /**
      * 验证一次性任务在预消费后即使 Agent 回合失败并重启服务，也不会被重新调用。
      */
     @Test
@@ -466,11 +544,9 @@ class TaskSchedulerServiceTest {
         assertEquals(2 * 60 * 60 * 1000 + 30 * 60 * 1000, nextWeekTask.calendarAnchorTimeMillis)
     }
 
-    /**
-     * 验证损坏主文件会禁用创建和取消，且不会访问遗留 `.bak` 文件。
-     */
+    /** 验证损坏主文件会中断调度器启动，且不会访问遗留 `.bak` 文件。 */
     @Test
-    fun `damaged schedule primary disables create and cancel without touching legacy bak`() {
+    fun `damaged schedule primary aborts startup without touching legacy bak`() {
         val sidecarFile = File(tempDirectory, "schedule.json.bak")
         val damagedPrimary = "[ invalid"
         val sidecarContent = ConfigJson.encodeToString(
@@ -479,19 +555,17 @@ class TaskSchedulerServiceTest {
         scheduleFile.writeText(damagedPrimary)
         sidecarFile.writeText(sidecarContent)
         service.close()
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
-            scheduleFile,
-            rejectBakOperations(),
-        )
 
         assertFailsWith<IllegalStateException> {
-            service.createTask("new", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
+            TaskSchedulerService(
+                CoroutineScope(EmptyCoroutineContext),
+                telegramService,
+                Provider { agentService },
+                settingsRepository,
+                scheduleFile,
+                rejectBakOperations(),
+            )
         }
-        assertFailsWith<IllegalStateException> { service.cancelTask("ignored") }
         assertEquals(damagedPrimary, scheduleFile.readText())
         assertEquals(sidecarContent, sidecarFile.readText())
     }
@@ -520,38 +594,50 @@ class TaskSchedulerServiceTest {
         assertEquals(backupContent, backupFile.readText())
     }
 
-    /**
-     * 验证主调度文件和备份均损坏时，创建和取消均拒绝且现场不被默认状态覆盖。
-     */
+    /** 验证有默认值的可选任务字段类型损坏时按默认值加载，而必填字段损坏会中断启动。 */
     @Test
-    fun `double damaged schedule files reject create and cancel without overwriting either file`() {
+    fun `schedule schema repairs optional fields and rejects damaged required fields`() {
+        scheduleFile.writeText(
+            """[{"id":"repair","instruction":"ok","executionTime":1,"loopMode":"ONCE","agentChatId":"12345","calendarAnchorTimeMillis":"invalid"}]""",
+        )
+        service.close()
+        service = newService(scheduleFile)
+
+        assertNull(service.listTasks().single().calendarAnchorTimeMillis)
+
+        service.close()
+        scheduleFile.writeText(
+            """[{"id":"fatal","executionTime":1,"loopMode":"ONCE","agentChatId":"12345"}]""",
+        )
+        assertFailsWith<IllegalStateException> { newService(scheduleFile) }
+    }
+
+    /** 验证主调度文件损坏时启动失败，且主文件与遗留备份均原样保留。 */
+    @Test
+    fun `damaged schedule primary preserves both primary and legacy backup`() {
         val backupFile = File(tempDirectory, "schedule.json.bak")
         val damagedPrimary = "[ invalid"
         val damagedBackup = "{ invalid"
         scheduleFile.writeText(damagedPrimary)
         backupFile.writeText(damagedBackup)
         service.close()
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
-            scheduleFile,
-        )
 
         assertFailsWith<IllegalStateException> {
-            service.createTask("new", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
+            TaskSchedulerService(
+                CoroutineScope(EmptyCoroutineContext),
+                telegramService,
+                Provider { agentService },
+                settingsRepository,
+                scheduleFile,
+            )
         }
-        assertFailsWith<IllegalStateException> { service.cancelTask("missing") }
         assertEquals(damagedPrimary, scheduleFile.readText())
         assertEquals(damagedBackup, backupFile.readText())
     }
 
-    /**
-     * 验证损坏主调度文件时不会读取遗留 `.bak` 任务或执行它。
-     */
+    /** 验证损坏主调度文件时中断启动，不会读取或执行遗留 `.bak` 任务。 */
     @Test
-    fun `scan ignores legacy bak task when primary is corrupt`() = runTest {
+    fun `startup rejects corrupt primary without executing legacy bak task`() = runTest {
         val sidecarFile = File(tempDirectory, "schedule.json.bak")
         val ignoredSidecarTask = ScheduledTask(
             "ignored",
@@ -563,21 +649,22 @@ class TaskSchedulerServiceTest {
         scheduleFile.writeText("[ invalid")
         sidecarFile.writeText(ConfigJson.encodeToString(listOf(ignoredSidecarTask)))
         service.close()
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
-            scheduleFile,
-            rejectBakOperations(),
-        )
         coEvery { agentService.sendMessage(any()) } returns "done"
         coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns successfulTelegramResponse()
 
-        service.scanAndExecute()
+        assertFailsWith<IllegalStateException> {
+            TaskSchedulerService(
+                CoroutineScope(EmptyCoroutineContext),
+                telegramService,
+                Provider { agentService },
+                settingsRepository,
+                scheduleFile,
+                rejectBakOperations(),
+            )
+        }
 
         coVerify(exactly = 0) { agentService.sendMessage(any()) }
-        assertTrue(service.listTasks().isEmpty())
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
     }
 
     /**
@@ -771,16 +858,15 @@ class TaskSchedulerServiceTest {
         }
         service.close()
         scheduleFile.writeText(deepJson)
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
-            scheduleFile,
-        )
 
         assertFailsWith<IllegalStateException> {
-            service.createTask("must not overwrite", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
+            TaskSchedulerService(
+                CoroutineScope(EmptyCoroutineContext),
+                telegramService,
+                Provider { agentService },
+                settingsRepository,
+                scheduleFile,
+            )
         }
         assertEquals(deepJson, scheduleFile.readText())
     }
@@ -926,6 +1012,18 @@ class TaskSchedulerServiceTest {
                 DefaultAtomicJsonFileOperations.atomicReplace(source, target)
             }
         }
+
+    /** 可在测试中切换目录同步故障的文件操作。 */
+    private class ToggleDirectorySyncFileOperations(
+        var failDirectorySync: Boolean,
+    ) : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+        override fun forceDirectory(path: Path) {
+            if (failDirectorySync) {
+                throw IOException("injected directory sync failure")
+            }
+            DefaultAtomicJsonFileOperations.forceDirectory(path)
+        }
+    }
 
     private fun successfulTelegramResponse(): TelegramApiResponse =
         TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")

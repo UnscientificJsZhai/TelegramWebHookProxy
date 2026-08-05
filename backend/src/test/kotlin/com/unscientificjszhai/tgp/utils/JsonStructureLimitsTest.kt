@@ -58,6 +58,31 @@ class JsonStructureLimitsTest {
         }
     }
 
+    /** 验证自定义预算可单独放宽指定调用，不改变默认节点与深度限制。 */
+    @Test
+    fun `custom budget is scoped to one validation`() {
+        val entries = (0..(JsonStructureLimits.MAX_NODES / 2)).associate { index ->
+            "field-$index" to JsonPrimitive(index)
+        }
+        val wide = JsonObject(entries)
+        assertFailsWith<JsonStructureLimitExceededException> {
+            JsonStructureLimits.validateElement(wide)
+        }
+
+        JsonStructureLimits.validateElement(
+            wide,
+            JsonStructureLimits.Budget(maxNodes = JsonStructureLimits.MAX_NODES + 16),
+        )
+
+        var deep: JsonElement = JsonPrimitive(0)
+        repeat(JsonStructureLimits.MAX_DEPTH + 1) { deep = JsonObject(mapOf("nested" to deep)) }
+        assertFailsWith<JsonStructureLimitExceededException> { JsonStructureLimits.validateElement(deep) }
+        JsonStructureLimits.validateElement(
+            deep,
+            JsonStructureLimits.Budget(maxDepth = JsonStructureLimits.MAX_DEPTH + 1),
+        )
+    }
+
     /** 验证浅层对象仍按原参数转换规则转换数字、布尔和 null。 */
     @Test
     fun `iterative object conversion preserves primitive coercions`() {

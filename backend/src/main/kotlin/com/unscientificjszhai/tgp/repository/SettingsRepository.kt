@@ -15,9 +15,12 @@ import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.JsonElementMigration
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.SchemaValidatedJsonStorage
+import com.unscientificjszhai.tgp.utils.requireDurable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -26,9 +29,8 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
-import kotlinx.serialization.json.put
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -42,8 +44,9 @@ import kotlin.concurrent.withLock
 /**
  * 持久化应用设置，并向观察者发布最新设置快照。
  *
- * 保存会同步写入配置文件；涉及 AI 代理生命周期的设置变更会登记屏障代次，以便
- * 代理在完成切换前避免使用过期配置。
+ * 构造时会按 Kotlin serialization schema 加载配置：旧代理结构会先迁移，可选损坏字段使用其构造默认值，
+ * JSON 结构、必填字段或文件 I/O 严重损坏会中断构造。保存仅在文件和目录项均确认耐久后发布设置；涉及 AI
+ * 代理生命周期的设置变更会登记屏障代次，以便代理在完成切换前避免使用过期配置。
  */
 class SettingsRepository private constructor(
     configFile: File,
@@ -58,8 +61,9 @@ class SettingsRepository private constructor(
     /**
      * 创建使用默认配置文件的设置仓储。
      *
-     * @constructor 创建使用 `config/settings.json` 的仓储；该目录不存在时会创建。
+     * @constructor 创建使用 `config/settings.json` 的仓储；首次保存时由统一存储创建目录并确认其目录项耐久。
      * @param modelSwitchBarrier 协调 AI 代理配置切换的屏障，必须由同一应用作用域共享。
+     * @throws IllegalStateException 设置文件结构、必填字段或业务资源边界严重损坏，或文件无法读取时抛出。
      */
     @Inject
     constructor(modelSwitchBarrier: ModelSwitchBarrier) : this(
@@ -77,7 +81,13 @@ class SettingsRepository private constructor(
     }
 
     private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
-    private val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SETTINGS_BYTES, fileOperations)
+    private val storage = SchemaValidatedJsonStorage(
+        storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SETTINGS_BYTES, fileOperations),
+        serializer = AppSettings.serializer(),
+        migrations = listOf(LEGACY_HTTP_PROXY_TYPE_MIGRATION),
+        validator = ::validateAppSettingsResourceLimits,
+        logger = logger,
+    )
     private val loadedSettings = loadSettings()
 
     @Volatile
@@ -91,7 +101,6 @@ class SettingsRepository private constructor(
     @Volatile
     internal var hasHistoricalInvalidOpenAiBaseUrl = loadedSettings.hasInvalidOpenAiBaseUrl
         private set
-    private var requiresStorageValidationBeforeWrite = loadedSettings.requiresStorageValidationBeforeWrite
 
     private val _settingsFlow = MutableStateFlow(loadedSettings.settings)
     private var settingsRevision = loadedSettings.settings.revision()
@@ -128,190 +137,26 @@ class SettingsRepository private constructor(
     private var telegramTokenGeneration = 0L
     private val telegramTokenLifecycleLock = ReentrantLock()
 
-    init {
-        configFile.parentFile?.let { parent ->
-            if (!parent.exists()) {
-                parent.mkdirs()
-            }
-        }
-    }
-
     private fun loadSettings(): LoadedSettings {
-        return when (val read = storage.readValidated(::parseSettings)) {
+        return when (val read = storage.read()) {
             AtomicJsonRead.Missing -> LoadedSettings(AppSettings(), hasInvalidProxy = false)
-            is AtomicJsonRead.Valid -> materializeSettingsCandidate(read.value)
+            is AtomicJsonRead.Valid -> read.value.toLoadedSettings(logger)
             is AtomicJsonRead.Corrupt -> {
                 logger.error(
-                    "Settings file is semantically invalid; preserving it; category={}",
+                    "Settings file is severely damaged; application startup is aborted; category={}",
                     SafeLogging.failureCategory(read.cause).wireName,
                 )
-                LoadedSettings(
-                    settings = AppSettings(),
-                    hasInvalidProxy = false,
-                    requiresStorageValidationBeforeWrite = true,
-                )
+                throw IllegalStateException("设置文件严重损坏，应用无法安全启动。", read.cause)
             }
 
             is AtomicJsonRead.IoFailure -> {
                 logger.error(
-                    "Unable to read settings file; delaying writes until it can be revalidated; category={}",
+                    "Unable to read settings file; application startup is aborted; category={}",
                     SafeLogging.failureCategory(read.cause).wireName,
                 )
-                LoadedSettings(
-                    settings = AppSettings(),
-                    hasInvalidProxy = false,
-                    requiresStorageValidationBeforeWrite = true,
-                )
+                throw IllegalStateException("设置文件无法读取，应用无法安全启动。", read.cause)
             }
 
-        }
-    }
-
-    private fun ensureStorageValidatedBeforeWrite() {
-        if (!requiresStorageValidationBeforeWrite) {
-            return
-        }
-        when (val read = storage.readValidated(::parseSettings)) {
-            AtomicJsonRead.Missing -> {
-                requiresStorageValidationBeforeWrite = false
-                return
-            }
-
-            is AtomicJsonRead.Valid -> {
-                val validated = materializeSettingsCandidate(read.value)
-                publishRevalidatedSettings(validated)
-                requiresStorageValidationBeforeWrite = false
-                throw StorageRevalidatedRetryException()
-            }
-
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException("设置文件已损坏，拒绝覆盖现场。", read.cause)
-            is AtomicJsonRead.IoFailure -> throw IllegalStateException("设置文件尚不可读取，拒绝覆盖现场。", read.cause)
-        }
-    }
-
-    private fun publishRevalidatedSettings(validated: LoadedSettings) {
-        val revalidatedSettings = validated.settings
-        val previousSettings = _settingsFlow.value
-        val tokenChanged = revalidatedSettings.telegramToken != previousSettings.telegramToken
-        val switchGeneration = if (revalidatedSettings.requiresAgentLifecycleBarrier(previousSettings)) {
-            modelSwitchBarrier.beginSwitch()
-        } else {
-            null
-        }
-        val publish = {
-            hasHistoricalInvalidProxy = validated.hasInvalidProxy
-            hasHistoricalInvalidMcp = validated.hasInvalidMcp
-            hasHistoricalInvalidOpenAiBaseUrl = validated.hasInvalidOpenAiBaseUrl
-            if (tokenChanged) {
-                _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
-                    token = revalidatedSettings.telegramToken,
-                    generation = ++telegramTokenGeneration,
-                )
-            }
-            _settingsFlow.value = revalidatedSettings
-            settingsRevision = revalidatedSettings.revision()
-            if (revalidatedSettings != previousSettings) {
-                _settingsUpdateFlow.value = SettingsUpdate(
-                    settings = revalidatedSettings,
-                    version = ++settingsVersion,
-                    switchGeneration = switchGeneration ?: modelSwitchBarrier.latestPendingSettingsGeneration(),
-                )
-            }
-        }
-        if (tokenChanged) {
-            telegramTokenLifecycleLock.withLock(publish)
-        } else {
-            publish()
-        }
-    }
-
-    private fun parseSettings(bytes: ByteArray): SettingsCandidate {
-        val content = bytes.toString(StandardCharsets.UTF_8)
-        val decodedSettings = runCatching { ConfigJson.decodeFromString<AppSettings>(content) }.getOrNull()
-        if (decodedSettings != null) {
-            validateAppSettingsResourceLimits(decodedSettings)
-            return SettingsCandidate.Decoded(decodedSettings)
-        }
-
-        val settings = ConfigJson.parseToJsonElement(content) as? JsonObject
-            ?: throw IllegalArgumentException("Settings root must be a JSON object")
-        val settingsWithoutProxy = buildJsonObject {
-            settings.forEach { (key, value) ->
-                if (key != "proxy") {
-                    put(key, value)
-                }
-            }
-        }
-        val protectedSettings = runCatching {
-            ConfigJson.decodeFromJsonElement<AppSettings>(settingsWithoutProxy)
-        }.getOrElse { throw IllegalArgumentException("Settings contain invalid non-proxy fields", it) }
-        val proxy = settings["proxy"] as? JsonObject
-        validateAppSettingsResourceLimits(protectedSettings)
-        validateLegacyProxyCredentialResourceLimits(proxy)
-
-        if (proxy != null && proxy.containsKey("host") && proxy.containsKey("port") && !proxy.containsKey("type")) {
-            val migratedProxy = buildJsonObject {
-                proxy.forEach { (key, value) -> put(key, value) }
-                put("type", "HTTP")
-            }
-            val migratedSettings = replaceProxy(settings, migratedProxy)
-            val decodedSettings = runCatching {
-                ConfigJson.decodeFromJsonElement<AppSettings>(migratedSettings)
-            }.getOrNull()
-            if (decodedSettings != null && !decodedSettings.proxy.isInvalidProxy()) {
-                validateAppSettingsResourceLimits(decodedSettings)
-                return SettingsCandidate.Migratable(decodedSettings, protectedSettings)
-            }
-        }
-        return SettingsCandidate.Protected(protectedSettings)
-    }
-
-    /** 校验历史未知代理类型中仍可识别的凭据字段，避免 fallback 路径跳过资源上限。 */
-    private fun validateLegacyProxyCredentialResourceLimits(proxy: JsonObject?) {
-        fun JsonObject.stringValue(name: String): String? =
-            (get(name) as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
-
-        validateAppSettingsResourceLimits(
-            AppSettings(
-                proxy = ProxySettings(
-                    host = "",
-                    port = 1,
-                    type = ProxyType.HTTP,
-                    username = proxy?.stringValue("username"),
-                    password = proxy?.stringValue("password"),
-                ),
-            ),
-        )
-    }
-
-    private fun materializeSettingsCandidate(candidate: SettingsCandidate): LoadedSettings = when (candidate) {
-        is SettingsCandidate.Decoded -> candidate.settings.toLoadedSettings()
-
-        is SettingsCandidate.Protected -> candidate.settings.toLoadedSettings(hasInvalidProxy = true)
-
-        is SettingsCandidate.Migratable -> {
-            val loaded = candidate.settings.toLoadedSettings()
-            if (loaded.hasInvalidMcp || loaded.hasInvalidOpenAiBaseUrl) {
-                // 不能在代理迁移时顺带覆盖历史非法 MCP 或 OpenAI 基础地址；必须由一次显式替换解决。
-                loaded
-            } else {
-                try {
-                    storage.commit(ConfigJson.encodeToString(loaded.settings).toByteArray(StandardCharsets.UTF_8))
-                    loaded
-                } catch (e: Exception) {
-                    logger.error(
-                        "Could not persist migrated legacy proxy; keeping original file protected; category={}",
-                        SafeLogging.failureCategory(e).wireName,
-                    )
-                    candidate.protectedSettings.toLoadedSettings(hasInvalidProxy = true)
-                }
-            }
-        }
-    }
-
-    private fun replaceProxy(settings: JsonObject, proxy: JsonObject): JsonObject = buildJsonObject {
-        settings.forEach { (key, value) ->
-            put(key, if (key == "proxy") proxy else value)
         }
     }
 
@@ -333,9 +178,9 @@ class SettingsRepository private constructor(
     /**
      * 在同一同步临界区内基于最新设置执行变换并持久化结果。
      *
-     * 写入前会完成存储状态检查及可选的修订值比较，然后调用 [transform]、校验结果并同步原子提交
-     * 配置文件。仅主文件替换成功后才发布设置、Token 代次、生命周期屏障和历史代理状态。变换结果
-     * 与当前设置相同时视为无操作，不写文件、不递增代次，也不发布设置事件。
+     * 先可选比较修订值和代次，再调用 [transform]、校验结果并同步原子提交配置文件。
+     * 只有文件替换与父目录同步均成功后，才发布设置、Token 代次、生命周期屏障和历史代理状态。
+     * 变换结果与当前设置相同时视为无操作，不写文件、不递增代次，也不发布设置事件。
      *
      * @param expectedRevision 期望的当前修订值；`null` 表示局部变换不执行 CAS，非空值必须是此前
      * [currentSettingsSnapshot] 返回的 64 位小写十六进制 SHA-256。
@@ -359,7 +204,7 @@ class SettingsRepository private constructor(
      * 显式替换时抛出；不会改变屏障、文件或任何设置流。
      * @throws IllegalArgumentException 代理、HTTP 工具或 MCP 设置不合法，或历史非法代理尚未被显式替换时
      * 抛出；不会改变屏障、文件或任何设置流。
-     * @throws Exception 配置文件无法编码或原子提交，或设置文件不可读取或已损坏时抛出。
+     * @throws Exception 配置无法编码、原子替换失败，或替换后的父目录耐久性无法确认时抛出。
      */
     @Synchronized
     fun updateSettings(
@@ -369,7 +214,6 @@ class SettingsRepository private constructor(
         expectedGeneration: Long? = null,
         transform: (AppSettings) -> AppSettings,
     ): SettingsUpdateResult {
-        ensureStorageValidatedBeforeWrite()
         val previousSettings = _settingsFlow.value
         val previousSnapshot = SettingsSnapshot(previousSettings, settingsRevision, settingsVersion)
         if (expectedRevision != null && expectedRevision != settingsRevision) {
@@ -409,7 +253,7 @@ class SettingsRepository private constructor(
         }
 
         try {
-            storage.commit(settings.serializedBytes())
+            storage.commit(settings).requireDurable()
         } catch (e: Exception) {
             modelSwitchBarrier.cancel(switchGeneration)
             throw e
@@ -579,20 +423,37 @@ class HistoricalInvalidOpenAiBaseUrlConfigurationException : IllegalArgumentExce
     "历史 OpenAI 基础地址不合法，必须显式替换该地址后才能保存设置。",
 )
 
+private val LEGACY_HTTP_PROXY_TYPE_MIGRATION = JsonElementMigration(
+    name = "settings-legacy-http-proxy-type",
+    transform = migration@{ document ->
+        val settings = document as? JsonObject ?: return@migration document
+        val proxy = settings["proxy"] as? JsonObject ?: return@migration document
+        if ("type" in proxy) {
+            return@migration document
+        }
+        val migratedProxy = JsonObject(proxy + ("type" to JsonPrimitive(ProxyType.HTTP.name)))
+        JsonObject(settings + ("proxy" to migratedProxy))
+    },
+)
+
 private fun ProxySettings?.isInvalidProxy(): Boolean = runCatching {
     validateProxySettings(this)
 }.isFailure
 
-private fun AppSettings.failClosedHttpToolSettings(): AppSettings {
+private fun AppSettings.failClosedHttpToolSettings(logger: Logger): AppSettings {
     val aiSettings = ai ?: return this
     return if (runCatching { validateHttpToolSettings(aiSettings.httpToolSettings) }.isSuccess) {
         this
     } else {
+        logger.warn("Invalid optional settings field replaced with its default; path=$.ai.httpToolSettings")
         copy(ai = aiSettings.copy(httpToolSettings = HttpToolSettings()))
     }
 }
 
-private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInvalidProxy()): LoadedSettings {
+private fun AppSettings.toLoadedSettings(
+    logger: Logger,
+    hasInvalidProxy: Boolean = proxy.isInvalidProxy(),
+): LoadedSettings {
     val aiSettings = ai
     val hasInvalidMcp = aiSettings?.mcpServers?.let { configs ->
         runCatching { validateMcpServerConfigs(configs) }.isFailure
@@ -600,14 +461,20 @@ private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInva
     val hasInvalidOpenAiBaseUrl = aiSettings?.let { settings ->
         runCatching { validateOpenAiBaseUrl(settings.openAiBaseUrl) }.isFailure
     } == true
-    val failClosedSettings = failClosedHttpToolSettings().let { settings ->
+    val failClosedSettings = failClosedHttpToolSettings(logger).let { settings ->
         if (hasInvalidMcp && settings.ai != null) {
+            logger.warn("Invalid optional settings field replaced with its default; path=$.ai.mcpServers")
             settings.copy(ai = settings.ai.copy(mcpServers = emptyList()))
         } else {
             settings
         }
     }.let { settings ->
-        if (hasInvalidProxy) settings.copy(proxy = null) else settings
+        if (hasInvalidProxy) {
+            logger.warn("Invalid optional settings field replaced with its default; path=$.proxy")
+            settings.copy(proxy = null)
+        } else {
+            settings
+        }
     }
     return LoadedSettings(
         settings = failClosedSettings,
@@ -616,9 +483,6 @@ private fun AppSettings.toLoadedSettings(hasInvalidProxy: Boolean = proxy.isInva
         hasInvalidOpenAiBaseUrl = hasInvalidOpenAiBaseUrl,
     )
 }
-
-private fun AppSettings.serializedBytes(): ByteArray =
-    ConfigJson.encodeToString(this).toByteArray(StandardCharsets.UTF_8)
 
 private fun AppSettings.revision(): String =
     MessageDigest.getInstance("SHA-256")
@@ -641,22 +505,6 @@ private data class LoadedSettings(
     val hasInvalidProxy: Boolean,
     val hasInvalidMcp: Boolean = false,
     val hasInvalidOpenAiBaseUrl: Boolean = false,
-    val requiresStorageValidationBeforeWrite: Boolean = false,
-)
-
-private sealed interface SettingsCandidate {
-    data class Decoded(val settings: AppSettings) : SettingsCandidate
-
-    data class Protected(val settings: AppSettings) : SettingsCandidate
-
-    data class Migratable(
-        val settings: AppSettings,
-        val protectedSettings: AppSettings,
-    ) : SettingsCandidate
-}
-
-private class StorageRevalidatedRetryException : IllegalStateException(
-    "设置存储已重新验证为磁盘快照；请基于最新设置重试保存。",
 )
 
 /**

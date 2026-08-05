@@ -865,14 +865,14 @@ class MessagePollerTest {
     }
 
     /**
-     * 验证模型选择不会通过复制带有未知历史代理的设置而静默删除该代理配置。
+     * 验证模型选择不会通过复制带有语义非法历史代理的设置而静默删除该代理配置。
      */
     @Test
     fun `model selection does not overwrite an unresolved historical proxy`() = runBlocking {
         val configFile = tempDirectory.resolve("historical-proxy-model.json")
         val originalContent =
             """
-            {"telegramToken":"100:token","proxy":{"host":"proxy.example.com","port":1080,"type":"UNKNOWN"},"ai":{"geminiApiKey":"test-key","agentEnabled":true,"agentChatId":"123","selectedModel":""}}
+            {"telegramToken":"100:token","proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"},"ai":{"geminiApiKey":"test-key","agentEnabled":true,"agentChatId":"123","selectedModel":""}}
             """.trimIndent()
         configFile.writeText(originalContent)
         val barrier = ModelSwitchBarrier()

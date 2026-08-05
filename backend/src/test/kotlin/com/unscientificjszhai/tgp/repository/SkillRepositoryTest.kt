@@ -5,6 +5,7 @@ import com.unscientificjszhai.tgp.models.SkillStatus
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.JsonStorageDurabilityUnknownException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -243,18 +244,62 @@ class SkillRepositoryTest {
         job.cancel()
     }
 
-    /**
-     * 验证语义损坏的主文件安全返回空结果，且不会访问遗留 `.bak` 文件。
-     */
+    /** 验证审批只有在目录项确认耐久后才对读取接口可见并发布事件。 */
     @Test
-    fun `damaged skills primary ignores legacy bak`() {
+    fun `approval remains on the last durable snapshot until directory sync recovers`() = runTest {
+        var directorySyncAvailable = true
+        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun forceDirectory(path: Path) {
+                if (!directorySyncAvailable) {
+                    throw IOException("injected directory sync failure")
+                }
+                DefaultAtomicJsonFileOperations.forceDirectory(path)
+            }
+        }
+        repository = SkillRepository.forTesting(skillsFile, fileOperations)
+        val pending = repository.saveSkill(
+            Skill(id = "durability", description = "pending", content = "content"),
+        )
+        val events = mutableListOf<Unit>()
+        val job = launch { repository.skillsUpdateEvent.collect { events += it } }
+        yield()
+
+        directorySyncAvailable = false
+        assertFailsWith<JsonStorageDurabilityUnknownException> {
+            repository.approveSkill(pending.id, pending.revision)
+        }
+        yield()
+
+        val visibleButUnknown = ConfigJson.decodeFromString<List<Skill>>(skillsFile.readText()).single()
+        assertEquals(SkillStatus.APPROVED, visibleButUnknown.status)
+        assertTrue(events.isEmpty())
+        assertTrue(repository.getApprovedSkillSummaries().isEmpty())
+        assertNull(repository.getApprovedSkillById(pending.id))
+        assertEquals(pending, repository.getSkillById(pending.id))
+
+        directorySyncAvailable = true
+        val approved = repository.approveSkill(pending.id, pending.revision)
+        yield()
+
+        assertEquals(SkillStatus.APPROVED, approved.status)
+        assertEquals(listOf(pending.id), repository.getApprovedSkillSummaries().map { it.id })
+        assertEquals(approved, repository.getApprovedSkillById(pending.id))
+        assertEquals(approved, repository.getSkillById(pending.id))
+        assertEquals(1, events.size)
+        job.cancel()
+    }
+
+    /** 验证语义损坏的主文件会中断仓储启动，且不会访问遗留 `.bak` 文件。 */
+    @Test
+    fun `damaged skills primary aborts startup and ignores legacy bak`() {
         val original = listOf(Skill(id = "backup", description = "backup", content = "content"))
         val backupContent = ConfigJson.encodeToString(original)
         skillsFile.writeText("[ invalid")
         File(tempDirectory, "skills.json.bak").writeText(backupContent)
-        repository = SkillRepository.forTesting(skillsFile, rejectBakOperations())
 
-        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
+        assertFailsWith<IllegalStateException> {
+            SkillRepository.forTesting(skillsFile, rejectBakOperations())
+        }
         assertEquals("[ invalid", skillsFile.readText())
         assertEquals(backupContent, File(tempDirectory, "skills.json.bak").readText())
     }
@@ -274,43 +319,34 @@ class SkillRepositoryTest {
         assertEquals(backupContent, File(tempDirectory, "skills.json.bak").readText())
     }
 
-    /**
-     * 验证主文件损坏时写入被拒绝，且遗留 `.bak` 文件不会被访问。
-     */
+    /** 验证主文件损坏时启动即被拒绝，且遗留 `.bak` 文件不会被访问。 */
     @Test
-    fun `damaged skills primary rejects mutations without touching legacy bak`() {
+    fun `damaged skills primary rejects startup without touching legacy bak`() {
         val original = listOf(Skill(id = "backup", description = "backup", content = "content"))
         val validBackup = ConfigJson.encodeToString(original)
         val damagedPrimary = "[ invalid"
         skillsFile.writeText(damagedPrimary)
         val backupFile = File(tempDirectory, "skills.json.bak")
         backupFile.writeText(validBackup)
-        repository = SkillRepository.forTesting(skillsFile, rejectBakOperations())
 
-        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
         assertFailsWith<IllegalStateException> {
-            repository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+            SkillRepository.forTesting(skillsFile, rejectBakOperations())
         }
         assertEquals(damagedPrimary, skillsFile.readText())
         assertEquals(validBackup, backupFile.readText())
     }
 
-    /**
-     * 验证主文件和备份均损坏时，读取提供安全空结果但所有后续写入都会拒绝并保留现场。
-     */
+    /** 验证主文件损坏时仓储启动失败并保留主文件与遗留备份现场。 */
     @Test
-    fun `double damaged skills files are preserved and mutations are rejected`() {
+    fun `damaged skills primary and legacy backup are preserved on startup failure`() {
         val damagedPrimary = "[ invalid"
         val damagedBackup = "{ invalid"
         skillsFile.writeText(damagedPrimary)
         File(tempDirectory, "skills.json.bak").writeText(damagedBackup)
-        repository = SkillRepository.forTesting(skillsFile)
 
-        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
         assertFailsWith<IllegalStateException> {
-            repository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+            SkillRepository.forTesting(skillsFile)
         }
-        assertFailsWith<IllegalStateException> { repository.deleteSkill("new") }
         assertEquals(damagedPrimary, skillsFile.readText())
         assertEquals(damagedBackup, File(tempDirectory, "skills.json.bak").readText())
     }
@@ -367,21 +403,30 @@ class SkillRepositoryTest {
         assertEquals(SkillStatus.APPROVED, approvedDraft.status)
     }
 
-    /** 验证缺少审批字段的历史数据保守降级为待审批，未知状态则隔离并拒绝覆盖。 */
+    /** 验证缺少或含未知审批状态的历史数据都按字段默认值保守降级为待审批。 */
     @Test
     fun `legacy skill status is fail closed`() {
         skillsFile.writeText("""[{"id":"legacy","description":"legacy","content":"LEGACY_CANARY"}]""")
+        repository = SkillRepository.forTesting(skillsFile)
 
         assertEquals(SkillStatus.PENDING, repository.getSkillById("legacy")?.status)
         assertTrue(repository.getApprovedSkillSummaries().isEmpty())
 
         skillsFile.writeText("""[{"id":"unknown","description":"unknown","content":"UNKNOWN_CANARY","status":"BYPASS"}]""")
         repository = SkillRepository.forTesting(skillsFile)
-        assertTrue(repository.getAllSkills(size = 10).items.isEmpty())
-        assertFailsWith<IllegalStateException> {
-            repository.createPendingDraft("new", "new")
-        }
+        assertEquals(SkillStatus.PENDING, repository.getSkillById("unknown")?.status)
+        assertTrue(repository.getApprovedSkillSummaries().isEmpty())
         assertTrue(skillsFile.readText().contains("UNKNOWN_CANARY"))
+    }
+
+    /** 验证技能元素缺少无默认值的必填字段时中断仓储构造并保留原文件。 */
+    @Test
+    fun `missing required skill field aborts construction`() {
+        val original = """[{"id":"required","content":"content"}]"""
+        skillsFile.writeText(original)
+
+        assertFailsWith<IllegalStateException> { SkillRepository.forTesting(skillsFile) }
+        assertEquals(original, skillsFile.readText())
     }
 
     /**
@@ -410,9 +455,7 @@ class SkillRepositoryTest {
         assertEquals(invalidBackup, backupFile.readText())
     }
 
-    /**
-     * 验证主文件缺失或语法损坏时，遗留 `.bak` 中的非法标识不会影响主文件行为。
-     */
+    /** 验证主文件缺失时忽略遗留备份，语法损坏时则在不访问备份的前提下中断启动。 */
     @Test
     fun `missing or damaged primary ignores invalid skills legacy bak`() = runTest {
         listOf("missing" to null, "damaged" to "[ invalid").forEach { (name, primaryContent) ->
@@ -423,27 +466,21 @@ class SkillRepositoryTest {
             )
             primaryContent?.let(primaryFile::writeText)
             backupFile.writeText(invalidBackup)
-            val isolatedRepository = SkillRepository.forTesting(primaryFile, rejectBakOperations())
-            val events = mutableListOf<Unit>()
-            val job = launch { isolatedRepository.skillsUpdateEvent.collect { events += it } }
-            yield()
-
-            assertTrue(isolatedRepository.getAllSkills(size = 10).items.isEmpty())
             if (primaryContent == null) {
+                val isolatedRepository = SkillRepository.forTesting(primaryFile, rejectBakOperations())
+                assertTrue(isolatedRepository.getAllSkills(size = 10).items.isEmpty())
                 isolatedRepository.saveSkill(Skill(id = "new", description = "new", content = "new"))
                 assertEquals("new", isolatedRepository.getSkillById("new")?.id)
             } else {
                 assertFailsWith<IllegalStateException> {
-                    isolatedRepository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+                    SkillRepository.forTesting(primaryFile, rejectBakOperations())
                 }
             }
-            delay(100.milliseconds)
 
             if (primaryContent != null) {
                 assertEquals(primaryContent, primaryFile.readText())
             }
             assertEquals(invalidBackup, backupFile.readText())
-            job.cancel()
         }
     }
 

@@ -11,14 +11,16 @@ import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentConfigurationNotReadyException
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.AtomicJsonCommitResult
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
-import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.SchemaValidatedJsonStorage
 import com.unscientificjszhai.tgp.utils.TelegramTextChunks
+import com.unscientificjszhai.tgp.utils.requireDurable
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -31,13 +33,13 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.io.File
-import java.nio.charset.StandardCharsets
 import java.time.Clock
 import java.time.DateTimeException
 import java.time.Instant
@@ -59,11 +61,14 @@ import kotlin.time.Duration.Companion.minutes
  *
  * 服务在创建时从 `config/schedule.json` 恢复任务并启动后台扫描；任务执行结果会发送到
  * 对应的 Telegram 会话。调用 [close] 会停止后续扫描；[start] 与 [close] 应在同一生命周期
- * 控制路径中调用。每次执行会先在状态锁内重新确认任务内容仍等于扫描快照且仍到期，随后
- * 原子持久化删除单次任务或推进循环任务，最后才调用代理和 Telegram。该预消费提交成功后，即使代理、投递、
- * 协程取消或进程崩溃发生在副作用完成前，也绝不会恢复或重试该次；这刻意提供 at-most-once，而非
- * exactly-once，代价是提交与副作用之间崩溃或取消可能遗漏一次执行。预提交失败、任务被取消或替换、
- * 或已经不再到期时不会调用代理。
+ * 控制路径中调用。恢复时按 [ScheduledTask] schema 将损坏的可选字段回退为默认值；必填字段或 JSON 结构
+ * 严重损坏会中断创建并保留现场。每次执行会先在状态锁内重新确认任务内容仍等于扫描快照且仍到期，
+ * 随后原子持久化删除单次任务或推进循环任务，只有文件替换与目录项同步都确认耐久后才调用代理和
+ * Telegram。
+ * 替换已可见但目录项耐久性未知时会保留内存任务并隔离副作用，后续扫描重新提交至确认耐久；该预消费确认
+ * 耐久后，即使代理、投递、协程取消或进程崩溃发生在副作用完成前，也绝不会恢复或重试该次；这刻意提供
+ * at-most-once，而非 exactly-once，代价是提交与副作用之间崩溃或取消可能遗漏一次执行。预提交失败、
+ * 任务被取消或替换、授权失效或已经不再到期时不会调用代理。
  * 调度的服务器时间和日历时区分别由 [Clock] 与 [ZoneId] 决定。错过的循环周期只预消费一次并跳到下一次
  * 未来执行，不逐期追赶；小时任务保持 Unix epoch 相位，日/周任务保持服务器时区中的本地日历锚点。DST
  * gap 解析到首个有效本地时间，overlap 使用较早偏移量；日/周任务会持久化创建时的本地时刻锚点，所以 gap
@@ -92,7 +97,7 @@ class TaskSchedulerService private constructor(
     private val telegramService: TelegramService,
     private val agentService: Provider<AgentService>,
     private val settingsRepository: SettingsRepository,
-    private val storage: AtomicJsonStorage,
+    private val storage: SchemaValidatedJsonStorage<List<ScheduledTask>>,
     startImmediately: Boolean,
     private val clock: Clock,
     private val zoneId: ZoneId,
@@ -121,7 +126,10 @@ class TaskSchedulerService private constructor(
         telegramService,
         agentService,
         settingsRepository,
-        AtomicJsonStorage(File("config/schedule.json").toPath(), ResourceLimits.SCHEDULE_BYTES),
+        SchemaValidatedJsonStorage(
+            AtomicJsonStorage(File("config/schedule.json").toPath(), ResourceLimits.SCHEDULE_BYTES),
+            ListSerializer(ScheduledTask.serializer()),
+        ),
         startImmediately = true,
         clock = Clock.systemDefaultZone(),
         zoneId = ZoneId.systemDefault(),
@@ -158,7 +166,10 @@ class TaskSchedulerService private constructor(
         telegramService,
         agentService,
         settingsRepository,
-        AtomicJsonStorage(scheduleFile.toPath(), ResourceLimits.SCHEDULE_BYTES, fileOperations),
+        SchemaValidatedJsonStorage(
+            AtomicJsonStorage(scheduleFile.toPath(), ResourceLimits.SCHEDULE_BYTES, fileOperations),
+            ListSerializer(ScheduledTask.serializer()),
+        ),
         startImmediately,
         clock,
         zoneId,
@@ -170,7 +181,6 @@ class TaskSchedulerService private constructor(
     private val stateLock = ReentrantLock()
     private val tasks = mutableListOf<ScheduledTask>()
     private val executingTaskIds = mutableSetOf<String>()
-    private var requiresStorageValidationBeforeWrite = false
     private var job: Job? = null
 
     init {
@@ -181,7 +191,7 @@ class TaskSchedulerService private constructor(
     }
 
     private fun loadTasks() {
-        when (val read = storage.readValidated(::decodeTasks)) {
+        when (val read = storage.read()) {
             AtomicJsonRead.Missing -> Unit
             is AtomicJsonRead.Valid -> stateLock.withLock {
                 tasks.clear()
@@ -190,54 +200,26 @@ class TaskSchedulerService private constructor(
             }
 
             is AtomicJsonRead.Corrupt -> {
-                requiresStorageValidationBeforeWrite = true
                 logger.error(
-                    "Schedule file is semantically invalid; preserving it; category={}",
+                    "Schedule file is severely damaged; application startup is aborted; category={}",
                     SafeLogging.failureCategory(read.cause).wireName,
                 )
+                throw IllegalStateException("定时任务文件严重损坏，应用无法安全启动。", read.cause)
             }
 
             is AtomicJsonRead.IoFailure -> {
-                requiresStorageValidationBeforeWrite = true
                 logger.error(
-                    "Unable to read scheduled tasks; delaying writes until it can be revalidated; category={}",
+                    "Unable to read scheduled tasks; application startup is aborted; category={}",
                     SafeLogging.failureCategory(read.cause).wireName,
                 )
+                throw IllegalStateException("定时任务文件无法读取，应用无法安全启动。", read.cause)
             }
 
         }
     }
 
-    private fun decodeTasks(bytes: ByteArray): List<ScheduledTask> {
-        val content = bytes.toString(StandardCharsets.UTF_8)
-        if (content.isBlank()) {
-            throw IllegalArgumentException("Scheduled tasks data must not be blank")
-        }
-        JsonStructureLimits.validateUtf8(bytes)
-        return ConfigJson.decodeFromString(content)
-    }
-
-    private fun persistTasks(candidate: List<ScheduledTask>) {
-        ensureStorageValidatedBeforeMutation()
-        storage.commit(ConfigJson.encodeToString(candidate).toByteArray(StandardCharsets.UTF_8))
-    }
-
-    private fun ensureStorageValidatedBeforeMutation() {
-        if (!requiresStorageValidationBeforeWrite) {
-            return
-        }
-        val validated = when (val read = storage.readValidated(::decodeTasks)) {
-            AtomicJsonRead.Missing -> emptyList()
-            is AtomicJsonRead.Valid -> read.value
-            is AtomicJsonRead.Corrupt -> throw IllegalStateException("定时任务文件已损坏，拒绝覆盖现场。", read.cause)
-            is AtomicJsonRead.IoFailure -> throw IllegalStateException(
-                "定时任务文件尚不可读取，拒绝覆盖现场。",
-                read.cause
-            )
-        }
-        tasks.clear()
-        tasks.addAll(validated)
-        requiresStorageValidationBeforeWrite = false
+    private fun persistTasks(candidate: List<ScheduledTask>): AtomicJsonCommitResult {
+        return storage.commit(candidate)
     }
 
     /**
@@ -270,9 +252,10 @@ class TaskSchedulerService private constructor(
      * 候选任务会在短临界区内声明执行权；并发扫描不会重复执行同一任务。每个候选会先确认 AI 授权；当前
      * 会话缺失、禁用或与任务会话不一致时，调度器会在任何 Agent 或 Telegram 副作用前原子删除该任务。
      * 无效 token 或最新 Agent 配置尚未就绪时会保留任务。通过 Agent 就绪屏障后会再次
-     * 确认授权、扫描快照和到期状态，并原子持久化预消费状态。因而预提交成功后的失败、取消和进程重启都
-     * 不会重放该次，提交失败则不会调用 Agent 且会在后续扫描保留任务。代理调用与 Telegram I/O 永远不在
-     * 状态锁或 token 生命周期租约内运行。
+     * 确认授权、扫描快照和到期状态，并原子持久化预消费状态。只有原子替换与目录同步都确认耐久才会放行
+     * 副作用；替换可见但耐久性未知时保留内存任务，在后续扫描重新提交并继续隔离。因此耐久预提交后的失败、
+     * 取消和进程重启都不会重放该次，提交失败或耐久性未知则不会调用 Agent。代理调用与 Telegram I/O 永远
+     * 不在状态锁或 token 生命周期租约内运行。
      *
      * @throws CancellationException 扫描被取消时原样抛出；若任务已经预提交，取消也不会恢复该次。
      */
@@ -287,17 +270,6 @@ class TaskSchedulerService private constructor(
             return
         }
         val tasksToExecute = stateLock.withLock {
-            try {
-                ensureStorageValidatedBeforeMutation()
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (e: Exception) {
-                logger.error(
-                    "Failed to revalidate task storage before scanning; this scan will retry later; category={}",
-                    SafeLogging.failureCategory(e).wireName,
-                )
-                return@withLock emptyList()
-            }
             tasks.filter { task -> task.executionTime <= currentTime && executingTaskIds.add(task.id) }
         }
 
@@ -395,7 +367,6 @@ class TaskSchedulerService private constructor(
     private fun prepareTaskForExecution(task: ScheduledTask, telegramLease: TelegramBotLease): PreparedTask? {
         return try {
             stateLock.withLock {
-                ensureStorageValidatedBeforeMutation()
                 val index = tasks.indexOfFirst { current ->
                     current.id == task.id && current == task
                 }
@@ -416,7 +387,7 @@ class TaskSchedulerService private constructor(
                 if (hasInvalidCalendarAnchor) {
                     logger.warn("Removing task {} because its persisted calendar anchor is invalid", task.id)
                     val candidate = tasks.toMutableList().apply { removeAt(index) }
-                    persistTasks(candidate)
+                    persistTasks(candidate).requireDurable()
                     tasks.clear()
                     tasks.addAll(candidate)
                     return@withLock null
@@ -441,7 +412,18 @@ class TaskSchedulerService private constructor(
                         )
                     }
                 }
-                persistTasks(candidate)
+                when (val commitResult = persistTasks(candidate)) {
+                    AtomicJsonCommitResult.Durable -> Unit
+                    is AtomicJsonCommitResult.ReplacedDurabilityUnknown -> {
+                        logger.error(
+                            "Task {} precommit is visible but not known durable; " +
+                                    "withholding side effects until a durable retry; category={}",
+                            task.id,
+                            SafeLogging.failureCategory(commitResult.cause).wireName,
+                        )
+                        return@withLock null
+                    }
+                }
                 tasks.clear()
                 tasks.addAll(candidate)
                 PreparedTask(currentTask, telegramLease)
@@ -490,7 +472,6 @@ class TaskSchedulerService private constructor(
     private fun revokeTask(task: ScheduledTask) {
         try {
             stateLock.withLock {
-                ensureStorageValidatedBeforeMutation()
                 val index = tasks.indexOfFirst { current ->
                     current.id == task.id && current == task
                 }
@@ -500,7 +481,7 @@ class TaskSchedulerService private constructor(
                 }
 
                 val candidate = tasks.toMutableList().apply { removeAt(index) }
-                persistTasks(candidate)
+                persistTasks(candidate).requireDurable()
                 tasks.clear()
                 tasks.addAll(candidate)
                 logger.info("Removed revoked task {}", task.id)
@@ -568,27 +549,27 @@ class TaskSchedulerService private constructor(
      * @receiver 已完整读取的 Telegram 响应快照。
      * @return HTTP 状态成功且响应 JSON 的 `ok` 字段为 `true` 时返回 `true`，否则返回 `false`。
      */
-    private fun TelegramApiResponse.isTelegramOk(): Boolean {
-        return status.isSuccess() && try {
+    private fun TelegramApiResponse.isTelegramOk(): Boolean =
+        status.isSuccess() && try {
             JsonStructureLimits.parseToJsonElement(Json, body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
         } catch (_: Exception) {
             false
         }
-    }
 
     /**
      * 创建并持久化一个定时任务。
      *
-     * 仅当完整任务列表已原子持久化成功后才返回新标识；持久化失败时内存任务列表保持不变。
+     * 仅当完整任务列表完成原子替换且目录项同步确认耐久后才返回新标识；持久化失败或耐久性未知时内存任务
+     * 列表保持不变。
      * @param instruction 到期时发送给 AI 代理的指令文本；允许为空字符串，将按原样保存。
      * @param executionTime 首次执行的 Unix 时间戳，单位为毫秒；可为过去时间，此时会在下一次
      * 扫描时执行。
      * @param loopMode 任务到期后的循环方式；[LoopMode.ONCE] 表示仅执行一次。
      * @param agentChatId 接收执行结果的 Telegram 会话标识；不得为空白，非空值按原样保存，不去除首尾空白。
      * @return 已成功持久化的新任务八位标识符。
-     * @throws IllegalArgumentException [agentChatId] 为空白时抛出；不会添加内存任务。
-     * @throws IllegalStateException 文件已损坏或暂不可读取时抛出；不会添加内存任务。
-     * @throws Exception 编码或原子持久化失败时抛出；不会添加内存任务。
+     * @throws IllegalArgumentException [agentChatId] 或编码后的任务列表不符合资源限制时抛出；不会添加
+     * 内存任务。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会添加内存任务。
      */
     fun createTask(instruction: String, executionTime: Long, loopMode: LoopMode, agentChatId: String): String {
         require(agentChatId.isNotBlank()) { "定时任务必须绑定非空代理会话标识。" }
@@ -602,9 +583,8 @@ class TaskSchedulerService private constructor(
             executionTime.calendarAnchorTimeMillisFor(loopMode, zoneId),
         )
         return stateLock.withLock {
-            ensureStorageValidatedBeforeMutation()
             val candidate = tasks + newTask
-            persistTasks(candidate)
+            persistTasks(candidate).requireDurable()
             tasks.add(newTask)
             id
         }
@@ -620,21 +600,20 @@ class TaskSchedulerService private constructor(
     /**
      * 取消指定任务并在取消成功时持久化最新任务列表。
      *
-     * 找到任务时，只有原子持久化成功才会从内存移除并返回 `true`；写入失败会抛出且内存不变。
+     * 找到任务时，只有原子替换与目录项同步均确认耐久才会从内存移除并返回 `true`；
+     * 写入失败或耐久性未知会抛出且内存不变。
      *
      * @param taskId 要取消的任务标识；空字符串或不存在的标识不会取消任务。
      * @return 找到并成功持久化移除任务时返回 `true`；不存在匹配任务时返回 `false`。
-     * @throws IllegalStateException 文件已损坏或暂不可读取时抛出；不会移除内存任务。
-     * @throws Exception 编码或原子持久化失败时抛出；不会移除内存任务。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会移除内存任务。
      */
     fun cancelTask(taskId: String): Boolean = stateLock.withLock {
-        ensureStorageValidatedBeforeMutation()
         val index = tasks.indexOfFirst { it.id == taskId }
         if (index == -1) {
             return@withLock false
         }
         val candidate = tasks.toMutableList().apply { removeAt(index) }
-        persistTasks(candidate)
+        persistTasks(candidate).requireDurable()
         tasks.clear()
         tasks.addAll(candidate)
         true

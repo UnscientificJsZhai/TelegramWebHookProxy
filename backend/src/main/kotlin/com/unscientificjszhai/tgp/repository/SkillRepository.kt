@@ -7,20 +7,20 @@ import com.unscientificjszhai.tgp.models.SkillStatus
 import com.unscientificjszhai.tgp.models.isValidSkillId
 import com.unscientificjszhai.tgp.models.validateSkill
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
-import com.unscientificjszhai.tgp.utils.AtomicJsonRawRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonRead
 import com.unscientificjszhai.tgp.utils.AtomicJsonStorage
-import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.SchemaValidatedJsonStorage
+import com.unscientificjszhai.tgp.utils.requireDurable
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.serialization.builtins.ListSerializer
 import org.slf4j.LoggerFactory
 import java.io.File
-import java.nio.charset.StandardCharsets
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -30,8 +30,11 @@ import kotlin.concurrent.withLock
 /**
  * 持久化技能草稿及审批状态，并向 Agent 提供仅含已批准技能的读取接口。
  *
- * 模型只能通过 [createPendingDraft] 创建待审批草稿；保存、批准和撤销都在成功原子提交后才改变
- * 对 Agent 可见的集合并发布 [skillsUpdateEvent]。
+ * 模型只能通过 [createPendingDraft] 创建待审批草稿；保存、批准和撤销都在文件替换及目录同步确认耐久后才
+ * 改变对 Agent 可见的集合并发布 [skillsUpdateEvent]。构造时会按 [Skill] schema 校验现有文件：有默认值的
+ * 字段损坏会记录日志并使用默认值，必填字段或 JSON 结构严重损坏会中断创建且保留现场；历史非法技能标识
+ * 保持既有隔离语义，不会提供给管理端或 Agent，也不能被后续写入覆盖。所有读取和后续写入均基于最后一次
+ * 确认耐久的快照；替换已经可见但目录项耐久性未知时，不会发布新快照或事件。
  */
 class SkillRepository private constructor(
     configFile: File,
@@ -40,7 +43,9 @@ class SkillRepository private constructor(
     /**
      * 创建使用默认技能配置文件的仓储。
      *
-     * @constructor 创建使用 `config/skills.json` 的仓储；该目录不存在时会创建。
+     * @constructor 创建使用 `config/skills.json` 的仓储；立即校验已有主文件，首次保存时由统一存储创建目录
+     * 并确认其目录项耐久。
+     * @throws IllegalStateException 主文件严重损坏或无法读取时抛出。
      */
     @Inject
     constructor() : this(File("config/skills.json"), DefaultAtomicJsonFileOperations)
@@ -53,9 +58,14 @@ class SkillRepository private constructor(
     }
 
     private val logger = LoggerFactory.getLogger(SkillRepository::class.java)
-    private val storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SKILLS_BYTES, fileOperations)
+    private val storage = SchemaValidatedJsonStorage(
+        AtomicJsonStorage(configFile.toPath(), ResourceLimits.SKILLS_BYTES, fileOperations),
+        ListSerializer(Skill.serializer()),
+        validator = ::validateSkills,
+    )
     private val storageLock = ReentrantLock()
-    private var requiresStorageValidationBeforeWrite = false
+    private var durableSnapshot = SkillSnapshot(exists = false, items = emptyList())
+    private var isolationFailure: SkillStorageIsolationException? = null
 
     private val _skillsUpdateEvent = MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,
@@ -70,18 +80,19 @@ class SkillRepository private constructor(
     val skillsUpdateEvent: SharedFlow<Unit> = _skillsUpdateEvent.asSharedFlow()
 
     init {
-        configFile.parentFile?.let { parent ->
-            if (!parent.exists()) {
-                parent.mkdirs()
-            }
+        // 结构和 required 字段损坏必须中断启动；历史非法 ID 沿用隔离语义，使既有 API 能统一返回不可用。
+        try {
+            durableSnapshot = loadInitialSnapshot()
+        } catch (failure: SkillStorageIsolationException) {
+            isolationFailure = failure
+            // 后续所有读写入口仍会抛出同一隔离异常。
         }
     }
 
     /**
      * 分页读取管理端可见的全部技能，包括待审批草稿。
      *
-     * 配置文件不存在时返回总数为 `0` 的空页；主文件无法解析时返回空页而不改写现场。主文件含历史
-     * 非法技能标识时，仓储会隔离该存储。
+     * 返回构造时或最近一次耐久提交确认的快照；配置文件在构造时不存在则返回总数为 `0` 的空页。
      *
      * @param page 从 `1` 开始的页码，必须在 `1..Int.MAX_VALUE` 范围内。
      * @param size 每页请求的技能数量，必须在 `1..50` 范围内。
@@ -100,7 +111,7 @@ class SkillRepository private constructor(
             } else {
                 val fromIndex = startIndex.toInt()
                 val toIndex = minOf(fromIndex + size, skills.size)
-                skills.subList(fromIndex, toIndex)
+                skills.subList(fromIndex, toIndex).toList()
             }
             PageResult(skills.size, items)
         }
@@ -134,7 +145,7 @@ class SkillRepository private constructor(
      * 按标识读取管理端可见的单个技能，包括待审批草稿。
      *
      * @param id 要查询的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
-     * @return 匹配的技能；未找到、文件不可读取或主文件无法解析时为 `null`。
+     * @return 匹配的技能；未找到时为 `null`。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
      * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
      */
@@ -147,7 +158,7 @@ class SkillRepository private constructor(
      * 按标识读取可提供给模型的已批准技能。
      *
      * @param id 要查询的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
-     * @return 匹配且处于 [SkillStatus.APPROVED] 的技能；未找到、未批准或文件不可读取时为 `null`。
+     * @return 匹配且处于 [SkillStatus.APPROVED] 的技能；未找到或未批准时为 `null`。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
      * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
      */
@@ -168,7 +179,8 @@ class SkillRepository private constructor(
      * @return 已持久化的待审批技能；已有技能的版本号会递增。
      * @throws IllegalArgumentException [skill] 的字段不符合格式或大小限制，或保存后技能总数超过 `64` 时抛出。
      * @throws SkillRevisionConflictException [skill] 指向已有技能但版本号已过期时抛出。
-     * @throws IllegalStateException 配置文件已损坏、含历史非法技能标识或暂不可读取时抛出；不会发布变更事件。
+     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出；不会发布变更事件。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun saveSkill(skill: Skill): Skill = storageLock.withLock {
         saveSkillInternal(
@@ -194,7 +206,8 @@ class SkillRepository private constructor(
      * @throws IllegalArgumentException 参数不符合格式、大小或创建/编辑的版本参数约束时抛出。
      * @throws SkillNotFoundException [id] 非空但对应技能已不存在时抛出。
      * @throws SkillRevisionConflictException [expectedRevision] 与当前版本不一致时抛出。
-     * @throws IllegalStateException 配置文件已损坏、含历史非法技能标识或暂不可读取时抛出；不会发布变更事件。
+     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出；不会发布变更事件。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun saveManagedSkill(
         id: String?,
@@ -247,7 +260,7 @@ class SkillRepository private constructor(
             skills += savedSkill
         }
         require(skills.size <= 64) { "技能数量不能超过 64 个。" }
-        storage.commit(ConfigJson.encodeToString(skills).toByteArray(StandardCharsets.UTF_8))
+        commitDurableSnapshot(skills)
         if (approvedSetChanged) {
             _skillsUpdateEvent.tryEmit(Unit)
         }
@@ -264,7 +277,8 @@ class SkillRepository private constructor(
      * @param content 模型提出的技能内容，不得超过 `64 KiB` UTF-8 字节。
      * @return 已持久化、状态为 [SkillStatus.PENDING] 的新草稿。
      * @throws IllegalArgumentException 描述、内容或总技能数量超过限制时抛出。
-     * @throws IllegalStateException 配置文件已损坏、含历史非法技能标识或暂不可读取时抛出。
+     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun createPendingDraft(description: String, content: String): Skill =
         saveManagedSkill(id = null, description = description, content = content, expectedRevision = null)
@@ -279,6 +293,8 @@ class SkillRepository private constructor(
      * @throws SkillNotFoundException 技能不存在时抛出。
      * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStateConflictException 技能并非待审批状态时抛出。
+     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun approveSkill(id: String, expectedRevision: Long): Skill =
         transitionSkillStatus(id, expectedRevision, SkillStatus.PENDING, SkillStatus.APPROVED)
@@ -293,6 +309,8 @@ class SkillRepository private constructor(
      * @throws SkillNotFoundException 技能不存在时抛出。
      * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStateConflictException 技能并非已批准状态时抛出。
+     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun revokeSkill(id: String, expectedRevision: Long): Skill =
         transitionSkillStatus(id, expectedRevision, SkillStatus.APPROVED, SkillStatus.PENDING)
@@ -304,7 +322,8 @@ class SkillRepository private constructor(
      *
      * @param id 要删除的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
-     * @throws IllegalStateException 配置文件已损坏、含历史非法技能标识或暂不可读取时抛出；不会发布变更事件。
+     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出；不会发布变更事件。
+     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun deleteSkill(id: String) {
         require(isValidSkillId(id)) { "技能标识不合法。" }
@@ -314,9 +333,7 @@ class SkillRepository private constructor(
                 return
             }
             val removed = snapshot.items.find { it.id == id }
-            storage.commit(
-                ConfigJson.encodeToString(snapshot.items.filterNot { it.id == id }).toByteArray(StandardCharsets.UTF_8)
-            )
+            commitDurableSnapshot(snapshot.items.filterNot { it.id == id })
             if (removed?.status == SkillStatus.APPROVED) {
                 _skillsUpdateEvent.tryEmit(Unit)
             }
@@ -346,96 +363,62 @@ class SkillRepository private constructor(
             }
             val transitioned = existing.copy(status = to, revision = existing.revision + 1)
             skills[index] = transitioned
-            storage.commit(ConfigJson.encodeToString(skills).toByteArray(StandardCharsets.UTF_8))
+            commitDurableSnapshot(skills)
             _skillsUpdateEvent.tryEmit(Unit)
             transitioned
         }
     }
 
-    private fun readSkillsForRead(): List<Skill> {
-        ensureNoHistoricalInvalidSkillIds()
-        return when (val read = storage.readValidated(::decodeSkills)) {
-            AtomicJsonRead.Missing -> {
-                requiresStorageValidationBeforeWrite = false
-                emptyList()
-            }
+    private fun loadInitialSnapshot(): SkillSnapshot {
+        return when (val read = storage.read()) {
+            AtomicJsonRead.Missing -> SkillSnapshot(exists = false, items = emptyList())
 
-            is AtomicJsonRead.Valid -> {
-                requiresStorageValidationBeforeWrite = false
-                read.value
-            }
+            is AtomicJsonRead.Valid -> SkillSnapshot(exists = true, items = read.value.toList())
 
             is AtomicJsonRead.Corrupt -> {
-                requiresStorageValidationBeforeWrite = true
+                if (read.cause is SkillStorageIsolationException) {
+                    logger.error("Skills storage contains an invalid historical ID; preserving and isolating it")
+                    throw read.cause
+                }
                 logger.error(
-                    "Skills file is semantically invalid; preserving it; category={}",
+                    "Skills file is severely damaged; refusing to continue; category={}",
                     SafeLogging.failureCategory(read.cause).wireName,
                 )
-                emptyList()
+                throw IllegalStateException("技能文件严重损坏，应用无法安全启动。", read.cause)
             }
 
             is AtomicJsonRead.IoFailure -> {
-                requiresStorageValidationBeforeWrite = true
                 logger.error(
-                    "Unable to read skills data; delaying writes until it can be revalidated; category={}",
+                    "Unable to read skills data; refusing to continue; category={}",
                     SafeLogging.failureCategory(read.cause).wireName,
                 )
-                emptyList()
+                throw IllegalStateException("技能文件无法读取，应用无法安全启动。", read.cause)
             }
         }
+    }
+
+    private fun readSkillsForRead(): List<Skill> {
+        isolationFailure?.let { throw it }
+        return durableSnapshot.items
     }
 
     private fun readSkillsForMutation(): SkillSnapshot {
-        ensureNoHistoricalInvalidSkillIds()
-        return when (val read = storage.readValidated(::decodeSkills)) {
-            AtomicJsonRead.Missing -> {
-                requiresStorageValidationBeforeWrite = false
-                SkillSnapshot(exists = false, items = emptyList())
-            }
-
-            is AtomicJsonRead.Valid -> {
-                requiresStorageValidationBeforeWrite = false
-                SkillSnapshot(exists = true, items = read.value)
-            }
-
-            is AtomicJsonRead.Corrupt -> {
-                requiresStorageValidationBeforeWrite = true
-                throw IllegalStateException("技能文件已损坏，拒绝覆盖现场。", read.cause)
-            }
-
-            is AtomicJsonRead.IoFailure -> {
-                requiresStorageValidationBeforeWrite = true
-                throw IllegalStateException("技能文件尚不可读取，拒绝覆盖现场。", read.cause)
-            }
-        }
+        isolationFailure?.let { throw it }
+        return durableSnapshot
     }
 
-    private fun decodeSkills(bytes: ByteArray): List<Skill> {
-        val content = bytes.toString(StandardCharsets.UTF_8)
-        if (content.isBlank()) {
-            throw IllegalArgumentException("Skills data must not be blank")
-        }
-        return ConfigJson.decodeFromString<List<Skill>>(content).also { skills ->
-            require(skills.size <= 64) { "技能数量不能超过 64 个。" }
-            skills.forEach(::validateSkill)
-        }
+    private fun commitDurableSnapshot(items: List<Skill>) {
+        val candidate = SkillSnapshot(exists = true, items = items.toList())
+        storage.commit(candidate.items).requireDurable()
+        durableSnapshot = candidate
     }
 
-    private fun ensureNoHistoricalInvalidSkillIds() {
-        val containsInvalidId = containsDecodableSkillWithInvalidId(storage.readPrimary())
-        if (containsInvalidId) {
-            requiresStorageValidationBeforeWrite = true
-            logger.error("Skills storage contains a decodable skill with an invalid ID; preserving files and isolating storage")
-            throw SkillStorageIsolationException()
+    private fun validateSkills(skills: List<Skill>) {
+        require(skills.size <= 64) { "技能数量不能超过 64 个。" }
+        skills.forEach { skill ->
+            if (!isValidSkillId(skill.id)) throw SkillStorageIsolationException()
+            validateSkill(skill)
         }
-    }
-
-    private fun containsDecodableSkillWithInvalidId(read: AtomicJsonRawRead): Boolean {
-        val bytes = (read as? AtomicJsonRawRead.Present)?.bytes ?: return false
-        val skills = runCatching {
-            ConfigJson.decodeFromString<List<Skill>>(bytes.toString(StandardCharsets.UTF_8))
-        }.getOrNull() ?: return false
-        return skills.any { !isValidSkillId(it.id) }
     }
 
     private data class SkillSnapshot(
