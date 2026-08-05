@@ -461,6 +461,62 @@ class RawAgentTransportTest {
         service.close().join()
     }
 
+    /** 验证 Gemini 原生请求会携带已内联、没有 `$ref` 或 `$defs` 的 MCP 参数架构。 */
+    @Test
+    fun `Gemini raw transport inlines MCP local definitions`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val mcpClientService = mockk<MCPClientService>()
+        coEvery { mcpClientService.connect(any()) } returns Unit
+        every { mcpClientService.getAllTools() } returns listOf("definitions" to localDefinitionMcpTool())
+        every { mcpClientService.close() } returns kotlinx.coroutines.Job().apply { complete() }
+        val service = GeminiAgentService(scope, settingsRepository, skillRepository, mcpClientService) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(MockResponse.Builder().body(geminiTextResponse("definitions inlined")).build())
+
+        assertEquals("definitions inlined", service.sendMessage("check definitions"))
+        val payload = assertNotNull(server.takeRequest()).body!!.utf8()
+
+        assertFalse(payload.contains("\"\$ref\""))
+        assertFalse(payload.contains("\"\$defs\""))
+        assertTrue(payload.contains("\"items\""))
+        assertTrue(payload.contains("\"required\""))
+        assertTrue(payload.contains("\"name\""))
+        service.close().join()
+    }
+
+    /** 验证 OpenAI 原生参数转换链路同样只接收已内联的 MCP schema。 */
+    @Test
+    fun `OpenAI raw transport inlines MCP local definitions`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key")),
+        )
+        val mcpClientService = mockk<MCPClientService>()
+        coEvery { mcpClientService.connect(any()) } returns Unit
+        every { mcpClientService.getAllTools() } returns listOf("definitions" to localDefinitionMcpTool())
+        every { mcpClientService.close() } returns kotlinx.coroutines.Job().apply { complete() }
+        val service = OpenAIAgentService(scope, settingsRepository, skillRepository, mcpClientService) { mockk() }
+        installRawOpenAITransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(
+            MockResponse.Builder().body(
+                """{"id":"chat-definitions","object":"chat.completion","created":0,"model":"gpt-5.6-luna","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"definitions inlined"}}]}""",
+            ).build(),
+        )
+
+        assertEquals("definitions inlined", service.sendMessage("check definitions"))
+        val payload = assertNotNull(server.takeRequest()).body!!.utf8()
+
+        assertFalse(payload.contains("\"\$ref\""))
+        assertFalse(payload.contains("\"\$defs\""))
+        assertTrue(payload.contains("\"items\""))
+        assertTrue(payload.contains("\"required\""))
+        assertTrue(payload.contains("\"name\""))
+        service.close().join()
+    }
+
     /**
      * 验证 Telegram OGG 语音以 multipart 转写为文本后才进入 OpenAI 聊天请求。
      */
@@ -643,34 +699,37 @@ class RawAgentTransportTest {
         service.close().join()
     }
 
-    /** 验证 Gemini 原生 wire adapter 不会丢弃 MCP Schema 的组合和约束字段。 */
+    /** 验证 Gemini 原生 wire adapter 会排除无法在参数转换链路中保真的 MCP schema。 */
     @Test
-    fun `Gemini raw transport preserves anyOf and schema constraints`() = runBlocking {
+    fun `Gemini raw transport excludes non portable MCP schema`() = runBlocking {
         settingsRepository.saveSettings(
             AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
         )
         val mcpClientService = mockk<MCPClientService>()
         coEvery { mcpClientService.connect(any()) } returns Unit
-        every { mcpClientService.getAllTools() } returns listOf("schema" to constrainedMcpTool())
+        every { mcpClientService.getAllTools() } returns listOf(
+            "schema" to constrainedMcpTool(),
+            "schema" to Tool("safe", ToolSchema(), "safe tool"),
+        )
         every { mcpClientService.close() } returns kotlinx.coroutines.Job().apply { complete() }
         val service = GeminiAgentService(scope, settingsRepository, skillRepository, mcpClientService) { mockk() }
         installRawGeminiTransport(service)
         assertNotNull(service.resetSession()).join()
         server.enqueue(
             MockResponse.Builder().body(
-                """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"schema preserved"}]}}]}""",
+                """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"safe schema published"}]}}]}""",
             ).build(),
         )
 
-        assertEquals("schema preserved", service.sendMessage("check schema"))
+        assertEquals("safe schema published", service.sendMessage("check schema"))
         val payload = assertNotNull(server.takeRequest()).body!!.utf8()
         assertFalse(payload.contains("schema_constrained"))
         assertTrue(Regex("mcp_[A-Za-z0-9_-]{43}").containsMatchIn(payload))
-        assertTrue(payload.contains("\"anyOf\""))
-        assertTrue(payload.contains("\"maxLength\":12"))
-        assertTrue(payload.contains("\"minimum\":1.0"))
-        assertTrue(payload.contains("\"pattern\":\"^[a-z]+$\""))
-        assertTrue(payload.contains("\"default\":{\"enabled\":true}"))
+        assertFalse(payload.contains("\"anyOf\""))
+        assertFalse(payload.contains("\"maxLength\":12"))
+        assertFalse(payload.contains("\"minimum\":1.0"))
+        assertFalse(payload.contains("\"pattern\":\"^[a-z]+$\""))
+        assertFalse(payload.contains("\"default\":{\"enabled\":true}"))
         service.close().join()
     }
 
@@ -746,6 +805,52 @@ class RawAgentTransportTest {
                     put("pattern", kotlinx.serialization.json.JsonPrimitive("^[a-z]+$"))
                     put("default", kotlinx.serialization.json.buildJsonObject {
                         put("enabled", kotlinx.serialization.json.JsonPrimitive(true))
+                    })
+                })
+            },
+        ),
+    )
+
+    /** 构造带多层和重复本地定义引用的 MCP 输入架构。 */
+    private fun localDefinitionMcpTool(): Tool = Tool(
+        name = "definitions",
+        inputSchema = ToolSchema(
+            properties = kotlinx.serialization.json.buildJsonObject {
+                put("request", kotlinx.serialization.json.buildJsonObject {
+                    put("\$ref", kotlinx.serialization.json.JsonPrimitive("#/\$defs/Request"))
+                })
+                put("items", kotlinx.serialization.json.buildJsonObject {
+                    put("type", kotlinx.serialization.json.JsonPrimitive("array"))
+                    put("items", kotlinx.serialization.json.buildJsonObject {
+                        put("\$ref", kotlinx.serialization.json.JsonPrimitive("#/\$defs/Item"))
+                    })
+                })
+                put("again", kotlinx.serialization.json.buildJsonObject {
+                    put("\$ref", kotlinx.serialization.json.JsonPrimitive("#/\$defs/Item"))
+                })
+            },
+            required = listOf("request"),
+            defs = kotlinx.serialization.json.buildJsonObject {
+                put("Request", kotlinx.serialization.json.buildJsonObject {
+                    put("type", kotlinx.serialization.json.JsonPrimitive("object"))
+                    put("properties", kotlinx.serialization.json.buildJsonObject {
+                        put("item", kotlinx.serialization.json.buildJsonObject {
+                            put("\$ref", kotlinx.serialization.json.JsonPrimitive("#/\$defs/Item"))
+                        })
+                    })
+                    put("required", kotlinx.serialization.json.buildJsonArray {
+                        add(kotlinx.serialization.json.JsonPrimitive("item"))
+                    })
+                })
+                put("Item", kotlinx.serialization.json.buildJsonObject {
+                    put("type", kotlinx.serialization.json.JsonPrimitive("object"))
+                    put("properties", kotlinx.serialization.json.buildJsonObject {
+                        put("name", kotlinx.serialization.json.buildJsonObject {
+                            put("type", kotlinx.serialization.json.JsonPrimitive("string"))
+                        })
+                    })
+                    put("required", kotlinx.serialization.json.buildJsonArray {
+                        add(kotlinx.serialization.json.JsonPrimitive("name"))
                     })
                 })
             },

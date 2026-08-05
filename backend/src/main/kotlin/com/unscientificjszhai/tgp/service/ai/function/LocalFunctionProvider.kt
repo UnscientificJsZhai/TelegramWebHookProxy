@@ -122,9 +122,12 @@ abstract class LocalFunctionProvider {
                     }
                 }
                 schema.description()?.ifPresent { map["description"] = it }
+                schema.enum_()?.ifPresent { map["enum"] = it }
                 schema.pattern()?.ifPresent { map["pattern"] = it }
                 schema.minLength()?.ifPresent { map["minLength"] = it }
                 schema.maxLength()?.ifPresent { map["maxLength"] = it }
+                schema.minimum()?.ifPresent { map["minimum"] = it }
+                schema.maximum()?.ifPresent { map["maximum"] = it }
                 schema.required()?.ifPresent { map["required"] = it }
                 schema.items()?.getOrNull()?.let { items ->
                     val itemsMap = LinkedHashMap<String, Any?>()

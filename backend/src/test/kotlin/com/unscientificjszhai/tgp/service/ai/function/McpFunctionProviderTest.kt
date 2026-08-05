@@ -17,9 +17,15 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -106,10 +112,9 @@ class McpFunctionProviderTest {
         val mcpClientService = mockk<MCPClientService>()
         var tools = listOf("server" to tool("second"), "server" to tool("first"))
         every { mcpClientService.getAllTools() } answers { tools }
-        val provider = McpFunctionProvider(
-            mcpClientService,
-            McpToolAliasGenerator { _, rawToolName -> if (rawToolName == "first") "alias_a" else "alias_z" },
-        )
+        val provider = McpFunctionProvider(mcpClientService) { _, rawToolName ->
+            if (rawToolName == "first") "alias_a" else "alias_z"
+        }
 
         assertEquals(listOf("alias_a", "alias_z"), provider.providedFunctions.map { it.name().get() })
         tools = tools.reversed()
@@ -127,16 +132,13 @@ class McpFunctionProviderTest {
             "server" to tool("failed"),
             "server" to tool("safe"),
         )
-        val provider = McpFunctionProvider(
-            mcpClientService,
-            McpToolAliasGenerator { _, rawToolName ->
-                when (rawToolName) {
-                    "invalid" -> "invalid alias"
-                    "failed" -> throw IllegalStateException("alias generator failure")
-                    else -> "safe_alias"
-                }
-            },
-        )
+        val provider = McpFunctionProvider(mcpClientService) { _, rawToolName ->
+            when (rawToolName) {
+                "invalid" -> "invalid alias"
+                "failed" -> throw IllegalStateException("alias generator failure")
+                else -> "safe_alias"
+            }
+        }
 
         assertEquals(listOf("safe_alias"), provider.providedFunctions.map { it.name().get() })
     }
@@ -159,6 +161,193 @@ class McpFunctionProviderTest {
     }
 
     /**
+     * 验证根 `$defs` 的多层本地引用会以内联约束同时抵达 Gemini 与 OpenAI 声明链路。
+     */
+    @Test
+    fun `local definitions are inlined for Gemini and OpenAI declarations`() = runTest {
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.getAllTools() } returns listOf("server" to definitionTool("valid"))
+        val provider = McpFunctionProvider(mcpClientService) { _, rawName -> rawName }
+
+        val geminiSchema = provider.providedFunctions.single().parameters().get().toJson()
+        val geminiJson = Json.parseToJsonElement(geminiSchema).jsonObject
+        assertFalse(geminiSchema.contains("\"\$ref\""))
+        assertFalse(geminiSchema.contains("\"\$defs\""))
+        assertTrue(geminiJson.toString().contains("\"required\""))
+        assertTrue(geminiJson.toString().contains("\"items\""))
+        assertTrue(geminiJson.toString().contains("\"name\""))
+
+        val openAiParameters = provider.providedOpenAIFunctions.single().parameters().get()._additionalProperties()
+        val openAiSchema = openAiParameters.toString()
+        assertFalse(openAiSchema.contains("\$ref"))
+        assertFalse(openAiSchema.contains("\$defs"))
+        assertTrue(openAiSchema.contains("items"))
+        assertTrue(openAiSchema.contains("name"))
+    }
+
+    /**
+     * 验证 Home Assistant 开关枚举与灯光数值范围不会过滤，且两条模型声明链均保留约束。
+     */
+    @Test
+    fun `Home Assistant enum and numeric bounds survive Gemini and OpenAI declarations`() = runTest {
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.getAllTools() } returns homeAssistantTools().map { "home-assistant" to it }
+        val provider = McpFunctionProvider(mcpClientService) { _, rawName -> rawName }
+
+        val geminiFunctions = provider.providedFunctions.associateBy { it.name().get() }
+        assertEquals(setOf("HassTurnOn", "HassLightSet"), geminiFunctions.keys)
+        assertTrue(provider.canHandle("HassTurnOn"))
+        assertTrue(provider.canHandle("HassLightSet"))
+
+        fun geminiProperty(toolName: String, propertyName: String): JsonObject = Json.parseToJsonElement(
+            checkNotNull(geminiFunctions[toolName]).parameters().get().toJson(),
+        ).jsonObject.getValue("properties").jsonObject.getValue(propertyName).jsonObject
+
+        val geminiDeviceClasses = geminiProperty("HassTurnOn", "device_class")
+        assertEquals(
+            listOf("outlet", "switch"),
+            geminiDeviceClasses.getValue("items").jsonObject.getValue("enum")
+                .jsonArray.map { it.jsonPrimitive.content },
+        )
+        val geminiBrightness = geminiProperty("HassLightSet", "brightness")
+        assertEquals(0.0, geminiBrightness.getValue("minimum").jsonPrimitive.content.toDouble())
+        assertEquals(100.0, geminiBrightness.getValue("maximum").jsonPrimitive.content.toDouble())
+
+        val openAiFunctions = provider.providedOpenAIFunctions.associateBy { it.name() }
+
+        @Suppress("UNCHECKED_CAST")
+        fun openAiProperty(toolName: String, propertyName: String): Map<String, Any?> {
+            val parameters = checkNotNull(openAiFunctions[toolName]).parameters().orElseThrow()._additionalProperties()
+            val properties = parameters.getValue("properties").convert(Map::class.java) as Map<String, Any?>
+            return properties.getValue(propertyName) as Map<String, Any?>
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        val openAiDeviceClassItems = openAiProperty("HassTurnOn", "device_class")["items"] as Map<String, Any?>
+        assertEquals(listOf("outlet", "switch"), openAiDeviceClassItems["enum"])
+        val openAiBrightness = openAiProperty("HassLightSet", "brightness")
+        assertEquals(0.0, (openAiBrightness["minimum"] as Number).toDouble())
+        assertEquals(100.0, (openAiBrightness["maximum"] as Number).toDouble())
+    }
+
+    /**
+     * 验证空枚举、非字符串枚举成员以及非数值边界仍会仅过滤对应 MCP 工具。
+     */
+    @Test
+    fun `invalid enum and numeric bound values skip only their MCP tools`() = runTest {
+        val invalidTools = listOf(
+            constrainedTool("empty-enum", "enum", buildJsonArray {}),
+            constrainedTool(
+                "non-string-enum",
+                "enum",
+                buildJsonArray {
+                    add(JsonPrimitive("light"))
+                    add(JsonPrimitive(1))
+                },
+            ),
+            constrainedTool("string-minimum", "minimum", JsonPrimitive("0"), type = "integer"),
+            constrainedTool("boolean-maximum", "maximum", JsonPrimitive(true), type = "integer"),
+            constrainedTool(
+                "imprecise-minimum",
+                "minimum",
+                JsonPrimitive(9_007_199_254_740_993L),
+                type = "integer",
+            ),
+            constrainedTool("overflow-maximum", "maximum", Json.parseToJsonElement("1e400"), type = "number"),
+            constrainedTool("underflow-minimum", "minimum", Json.parseToJsonElement("1e-400"), type = "number"),
+        )
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.getAllTools() } returns invalidTools.map { "server" to it } + ("server" to tool("safe"))
+        val provider = McpFunctionProvider(mcpClientService) { _, rawName -> rawName }
+
+        assertEquals(listOf("safe"), provider.providedFunctions.map { it.name().get() })
+        invalidTools.forEach { assertFalse(provider.canHandle(it.name)) }
+    }
+
+    /**
+     * 验证 RFC6901 中的 `~0` 和 `~1` 会解析为定义表中的原始名称。
+     */
+    @Test
+    fun `local definition references decode RFC6901 escaped names`() = runTest {
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.getAllTools() } returns listOf("server" to escapedDefinitionTool())
+        val provider = McpFunctionProvider(mcpClientService)
+
+        val schema = provider.providedFunctions.single().parameters().get().toJson()
+
+        assertFalse(schema.contains("\$ref"))
+        assertFalse(schema.contains("\$defs"))
+        assertTrue(schema.contains("escapedValue"))
+    }
+
+    /** 不可由 Gemini 与 OpenAI 参数链共同保真的 `default` schema 关键字会拒绝当前工具。 */
+    @Test
+    fun `default schema keywords skip only their MCP tool`() = runTest {
+        val mcpClientService = mockk<MCPClientService>()
+        every { mcpClientService.getAllTools() } returns listOf(
+            "server" to Tool(
+                "literal-default",
+                ToolSchema(
+                    properties = buildJsonObject {
+                        put(
+                            "value",
+                            buildJsonObject {
+                                put("type", "string")
+                                put(
+                                    "default",
+                                    buildJsonObject {
+                                        put("\$ref", "not-a-schema-reference")
+                                        put("\$defs", buildJsonObject { put("literal", true) })
+                                    },
+                                )
+                            },
+                        )
+                    },
+                ),
+            ),
+            "server" to tool("safe"),
+        )
+        val provider = McpFunctionProvider(mcpClientService) { _, rawName -> rawName }
+
+        assertEquals(listOf("safe"), provider.providedFunctions.map { it.name().get() })
+        assertFalse(provider.canHandle("literal-default"))
+    }
+
+    /**
+     * 验证无法在固定资源内无损内联的候选只会移除自身，且不会留下可调用绑定。
+     */
+    @Test
+    fun `invalid local definition references skip only their MCP tools`() = runTest {
+        val mcpClientService = mockk<MCPClientService>()
+        val invalidTools = listOf(
+            invalidReferenceTool("external", "https://example.test/schema"),
+            invalidReferenceTool("fragment", "#/definitions/Foo"),
+            invalidReferenceTool("percent", "#/\$defs/Foo%20"),
+            invalidReferenceTool("invalid-escape", "#/\$defs/Foo~2"),
+            invalidReferenceTool("sibling", "#/\$defs/Foo", sibling = true),
+            invalidReferenceTool("missing", "#/\$defs/Missing"),
+            primitiveDefinitionTool("primitive-target"),
+            nestedDefinitionsTool("nested-definitions"),
+            cyclicDefinitionTool("direct-cycle", indirect = false),
+            cyclicDefinitionTool("indirect-cycle", indirect = true),
+            referenceExpansionBudgetTool("reference-budget"),
+            unsupportedDefinitionKeywordTool("definition-any-of", "anyOf"),
+            allOfWrappedDefinitionTool("all-of-wrapper"),
+        )
+        every { mcpClientService.getAllTools() } returns invalidTools.map { "server" to it } + ("server" to tool("safe"))
+        val provider = McpFunctionProvider(mcpClientService) { _, rawName -> rawName }
+
+        assertEquals(listOf("safe"), provider.providedFunctions.map { it.name().get() })
+        invalidTools.forEach { invalid ->
+            assertFalse(provider.canHandle(invalid.name))
+            assertEquals(
+                "mcp_tool_unavailable",
+                provider.execute(invalid.name, emptyMap())["error"]?.toString()?.removeSurrounding("\""),
+            )
+        }
+    }
+
+    /**
      * 验证内部名称碰撞会从声明和执行路由中整体移除。
      */
     @Test
@@ -168,7 +357,7 @@ class McpFunctionProviderTest {
             "server_part" to tool("tool"),
             "server" to tool("part_tool"),
         )
-        val provider = McpFunctionProvider(mcpClientService, McpToolAliasGenerator { _, _ -> collidingAlias })
+        val provider = McpFunctionProvider(mcpClientService) { _, _ -> collidingAlias }
 
         assertTrue(provider.providedFunctions.isEmpty())
         assertFalse(provider.canHandle(collidingAlias))
@@ -223,7 +412,7 @@ class McpFunctionProviderTest {
     fun `MCP and local provider collisions are not declared or executed`() = runTest {
         val mcpClientService = mockk<MCPClientService>()
         every { mcpClientService.getAllTools() } returns listOf("server" to tool("tool"))
-        val mcpProvider = McpFunctionProvider(mcpClientService, McpToolAliasGenerator { _, _ -> collidingAlias })
+        val mcpProvider = McpFunctionProvider(mcpClientService) { _, _ -> collidingAlias }
         val localProvider = FixedFunctionProvider(collidingAlias)
         val router = LocalFunctionRouter(listOf(mcpProvider, localProvider))
         val routeSnapshot = router.refresh()
@@ -288,5 +477,211 @@ class McpFunctionProviderTest {
         val collidingAlias = "mcp_" + "a".repeat(43)
 
         fun tool(name: String): Tool = Tool(name, ToolSchema())
+
+        fun homeAssistantTools(): List<Tool> = listOf(
+            Tool(
+                name = "HassTurnOn",
+                inputSchema = ToolSchema(
+                    properties = buildJsonObject {
+                        put("name", buildJsonObject { put("type", "string") })
+                        put("domain", buildJsonObject {
+                            put("type", "array")
+                            put("items", buildJsonObject { put("type", "string") })
+                        })
+                        put("device_class", buildJsonObject {
+                            put("type", "array")
+                            put("items", buildJsonObject {
+                                put("type", "string")
+                                put("enum", buildJsonArray {
+                                    add(JsonPrimitive("outlet"))
+                                    add(JsonPrimitive("switch"))
+                                })
+                            })
+                        })
+                    },
+                ),
+            ),
+            Tool(
+                name = "HassLightSet",
+                inputSchema = ToolSchema(
+                    properties = buildJsonObject {
+                        put("name", buildJsonObject { put("type", "string") })
+                        put("brightness", buildJsonObject {
+                            put("type", "integer")
+                            put("minimum", 0)
+                            put("maximum", 100)
+                        })
+                    },
+                ),
+            ),
+        )
+
+        fun constrainedTool(
+            name: String,
+            keyword: String,
+            value: JsonElement,
+            type: String = "string",
+        ): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    put("value", buildJsonObject {
+                        put("type", type)
+                        put(keyword, value)
+                    })
+                },
+            ),
+        )
+
+        fun definitionTool(name: String): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    put("request", buildJsonObject { put("\$ref", "#/\$defs/Request") })
+                    put("items", buildJsonObject {
+                        put("type", "array")
+                        put("items", buildJsonObject { put("\$ref", "#/\$defs/Item") })
+                    })
+                    put("again", buildJsonObject { put("\$ref", "#/\$defs/Item") })
+                },
+                required = listOf("request"),
+                defs = buildJsonObject {
+                    put("Request", buildJsonObject {
+                        put("type", "object")
+                        put("properties", buildJsonObject {
+                            put("item", buildJsonObject { put("\$ref", "#/\$defs/Item") })
+                        })
+                        put("required", buildJsonArray { add(JsonPrimitive("item")) })
+                    })
+                    put("Item", buildJsonObject {
+                        put("type", "object")
+                        put("properties", buildJsonObject {
+                            put("name", buildJsonObject { put("type", "string") })
+                        })
+                        put("required", buildJsonArray { add(JsonPrimitive("name")) })
+                    })
+                },
+            ),
+        )
+
+        fun escapedDefinitionTool(): Tool = Tool(
+            name = "escaped",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    put("escaped", buildJsonObject { put("\$ref", "#/\$defs/slash~1name~0part") })
+                },
+                defs = buildJsonObject {
+                    put("slash/name~part", buildJsonObject {
+                        put("type", "object")
+                        put("properties", buildJsonObject {
+                            put("escapedValue", buildJsonObject { put("type", "string") })
+                        })
+                    })
+                },
+            ),
+        )
+
+        fun invalidReferenceTool(name: String, reference: String, sibling: Boolean = false): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    put("value", buildJsonObject {
+                        put("\$ref", reference)
+                        if (sibling) put("description", "must reject")
+                    })
+                },
+                defs = buildJsonObject {
+                    put("Foo", buildJsonObject { put("type", "string") })
+                },
+            ),
+        )
+
+        fun primitiveDefinitionTool(name: String): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject { put("value", buildJsonObject { put("\$ref", "#/\$defs/Foo") }) },
+                defs = buildJsonObject { put("Foo", JsonPrimitive("not a schema")) },
+            ),
+        )
+
+        fun nestedDefinitionsTool(name: String): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject { put("value", buildJsonObject { put("\$ref", "#/\$defs/Foo") }) },
+                defs = buildJsonObject {
+                    put("Foo", buildJsonObject {
+                        put("\$defs", buildJsonObject { put("Nested", buildJsonObject { put("type", "string") }) })
+                        put("type", "object")
+                    })
+                },
+            ),
+        )
+
+        fun cyclicDefinitionTool(name: String, indirect: Boolean): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject { put("value", buildJsonObject { put("\$ref", "#/\$defs/A") }) },
+                defs = buildJsonObject {
+                    put("A", buildJsonObject { put("\$ref", if (indirect) "#/\$defs/B" else "#/\$defs/A") })
+                    if (indirect) put("B", buildJsonObject { put("\$ref", "#/\$defs/A") })
+                },
+            ),
+        )
+
+        fun referenceExpansionBudgetTool(name: String): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    repeat(129) { index -> put("value$index", buildJsonObject { put("\$ref", "#/\$defs/Item") }) }
+                },
+                defs = buildJsonObject {
+                    put("Item", buildJsonObject { put("type", "string") })
+                },
+            ),
+        )
+
+        fun unsupportedDefinitionKeywordTool(name: String, keyword: String): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    put("value", buildJsonObject { put("\$ref", "#/\$defs/Foo") })
+                },
+                defs = buildJsonObject {
+                    put("Foo", buildJsonObject {
+                        put("type", "string")
+                        when (keyword) {
+                            "anyOf" -> put(
+                                keyword,
+                                buildJsonArray {
+                                    add(buildJsonObject { put("type", "string") })
+                                    add(buildJsonObject { put("type", "integer") })
+                                },
+                            )
+
+                            else -> error("测试仅支持受拒绝的 schema 关键字。")
+                        }
+                    })
+                },
+            ),
+        )
+
+        fun allOfWrappedDefinitionTool(name: String): Tool = Tool(
+            name = name,
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    put("value", buildJsonObject {
+                        put(
+                            "allOf",
+                            buildJsonArray {
+                                add(buildJsonObject { put("\$ref", "#/\$defs/Foo") })
+                            },
+                        )
+                    })
+                },
+                defs = buildJsonObject {
+                    put("Foo", buildJsonObject { put("type", "string") })
+                },
+            ),
+        )
     }
 }
