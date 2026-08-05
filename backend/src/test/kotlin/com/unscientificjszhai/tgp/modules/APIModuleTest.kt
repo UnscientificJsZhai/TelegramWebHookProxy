@@ -15,6 +15,8 @@ import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -57,6 +59,8 @@ class APIModuleTest {
     fun `send message rejects invalid JSON text without calling Telegram`() = withTestApi { _, telegramService, _ ->
         val invalidBodies = listOf(
             "{}",
+            "[]",
+            "null",
             """{"text":null}""",
             """{"text":{}}""",
             """{"text":[]}""",
@@ -75,6 +79,31 @@ class APIModuleTest {
             }
         }
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+    }
+
+    /** 验证深层未知 JSON 在 DTO 字段读取前受结构限制保护，且不会投递消息。 */
+    @Test
+    fun `send message rejects deep unknown JSON before delivery`() = withTestApi { _, telegramService, _ ->
+        val deepJson = buildString {
+            append("""{"text":"ignored","unknown":""")
+            repeat(JsonStructureLimits.MAX_DEPTH + 1) { append('[') }
+            append('0')
+            repeat(JsonStructureLimits.MAX_DEPTH + 1) { append(']') }
+            append('}')
+        }
+        assertTrue(deepJson.encodeToByteArray().size < 64 * 1024)
+
+        client.post("/api/send-message") {
+            contentType(ContentType.Application.Json)
+            setBody(deepJson)
+        }.apply {
+            assertEquals(HttpStatusCode.BadRequest, status)
+            assertSafeErrorBody(bodyAsText())
+        }
+
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
     }
 
     /**
@@ -83,7 +112,8 @@ class APIModuleTest {
     @Test
     fun `send message supports custom fields but rejects invalid custom field parameters`() =
         withTestApi { repository, telegramService, _ ->
-            coEvery { telegramService.sendMessage(any(), any(), any()) } returns TelegramApiResponse(
+            repository.updateSettings { it.copy(telegramToken = "100:custom-token") }
+            coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(
                 HttpStatusCode.OK,
                 """{"ok":true}""",
             )
@@ -100,17 +130,23 @@ class APIModuleTest {
             }.apply {
                 assertEquals(HttpStatusCode.OK, status)
             }
-            coVerify { telegramService.sendMessage("json chat", "json message", any()) }
-            coVerify { telegramService.sendMessage("form chat", "form message", any()) }
+            coVerify(exactly = 1) {
+                telegramService.sendMessageForToken("100:custom-token", "json chat", "json message", null)
+            }
+            coVerify(exactly = 1) {
+                telegramService.sendMessageForToken("100:custom-token", "form chat", "form message", null)
+            }
 
-            repository.updateSettings { it.copy(chatId = "default chat") }
+            repository.updateSettings { it.copy(telegramToken = "100:token-a", chatId = "chat-a") }
             client.post("/api/send-message") {
                 contentType(ContentType.Application.Json)
                 setBody("""{"text":"default chat message","chatId":null}""")
             }.apply {
                 assertEquals(HttpStatusCode.OK, status)
             }
-            coVerify { telegramService.sendMessage("default chat", "default chat message", any()) }
+            coVerify(exactly = 1) {
+                telegramService.sendMessageForToken("100:token-a", "chat-a", "default chat message", null)
+            }
 
             listOf(
                 "/api/send-message?messagefield=",
@@ -125,7 +161,59 @@ class APIModuleTest {
                     assertEquals(HttpStatusCode.BadRequest, status)
                 }
             }
-            coVerify(exactly = 3) { telegramService.sendMessage(any(), any(), any()) }
+            coVerify(exactly = 3) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
+        }
+
+    /** 验证发送消息接口按 UTF-16 code unit 执行 Telegram 单条文本上限，且不会自动分片。 */
+    @Test
+    fun `send message enforces Telegram UTF-16 text length without splitting`() =
+        withTestApi { repository, telegramService, _ ->
+            repository.updateSettings { it.copy(telegramToken = "100:length-token", chatId = "length-chat") }
+            coEvery { telegramService.sendMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(
+                HttpStatusCode.OK,
+                """{"ok":true}""",
+            )
+            val bmpAtLimit = "x".repeat(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH)
+            val emojiAtLimit = "😀".repeat(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH / 2)
+            val bmpOverLimit = "x".repeat(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH + 1)
+            val emojiOverLimit = emojiAtLimit + "x"
+            assertEquals(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH, bmpAtLimit.length)
+            assertEquals(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH, emojiAtLimit.length)
+            assertEquals(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH + 1, bmpOverLimit.length)
+            assertEquals(MAX_TELEGRAM_MESSAGE_TEXT_LENGTH + 1, emojiOverLimit.length)
+
+            listOf(bmpAtLimit, emojiAtLimit).forEach { text ->
+                client.post("/api/send-message") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"text":${Json.encodeToString(text)}}""")
+                }.apply {
+                    assertEquals(HttpStatusCode.OK, status)
+                }
+            }
+            listOf(bmpOverLimit, emojiOverLimit).forEach { text ->
+                client.post("/api/send-message") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"text":${Json.encodeToString(text)}}""")
+                }.apply {
+                    assertEquals(HttpStatusCode.BadRequest, status)
+                    assertSafeErrorBody(bodyAsText())
+                }
+            }
+
+            coVerify(exactly = 1) {
+                telegramService.sendMessageForToken("100:length-token", "length-chat", bmpAtLimit, null)
+            }
+            coVerify(exactly = 1) {
+                telegramService.sendMessageForToken("100:length-token", "length-chat", emojiAtLimit, null)
+            }
+            coVerify(exactly = 0) {
+                telegramService.sendMessageForToken("100:length-token", "length-chat", bmpOverLimit, null)
+            }
+            coVerify(exactly = 0) {
+                telegramService.sendMessageForToken("100:length-token", "length-chat", emojiOverLimit, null)
+            }
+            coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
         }
 
     /** 验证超出路由请求体限制时，`413` 错误优先于 JSON 解析。 */
@@ -142,6 +230,7 @@ class APIModuleTest {
             )
         }
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
     }
 
     /** 验证所有设置写入入口均拒绝超限字段或请求体，且不改变持久化状态。 */

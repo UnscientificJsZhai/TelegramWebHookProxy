@@ -10,6 +10,7 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdateResult
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.*
@@ -123,9 +124,11 @@ fun Application.apiModule(appComponent: AppComponent) {
                     val contentType = call.request.contentType()
                     val (requestChatId, requestText) = when {
                         contentType.match(ContentType.Application.Json) -> {
-                            val json = call.receive<JsonObject>()
+                            val json = call.readSendMessageJsonObject() ?: return@post
                             val (chatId, text) = try {
                                 json.optionalStringValue(chatIdField) to json.requiredStringValue(messageField)
+                            } catch (e: CancellationException) {
+                                throw e
                             } catch (_: IllegalArgumentException) {
                                 call.respondApiInputError("消息请求格式不合法")
                                 return@post
@@ -156,14 +159,23 @@ fun Application.apiModule(appComponent: AppComponent) {
                         call.respondApiInputError("Message text is required")
                         return@post
                     }
+                    if (requestText.length > MAX_TELEGRAM_MESSAGE_TEXT_LENGTH) {
+                        call.respondApiInputError("Message text exceeds Telegram's 4096 character limit")
+                        return@post
+                    }
 
                     try {
-                        val chatId = (requestChatId ?: "").ifBlank { settingsRepository.settingsFlow.value.chatId }
+                        val snapshot = settingsRepository.currentSettingsSnapshot()
+                        val chatId = (requestChatId ?: "").ifBlank { snapshot.settings.chatId }
                         if (chatId.isBlank()) {
                             call.respondApiInputError("Chat ID is required")
                             return@post
                         }
-                        val response = telegramService.sendMessage(chatId, requestText)
+                        val response = telegramService.sendMessageForToken(
+                            snapshot.settings.telegramToken,
+                            chatId,
+                            requestText,
+                        )
                         call.respond(response.status, response.body)
                     } catch (e: CancellationException) {
                         throw e
@@ -320,6 +332,19 @@ private data class ChatSettingsRequest(val chatId: String)
 private data class SettingsErrorResponse(val error: String)
 
 private fun String.utf8Size(): Long = toByteArray(StandardCharsets.UTF_8).size.toLong()
+
+/** 读取并受限解析发送消息请求的原始 JSON 对象；未知字段保留以兼容自定义字段名。 */
+private suspend fun ApplicationCall.readSendMessageJsonObject(): JsonObject? = try {
+    JsonStructureLimits.parseToJsonElement(strictSettingsJson, receiveText()) as? JsonObject
+        ?: throw IllegalArgumentException("Send message request root must be a JSON object.")
+} catch (e: CancellationException) {
+    throw e
+} catch (e: PayloadTooLargeException) {
+    throw e
+} catch (_: Exception) {
+    respondApiInputError("消息请求格式不合法")
+    null
+}
 
 /** 读取并严格解析设置请求的原始 JSON 对象；不会使用应用全局的宽松 JSON 配置。 */
 private suspend fun ApplicationCall.readSettingsJsonObject(): JsonObject? = try {

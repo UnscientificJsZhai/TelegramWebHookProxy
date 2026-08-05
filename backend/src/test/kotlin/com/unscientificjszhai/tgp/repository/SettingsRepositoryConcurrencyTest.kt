@@ -1,17 +1,21 @@
 package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CyclicBarrier
 import kotlin.concurrent.thread
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 
 /**
  * 设置仓储并发变换与内容修订值的测试设计。
@@ -90,6 +94,51 @@ class SettingsRepositoryConcurrencyTest {
             assertEquals(versionAfterCommit, repository.settingsUpdateFlow.value.version)
             assertEquals(generationAfterCommit, barrier.latestPendingGeneration())
             assertEquals("current-chat", repository.settingsFlow.value.chatId)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    /** 验证读取设置快照时，不会将并发切换中的 token 和默认聊天标识跨代次混合。 */
+    @Test
+    fun `concurrent settings snapshots always preserve token and chat pairing`() {
+        val directory = createTempDirectory("settings-snapshot-pairing-test").toFile()
+        try {
+            val repository = SettingsRepository.forTesting(directory.resolve("settings.json"), ModelSwitchBarrier())
+            val settingsA = AppSettings(telegramToken = "100:token-a", chatId = "chat-a")
+            val settingsB = AppSettings(telegramToken = "200:token-b", chatId = "chat-b")
+            repository.updateSettings { settingsA }
+            val startIteration = CyclicBarrier(2)
+            val finishIteration = CyclicBarrier(2)
+            val observedPairs = ConcurrentLinkedQueue<Pair<String, String>>()
+            val iterations = 100
+
+            val writer = thread(start = true) {
+                repeat(iterations) { index ->
+                    startIteration.await()
+                    repository.updateSettings { if (index % 2 == 0) settingsB else settingsA }
+                    finishIteration.await()
+                }
+            }
+            val reader = thread(start = true) {
+                repeat(iterations) {
+                    startIteration.await()
+                    val settings = repository.currentSettingsSnapshot().settings
+                    observedPairs.add(settings.telegramToken to settings.chatId)
+                    finishIteration.await()
+                }
+            }
+
+            writer.join()
+            reader.join()
+
+            assertEquals(iterations, observedPairs.size)
+            observedPairs.forEach { observed ->
+                assertTrue(
+                    observed == (settingsA.telegramToken to settingsA.chatId) ||
+                            observed == (settingsB.telegramToken to settingsB.chatId),
+                )
+            }
         } finally {
             directory.deleteRecursively()
         }
