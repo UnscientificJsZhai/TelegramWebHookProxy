@@ -802,8 +802,7 @@ class GeminiAgentServiceTest {
     }
 
     /**
-     * 验证 reset 与模型切换共享会话线性化边界：先取得会话锁的 reset 可以完成，但随后选择的模型候选
-     * 必须成为最终已发布会话。
+     * 验证模型切换会以更高的重置代次取代已经开始但尚未提交的人工 reset，最终只发布最新模型候选。
      */
     @Test
     fun `concurrent reset and model switch publish the latest selected model`() = runBlocking {
@@ -828,7 +827,7 @@ class GeminiAgentServiceTest {
         resetJob.join()
         switchJob.join()
 
-        assertFalse(resetJob.isCancelled)
+        assertTrue(resetJob.isCancelled)
         assertFalse(switchJob.isCancelled)
         assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
         assertSame(switchCandidate, privateField("chat"))
@@ -1312,23 +1311,27 @@ class GeminiAgentServiceTest {
         assertEquals("恢复后的会话历史", postRecoveryRequest.captured.first().parts().get().single().text().get())
     }
 
-    /** 验证 SDK 工具超限后的候选重置失败时，旧 Chat 不会重新接收后续请求。 */
+    /** 验证 SDK 工具超限恢复失败保持旧会话封闭，但后续成功的人工 reset 会解除旧恢复标记。 */
     @Test
-    fun `failed SDK tool-limit recovery rejects subsequent sends`() = runBlocking {
+    fun `failed SDK tool-limit recovery is superseded by a successful public reset`() = runBlocking {
         val chats = mockk<Chats>()
         val exhaustedCandidate = mockk<Chat>()
+        val recoveredCandidate = mockk<Chat>()
         val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
         val creationCount = AtomicInteger()
         settingsRepository.saveSettings(AppSettings(ai = AISettings()))
         every { chats.create(any<String>(), any<GenerateContentConfig>()) } answers {
-            if (creationCount.incrementAndGet() > MAX_TOOL_CALL_ROUNDS + 1) {
-                throw IllegalStateException("recovery creation failed")
+            when (creationCount.incrementAndGet()) {
+                in 1..(MAX_TOOL_CALL_ROUNDS + 1) -> exhaustedCandidate
+                MAX_TOOL_CALL_ROUNDS + 2 -> throw IllegalStateException("recovery creation failed")
+                else -> recoveredCandidate
             }
-            exhaustedCandidate
         }
         every { exhaustedCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
             Part.builder().functionCall(functionCall).build(),
         )
+        every { recoveredCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("人工重置后回复"))
+        every { recoveredCandidate.getHistory(true) } returns ImmutableList.of()
         injectClient(chats)
         injectChat(mockk())
         setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
@@ -1341,6 +1344,11 @@ class GeminiAgentServiceTest {
         assertTrue(recoveryJob.isCancelled)
         assertFailsWith<IllegalStateException> { service.sendMessage("不能回退到旧会话") }
         verify(exactly = MAX_TOOL_CALL_ROUNDS + 1) { exhaustedCandidate.sendMessage(any<List<Content>>()) }
+
+        val manualReset = assertNotNull(service.resetSession())
+        withTimeout(5.seconds) { manualReset.join() }
+        assertFalse(manualReset.isCancelled)
+        assertEquals("人工重置后回复", service.sendMessage("恢复服务"))
     }
 
     /** 验证被取消的 SDK 工具超限恢复同样封闭旧会话。 */
@@ -1351,11 +1359,15 @@ class GeminiAgentServiceTest {
         val neverReleaseRecovery = CompletableDeferred<Unit>()
         val chats = mockk<Chats>()
         val exhaustedCandidate = mockk<Chat>()
+        val recoveredCandidate = mockk<Chat>()
         val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
+        val connectionCount = AtomicInteger()
         settingsRepository.saveSettings(AppSettings(ai = AISettings()))
         coEvery { mcpClientService.connect(any()) } coAnswers {
-            recoveryStarted.complete(Unit)
-            neverReleaseRecovery.await()
+            if (connectionCount.incrementAndGet() == 1) {
+                recoveryStarted.complete(Unit)
+                neverReleaseRecovery.await()
+            }
         }
         every { mcpClientService.getAllTools() } returns emptyList()
         every { mcpClientService.close() } returns Job().apply { complete() }
@@ -1365,10 +1377,13 @@ class GeminiAgentServiceTest {
             skillRepository,
             mcpClientService,
         ) { mockk() }
-        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns exhaustedCandidate
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany
+                (List(MAX_TOOL_CALL_ROUNDS + 1) { exhaustedCandidate } + listOf(recoveredCandidate, recoveredCandidate))
         every { exhaustedCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
             Part.builder().functionCall(functionCall).build(),
         )
+        every { recoveredCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("取消恢复后回复"))
+        every { recoveredCandidate.getHistory(true) } returns ImmutableList.of()
         injectClient(chats)
         injectChat(mockk())
         setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
@@ -1382,6 +1397,11 @@ class GeminiAgentServiceTest {
         assertTrue(recoveryJob.isCancelled)
         assertFailsWith<IllegalStateException> { service.sendMessage("不能回退到旧会话") }
         verify(exactly = MAX_TOOL_CALL_ROUNDS + 1) { exhaustedCandidate.sendMessage(any<List<Content>>()) }
+
+        val manualReset = assertNotNull(service.resetSession())
+        withTimeout(5.seconds) { manualReset.join() }
+        assertFalse(manualReset.isCancelled)
+        assertEquals("取消恢复后回复", service.sendMessage("恢复服务"))
     }
 
     /**

@@ -172,9 +172,9 @@ class RawAgentTransportTest {
         service.close().join()
     }
 
-    /** 验证原生 Gemini 路径在工具超限恢复完成前不会读取旧会话，并在恢复后只使用新会话。 */
+    /** 验证无法启动的原生 Gemini 恢复标记会 fail-closed，随后成功的人工 reset 会原子取代它。 */
     @Test
-    fun `Gemini raw pending recovery blocks the old session and resumes with the new session`() = runBlocking {
+    fun `Gemini raw job-null recovery marker is superseded by a successful public reset`() = runBlocking {
         settingsRepository.saveSettings(
             AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
         )
@@ -182,24 +182,16 @@ class RawAgentTransportTest {
             GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
         installRawGeminiTransport(service)
         assertNotNull(service.resetSession()).join()
-        val oldSession = assertNotNull(privateField(service, "rawSession"))
-        setPrivateField(service, "currentModel", "models/recovered-session")
-        assertNotNull(service.resetSession()).join()
-        val recoveredSession = assertNotNull(privateField(service, "rawSession"))
-        setPrivateField(service, "rawSession", oldSession)
-        val recoveryJob = kotlinx.coroutines.Job()
-        installPendingToolLimitRecovery(service, recoveryJob)
-        server.enqueue(MockResponse.Builder().body(geminiTextResponse("恢复后回复")).build())
-        val waitingSend = async(start = CoroutineStart.UNDISPATCHED) { service.sendMessage("不得提前请求") }
 
-        assertFalse(waitingSend.isCompleted)
+        installPendingToolLimitRecovery(service, job = null, generation = 1)
+        assertFailsWith<IllegalStateException> { service.sendMessage("不得使用旧会话") }
         assertEquals(0, server.requestCount)
-        setPrivateField(service, "rawSession", recoveredSession)
-        recoveryJob.complete()
 
-        assertEquals("恢复后回复", withTimeout(5.seconds) { waitingSend.await() })
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(MockResponse.Builder().body(geminiTextResponse("恢复后回复")).build())
+        assertEquals("恢复后回复", service.sendMessage("人工重置后发送"))
         val recoveredRequest = assertNotNull(server.takeRequest())
-        assertTrue(recoveredRequest.target.contains("/models/recovered-session:generateContent"))
+        assertTrue(recoveredRequest.target.contains("/models/gemini-3.5-flash-lite:generateContent"))
         assertEquals(1, geminiContents(recoveredRequest.body!!.utf8()).size)
         service.close().join()
     }
@@ -250,9 +242,9 @@ class RawAgentTransportTest {
         }
     }
 
-    /** 验证原生 Gemini 的实际工具超限恢复失败后，后续发送不会回退到仍保留的旧会话。 */
+    /** 验证原生 Gemini 的实际工具超限恢复失败保持旧会话封闭，但成功人工 reset 能恢复服务。 */
     @Test
-    fun `failed Gemini raw tool-limit recovery rejects later sends without an old request`() = runBlocking {
+    fun `failed Gemini raw tool-limit recovery is superseded by a successful public reset`() = runBlocking {
         val mcpClientService = mockk<MCPClientService>()
         val connectionCount = AtomicInteger()
         settingsRepository.saveSettings(
@@ -282,6 +274,13 @@ class RawAgentTransportTest {
             assertEquals(MAX_TOOL_CALL_ROUNDS + 1, server.requestCount)
             assertFailsWith<IllegalStateException> { service.sendMessage("不得使用旧会话") }
             assertEquals(MAX_TOOL_CALL_ROUNDS + 1, server.requestCount)
+
+            val manualReset = assertNotNull(service.resetSession())
+            withTimeout(5.seconds) { manualReset.join() }
+            assertFalse(manualReset.isCancelled)
+            server.enqueue(MockResponse.Builder().body(geminiTextResponse("人工重置后回复")).build())
+            assertEquals("人工重置后回复", service.sendMessage("恢复服务"))
+            assertEquals(MAX_TOOL_CALL_ROUNDS + 2, server.requestCount)
         } finally {
             service.close().join()
         }
@@ -702,13 +701,23 @@ class RawAgentTransportTest {
         target.javaClass.getDeclaredField(fieldName).apply { isAccessible = true }.set(target, value)
     }
 
-    private fun installPendingToolLimitRecovery(service: GeminiAgentService, job: kotlinx.coroutines.Job) {
+    private fun installPendingToolLimitRecovery(
+        service: GeminiAgentService,
+        job: kotlinx.coroutines.Job?,
+        generation: Long,
+    ) {
+        val attemptType = GeminiAgentService::class.java.declaredClasses.single {
+            it.simpleName == "ResetAttempt"
+        }
+        val attempt = attemptType.declaredConstructors.single().apply {
+            isAccessible = true
+        }.newInstance(generation)
         val recoveryType = GeminiAgentService::class.java.declaredClasses.single {
             it.simpleName == "ToolLimitRecovery"
         }
         val recovery = recoveryType.declaredConstructors.single().apply {
             isAccessible = true
-        }.newInstance(job)
+        }.newInstance(attempt, job)
         setPrivateField(service, "pendingToolLimitRecovery", recovery)
     }
 
