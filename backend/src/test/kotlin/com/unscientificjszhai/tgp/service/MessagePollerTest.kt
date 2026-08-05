@@ -450,6 +450,65 @@ class MessagePollerTest {
         }
     }
 
+    /** 验证语音下载的 4xx 或 5xx 会在 durable claim 前重试，不会固化 Agent 回合或发送回复。 */
+    @Test
+    fun `voice download HTTP failures retry before durable claim`() = runBlocking {
+        listOf(HttpStatusCode.BadRequest, HttpStatusCode.InternalServerError).forEach { status ->
+            val retryStarted = CompletableDeferred<Duration>()
+            val allowRetry = CompletableDeferred<Unit>()
+            val fixture = fixture(
+                retryDelay = { delayDuration ->
+                    retryStarted.complete(delayDuration)
+                    allowRetry.await()
+                },
+            )
+            val chat = Chat(id = 123L, type = "private", firstName = "Test")
+            fixture.updates.saveLastUpdateId("100", 10)
+            fixture.saveSettings(
+                AppSettings(telegramToken = "100:A", ai = AISettings(agentEnabled = true, agentChatId = "123")),
+            )
+            coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns GetUpdatesResponse(
+                ok = true,
+                result = listOf(
+                    Update(
+                        11,
+                        message = authorizedMessage(
+                            1,
+                            chat,
+                            voice = Voice("voice-id", "voice-unique-id", duration = 1),
+                        ),
+                    ),
+                ),
+            )
+            coEvery { fixture.telegram.getFileForToken("100:A", "voice-id") } returns FileResponse(
+                ok = true,
+                result = TelegramFile("voice-id", "voice-unique-id", filePath = "voices/voice.ogg"),
+            )
+            coEvery { fixture.telegram.downloadFileForToken("100:A", "voices/voice.ogg") } throws
+                    IllegalStateException("Telegram file download failed with HTTP status ${status.value}.")
+
+            fixture.poller.start()
+            try {
+                assertEquals(1.seconds, withTimeout(2.seconds) { retryStarted.await() })
+
+                val botData = fixture.updates.getData("100")
+                assertEquals(10, botData.lastUpdateId)
+                assertEquals(11, botData.retryCheckpoint?.targetUpdateId)
+                assertEquals(1, botData.retryCheckpoint?.retryCount)
+                assertTrue(botData.agentTurnJournal.isEmpty())
+                assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
+                coVerify(exactly = 0) { fixture.agent.sendMessage(null, any()) }
+                coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
+                coVerify(exactly = 1) { fixture.telegram.getFileForToken("100:A", "voice-id") }
+                coVerify(exactly = 1) { fixture.telegram.downloadFileForToken("100:A", "voices/voice.ogg") }
+            } finally {
+                allowRetry.complete(Unit)
+                fixture.poller.close()
+            }
+        }
+    }
+
     /** 验证持久化 Agent 回合超时只会静默确认进行中 journal，不会直发或创建 outbox 回复。 */
     @Test
     fun `durable processing timeout silently confirms in progress journal`() = runBlocking {

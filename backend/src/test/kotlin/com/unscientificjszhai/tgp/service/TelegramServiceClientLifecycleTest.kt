@@ -15,12 +15,14 @@ import io.ktor.client.request.HttpRequestData
 import io.ktor.client.request.HttpResponseData
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
+import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import java.util.concurrent.CountDownLatch
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -436,6 +438,68 @@ class TelegramServiceClientLifecycleTest {
             eventually { assertFalse(oldClient.coroutineContext[Job]!!.isActive) }
         } finally {
             release.complete(Unit)
+            service.close()
+        }
+    }
+
+    /** 验证文件下载只接受 2xx 二进制响应，且失败不会回显未读取的错误正文或请求敏感信息。 */
+    @Test
+    fun `file download rejects non success bodies without exposing them and preserves binary bytes`() = runBlocking {
+        val jsonMarker = "DOWNLOAD_ERROR_JSON_MARKER"
+        val htmlMarker = "DOWNLOAD_ERROR_HTML_MARKER"
+        val token = "100:download-token-canary"
+        val binaryPayload = byteArrayOf(0x00, 0x7f, 0x80.toByte(), 0xff.toByte(), 0x1b, 0x0a)
+        val settings = SettingsRepository.forTesting(
+            temporaryDirectory.resolve("download-status-settings.json"),
+            ModelSwitchBarrier(),
+        )
+        val service = TelegramService(
+            scope,
+            settings,
+            UpdatesRepository(temporaryDirectory.resolve("download-status-updates.json")),
+        ) {
+            newClient { request ->
+                when {
+                    request.url.encodedPath.endsWith("error-json.ogg") -> respond(
+                        content = """{"ok":false,"description":"$jsonMarker"}""",
+                        status = HttpStatusCode.BadRequest,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+
+                    request.url.encodedPath.endsWith("error-html.ogg") -> respond(
+                        content = "<html><body>$htmlMarker</body></html>",
+                        status = HttpStatusCode.InternalServerError,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Text.Html.toString()),
+                    )
+
+                    request.url.encodedPath.endsWith("binary.ogg") -> respond(
+                        content = ByteReadChannel(binaryPayload),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.OctetStream.toString()),
+                    )
+
+                    else -> error("Unexpected request path: ${request.url.encodedPath}")
+                }
+            }
+        }
+
+        try {
+            listOf(
+                HttpStatusCode.BadRequest to "voices/error-json.ogg",
+                HttpStatusCode.InternalServerError to "voices/error-html.ogg",
+            ).forEach { (status, filePath) ->
+                val exception = assertFailsWith<IllegalStateException> {
+                    service.downloadFileForToken(token, filePath)
+                }
+                assertEquals("Telegram file download failed with HTTP status ${status.value}.", exception.message)
+                assertFalse(exception.message.orEmpty().contains(jsonMarker))
+                assertFalse(exception.message.orEmpty().contains(htmlMarker))
+                assertFalse(exception.message.orEmpty().contains(token))
+                assertFalse(exception.message.orEmpty().contains(filePath))
+            }
+
+            assertContentEquals(binaryPayload, service.downloadFileForToken(token, "voices/binary.ogg"))
+        } finally {
             service.close()
         }
     }

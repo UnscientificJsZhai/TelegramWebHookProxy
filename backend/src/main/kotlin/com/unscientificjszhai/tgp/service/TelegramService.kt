@@ -382,8 +382,9 @@ class TelegramService private constructor(
      * 请求；捕获后的在途请求可使用该令牌完成。
      *
      * @param filePath Telegram 返回的相对文件路径，不能为空。
-     * @return 下载得到的字节数组；空文件返回空数组。
-     * @throws IllegalStateException 当前机器人令牌为空时抛出。
+     * @return 仅在 Telegram 文件下载响应为 HTTP `2xx` 时返回下载得到的字节数组；空文件返回空数组。
+     * @throws IllegalStateException 当前机器人令牌为空，或文件下载响应不是 HTTP `2xx` 时抛出；后者的异常消息仅包含数值 HTTP 状态码。
+     * @throws TelegramPayloadTooLargeException HTTP `2xx` 响应解压后的实际字节数超过文件下载上限时抛出。
      */
     suspend fun downloadFile(filePath: String): ByteArray = downloadFileForToken(currentTelegramToken(), filePath)
 
@@ -392,7 +393,17 @@ class TelegramService private constructor(
         requireTelegramToken(token)
         val url = "https://api.telegram.org/file/bot$token/$filePath"
 
-        return withClientLease { client -> client.get(url).readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES) }
+        return withClientLease { client ->
+            val response = client.get(url)
+            if (!response.status.isSuccess()) {
+                val exception = IllegalStateException(
+                    "Telegram file download failed with HTTP status ${response.status.value}.",
+                )
+                response.bodyAsChannel().cancel(exception)
+                throw exception
+            }
+            response.readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES)
+        }
     }
 
     /**
