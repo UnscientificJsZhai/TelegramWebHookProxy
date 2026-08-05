@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -28,6 +29,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Telegram HTTP 客户端代理切换与关闭生命周期的测试设计。
@@ -504,6 +506,58 @@ class TelegramServiceClientLifecycleTest {
         }
     }
 
+    /** 验证机器人命令更新只接受 HTTP `2xx` 且顶层 `ok:true` 的 JSON 响应。 */
+    @Test
+    fun `bot command updates reject unsuccessful or malformed Telegram responses without leaking details`() =
+        runBlocking {
+            val token = "100:command-token-canary"
+            val responseBodies = ArrayDeque(
+                listOf(
+                    HttpStatusCode.BadRequest to """{"ok":false,"description":"COMMAND_STATUS_MARKER"}""",
+                    HttpStatusCode.OK to """{"ok":false,"description":"COMMAND_OK_FALSE_MARKER"}""",
+                    HttpStatusCode.OK to "",
+                    HttpStatusCode.OK to "{",
+                    HttpStatusCode.OK to """{"ok":true,"result":true}""",
+                ),
+            )
+            val settings = SettingsRepository.forTesting(
+                temporaryDirectory.resolve("command-status-settings.json"),
+                ModelSwitchBarrier(),
+            )
+            val service = TelegramService(
+                scope,
+                settings,
+                UpdatesRepository(temporaryDirectory.resolve("command-status-updates.json")),
+            ) {
+                newClient {
+                    val (status, body) = checkNotNull(responseBodies.removeFirstOrNull())
+                    respond(
+                        content = body,
+                        status = status,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+            }
+
+            try {
+                repeat(4) {
+                    val exception = assertFailsWith<IllegalStateException> {
+                        service.updateBotCommands(token, AIProvider.GEMINI)
+                    }
+                    assertEquals("Telegram bot command update failed.", exception.message)
+                    assertFalse(exception.message.orEmpty().contains(token))
+                    assertFalse(exception.message.orEmpty().contains("COMMAND_STATUS_MARKER"))
+                    assertFalse(exception.message.orEmpty().contains("COMMAND_OK_FALSE_MARKER"))
+                }
+
+                val success = service.updateBotCommands(token, AIProvider.GEMINI)
+                assertEquals(HttpStatusCode.OK, success.status)
+                assertEquals("""{"ok":true,"result":true}""", success.body)
+            } finally {
+                service.close()
+            }
+        }
+
     /**
      * 验证关闭与候选创建、流更新竞争时，未安装候选会关闭且服务不再接受新请求。
      */
@@ -578,7 +632,7 @@ class TelegramServiceClientLifecycleTest {
                     assertion()
                     return@withTimeout
                 } catch (_: AssertionError) {
-                    delay(20)
+                    delay(20.milliseconds)
                 }
             }
         }

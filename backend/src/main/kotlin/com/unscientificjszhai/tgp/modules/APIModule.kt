@@ -8,11 +8,9 @@ import com.unscientificjszhai.tgp.repository.HistoricalInvalidOpenAiBaseUrlConfi
 import com.unscientificjszhai.tgp.repository.SettingsRevisionMismatchException
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SettingsUpdateResult
-import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import com.unscientificjszhai.tgp.utils.ResourceLimits
-import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -60,11 +58,11 @@ fun Application.apiModule(appComponent: AppComponent) {
             route("/settings") {
                 install(RequestBodyLimit) { bodyLimit { ResourceLimits.SETTINGS_REQUEST_BYTES } }
                 put {
-                    call.handleFullSettingsUpdate(settingsRepository, telegramService)
+                    call.handleFullSettingsUpdate(settingsRepository)
                 }
                 // 保留既有 POST 路径，且与 PUT 使用相同的严格完整替换契约。
                 post {
-                    call.handleFullSettingsUpdate(settingsRepository, telegramService)
+                    call.handleFullSettingsUpdate(settingsRepository)
                 }
                 patch {
                     val expectedRevision = call.requiredSettingsRevision() ?: return@patch
@@ -79,7 +77,6 @@ fun Application.apiModule(appComponent: AppComponent) {
                     }
                     val update = call.commitSettingsUpdate(
                         settingsRepository,
-                        telegramService,
                         expectedRevision,
                         patch.explicitlyReplacesHistoricalMcpServers(),
                         patch.explicitlyReplacesHistoricalOpenAiBaseUrl(),
@@ -105,7 +102,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                         return@post
                     }
                     val update =
-                        call.commitSettingsUpdate(settingsRepository, telegramService, expectedRevision) { current ->
+                        call.commitSettingsUpdate(settingsRepository, expectedRevision) { current ->
                             current.copy(chatId = chatId)
                         } ?: return@post
                     call.respondSettingsUpdate(update)
@@ -379,7 +376,6 @@ private suspend fun ApplicationCall.requiredSettingsRevision(): String? = when (
 /** 处理严格完整替换的 PUT 与兼容 POST 设置请求。 */
 private suspend fun ApplicationCall.handleFullSettingsUpdate(
     settingsRepository: SettingsRepository,
-    telegramService: TelegramService,
 ) {
     val expectedRevision = requiredSettingsRevision() ?: return
     val request = readSettingsJsonObject() ?: return
@@ -394,7 +390,6 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
     }
     val update = commitSettingsUpdate(
         settingsRepository,
-        telegramService,
         expectedRevision,
         replacesHistoricalInvalidMcpServers = true,
         replacesHistoricalInvalidOpenAiBaseUrl = true,
@@ -403,11 +398,10 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
 }
 
 /**
- * 在仓储的锁内提交设置变换，并为 PUT、PATCH 与兼容聊天更新统一应用模型选择及机器人命令副作用。
+ * 在仓储的锁内提交设置变换，并为 PUT、PATCH 与兼容聊天更新统一应用模型选择。
  */
 private suspend fun ApplicationCall.commitSettingsUpdate(
     settingsRepository: SettingsRepository,
-    telegramService: TelegramService,
     expectedRevision: String,
     replacesHistoricalInvalidMcpServers: Boolean = false,
     replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
@@ -438,22 +432,6 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
         return null
     }
 
-    val oldSettings = update.previous.settings
-    val savedSettings = update.current.settings
-    val oldEffectiveProvider = oldSettings.ai?.takeIf { it.agentEnabled }?.provider
-    val newEffectiveProvider = savedSettings.ai?.takeIf { it.agentEnabled }?.provider
-    if (savedSettings.telegramToken != oldSettings.telegramToken || newEffectiveProvider != oldEffectiveProvider) {
-        if (savedSettings.telegramToken.isNotBlank()) {
-            try {
-                telegramService.updateBotCommands(savedSettings.telegramToken, newEffectiveProvider)
-            } catch (e: Exception) {
-                application.log.error(
-                    "Failed to update bot commands; category={}",
-                    SafeLogging.failureCategory(e).wireName,
-                )
-            }
-        }
-    }
     return update
 }
 

@@ -34,6 +34,7 @@ import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import java.io.File
+import java.io.IOException
 import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
@@ -523,33 +524,34 @@ class APIModuleTest {
     }
 
     /**
-     * 验证有效 AI 提供方切换会重新发布机器人模型命令。
+     * 验证设置提交只持久化并发布版本，Telegram 命令由应用级协调器异步收敛。
      */
     @Test
-    fun `provider switch refreshes bot model commands`() = withTestApi { repository, telegramService, _ ->
-        val geminiSettings = AppSettings(
-            telegramToken = "100:token",
-            ai = AISettings(provider = AIProvider.GEMINI, agentEnabled = true, geminiApiKey = "gemini-key"),
-        )
-        repository.saveSettings(geminiSettings)
-        val openAiSettings = geminiSettings.copy(
-            ai = geminiSettings.ai!!.copy(
-                provider = AIProvider.OPENAI,
-                openAiApiKey = "openai-key",
-            ),
-        )
+    fun `provider switch does not synchronously write bot commands from the API route`() =
+        withTestApi { repository, telegramService, _ ->
+            val geminiSettings = AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(provider = AIProvider.GEMINI, agentEnabled = true, geminiApiKey = "gemini-key"),
+            )
+            repository.saveSettings(geminiSettings)
+            val openAiSettings = geminiSettings.copy(
+                ai = geminiSettings.ai!!.copy(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "openai-key",
+                ),
+            )
 
-        val revision = currentSettingsETag()
-        client.put("/api/settings") {
-            header(HttpHeaders.IfMatch, revision)
-            contentType(ContentType.Application.Json)
-            setBody(completeSettingsJson.encodeToString(openAiSettings))
-        }.apply {
-            assertEquals(HttpStatusCode.OK, status)
+            val revision = currentSettingsETag()
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, revision)
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(openAiSettings))
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+            }
+
+            coVerify(exactly = 0) { telegramService.updateBotCommands(any(), any()) }
         }
-
-        coVerify(exactly = 1) { telegramService.updateBotCommands("100:token", AIProvider.OPENAI) }
-    }
 
     /**
      * 验证非法代理和未知协议会返回 400，且不会保存设置或更新机器人指令。
@@ -1035,7 +1037,7 @@ class APIModuleTest {
                 assertEquals(HttpStatusCode.OK, status)
             }
             assertEquals("", repository.settingsFlow.value.ai?.selectedModel)
-            coVerify(exactly = 1) { telegramService.updateBotCommands("100:token", AIProvider.OPENAI) }
+            coVerify(exactly = 0) { telegramService.updateBotCommands(any(), any()) }
         }
 
     /** 验证兼容 POST 仍使用与 PUT 相同的完整严格设置契约。 */

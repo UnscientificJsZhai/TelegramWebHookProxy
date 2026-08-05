@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.di
 
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.BotCommandReconciler
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
@@ -23,6 +24,9 @@ interface AppComponent {
 
     /** 与 Telegram Bot API 通信的服务。 */
     val telegramService: TelegramService
+
+    /** 串行收敛当前设置对应 Telegram Bot 命令的应用级协调器。 */
+    val botCommandReconciler: BotCommandReconciler
 
     /** 轮询和处理 Telegram 消息的服务。 */
     val messagePoller: MessagePoller

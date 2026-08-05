@@ -18,6 +18,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import io.ktor.utils.io.readAvailable
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
@@ -410,11 +413,14 @@ class TelegramService private constructor(
      * 更新机器人的可用指令列表。
      *
      * [aiProvider] 非空时设置与该提供方匹配的模型及会话相关指令；为 `null` 时删除全部机器人指令。
+     * 仅当 Telegram 返回 HTTP `2xx` 且顶层 JSON 对象的 `ok` 为 `true` 时本次更新才视为成功；其他
+     * 状态、空或畸形正文、`ok:false` 与通信异常都会以不含正文或 token 的异常失败。
      *
      * @param token 用于本次请求的 Telegram 机器人令牌，不能为空。
      * @param aiProvider 当前有效的 AI 服务提供方；`null` 表示未启用 AI，不发布任何指令。
-     * @return 已完整读取、不再依赖 HTTP 客户端的 Telegram 响应快照。
-     * @throws IllegalStateException [token] 为空时抛出。
+     * @return 已通过 Telegram 成功语义验证、且不再依赖 HTTP 客户端的响应快照。
+     * @throws IllegalStateException [token] 为空，或 Telegram 未以 HTTP `2xx` 顶层 `ok:true` 响应确认更新时抛出；
+     * 异常消息不包含响应正文或 token。
      */
     suspend fun updateBotCommands(
         token: String,
@@ -422,28 +428,35 @@ class TelegramService private constructor(
     ): TelegramApiResponse {
         requireTelegramToken(token)
 
-        return withClientLease { client ->
-            if (aiProvider != null) {
-                val url = "https://api.telegram.org/bot$token/setMyCommands"
-                val modelDescription = when (aiProvider) {
-                    AIProvider.GEMINI -> "切换 Gemini 模型"
-                    AIProvider.OPENAI -> "切换 OpenAI 模型"
-                }
-                client.post(url) {
-                    contentType(ContentType.Application.Json)
-                    setBody(
-                        SetMyCommandsRequest(
-                            commands = listOf(
-                                BotCommand("model", modelDescription),
-                                BotCommand("reset", "重置对话上下文"),
-                                BotCommand("keep", "延长上下文自动清理时间"),
+        return try {
+            withClientLease { client ->
+                val response = if (aiProvider != null) {
+                    val url = "https://api.telegram.org/bot$token/setMyCommands"
+                    val modelDescription = when (aiProvider) {
+                        AIProvider.GEMINI -> "切换 Gemini 模型"
+                        AIProvider.OPENAI -> "切换 OpenAI 模型"
+                    }
+                    client.post(url) {
+                        contentType(ContentType.Application.Json)
+                        setBody(
+                            SetMyCommandsRequest(
+                                commands = listOf(
+                                    BotCommand("model", modelDescription),
+                                    BotCommand("reset", "重置对话上下文"),
+                                    BotCommand("keep", "延长上下文自动清理时间"),
+                                ),
                             ),
-                        ),
-                    )
-                }.toTelegramApiResponse()
-            } else {
-                client.post("https://api.telegram.org/bot$token/deleteMyCommands").toTelegramApiResponse()
+                        )
+                    }
+                } else {
+                    client.post("https://api.telegram.org/bot$token/deleteMyCommands")
+                }
+                response.requireSuccessfulBotCommandUpdate()
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            throw IllegalStateException("Telegram bot command update failed.")
         }
     }
 
@@ -493,6 +506,22 @@ class TelegramService private constructor(
 
     private suspend fun HttpResponse.toTelegramApiResponse(): TelegramApiResponse =
         TelegramApiResponse(status = status, body = readTelegramBytes(MAX_TELEGRAM_API_BYTES).decodeToString())
+
+    /** 验证机器人命令更新的成功状态，并返回已完整读取的响应快照。 */
+    private suspend fun HttpResponse.requireSuccessfulBotCommandUpdate(): TelegramApiResponse {
+        if (!status.isSuccess()) {
+            bodyAsChannel().cancel(CancellationException("Telegram bot command update failed."))
+            throw IllegalStateException("Telegram bot command update failed.")
+        }
+        val bytes = readTelegramBytes(MAX_TELEGRAM_API_BYTES)
+        JsonStructureLimits.validateUtf8(bytes)
+        val payload = JsonStructureLimits.parseToJsonElement(telegramJson, bytes.decodeToString()) as? JsonObject
+            ?: throw IllegalStateException("Telegram bot command update failed.")
+        if (payload["ok"]?.jsonPrimitive?.booleanOrNull != true) {
+            throw IllegalStateException("Telegram bot command update failed.")
+        }
+        return TelegramApiResponse(status = status, body = bytes.decodeToString())
+    }
 
     private class ClientLease(
         val client: HttpClient,
