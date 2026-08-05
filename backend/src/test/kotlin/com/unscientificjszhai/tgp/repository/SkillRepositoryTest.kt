@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.yield
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
@@ -35,6 +36,24 @@ class SkillRepositoryTest {
     @AfterTest
     fun teardown() {
         tempDirectory.deleteRecursively()
+    }
+
+    /** 技能入口不把非法 UTF-8 或未知版本误当历史非法标识隔离，也不会改写原始字节。 */
+    @Test
+    fun `skills load preserves malformed UTF8 and future version without isolation`() {
+        val cases = listOf(
+            "malformed-utf8" to ("[{\"id\":\"".encodeToByteArray() + byteArrayOf(0xc3.toByte()) + "\"}]".encodeToByteArray()),
+            "future-version" to """{"schemaVersion":2,"data":[]}""".encodeToByteArray(),
+        )
+
+        cases.forEach { (name, original) ->
+            val file = File(tempDirectory, "$name-skills.json")
+            Files.write(file.toPath(), original)
+
+            val failure = assertFailsWith<IllegalStateException> { SkillRepository.forTesting(file) }
+            assertFalse(failure is SkillStorageIsolationException)
+            assertEquals(original.toList(), Files.readAllBytes(file.toPath()).toList())
+        }
     }
 
     /**

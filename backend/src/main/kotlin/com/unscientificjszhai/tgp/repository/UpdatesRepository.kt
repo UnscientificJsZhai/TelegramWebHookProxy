@@ -1416,19 +1416,33 @@ class UpdatesRepository private constructor(
             maxNodes = ResourceLimits.UPDATES_BYTES,
         )
         val CURRENT_UPDATES_ROOT_FIELDS = setOf("bots", "chatRecency", "chatRecencyClock")
+        val LEGACY_UPDATES_ROOT_FIELDS = setOf(
+            "chats",
+            "lastUpdateId",
+            "pendingTelegramReplies",
+            "agentTurnJournal",
+            "retryCheckpoint",
+        )
 
         val LEGACY_ROOT_MIGRATION = JsonElementMigration("updates-legacy-root-to-bots") { root ->
             when (root) {
-                is JsonObject -> if (root.keys.any(CURRENT_UPDATES_ROOT_FIELDS::contains)) {
-                    root
-                } else {
-                    // 旧 UpdatesData 的全部字段均有默认值；没有当前根格式标志的对象（包括 `{}`）都属于旧格式。
-                    wrapLegacyUpdates(root)
-                }
-
                 is JsonArray -> wrapLegacyUpdates(
                     buildJsonObject { put("chats", root) },
                 )
+
+                is JsonObject -> {
+                    val fields = root.keys
+                    require(fields.all { it in CURRENT_UPDATES_ROOT_FIELDS || it in LEGACY_UPDATES_ROOT_FIELDS }) {
+                        "Updates v0 root contains unknown fields."
+                    }
+                    val containsCurrentRootField = fields.any(CURRENT_UPDATES_ROOT_FIELDS::contains)
+                    val containsLegacyRootField = fields.any(LEGACY_UPDATES_ROOT_FIELDS::contains)
+                    require(!(containsCurrentRootField && containsLegacyRootField)) {
+                        "Updates v0 root must not mix legacy and current fields."
+                    }
+                    // 旧 UpdatesData 的全部字段均有默认值；没有当前根格式标志的对象（包括 `{}`）都属于旧格式。
+                    if (containsCurrentRootField) root else wrapLegacyUpdates(root)
+                }
 
                 else -> root
             }

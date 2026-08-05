@@ -7,6 +7,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.io.IOException
@@ -168,6 +171,140 @@ class SchemaValidatedJsonStorageTest {
         assertIs<AtomicJsonRead.Corrupt>(fixtureStorage(brokenJson).read())
     }
 
+    /** 默认 v0 写入保持历史根 payload，而显式 v1 写入和读取使用完整版本封套。 */
+    @Test
+    fun `v0 and v1 storage formats round trip`() {
+        val v0File = tempDirectory.resolve("legacy-v0.json")
+        val v0Storage = fixtureStorage(v0File)
+        v0Storage.commit(Fixture("legacy"))
+        assertEquals(
+            "legacy",
+            ConfigJson.parseToJsonElement(Files.readString(v0File)).jsonObject["required"]?.jsonPrimitive?.content
+        )
+        assertEquals(Fixture("legacy"), assertIs<AtomicJsonRead.Valid<Fixture>>(v0Storage.read()).value)
+
+        val v1File = tempDirectory.resolve("versioned-v1.json")
+        val v1Storage = fixtureStorage(v1File, writeFormat = JsonStorageWriteFormat.VERSIONED_V1)
+        v1Storage.commit(Fixture("versioned"))
+        val document = ConfigJson.parseToJsonElement(Files.readString(v1File)).jsonObject
+        assertEquals(1, document.getValue("schemaVersion").jsonPrimitive.int)
+        assertEquals("versioned", document.getValue("data").jsonObject.getValue("required").jsonPrimitive.content)
+        assertEquals(Fixture("versioned"), assertIs<AtomicJsonRead.Valid<Fixture>>(v1Storage.read()).value)
+    }
+
+    /** 只允许恰有整数版本和 data 的 v1 封套，不能将畸形版本元数据交给兼容解码。 */
+    @Test
+    fun `versioned envelope shape and version must be strict`() {
+        val invalidDocuments = listOf(
+            """{"schemaVersion":"1","data":{"required":"ok"}}""",
+            """{"schemaVersion":true,"data":{"required":"ok"}}""",
+            """{"schemaVersion":1.0,"data":{"required":"ok"}}""",
+            """{"schemaVersion":0,"data":{"required":"ok"}}""",
+            """{"schemaVersion":1}""",
+            """{"data":{"required":"ok"}}""",
+            """{"schemaVersion":1,"data":{"required":"ok"},"extra":true}""",
+        )
+
+        invalidDocuments.forEachIndexed { index, source ->
+            val file = tempDirectory.resolve("invalid-envelope-$index.json")
+            Files.writeString(file, source)
+            assertIs<AtomicJsonRead.Corrupt>(fixtureStorage(file).read(), "case=$index")
+        }
+    }
+
+    /** 重复根键不能让 JSON 解析器以末值覆盖较高版本或较早 data，并会锁住后续提交。 */
+    @Test
+    fun `duplicate root keys preserve bytes without migration decode or commit`() {
+        val cases = listOf(
+            "future-version-bypass" to """{"schemaVersion":2,"schemaVersion":1,"data":{"required":"bypass"}}""",
+            "escaped-version-bypass" to """{"schemaVersion":2,"schema\u0056ersion":1,"data":{"required":"bypass"}}""",
+            "duplicate-data" to """{"schemaVersion":1,"data":{"required":"first"},"data":{"required":"last"}}""",
+            "duplicate-v0-key" to """{"required":"first","required":"last"}""",
+        )
+
+        cases.forEach { (name, source) ->
+            val file = tempDirectory.resolve("duplicate-root-$name.json")
+            val original = source.encodeToByteArray()
+            Files.write(file, original)
+            var migrationCalls = 0
+            var validatorCalls = 0
+            val storage = fixtureStorage(
+                file,
+                migrations = listOf(JsonElementMigration("must-not-run-$name") {
+                    migrationCalls++
+                    it
+                }),
+                validator = { validatorCalls++ },
+            )
+
+            val failure = assertIs<AtomicJsonRead.Corrupt>(storage.read(), "case=$name").cause
+            assertIs<JsonStorageDuplicateRootKeyException>(failure, "case=$name")
+            assertEquals(0, migrationCalls, "case=$name")
+            assertEquals(0, validatorCalls, "case=$name")
+            assertEquals(original.toList(), Files.readAllBytes(file).toList(), "case=$name")
+            assertFailsWith<JsonStorageDuplicateRootKeyException>("case=$name") {
+                storage.commit(Fixture("replacement"))
+            }
+            assertEquals(original.toList(), Files.readAllBytes(file).toList(), "case=$name")
+        }
+    }
+
+    /** 高版本在迁移、修复和解码前拒绝，保留原始字节并禁止此实例随后写回。 */
+    @Test
+    fun `future version preserves bytes without migration decode or commit`() {
+        val file = tempDirectory.resolve("future-version.json")
+        val original = """{"schemaVersion":2,"data":{"required":"future"}}""".encodeToByteArray()
+        Files.write(file, original)
+        var migrationCalls = 0
+        var validatorCalls = 0
+        val migration = JsonElementMigration("must-not-run") {
+            migrationCalls++
+            it
+        }
+        val storage = fixtureStorage(
+            file,
+            migrations = listOf(migration),
+            validator = { validatorCalls++ },
+        )
+
+        val failure = assertIs<AtomicJsonRead.Corrupt>(storage.read()).cause
+        assertIs<JsonStorageUnsupportedSchemaVersionException>(failure)
+        assertEquals(0, migrationCalls)
+        assertEquals(0, validatorCalls)
+        assertEquals(original.toList(), Files.readAllBytes(file).toList())
+        assertFailsWith<JsonStorageUnsupportedSchemaVersionException> { storage.commit(Fixture("replacement")) }
+        assertEquals(original.toList(), Files.readAllBytes(file).toList())
+    }
+
+    /** 成功读取 v1 后，即使默认策略为 v0，后续提交也不能将文件降级为无封套根。 */
+    @Test
+    fun `successful v1 read makes later commits monotonic`() {
+        val file = tempDirectory.resolve("monotonic-version.json")
+        Files.writeString(file, """{"schemaVersion":1,"data":{"required":"before"}}""")
+        val storage = fixtureStorage(file, writeFormat = JsonStorageWriteFormat.LEGACY_V0)
+
+        assertEquals(Fixture("before"), assertIs<AtomicJsonRead.Valid<Fixture>>(storage.read()).value)
+        storage.commit(Fixture("after"))
+
+        val document = ConfigJson.parseToJsonElement(Files.readString(file)).jsonObject
+        assertEquals(1, document.getValue("schemaVersion").jsonPrimitive.int)
+        assertEquals("after", document.getValue("data").jsonObject.getValue("required").jsonPrimitive.content)
+    }
+
+    /** 启动时格式策略默认关闭，只接受文档化的精确枚举值。 */
+    @Test
+    fun `write format policy defaults and rejects invalid values`() {
+        assertEquals(JsonStorageWriteFormat.LEGACY_V0, JsonStorageWriteFormatPolicy.fromStartupEnvironment(null))
+        assertEquals(JsonStorageWriteFormat.LEGACY_V0, JsonStorageWriteFormatPolicy.fromStartupEnvironment("LEGACY_V0"))
+        assertEquals(
+            JsonStorageWriteFormat.VERSIONED_V1,
+            JsonStorageWriteFormatPolicy.fromStartupEnvironment("VERSIONED_V1")
+        )
+        assertFailsWith<IllegalArgumentException> {
+            JsonStorageWriteFormatPolicy.fromStartupEnvironment("versioned_v1")
+        }
+    }
+
     /** 写入原样返回底层目录同步的 Durable 或可见但耐久性未知状态。 */
     @Test
     fun `commit returns atomic storage durability status`() {
@@ -248,12 +385,16 @@ class SchemaValidatedJsonStorageTest {
         migrations: List<JsonElementMigration> = emptyList(),
         structureBudget: JsonStructureLimits.Budget = JsonStructureLimits.DEFAULT_BUDGET,
         logger: org.slf4j.Logger = LoggerFactory.getLogger(SchemaValidatedJsonStorage::class.java),
+        validator: (Fixture) -> Unit = {},
+        writeFormat: JsonStorageWriteFormat = JsonStorageWriteFormat.LEGACY_V0,
     ): SchemaValidatedJsonStorage<Fixture> = SchemaValidatedJsonStorage(
         AtomicJsonStorage(file, TEST_MAX_BYTES, operations),
         Fixture.serializer(),
         migrations = migrations,
         structureBudget = structureBudget,
         logger = logger,
+        validator = validator,
+        writeFormat = writeFormat,
     )
 
     private fun logCapture(suffix: String): LogCapture {

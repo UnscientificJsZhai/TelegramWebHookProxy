@@ -16,6 +16,7 @@ import com.unscientificjszhai.tgp.utils.JsonStorageDurabilityUnknownException
 import com.unscientificjszhai.tgp.utils.ResourceLimits
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
@@ -35,6 +36,25 @@ class SettingsRepositoryBarrierTest {
     @AfterTest
     fun cleanUp() {
         tempDirectory.deleteRecursively()
+    }
+
+    /** 设置入口会拒绝非法 UTF-8 与未知 v1 版本，且绝不改写待恢复的原始字节。 */
+    @Test
+    fun `settings load preserves malformed UTF8 and future version bytes`() {
+        val cases = listOf(
+            "malformed-utf8" to ("{\"telegramToken\":\"".encodeToByteArray() + byteArrayOf(0xc3.toByte()) + "\"}".encodeToByteArray()),
+            "future-version" to """{"schemaVersion":2,"data":{"telegramToken":"future"}}""".encodeToByteArray(),
+        )
+
+        cases.forEach { (name, original) ->
+            val configFile = File(tempDirectory, "$name-settings.json")
+            Files.write(configFile.toPath(), original)
+
+            assertFailsWith<IllegalStateException> {
+                SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            }
+            assertEquals(original.toList(), Files.readAllBytes(configFile.toPath()).toList())
+        }
     }
 
     /**

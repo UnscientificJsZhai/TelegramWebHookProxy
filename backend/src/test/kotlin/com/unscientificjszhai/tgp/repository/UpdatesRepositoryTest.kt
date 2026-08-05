@@ -15,6 +15,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
@@ -141,9 +142,9 @@ class UpdatesRepositoryTest {
         assertEquals(33, UpdatesRepository(objectFile).getData("200").lastUpdateId)
     }
 
-    /** 验证没有当前根标志的对象仍按旧单 bot 格式迁移，而当前根元数据对象不会被误迁移。 */
+    /** v0 根只接受明确的历史或当前字段集合；未知字段和混合格式不能再靠猜测迁移。 */
     @Test
-    fun `empty legacy object migrates without misclassifying current root metadata`() {
+    fun `updates v0 root migration distinguishes legacy current unknown and mixed roots`() {
         val emptyLegacyFile = tempDirectory.resolve("empty-legacy-object.json")
         emptyLegacyFile.writeText("{}")
         val emptyLegacyRepository = UpdatesRepository(emptyLegacyFile)
@@ -155,12 +156,6 @@ class UpdatesRepositoryTest {
         assertTrue("300" in migrated.bots)
         assertEquals(UpdatesData(), UpdatesRepository(emptyLegacyFile).getData("300"))
 
-        val unknownOnlyLegacyFile = tempDirectory.resolve("unknown-only-legacy-object.json")
-        unknownOnlyLegacyFile.writeText("""{"futureLegacyField":true}""")
-        val unknownOnlyLegacyRepository = UpdatesRepository(unknownOnlyLegacyFile)
-        assertEquals(UpdatesData(), unknownOnlyLegacyRepository.getData("301"))
-        assertTrue("301" in ConfigJson.decodeFromString<BotUpdatesData>(unknownOnlyLegacyFile.readText()).bots)
-
         val metadataFile = tempDirectory.resolve("current-root-metadata.json")
         val metadataContent = """{"chatRecency":{},"chatRecencyClock":7}"""
         metadataFile.writeText(metadataContent)
@@ -168,6 +163,46 @@ class UpdatesRepositoryTest {
 
         assertEquals(UpdatesData(), metadataRepository.getData("400"))
         assertEquals(metadataContent, metadataFile.readText())
+
+        listOf(
+            "unknown" to """{"futureLegacyField":true}""",
+            "mixed" to """{"bots":{},"lastUpdateId":7}""",
+        ).forEach { (name, source) ->
+            val file = tempDirectory.resolve("$name-v0-root.json")
+            file.writeText(source)
+            assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
+            assertEquals(source, file.readText())
+        }
+    }
+
+    /** v1 的 data 直接按当前 BotUpdatesData 读取，绝不套用只属于 v0 的单 bot 根迁移。 */
+    @Test
+    fun `updates v1 data does not run legacy root migration`() {
+        val file = tempDirectory.resolve("versioned-legacy-looking-updates.json")
+        val source = """{"schemaVersion":1,"data":{"lastUpdateId":99}}"""
+        file.writeText(source)
+
+        val repository = UpdatesRepository(file)
+
+        assertEquals(UpdatesData(), repository.getData(" "))
+        assertEquals(source, file.readText())
+    }
+
+    /** Updates 入口会保留非法 UTF-8 与未知 v1 版本的字节，不能加载后再规范化覆盖。 */
+    @Test
+    fun `updates load preserves malformed UTF8 and future version bytes`() {
+        val cases = listOf(
+            "malformed-utf8" to ("{\"bots\":{\"100\":{\"chats\":[{\"id\":\"".encodeToByteArray() + byteArrayOf(0xc3.toByte()) + "\"}]}}}".encodeToByteArray()),
+            "future-version" to """{"schemaVersion":2,"data":{"bots":{}}}""".encodeToByteArray(),
+        )
+
+        cases.forEach { (name, original) ->
+            val file = tempDirectory.resolve("$name-updates.json")
+            Files.write(file.toPath(), original)
+
+            assertFailsWith<IllegalStateException> { UpdatesRepository(file) }
+            assertEquals(original.toList(), Files.readAllBytes(file.toPath()).toList())
+        }
     }
 
     /** 验证 schema 中带默认值的损坏字段会按默认值恢复并允许后续规范化提交。 */

@@ -98,6 +98,23 @@ class TaskSchedulerServiceTest {
         assertEquals(0, service.listTasks().size)
     }
 
+    /** 调度入口拒绝非法 UTF-8 与未知 v1 版本，启动失败前不改写可供恢复的原始字节。 */
+    @Test
+    fun `scheduler load preserves malformed UTF8 and future version bytes`() {
+        service.close()
+        val cases = listOf(
+            "malformed-utf8" to ("[{\"id\":\"".encodeToByteArray() + byteArrayOf(0xc3.toByte()) + "\"}]".encodeToByteArray()),
+            "future-version" to """{"schemaVersion":2,"data":[]}""".encodeToByteArray(),
+        )
+
+        cases.forEach { (name, original) ->
+            scheduleFile.writeBytes(original)
+
+            assertFailsWith<IllegalStateException> { newService(scheduleFile) }
+            assertContentEquals(original, scheduleFile.readBytes(), "case=$name")
+        }
+    }
+
     /**
      * 验证新建任务拒绝空白会话标识，且非空白标识不会在持久化前被修改。
      */
