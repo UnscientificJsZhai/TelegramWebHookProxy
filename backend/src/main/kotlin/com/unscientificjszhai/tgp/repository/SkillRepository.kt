@@ -32,9 +32,9 @@ import kotlin.concurrent.withLock
  *
  * 模型只能通过 [createPendingDraft] 创建待审批草稿；保存、批准和撤销都在文件替换及目录同步确认耐久后才
  * 改变对 Agent 可见的集合并发布 [skillsUpdateEvent]。构造时会按 [Skill] schema 校验现有文件：有默认值的
- * 字段损坏会记录日志并使用默认值，必填字段或 JSON 结构严重损坏会中断创建且保留现场；历史非法技能标识
- * 保持既有隔离语义，不会提供给管理端或 Agent，也不能被后续写入覆盖。所有读取和后续写入均基于最后一次
- * 确认耐久的快照；替换已经可见但目录项耐久性未知时，不会发布新快照或事件。
+ * 字段损坏会记录日志并使用默认值，必填字段或 JSON 结构严重损坏会中断创建且保留现场；历史中非法的技能标识
+ * 或重复标识属于不一致数据，会被隔离，不会提供给管理端或 Agent，也不能被后续写入覆盖。所有读取和后续写入
+ * 均基于最后一次确认耐久的快照；替换已经可见但目录项耐久性未知时，不会发布新快照或事件。
  */
 class SkillRepository private constructor(
     configFile: File,
@@ -61,7 +61,7 @@ class SkillRepository private constructor(
     private val storage = SchemaValidatedJsonStorage(
         AtomicJsonStorage(configFile.toPath(), ResourceLimits.SKILLS_BYTES, fileOperations),
         ListSerializer(Skill.serializer()),
-        validator = ::validateSkills,
+        validator = ::validateSkillCollection,
     )
     private val storageLock = ReentrantLock()
     private var durableSnapshot = SkillSnapshot(exists = false, items = emptyList())
@@ -80,7 +80,7 @@ class SkillRepository private constructor(
     val skillsUpdateEvent: SharedFlow<Unit> = _skillsUpdateEvent.asSharedFlow()
 
     init {
-        // 结构和 required 字段损坏必须中断启动；历史非法 ID 沿用隔离语义，使既有 API 能统一返回不可用。
+        // 结构和 required 字段损坏必须中断启动；历史非法或重复 ID 沿用隔离语义，使既有 API 能统一返回不可用。
         try {
             durableSnapshot = loadInitialSnapshot()
         } catch (failure: SkillStorageIsolationException) {
@@ -98,7 +98,7 @@ class SkillRepository private constructor(
      * @param size 每页请求的技能数量，必须在 `1..50` 范围内。
      * @return 包含总技能数和当前页技能的结果；技能顺序与配置文件一致。
      * @throws IllegalArgumentException [page] 小于 `1` 或 [size] 不在 `1..50` 范围内时抛出。
-     * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
+     * @throws SkillStorageIsolationException 主文件存在可解析但标识非法或重复的历史数据时抛出。
      */
     fun getAllSkills(page: Int = 1, size: Int = 10): PageResult<Skill> {
         require(page >= 1) { "页码必须大于等于 1。" }
@@ -121,7 +121,7 @@ class SkillRepository private constructor(
      * 读取管理端可见的全部技能摘要，包括待审批草稿。
      *
      * @return 技能摘要列表，顺序与配置文件一致；没有可读取的技能时为空列表。
-     * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
+     * @throws SkillStorageIsolationException 主文件存在可解析但标识非法或重复的历史数据时抛出。
      */
     fun getSkillSummaries(): List<SkillBrief> = storageLock.withLock {
         readSkillsForRead().map { SkillBrief(it.id, it.description) }
@@ -131,7 +131,7 @@ class SkillRepository private constructor(
      * 读取可安全提供给模型的已批准技能摘要。
      *
      * @return 仅包含 [SkillStatus.APPROVED] 技能的摘要列表，顺序与配置文件一致；没有已批准技能时为空列表。
-     * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
+     * @throws SkillStorageIsolationException 主文件存在可解析但标识非法或重复的历史数据时抛出。
      */
     fun getApprovedSkillSummaries(): List<SkillBrief> = storageLock.withLock {
         readSkillsForRead()
@@ -147,7 +147,7 @@ class SkillRepository private constructor(
      * @param id 要查询的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
      * @return 匹配的技能；未找到时为 `null`。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
-     * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
+     * @throws SkillStorageIsolationException 主文件存在可解析但标识非法或重复的历史数据时抛出。
      */
     fun getSkillById(id: String): Skill? {
         require(isValidSkillId(id)) { "技能标识不合法。" }
@@ -160,7 +160,7 @@ class SkillRepository private constructor(
      * @param id 要查询的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
      * @return 匹配且处于 [SkillStatus.APPROVED] 的技能；未找到或未批准时为 `null`。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
-     * @throws SkillStorageIsolationException 主文件存在可解析但包含非法技能标识的历史数据时抛出。
+     * @throws SkillStorageIsolationException 主文件存在可解析但标识非法或重复的历史数据时抛出。
      */
     fun getApprovedSkillById(id: String): Skill? {
         require(isValidSkillId(id)) { "技能标识不合法。" }
@@ -179,7 +179,7 @@ class SkillRepository private constructor(
      * @return 已持久化的待审批技能；已有技能的版本号会递增。
      * @throws IllegalArgumentException [skill] 的字段不符合格式或大小限制，或保存后技能总数超过 `64` 时抛出。
      * @throws SkillRevisionConflictException [skill] 指向已有技能但版本号已过期时抛出。
-     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出；不会发布变更事件。
+     * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
      * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun saveSkill(skill: Skill): Skill = storageLock.withLock {
@@ -206,7 +206,7 @@ class SkillRepository private constructor(
      * @throws IllegalArgumentException 参数不符合格式、大小或创建/编辑的版本参数约束时抛出。
      * @throws SkillNotFoundException [id] 非空但对应技能已不存在时抛出。
      * @throws SkillRevisionConflictException [expectedRevision] 与当前版本不一致时抛出。
-     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出；不会发布变更事件。
+     * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
      * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun saveManagedSkill(
@@ -277,7 +277,7 @@ class SkillRepository private constructor(
      * @param content 模型提出的技能内容，不得超过 `64 KiB` UTF-8 字节。
      * @return 已持久化、状态为 [SkillStatus.PENDING] 的新草稿。
      * @throws IllegalArgumentException 描述、内容或总技能数量超过限制时抛出。
-     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出。
+     * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出。
      * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun createPendingDraft(description: String, content: String): Skill =
@@ -293,7 +293,7 @@ class SkillRepository private constructor(
      * @throws SkillNotFoundException 技能不存在时抛出。
      * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStateConflictException 技能并非待审批状态时抛出。
-     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出。
+     * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出。
      * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun approveSkill(id: String, expectedRevision: Long): Skill =
@@ -309,7 +309,7 @@ class SkillRepository private constructor(
      * @throws SkillNotFoundException 技能不存在时抛出。
      * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStateConflictException 技能并非已批准状态时抛出。
-     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出。
+     * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出。
      * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun revokeSkill(id: String, expectedRevision: Long): Skill =
@@ -322,7 +322,7 @@ class SkillRepository private constructor(
      *
      * @param id 要删除的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
-     * @throws IllegalStateException 构造时检测到历史非法技能标识并隔离存储时抛出；不会发布变更事件。
+     * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
      * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun deleteSkill(id: String) {
@@ -377,7 +377,7 @@ class SkillRepository private constructor(
 
             is AtomicJsonRead.Corrupt -> {
                 if (read.cause is SkillStorageIsolationException) {
-                    logger.error("Skills storage contains an invalid historical ID; preserving and isolating it")
+                    logger.error("Skills storage contains invalid or inconsistent historical data; preserving and isolating it")
                     throw read.cause
                 }
                 logger.error(
@@ -413,23 +413,25 @@ class SkillRepository private constructor(
         durableSnapshot = candidate
     }
 
-    private fun validateSkills(skills: List<Skill>) {
-        require(skills.size <= 64) { "技能数量不能超过 64 个。" }
-        skills.forEach { skill ->
-            if (!isValidSkillId(skill.id)) throw SkillStorageIsolationException()
-            validateSkill(skill)
-        }
-    }
-
     private data class SkillSnapshot(
         val exists: Boolean,
         val items: List<Skill>,
     )
 }
 
-/** 表示技能主文件包含可解析但不再允许的技能标识，因而已被隔离。 */
+internal fun validateSkillCollection(skills: List<Skill>) {
+    require(skills.size <= 64) { "技能数量不能超过 64 个。" }
+    val ids = HashSet<String>(skills.size)
+    skills.forEach { skill ->
+        if (!isValidSkillId(skill.id)) throw SkillStorageIsolationException()
+        if (!ids.add(skill.id)) throw SkillStorageIsolationException()
+        validateSkill(skill)
+    }
+}
+
+/** 表示技能主文件包含可解析但标识非法或重复的不一致历史数据，因而已被隔离。 */
 internal class SkillStorageIsolationException : IllegalStateException(
-    "技能存储包含非法历史标识，已隔离且拒绝读写。",
+    "技能存储包含非法或重复的历史标识，已隔离且拒绝读写。",
 )
 
 /** 表示请求的技能不存在。 */

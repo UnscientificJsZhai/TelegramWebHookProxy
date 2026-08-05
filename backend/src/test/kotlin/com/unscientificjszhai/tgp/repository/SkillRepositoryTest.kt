@@ -404,6 +404,87 @@ class SkillRepositoryTest {
         job.cancel()
     }
 
+    /** 验证提交路径使用的集合校验会拒绝 revision 和状态不同的重复技能标识。 */
+    @Test
+    fun `skill collection validator rejects duplicate IDs`() {
+        val candidate = listOf(
+            Skill(
+                id = "duplicate",
+                description = "first approved",
+                content = "first",
+                status = SkillStatus.APPROVED,
+                revision = 3,
+            ),
+            Skill(
+                id = "duplicate",
+                description = "second pending",
+                content = "second",
+                status = SkillStatus.PENDING,
+                revision = 4,
+            ),
+        )
+
+        assertFailsWith<SkillStorageIsolationException> { validateSkillCollection(candidate) }
+    }
+
+    /**
+     * 验证可解析但存在重复标识的主文件会被隔离，不能依赖首个已批准条目读取或借由后续读写路径改写。
+     */
+    @Test
+    fun `duplicate skill id in primary isolates storage without recovery or events`() = runTest {
+        val duplicatePrimary = ConfigJson.encodeToString(
+            listOf(
+                Skill(
+                    id = "duplicate",
+                    description = "first approved",
+                    content = "first",
+                    status = SkillStatus.APPROVED,
+                    revision = 3,
+                ),
+                Skill(
+                    id = "duplicate",
+                    description = "second pending",
+                    content = "second",
+                    status = SkillStatus.PENDING,
+                    revision = 4,
+                ),
+            ),
+        )
+        skillsFile.writeText(duplicatePrimary)
+        repository = SkillRepository.forTesting(skillsFile)
+        val events = mutableListOf<Unit>()
+        val job = launch { repository.skillsUpdateEvent.collect { events += it } }
+        yield()
+
+        assertFailsWith<SkillStorageIsolationException> { repository.getAllSkills(size = 10) }
+        assertFailsWith<SkillStorageIsolationException> { repository.getSkillSummaries() }
+        assertFailsWith<SkillStorageIsolationException> { repository.getSkillById("duplicate") }
+        assertFailsWith<SkillStorageIsolationException> { repository.getApprovedSkillSummaries() }
+        assertFailsWith<SkillStorageIsolationException> { repository.getApprovedSkillById("duplicate") }
+        assertFailsWith<SkillStorageIsolationException> {
+            repository.saveSkill(Skill(id = "new", description = "new", content = "new"))
+        }
+        assertFailsWith<SkillStorageIsolationException> {
+            repository.saveManagedSkill(
+                id = null,
+                description = "new managed",
+                content = "new managed",
+                expectedRevision = null,
+            )
+        }
+        assertFailsWith<SkillStorageIsolationException> {
+            repository.createPendingDraft("new draft", "new draft")
+        }
+        assertFailsWith<SkillStorageIsolationException> { repository.approveSkill("duplicate", 3) }
+        assertFailsWith<SkillStorageIsolationException> { repository.revokeSkill("duplicate", 3) }
+        assertFailsWith<SkillStorageIsolationException> { repository.deleteSkill("duplicate") }
+        delay(100.milliseconds)
+
+        assertEquals(duplicatePrimary, skillsFile.readText())
+        assertTrue(events.isEmpty())
+        job.cancel()
+    }
+
     /** 验证模型草稿不能覆盖既有技能，且审批需要匹配管理员看到的版本。 */
     @Test
     fun `pending drafts are model-isolated and approval uses compare and set`() {
