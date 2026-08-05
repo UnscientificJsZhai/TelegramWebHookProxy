@@ -101,7 +101,7 @@ class MessagePoller @Inject constructor(
 
     private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
 
-    /** 服务拥有的根任务；其完成覆盖所有轮询会话及其不可取消收尾。 */
+    /** 服务拥有的根任务；其完成覆盖所有轮询会话及其 Agent 重置等待。 */
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + scopeJob)
     private val lifecycleLock = Any()
@@ -444,8 +444,10 @@ class MessagePoller @Inject constructor(
             SessionReplacement.Install -> null
             is SessionReplacement.ResetPrevious -> {
                 replacement.previous.scope.cancel(CancellationException("Telegram token changed"))
-                withContext(NonCancellable) {
-                    replacement.previous.scope.coroutineContext[Job]?.join()
+                replacement.previous.scope.coroutineContext[Job]?.join()
+                currentCoroutineContext().ensureActive()
+                if (closed) {
+                    return
                 }
                 if (!completeInitialAgentReset(replacement.pendingReset)) {
                     logger.warn(
@@ -468,6 +470,10 @@ class MessagePoller @Inject constructor(
                         "Refusing to start polling session at token generation {} until the pending Agent reset succeeds.",
                         generation,
                     )
+                    return
+                }
+                currentCoroutineContext().ensureActive()
+                if (closed) {
                     return
                 }
                 replacement.pendingReset.takeIf { it.source == AgentResetSource.TOKEN_ROTATION }
@@ -987,10 +993,10 @@ class MessagePoller @Inject constructor(
      * 原子摘除仍为当前代次的认证失败会话，并在外部屏障代次内清除 Agent 上下文。
      *
      * 认证失败不能由当前已经持久化的设置快照覆盖，因此登记为外部代次。初次重置失败时保留
-     * [PendingAgentReset]；后续 token 会话只能在重试成功后安装。会话 scope 的取消会取消调用本方法的
-     * 轮询协程，故清理必须置于 [NonCancellable] 中；不会等待该 scope，以免等待自身造成死锁。
+     * [PendingAgentReset]；后续 token 会话只能在重试成功后安装。认证失败会先取消旧会话，再由服务根 scope
+     * 执行可取消的重置；因此关闭根 scope 可以中断悬挂的重置等待，而正常认证失败仍不会等待自身会话终止。
      */
-    private suspend fun terminateAuthenticationFailedSession(session: PollingSession) {
+    private fun terminateAuthenticationFailedSession(session: PollingSession) {
         val pendingReset = settingsRepository.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (!closed && currentSession === session && isTokenGenerationCurrent(session)) {
@@ -1010,12 +1016,14 @@ class MessagePoller @Inject constructor(
         }
         pendingReset ?: return
 
-        withContext(NonCancellable) {
-            session.scope.cancel(CancellationException("Telegram authentication failed"))
+        session.scope.cancel(CancellationException("Telegram authentication failed"))
+        scope.launch {
             if (!completeInitialAgentReset(pendingReset)) {
-                logger.warn(
-                    "Agent session reset failed after Telegram authentication failure; blocking new polling sessions until a retry succeeds.",
-                )
+                if (!closed) {
+                    logger.warn(
+                        "Agent session reset failed after Telegram authentication failure; blocking new polling sessions until a retry succeeds.",
+                    )
+                }
             }
         }
     }
@@ -1104,30 +1112,27 @@ class MessagePoller @Inject constructor(
             modelSwitchBarrier.complete(pendingReset.barrierGeneration)
         }
         return resetSucceeded && (
-                pendingReset.source == AgentResetSource.AUTHENTICATION_FAILURE || isPendingAgentResetCurrent(
-                    pendingReset
-                )
+                pendingReset.source == AgentResetSource.AUTHENTICATION_FAILURE ||
+                        isPendingAgentResetCurrent(pendingReset)
                 )
     }
 
-    /** 在外部屏障已关闭时执行一次 Agent 重置，并把所有失败语义转换为可重试的 `false`。 */
-    private suspend fun performAgentReset(): Boolean = withContext(NonCancellable) {
-        try {
-            modelSwitchBarrier.awaitInFlightRequests()
-            awaitSuccessfulAgentReset()
-        } catch (e: CancellationException) {
-            logger.warn(
-                "Agent session reset was cancelled; keeping polling fail-closed; category={}",
-                SafeLogging.failureCategory(e).wireName,
-            )
-            false
-        } catch (e: Exception) {
-            logger.warn(
-                "Failed to reset agent session; keeping polling fail-closed; category={}",
-                SafeLogging.failureCategory(e).wireName,
-            )
-            false
-        }
+    /** 在外部屏障已关闭时执行一次可取消的 Agent 重置，并把所有失败语义转换为可重试的 `false`。 */
+    private suspend fun performAgentReset(): Boolean = try {
+        modelSwitchBarrier.awaitInFlightRequests()
+        awaitSuccessfulAgentReset()
+    } catch (e: CancellationException) {
+        logger.warn(
+            "Agent session reset was cancelled; keeping polling fail-closed; category={}",
+            SafeLogging.failureCategory(e).wireName,
+        )
+        false
+    } catch (e: Exception) {
+        logger.warn(
+            "Failed to reset agent session; keeping polling fail-closed; category={}",
+            SafeLogging.failureCategory(e).wireName,
+        )
+        false
     }
 
     /** 判断待处理 Agent 重置仍归当前未关闭服务所有。 */
@@ -2657,8 +2662,9 @@ class MessagePoller @Inject constructor(
     /**
      * 等待代理重置结束，并以 [Job.isCancelled] 判定成功。
      *
-     * [Job.join] 不会传播任务自身的失败；当前消费者或轮询会话被取消时仍会原样传播其取消，避免旧会话在
-     * token 切换后继续执行。代理返回 `null`、抛出普通异常或返回已取消任务都会返回 `false`。
+     * [Job.join] 不会传播任务自身的失败；当前消费者或轮询会话被取消时会先取消尚未结束的 reset 任务，再原样
+     * 传播取消，避免旧会话在 token 切换或服务关闭后继续执行。代理返回 `null`、抛出普通异常或返回已取消任务
+     * 都会返回 `false`。
      */
     private suspend fun awaitSuccessfulAgentReset(): Boolean {
         val resetJob = try {
@@ -2673,7 +2679,12 @@ class MessagePoller @Inject constructor(
             return false
         } ?: return false
 
-        resetJob.join()
+        try {
+            resetJob.join()
+        } catch (e: CancellationException) {
+            resetJob.cancel(e)
+            throw e
+        }
         return !resetJob.isCancelled
     }
 
@@ -2857,12 +2868,15 @@ class MessagePoller @Inject constructor(
             settingsJob.also { settingsJob = null }
         }
         jobToCancel?.cancel()
-        val pendingReset = sessionLock.withLock {
-            pendingAgentReset.also { pendingAgentReset = null }
+        sessionLock.withLock {
+            pendingAgentReset?.let { pendingReset ->
+                // 在同一个临界区内先摘除状态、释放所有等待器并放行屏障，防止取消的 reset 与新会话安装交错。
+                pendingAgentReset = null
+                pendingReset.initialResetCompletion.complete(false)
+                pendingReset.retryCompletion?.complete(false)
+                modelSwitchBarrier.complete(pendingReset.barrierGeneration)
+            }
         }
-        pendingReset?.initialResetCompletion?.complete(false)
-        pendingReset?.retryCompletion?.complete(false)
-        pendingReset?.let { modelSwitchBarrier.complete(it.barrierGeneration) }
         detachAndCancelCurrentSession()
         scopeJob.cancel(CancellationException("Message poller stopped."))
         logger.info("Agent poller stopped.")

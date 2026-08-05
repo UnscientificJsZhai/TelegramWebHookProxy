@@ -3229,6 +3229,80 @@ class MessagePollerTest {
     }
 
     /**
+     * 验证认证失败后的悬挂 Agent reset 会被关闭根 scope 取消；关闭后不会重建会话，并且待处理的外部屏障会释放。
+     */
+    @Test
+    fun `close cancels a hanging authentication failure reset without rebuilding its session`() = runBlocking {
+        val resetStarted = CompletableDeferred<Unit>()
+        val resetJob = Job()
+        val fixture = fixture()
+        fixture.updates.saveLastUpdateId("100", 10)
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns
+                GetUpdatesResponse(ok = false, errorCode = 401, description = "Unauthorized")
+        every { fixture.agent.resetSession() } answers {
+            resetStarted.complete(Unit)
+            resetJob
+        }
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { resetStarted.await() }
+            eventually {
+                assertNull(currentSessionOrNull(fixture.poller))
+                assertTrue(fixture.barrier.isSwitching)
+            }
+
+            fixture.poller.close()
+            withTimeout(2.seconds) { fixture.poller.awaitStopped() }
+
+            assertTrue(resetJob.isCancelled)
+            assertNull(currentSessionOrNull(fixture.poller))
+            assertFalse(fixture.barrier.isSwitching)
+            coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:A", 11, 30) }
+        } finally {
+            resetJob.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
+     * 验证关闭根 scope 会取消 token 轮换中悬挂的 Agent reset；关闭不必等待该 reset 自行返回，也绝不能在取消后
+     * 安装新会话。
+     */
+    @Test
+    fun `close cancels a hanging token rotation agent reset`() = runBlocking {
+        val resetStarted = CompletableDeferred<Unit>()
+        val resetJob = Job()
+        val fixture = fixture()
+        every { fixture.agent.resetSession() } answers {
+            resetStarted.complete(Unit)
+            resetJob
+        }
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", any(), any()) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.getUpdatesForToken("200:B", any(), any()) } returns GetUpdatesResponse(ok = true)
+        fixture.saveSettings(AppSettings(telegramToken = "100:A"))
+
+        fixture.poller.start()
+        try {
+            eventually { assertEquals("100:A", sessionToken(currentSession(fixture.poller))) }
+            fixture.saveSettings(AppSettings(telegramToken = "200:B"))
+            withTimeout(2.seconds) { resetStarted.await() }
+            assertNull(currentSessionOrNull(fixture.poller))
+
+            fixture.poller.close()
+            withTimeout(2.seconds) { fixture.poller.awaitStopped() }
+
+            assertTrue(resetJob.isCancelled)
+            assertNull(currentSessionOrNull(fixture.poller))
+            coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("200:B", any(), any()) }
+        } finally {
+            resetJob.cancel()
+            fixture.poller.close()
+        }
+    }
+
+    /**
      * 验证 401/403 的初次认证重置返回空值或取消时，B 会话会在安装前重试且始终保持 fail-closed。
      */
     @Test
