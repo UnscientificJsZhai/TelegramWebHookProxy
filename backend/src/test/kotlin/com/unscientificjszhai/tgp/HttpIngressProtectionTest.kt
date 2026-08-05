@@ -88,50 +88,35 @@ class HttpIngressProtectionTest {
     }
 
     /**
-     * 验证跳过前导控制字符后的分片 request-line 仍从首个方法 token 开始计算 header deadline。
+     * 验证 CR、LF、空格和 DEL 的滴流都会从首个原始字节开始计算 header deadline。
      */
     @Test
-    fun `leading control before partial request line keeps header deadline`() = withIngressServer(
-        limits = testLimits(
-            rawReadIdleTimeout = 2.seconds,
-            headerTimeout = 180.milliseconds,
-            requestTotalTimeout = 2.seconds,
-        ),
-    ) { port, _ ->
-        Socket("127.0.0.1", port).use { socket ->
-            socket.outputStream.writeRequest("\r\nGET /ok HTTP/1.1\r\n")
-            val elapsed = measureTime {
-                val closedWhileWriting = socket.writeSlowly("Host: localhost\r\n\r\n", 45)
-                assertTrue(closedWhileWriting || socket.awaitClosed())
+    fun `control character drip is closed by header deadline`() {
+        val controls = listOf(
+            "CR" to "\r",
+            "LF" to "\n",
+            "space" to " ",
+            "DEL" to "\u007f",
+        )
+        for ((description, control) in controls) {
+            withIngressServer(
+                limits = testLimits(
+                    rawReadIdleTimeout = 150.milliseconds,
+                    headerTimeout = 180.milliseconds,
+                    requestTotalTimeout = 2.seconds,
+                ),
+            ) { port, _ ->
+                Socket("127.0.0.1", port).use { socket ->
+                    val elapsed = measureTime {
+                        val closedWhileWriting = socket.writeSlowly(control.repeat(10), 45)
+                        assertTrue(closedWhileWriting || socket.awaitClosed(), "$description drip did not close")
+                    }
+                    assertTrue(
+                        elapsed < 500.milliseconds,
+                        "$description drip closed after $elapsed instead of the header deadline",
+                    )
+                }
             }
-            assertTrue(
-                elapsed < 500.milliseconds,
-                "controlled request line closed after $elapsed instead of header deadline"
-            )
-        }
-    }
-
-    /**
-     * 验证 Netty 会跳过的 DEL 控制字符不会推迟分片 request-line 的 header deadline。
-     */
-    @Test
-    fun `DEL before partial request line keeps header deadline`() = withIngressServer(
-        limits = testLimits(
-            rawReadIdleTimeout = 2.seconds,
-            headerTimeout = 180.milliseconds,
-            requestTotalTimeout = 2.seconds,
-        ),
-    ) { port, _ ->
-        Socket("127.0.0.1", port).use { socket ->
-            socket.outputStream.writeRequest("\u007fGET /ok HTTP/1.1\r\n")
-            val elapsed = measureTime {
-                val closedWhileWriting = socket.writeSlowly("Host: localhost\r\n\r\n", 45)
-                assertTrue(closedWhileWriting || socket.awaitClosed())
-            }
-            assertTrue(
-                elapsed < 500.milliseconds,
-                "DEL-prefixed request line closed after $elapsed instead of header deadline"
-            )
         }
     }
 
@@ -200,8 +185,7 @@ class HttpIngressProtectionTest {
     fun `connection permit is rejected and released on close`() = withIngressServer(
         limits = testLimits(maxConnections = 1, rawReadIdleTimeout = 500.milliseconds),
     ) { port, admission ->
-        val first = Socket("127.0.0.1", port)
-        try {
+        Socket("127.0.0.1", port).use { first ->
             assertEventually { admission.availablePermits() == 0 }
 
             Socket("127.0.0.1", port).use { rejected ->
@@ -216,8 +200,6 @@ class HttpIngressProtectionTest {
                 assertEventually { admission.availablePermits() == 0 }
             }
             assertEventually { admission.availablePermits() == 1 }
-        } finally {
-            first.close()
         }
     }
 
@@ -508,34 +490,38 @@ class HttpIngressProtectionTest {
     }
 
     /**
-     * 验证扩展 method 和前导控制字符后的分片 request-line 均会在 decoder 确认候选请求后启动 marker。
+     * 验证等待请求状态的首个原始字节（包括 Netty 忽略的前导控制字符）会启动 marker，且后续控制字节不会重复启动。
      */
     @Test
-    fun `tracking codec handles extension methods controls and split request line`() {
+    fun `tracking codec starts marker from raw first byte only once`() {
         assertMarkerForPartialRequest("MKCOL /", "MKCOL")
         assertMarkerForPartialRequest("BREW /", "BREW")
-        assertMarkerForPartialRequest("\u007fGET /", "DEL-prefixed GET")
 
-        val controlEvents = mutableListOf<String>()
-        val controlChannel =
-            EmbeddedChannel(TrackingHttpServerCodec(testLimits()), markerObservingHandler(controlEvents))
-        try {
-            controlChannel.writeInbound(Unpooled.copiedBuffer("\r\n", Charsets.US_ASCII))
-            assertTrue(controlEvents.isEmpty())
-        } finally {
-            controlChannel.drainInboundMessages()
-            controlChannel.finishAndReleaseAll()
+        for ((description, control) in listOf("CR" to "\r", "LF" to "\n", "space" to " ", "DEL" to "\u007f")) {
+            val observed = mutableListOf<String>()
+            val channel = EmbeddedChannel(TrackingHttpServerCodec(testLimits()), markerObservingHandler(observed))
+            try {
+                channel.writeInbound(Unpooled.copiedBuffer(control, Charsets.US_ASCII))
+                assertEquals(listOf("marker"), observed, "$description first byte must start a request deadline")
+            } finally {
+                channel.drainInboundMessages()
+                channel.finishAndReleaseAll()
+            }
         }
 
-        val splitEvents = mutableListOf<String>()
-        val splitChannel = EmbeddedChannel(TrackingHttpServerCodec(testLimits()), markerObservingHandler(splitEvents))
+        val repeatedControlEvents = mutableListOf<String>()
+        val repeatedControlChannel = EmbeddedChannel(
+            TrackingHttpServerCodec(testLimits()),
+            markerObservingHandler(repeatedControlEvents),
+        )
         try {
-            splitChannel.writeInbound(Unpooled.copiedBuffer("GET / HTTP/1.1\r\n", Charsets.US_ASCII))
-            splitChannel.writeInbound(Unpooled.copiedBuffer("Host: localhost\r\n\r\n", Charsets.US_ASCII))
-            assertEquals(listOf("marker", "request", "last"), splitEvents)
+            repeatedControlChannel.writeInbound(Unpooled.copiedBuffer("\r", Charsets.US_ASCII))
+            repeatedControlChannel.writeInbound(Unpooled.copiedBuffer("\n", Charsets.US_ASCII))
+            repeatedControlChannel.writeInbound(Unpooled.copiedBuffer(" \u007f", Charsets.US_ASCII))
+            assertEquals(listOf("marker"), repeatedControlEvents)
         } finally {
-            splitChannel.drainInboundMessages()
-            splitChannel.finishAndReleaseAll()
+            repeatedControlChannel.drainInboundMessages()
+            repeatedControlChannel.finishAndReleaseAll()
         }
     }
 

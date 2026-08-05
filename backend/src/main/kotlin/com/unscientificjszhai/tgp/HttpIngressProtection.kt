@@ -167,10 +167,11 @@ internal fun ChannelPipeline.installHttpIngressProtection(
 }
 
 /**
- * 由 HTTP codec 在解析到请求首字节时发出的内部标记。
+ * 由 HTTP codec 在等待请求状态收到首个原始字节时发出的内部标记。
  *
- * 标记只携带首个请求字节的单调时钟，不持有 [ByteBuf]，因此不需要引用计数释放。它会被
- * [HttpRequestDeadlineHandler] 消费，不会传递给 Ktor 的 HTTP 处理器。
+ * 该首字节可为 Netty 在解析 HTTP 请求时忽略的前导控制字符。标记只携带该字节的单调时钟，
+ * 不持有 [ByteBuf]，因此不需要引用计数释放。它会被 [HttpRequestDeadlineHandler] 消费，不会
+ * 传递给 Ktor 的 HTTP 处理器。
  */
 internal data class RequestStartMarker(val startedAtNanos: Long)
 
@@ -178,7 +179,7 @@ internal data class RequestStartMarker(val startedAtNanos: Long)
  * 带请求首字节标记的 Netty HTTP/1 server codec。
  *
  * 此实现保留 Netty [io.netty.handler.codec.http.HttpServerCodec] 的请求方法队列与 HEAD、CONNECT
- * 响应编码语义，并在每个请求首字节处插入 [RequestStartMarker]。
+ * 响应编码语义，并在等待请求状态收到每个请求的首个原始字节时插入 [RequestStartMarker]。
  */
 internal class TrackingHttpServerCodec(
     limits: HttpIngressLimits,
@@ -203,7 +204,8 @@ internal class TrackingHttpServerCodec(
 }
 
 /**
- * 记录本次 raw read 的时钟，并在 HTTP decoder 确认请求边界后产生同分片标记。
+ * 记录原始读取时间线，并在等待请求时的首个原始字节到达前启动标记；同分片后续请求的标记会在
+ * 前一请求边界解析后追加到输出。
  */
 internal class TrackingHttpRequestDecoder(
     config: HttpDecoderConfig,
@@ -215,6 +217,10 @@ internal class TrackingHttpRequestDecoder(
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         if (msg is ByteBuf && msg.isReadable) {
             byteTimeline.recordRawBytes(msg.readableBytes(), System.nanoTime())
+            if (awaitingRequestStart) {
+                awaitingRequestStart = false
+                ctx.fireUserEventTriggered(RequestStartMarker(byteTimeline.timestampAtCurrentOffset()))
+            }
         }
         super.channelRead(ctx, msg)
     }
@@ -222,76 +228,24 @@ internal class TrackingHttpRequestDecoder(
     override fun decode(ctx: ChannelHandlerContext, buffer: ByteBuf, out: MutableList<Any>) {
         val outputStart = out.size
         val readerIndexBeforeDecode = buffer.readerIndex()
-        val consumedOffsetBeforeDecode = byteTimeline.currentOffset()
-        val requestStartAtNanos = if (awaitingRequestStart) {
-            findHttpMethodStart(buffer)?.let { methodStartIndex ->
-                byteTimeline.timestampAtOffset(consumedOffsetBeforeDecode + methodStartIndex - readerIndexBeforeDecode)
-            }
-        } else {
-            null
-        }
         super.decode(ctx, buffer, out)
         val consumedByteCount = buffer.readerIndex() - readerIndexBeforeDecode
         byteTimeline.advance(consumedByteCount)
 
         var completedRequest = false
-        var decodedRequest = false
         for (index in outputStart until out.size) {
             when (val message = out[index]) {
-                is HttpRequest -> {
-                    requestMethods.add(message.method())
-                    decodedRequest = message.decoderResult().isSuccess
-                }
-
+                is HttpRequest -> requestMethods.add(message.method())
                 is LastHttpContent -> completedRequest = true
             }
         }
-        if (awaitingRequestStart && decodedRequest && consumedByteCount > 0) {
-            out.add(outputStart, RequestStartMarker(requireNotNull(requestStartAtNanos)))
-            awaitingRequestStart = false
-        }
         if (completedRequest && buffer.isReadable) {
-            if (hasHttpMethodTokenPrefix(buffer)) {
-                out.add(RequestStartMarker(byteTimeline.timestampAtCurrentOffset()))
-                awaitingRequestStart = false
-            } else {
-                awaitingRequestStart = true
-            }
+            out.add(RequestStartMarker(byteTimeline.timestampAtCurrentOffset()))
+            awaitingRequestStart = false
         } else if (completedRequest) {
             awaitingRequestStart = true
-        } else if (awaitingRequestStart) {
-            val partialRequestStartAtNanos = when {
-                requestStartAtNanos != null && (consumedByteCount > 0 || buffer.isReadable) -> requestStartAtNanos
-                buffer.isReadable && hasHttpMethodTokenPrefix(buffer) -> byteTimeline.timestampAtCurrentOffset()
-                else -> null
-            }
-            if (partialRequestStartAtNanos != null) {
-                ctx.fireUserEventTriggered(RequestStartMarker(partialRequestStartAtNanos))
-                awaitingRequestStart = false
-            }
         }
     }
-
-    private fun hasHttpMethodTokenPrefix(buffer: ByteBuf): Boolean {
-        return findHttpMethodStart(buffer) != null
-    }
-
-    private fun findHttpMethodStart(buffer: ByteBuf): Int? {
-        for (index in buffer.readerIndex() until buffer.writerIndex()) {
-            val asciiByte = buffer.getUnsignedByte(index).toInt()
-            if (asciiByte.isNettyControlOrWhitespace()) continue
-            return index.takeIf { asciiByte.isHttpTokenStart() }
-        }
-        return null
-    }
-
-    private fun Int.isNettyControlOrWhitespace(): Boolean = this in 0x00..0x20 || this == 0x7f
-
-    private fun Int.isHttpTokenStart(): Boolean =
-        this in '0'.code..'9'.code ||
-                this in 'A'.code..'Z'.code ||
-                this in 'a'.code..'z'.code ||
-                toChar() in "!#$%&'*+-.^_`|~"
 }
 
 /**
@@ -313,8 +267,6 @@ internal class HttpByteTimeline {
     fun timestampAtCurrentOffset(): Long {
         return timestampAtOffset(consumedOffset)
     }
-
-    fun currentOffset(): Long = consumedOffset
 
     fun timestampAtOffset(offset: Long): Long {
         require(offset in consumedOffset until receivedOffset) { "offset $offset has no received raw byte" }
