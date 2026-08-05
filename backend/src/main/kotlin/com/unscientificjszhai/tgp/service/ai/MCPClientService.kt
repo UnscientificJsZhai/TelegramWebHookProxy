@@ -21,6 +21,8 @@ import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.EmbeddedResource
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
+import io.modelcontextprotocol.kotlin.sdk.types.ListToolsRequest
+import io.modelcontextprotocol.kotlin.sdk.types.PaginatedRequestParams
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -255,17 +257,8 @@ class MCPClientService internal constructor(
             val candidates = linkedMapOf<String, Pair<Client, List<Tool>>>()
             try {
                 for (config in requested.configs) {
-                    val candidate = connectCandidate(config)
-                    try {
-                        validateDiscoveredTools(
-                            candidate.second,
-                            candidates.values.sumOf { it.second.size },
-                        )
-                        candidates[config.name] = candidate
-                    } catch (e: Exception) {
-                        scheduleClientForCleanup(config.name, candidate.first)
-                        throw e
-                    }
+                    val candidate = connectCandidate(config, candidates.values.sumOf { it.second.size })
+                    candidates[config.name] = candidate
                 }
                 currentCoroutineContext().ensureActive()
             } catch (e: CancellationException) {
@@ -464,7 +457,7 @@ class MCPClientService internal constructor(
     /** 等待 cleanup fence 前登记的客户端清理实际结束；调用时不持有连接锁或清理锁。 */
     private suspend fun awaitTrackedClientCleanup(): Unit = fenceTrackedClientCleanup().joinAll()
 
-    private suspend fun connectCandidate(config: MCPServerConfig): Pair<Client, List<Tool>> {
+    private suspend fun connectCandidate(config: MCPServerConfig, existingToolCount: Int): Pair<Client, List<Tool>> {
         val client = clientFactory()
 
         val url = config.url
@@ -480,7 +473,7 @@ class MCPClientService internal constructor(
 
         try {
             client.connect(transport)
-            val tools = client.listTools().tools.toList()
+            val tools = listAllTools(client, existingToolCount)
             currentCoroutineContext().ensureActive()
             logger.info("Connected to MCP server: ${config.name}, discovered ${tools.size} tools.")
             return client to tools
@@ -490,6 +483,41 @@ class MCPClientService internal constructor(
         } catch (e: Exception) {
             scheduleClientForCleanup(config.name, client)
             throw e
+        }
+    }
+
+    /**
+     * 在当前 MCP 批次与连接锁内读取一个服务器的全部工具页。
+     *
+     * 每页加入候选前即校验工具并累计单服务器和跨服务器预算；发现失败会由调用方清理该候选，绝不发布部分
+     * 工具快照。
+     */
+    private suspend fun listAllTools(client: Client, existingToolCount: Int): List<Tool> {
+        val discovered = mutableListOf<Tool>()
+        val seenCursors = mutableSetOf<String>()
+        var cursor: String? = null
+        var pages = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            check(++pages <= MAX_MCP_TOOL_DISCOVERY_PAGES) { "MCP 工具发现页数超过限制。" }
+            val result = if (cursor == null) {
+                client.listTools(ListToolsRequest())
+            } else {
+                client.listTools(ListToolsRequest(PaginatedRequestParams(cursor)))
+            }
+            result.tools.forEach { tool ->
+                check(discovered.size < MAX_MCP_TOOLS_PER_SERVER) {
+                    "单个 MCP 服务器工具不能超过 $MAX_MCP_TOOLS_PER_SERVER 个。"
+                }
+                check(existingToolCount + discovered.size < MAX_MCP_TOOLS_TOTAL) {
+                    "MCP 工具总数不能超过 $MAX_MCP_TOOLS_TOTAL 个。"
+                }
+                validateDiscoveredTool(tool)
+                discovered += tool
+            }
+            val nextCursor = result.nextCursor ?: return discovered
+            check(seenCursors.add(nextCursor)) { "MCP 工具分页游标重复。" }
+            cursor = nextCursor
         }
     }
 
@@ -610,6 +638,7 @@ class MCPClientService internal constructor(
 }
 
 internal const val MAX_MCP_RESPONSE_BYTES = 1024L * 1024L
+internal const val MAX_MCP_TOOL_DISCOVERY_PAGES = 16
 internal const val MAX_MCP_TOOLS_PER_SERVER = 32
 internal const val MAX_MCP_TOOLS_TOTAL = 128
 internal const val MAX_MCP_TOOL_NAME_BYTES = 128
@@ -764,29 +793,21 @@ private fun okhttp3.MediaType?.isMcpJson(): Boolean =
 
 private fun okhttp3.MediaType?.isMcpSse(): Boolean = this?.type == "text" && subtype == "event-stream"
 
-private fun validateDiscoveredTools(tools: List<Tool>, existingCount: Int) {
-    require(tools.size <= MAX_MCP_TOOLS_PER_SERVER) {
-        "单个 MCP 服务器工具不能超过 $MAX_MCP_TOOLS_PER_SERVER 个。"
+private fun validateDiscoveredTool(tool: Tool) {
+    tool.inputSchema.properties?.let(JsonStructureLimits::validateElement)
+    tool.inputSchema.defs?.let(JsonStructureLimits::validateElement)
+    tool.outputSchema?.properties?.let(JsonStructureLimits::validateElement)
+    tool.outputSchema?.defs?.let(JsonStructureLimits::validateElement)
+    tool.meta?.let(JsonStructureLimits::validateElement)
+    require(tool.name.toByteArray(StandardCharsets.UTF_8).size in 1..MAX_MCP_TOOL_NAME_BYTES) {
+        "MCP 工具名称长度不合法。"
     }
-    require(existingCount + tools.size <= MAX_MCP_TOOLS_TOTAL) {
-        "MCP 工具总数不能超过 $MAX_MCP_TOOLS_TOTAL 个。"
+    require((tool.description ?: "").toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_DESCRIPTION_BYTES) {
+        "MCP 工具描述超过限制。"
     }
-    tools.forEach { tool ->
-        tool.inputSchema.properties?.let(JsonStructureLimits::validateElement)
-        tool.inputSchema.defs?.let(JsonStructureLimits::validateElement)
-        tool.outputSchema?.properties?.let(JsonStructureLimits::validateElement)
-        tool.outputSchema?.defs?.let(JsonStructureLimits::validateElement)
-        tool.meta?.let(JsonStructureLimits::validateElement)
-        require(tool.name.toByteArray(StandardCharsets.UTF_8).size in 1..MAX_MCP_TOOL_NAME_BYTES) {
-            "MCP 工具名称长度不合法。"
-        }
-        require((tool.description ?: "").toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_DESCRIPTION_BYTES) {
-            "MCP 工具描述超过限制。"
-        }
-        // 结构已经先受显式栈校验，之后才允许 SDK 进行可能递归的 schema 序列化。
-        require(tool.inputSchema.toString().toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_SCHEMA_BYTES) {
-            "MCP 工具输入架构超过限制。"
-        }
+    // 结构已经先受显式栈校验，之后才允许 SDK 进行可能递归的 schema 序列化。
+    require(tool.inputSchema.toString().toByteArray(StandardCharsets.UTF_8).size <= MAX_MCP_TOOL_SCHEMA_BYTES) {
+        "MCP 工具输入架构超过限制。"
     }
 }
 

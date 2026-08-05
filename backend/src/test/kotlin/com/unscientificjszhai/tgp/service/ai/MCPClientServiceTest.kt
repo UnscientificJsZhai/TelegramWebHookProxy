@@ -9,6 +9,7 @@ import io.mockk.mockk
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.EmbeddedResource
+import io.modelcontextprotocol.kotlin.sdk.types.ListToolsRequest
 import io.modelcontextprotocol.kotlin.sdk.types.ListToolsResult
 import io.modelcontextprotocol.kotlin.sdk.types.TextResourceContents
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
@@ -38,6 +39,152 @@ import okio.Buffer
  * MCP 客户端连接更新与终态关闭行为的测试设计。
  */
 class MCPClientServiceTest {
+
+    /** MCP 工具发现会将后续 cursor 页中的工具一并发布到可调用快照。 */
+    @Test
+    fun `tool discovery follows cursors and publishes tools from every page`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        val requests = mutableListOf<ListToolsRequest>()
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools(any<ListToolsRequest>()) } coAnswers {
+            (invocation.args.first() as ListToolsRequest).also(requests::add).let { request ->
+                when (request.params?.cursor) {
+                    null -> ListToolsResult(listOf(Tool("first", ToolSchema())), nextCursor = "next")
+                    "next" -> ListToolsResult(listOf(Tool("second", ToolSchema())))
+                    else -> error("unexpected cursor")
+                }
+            }
+        }
+        coEvery { client.close() } returns Unit
+
+        service.connect(listOf(MCPServerConfig(name = "server", url = "https://example.com/mcp")))
+
+        assertEquals(listOf("first", "second"), service.getAllTools().map { it.second.name })
+        assertEquals(listOf(null, "next"), requests.map { it.params?.cursor })
+        service.close().join()
+    }
+
+    /** 重复的 MCP cursor 必须废弃候选并清理客户端，不能发布首个页面的部分工具。 */
+    @Test
+    fun `repeated tool cursor discards the candidate without publishing partial tools`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools(any<ListToolsRequest>()) } returnsMany listOf(
+            ListToolsResult(listOf(Tool("first", ToolSchema())), nextCursor = "loop"),
+            ListToolsResult(listOf(Tool("second", ToolSchema())), nextCursor = "loop"),
+        )
+        coEvery { client.close() } returns Unit
+
+        service.connect(listOf(MCPServerConfig(name = "server", url = "https://example.com/mcp")))
+
+        assertEquals(emptyList(), service.getAllTools())
+        service.close().join()
+        coVerify(exactly = 1) { client.close() }
+    }
+
+    /** 跨页累加的工具数达到单服务器上限后，候选不得发布。 */
+    @Test
+    fun `tool discovery enforces the per server cap across pages`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools(any<ListToolsRequest>()) } returnsMany listOf(
+            ListToolsResult(
+                List(MAX_MCP_TOOLS_PER_SERVER) { index -> Tool("tool-$index", ToolSchema()) },
+                nextCursor = "overflow",
+            ),
+            ListToolsResult(listOf(Tool("overflow", ToolSchema()))),
+        )
+        coEvery { client.close() } returns Unit
+
+        service.connect(listOf(MCPServerConfig(name = "server", url = "https://example.com/mcp")))
+
+        assertEquals(emptyList(), service.getAllTools())
+        service.close().join()
+        coVerify(exactly = 1) { client.close() }
+    }
+
+    /** 跨服务器累加的工具数超过全局上限时，整批候选不得发布。 */
+    @Test
+    fun `tool discovery enforces the total cap across servers`() = runBlocking {
+        val clients = ArrayDeque(List(5) { mockk<Client>() })
+        val createdClients = clients.toList()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { clients.removeFirst() }
+        createdClients.forEachIndexed { index, client ->
+            coEvery { client.connect(any()) } returns Unit
+            coEvery { client.listTools(any<ListToolsRequest>()) } returns ListToolsResult(
+                List(if (index < 4) MAX_MCP_TOOLS_PER_SERVER else 1) { toolIndex ->
+                    Tool("server-$index-tool-$toolIndex", ToolSchema())
+                },
+            )
+            coEvery { client.close() } returns Unit
+        }
+
+        service.connect(
+            List(5) { index ->
+                MCPServerConfig(name = "server-$index", url = "https://example-$index.com/mcp")
+            },
+        )
+
+        assertEquals(emptyList(), service.getAllTools())
+        service.close().join()
+        createdClients.forEach { client -> coVerify(exactly = 1) { client.close() } }
+    }
+
+    /** 工具分页超过固定页数预算时会清理候选，且不会尝试读取超限页面。 */
+    @Test
+    fun `tool discovery page cap discards the candidate`() = runBlocking {
+        val client = mockk<Client>()
+        val service = MCPClientService(CoroutineScope(EmptyCoroutineContext)) { client }
+        var calls = 0
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools(any<ListToolsRequest>()) } coAnswers {
+            calls += 1
+            ListToolsResult(emptyList(), nextCursor = "cursor-$calls")
+        }
+        coEvery { client.close() } returns Unit
+
+        service.connect(listOf(MCPServerConfig(name = "server", url = "https://example.com/mcp")))
+
+        assertEquals(MAX_MCP_TOOL_DISCOVERY_PAGES, calls)
+        assertEquals(emptyList(), service.getAllTools())
+        service.close().join()
+        coVerify(exactly = 1) { client.close() }
+    }
+
+    /** MCP 批次时限覆盖阻塞的后续工具页；超时后候选必须清理且不可见。 */
+    @Test
+    fun `tool discovery timeout cleans up an unresponsive paged candidate`() = runBlocking {
+        val client = mockk<Client>()
+        val listingStarted = CompletableDeferred<Unit>()
+        val cleanupStarted = CompletableDeferred<Unit>()
+        var calls = 0
+        val service = MCPClientService(
+            CoroutineScope(EmptyCoroutineContext),
+            AgentExecutionDeadlines(mcpBatch = 100.milliseconds),
+        ) { client }
+        coEvery { client.connect(any()) } returns Unit
+        coEvery { client.listTools(any<ListToolsRequest>()) } coAnswers {
+            if (++calls == 1) {
+                ListToolsResult(listOf(Tool("first", ToolSchema())), nextCursor = "next")
+            } else {
+                listingStarted.complete(Unit)
+                awaitCancellation()
+            }
+        }
+        coEvery { client.close() } coAnswers { cleanupStarted.complete(Unit) }
+
+        withTimeout(1.seconds) {
+            service.connect(listOf(MCPServerConfig(name = "server", url = "https://example.com/mcp")))
+        }
+
+        withTimeout(1.seconds) { listingStarted.await() }
+        withTimeout(1.seconds) { cleanupStarted.await() }
+        assertEquals(emptyList(), service.getAllTools())
+        withTimeout(1.seconds) { service.close().join() }
+    }
 
     /** 验证深层 Kotlin 参数在序列化到 MCP JSON 前被显式栈校验，底层客户端不会收到调用。 */
     @Test

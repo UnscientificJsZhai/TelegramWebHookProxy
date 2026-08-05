@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 import com.google.genai.Chat
 import com.google.genai.Client
 import com.google.genai.JsonSerializable
+import com.google.genai.Models
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.AIProvider
@@ -67,7 +68,7 @@ import kotlin.jvm.optionals.getOrNull
  * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
  * @param mcpClientService 管理会话可调用的 MCP 工具连接。
  * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
- * @param deadlines 限制候选初始化与其 MCP 批次的总体执行时间。
+ * @param deadlines 限制候选初始化、模型发现及其 MCP 批次的总体执行时间。
  */
 @AgentScope
 class GeminiAgentService @Inject internal constructor(
@@ -448,15 +449,16 @@ class GeminiAgentService @Inject internal constructor(
             }
             val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
             val currentTransport = rawTransport
-            val refreshedModels = when {
-                currentTransport != null -> listRawModels(currentTransport)
-                else -> {
-                    val models = client?.models ?: return@withLock null
-                    withContext(Dispatchers.IO) {
-                        models.list(ListModelsConfig.builder().build()).mapNotNull { it.name().getOrNull() }
+            val refreshedModels = withTimeout(deadlines.geminiModelDiscovery) {
+                when {
+                    currentTransport != null -> listRawModels(currentTransport)
+                    else -> {
+                        client?.models?.let { models ->
+                            withContext(Dispatchers.IO) { listSdkModels(models) }
+                        }
                     }
                 }
-            }
+            } ?: return@withLock null
             val refreshResult = synchronized(modelStateLock) {
                 if (modelSelectionVersion != selectionVersion) {
                     return@withLock null
@@ -965,24 +967,29 @@ class GeminiAgentService @Inject internal constructor(
                                     check(!closed && rawSession === session) { "Gemini session was replaced before commit" }
                                     rawSession = session.copy(history = tentativeHistory)
                                     reply = completedReply
-                                }
-
-                                ensureToolCallRoundIsAllowed(toolCallRounds++)
-                                ensureToolCallCountIsAllowed(functionCalls.size, toolCallsExecuted)
-                                toolCallsExecuted += functionCalls.size
-                                val responses = buildJsonArray {
-                                    functionCalls.forEach { functionCall ->
-                                        add(createGeminiFunctionResponse(functionCall, session.functionRouteSnapshot))
+                                } else {
+                                    ensureToolCallRoundIsAllowed(toolCallRounds++)
+                                    ensureToolCallCountIsAllowed(functionCalls.size, toolCallsExecuted)
+                                    toolCallsExecuted += functionCalls.size
+                                    val responses = buildJsonArray {
+                                        functionCalls.forEach { functionCall ->
+                                            add(
+                                                createGeminiFunctionResponse(
+                                                    functionCall,
+                                                    session.functionRouteSnapshot
+                                                )
+                                            )
+                                        }
                                     }
+                                    tentativeHistory += buildJsonObject {
+                                        put("role", "user")
+                                        put("parts", responses)
+                                    }
+                                    normalizeRawGeminiCandidate(
+                                        tentativeHistory,
+                                        currentRawGeminiTurnStart(tentativeHistory)
+                                    )
                                 }
-                                tentativeHistory += buildJsonObject {
-                                    put("role", "user")
-                                    put("parts", responses)
-                                }
-                                normalizeRawGeminiCandidate(
-                                    tentativeHistory,
-                                    currentRawGeminiTurnStart(tentativeHistory)
-                                )
                             }
                             reply
                         }
@@ -1418,20 +1425,113 @@ class GeminiAgentService @Inject internal constructor(
             }
         }
 
-    /** 刷新 Gemini 模型列表并只接受服务声明的名称。 */
+    /**
+     * 刷新 Gemini 模型列表并只接受声明支持 `generateContent` 的非空名称。
+     *
+     * 原生 API 分页令牌、页数、条目数和重复模型名称均受固定预算限制；任一页失败时不返回部分列表。
+     */
     private suspend fun listRawModels(transport: CancellableOkHttpTransport): List<String> {
         val apiKey = rawApiKey ?: throw IllegalStateException("Gemini API key is not initialized.")
         val baseUrl = rawBaseUrl ?: throw IllegalStateException("Gemini base URL is not initialized.")
-        val response = transport.execute(
-            Request.Builder()
-                .url("$baseUrl/models".toHttpUrl().newBuilder().addQueryParameter("key", apiKey).build())
-                .get()
-                .build(),
-        )
-        requireGeminiSuccess(response)
-        return JsonStructureLimits.parseToJsonElement(wireJson, response.body).jsonObject["models"]?.jsonArray
-            ?.mapNotNull { it.jsonObject["name"]?.jsonPrimitive?.contentOrNull }
-            .orEmpty()
+        val discoveredModels = mutableListOf<String>()
+        val discoveredNames = mutableSetOf<String>()
+        val seenPageTokens = mutableSetOf<String>()
+        var pageToken: String? = null
+        var pages = 0
+        var entries = 0
+        var tokenBytes = 0
+        var duplicateNames = 0
+        do {
+            currentCoroutineContext().ensureActive()
+            check(++pages <= MAX_GEMINI_MODEL_DISCOVERY_PAGES) {
+                "Gemini 模型发现页数超过限制。"
+            }
+            val url = "$baseUrl/models".toHttpUrl().newBuilder()
+                .addQueryParameter("key", apiKey)
+                .apply { pageToken?.let { addQueryParameter("pageToken", it) } }
+                .build()
+            val response = transport.execute(Request.Builder().url(url).get().build())
+            requireGeminiSuccess(response)
+            val root = JsonStructureLimits.parseToJsonElement(wireJson, response.body).jsonObject
+            val pageModels = root["models"] as? JsonArray
+                ?: throw IllegalArgumentException("Gemini 模型列表响应缺少 models 数组。")
+            pageModels.forEach { entry ->
+                check(++entries <= MAX_GEMINI_MODEL_DISCOVERY_ENTRIES) {
+                    "Gemini 模型发现条目超过限制。"
+                }
+                val model = entry as? JsonObject ?: return@forEach
+                val name = (model["name"] as? JsonPrimitive)
+                    ?.takeIf(JsonPrimitive::isString)
+                    ?.content
+                    ?.takeIf(String::isNotBlank)
+                    ?: return@forEach
+                val supportedMethods = model["supportedGenerationMethods"] as? JsonArray
+                if (supportedMethods?.any { method ->
+                        (method as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content == "generateContent"
+                    } != true
+                ) {
+                    return@forEach
+                }
+                if (discoveredNames.add(name)) {
+                    discoveredModels += name
+                } else {
+                    check(++duplicateNames <= MAX_GEMINI_MODEL_DISCOVERY_DUPLICATES) {
+                        "Gemini 模型发现重复名称超过限制。"
+                    }
+                }
+            }
+            pageToken = root["nextPageToken"]?.let { token ->
+                val value = (token as? JsonPrimitive)
+                    ?.takeIf(JsonPrimitive::isString)
+                    ?.content
+                    ?.takeIf(String::isNotBlank)
+                    ?: throw IllegalArgumentException("Gemini 模型分页令牌不合法。")
+                tokenBytes += value.toByteArray(StandardCharsets.UTF_8).size
+                check(tokenBytes <= MAX_GEMINI_MODEL_DISCOVERY_TOKEN_BYTES) {
+                    "Gemini 模型分页令牌超过限制。"
+                }
+                check(seenPageTokens.add(value)) { "Gemini 模型分页令牌重复。" }
+                value
+            }
+        } while (pageToken != null)
+        return discoveredModels
+    }
+
+    /** 使用 SDK 的显式分页 API 读取支持 `generateContent` 的模型，绝不使用自动迭代器。 */
+    private suspend fun listSdkModels(models: Models): List<String> {
+        val pager = models.list(ListModelsConfig.builder().build())
+        val discoveredModels = mutableListOf<String>()
+        val discoveredNames = mutableSetOf<String>()
+        var pages = 0
+        var entries = 0
+        var duplicateNames = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            check(++pages <= MAX_GEMINI_MODEL_DISCOVERY_PAGES) {
+                "Gemini 模型发现页数超过限制。"
+            }
+            pager.page().forEach { model ->
+                check(++entries <= MAX_GEMINI_MODEL_DISCOVERY_ENTRIES) {
+                    "Gemini 模型发现条目超过限制。"
+                }
+                val name = model.name().getOrNull()?.takeIf(String::isNotBlank) ?: return@forEach
+                if (model.supportedActions().getOrNull()?.any { it == "generateContent" } != true) {
+                    return@forEach
+                }
+                if (discoveredNames.add(name)) {
+                    discoveredModels += name
+                } else {
+                    check(++duplicateNames <= MAX_GEMINI_MODEL_DISCOVERY_DUPLICATES) {
+                        "Gemini 模型发现重复名称超过限制。"
+                    }
+                }
+            }
+            try {
+                pager.nextPage()
+            } catch (_: IndexOutOfBoundsException) {
+                return discoveredModels
+            }
+        }
     }
 
     /** 将 HTTP 失败转换为携带有限响应正文的异常，避免把失败结果当作模型协议解析。 */
@@ -1734,3 +1834,8 @@ class GeminiAgentService @Inject internal constructor(
         closeJob!!
     }
 }
+
+internal const val MAX_GEMINI_MODEL_DISCOVERY_PAGES = 16
+internal const val MAX_GEMINI_MODEL_DISCOVERY_ENTRIES = 256
+internal const val MAX_GEMINI_MODEL_DISCOVERY_TOKEN_BYTES = 8 * 1024
+internal const val MAX_GEMINI_MODEL_DISCOVERY_DUPLICATES = 32

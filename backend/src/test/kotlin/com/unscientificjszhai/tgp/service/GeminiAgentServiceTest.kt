@@ -16,7 +16,9 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
+import com.unscientificjszhai.tgp.service.ai.agent.CancellableOkHttpTransport
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_GEMINI_MODEL_DISCOVERY_ENTRIES
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
@@ -34,6 +36,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.put
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import okhttp3.OkHttpClient
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -86,6 +89,126 @@ class GeminiAgentServiceTest {
             ),
             service.availableModels,
         )
+    }
+
+    /** 原生 Gemini 模型发现会读取后续页，并过滤没有精确声明 `generateContent` 的模型。 */
+    @Test
+    fun `raw Gemini model discovery paginates and filters unsupported models`() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        val rawService = rawDiscoveryService(server)
+        try {
+            rawService.availableModels = listOf("models/first")
+            setPrivateField(rawService, "currentModel", "models/first")
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"models":[{"name":"models/first","supportedGenerationMethods":["generateContent"]},{"name":"models/embed","supportedGenerationMethods":["embedContent"]},{"name":" ","supportedGenerationMethods":["generateContent"]}],"nextPageToken":"next-page"}""",
+                ).build(),
+            )
+            server.enqueue(
+                MockResponse.Builder().body(
+                    """{"models":[{"name":"models/first","supportedGenerationMethods":["generateContent"]},{"name":"models/second","supportedGenerationMethods":["generateContent"]},{"name":"models/invalid-capability","supportedGenerationMethods":["GenerateContent"]}]}""",
+                ).build(),
+            )
+
+            val snapshot = assertNotNull(rawService.updateModel())
+
+            assertEquals(listOf("models/first", "models/second"), snapshot.availableModels)
+            assertEquals("models/first", snapshot.currentModel)
+            assertTrue(assertNotNull(server.takeRequest(1, TimeUnit.SECONDS)).target.endsWith("/models?key=test-key"))
+            assertTrue(
+                assertNotNull(server.takeRequest(1, TimeUnit.SECONDS)).target
+                    .contains("pageToken=next-page"),
+            )
+            Unit
+        } finally {
+            rawService.close().join()
+            server.close()
+        }
+    }
+
+    /** 重复的原生分页令牌会拒绝整个刷新，并保留已发布的模型快照。 */
+    @Test
+    fun `raw Gemini model discovery rejects repeated page tokens without publishing a partial snapshot`() =
+        runBlocking {
+            val server = MockWebServer()
+            server.start()
+            val rawService = rawDiscoveryService(server)
+            val beforeModels = rawService.availableModels
+            val beforeCurrent = rawService.currentModel
+            try {
+                server.enqueue(
+                    MockResponse.Builder().body(
+                        """{"models":[{"name":"models/first","supportedGenerationMethods":["generateContent"]}],"nextPageToken":"loop"}""",
+                    ).build(),
+                )
+                server.enqueue(
+                    MockResponse.Builder().body(
+                        """{"models":[{"name":"models/second","supportedGenerationMethods":["generateContent"]}],"nextPageToken":"loop"}""",
+                    ).build(),
+                )
+
+                assertNull(rawService.updateModel())
+
+                assertEquals(beforeModels, rawService.availableModels)
+                assertEquals(beforeCurrent, rawService.currentModel)
+                assertNotNull(server.takeRequest(1, TimeUnit.SECONDS))
+                assertNotNull(server.takeRequest(1, TimeUnit.SECONDS))
+                Unit
+            } finally {
+                rawService.close().join()
+                server.close()
+            }
+        }
+
+    /** 超过原生模型条目预算会拒绝整个刷新，不得用已读取的前缀替换当前快照。 */
+    @Test
+    fun `raw Gemini model discovery entry cap preserves the previous snapshot`() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        val rawService = rawDiscoveryService(server)
+        val beforeModels = rawService.availableModels
+        val beforeCurrent = rawService.currentModel
+        try {
+            val models = (0..MAX_GEMINI_MODEL_DISCOVERY_ENTRIES).joinToString(separator = ",") { index ->
+                """{"name":"models/$index","supportedGenerationMethods":["generateContent"]}"""
+            }
+            server.enqueue(MockResponse.Builder().body("""{"models":[$models]}""").build())
+
+            assertNull(rawService.updateModel())
+
+            assertEquals(beforeModels, rawService.availableModels)
+            assertEquals(beforeCurrent, rawService.currentModel)
+            Unit
+        } finally {
+            rawService.close().join()
+            server.close()
+        }
+    }
+
+    /** 原生模型发现总时限会取消慢页，且不会提交任何模型快照变更。 */
+    @Test
+    fun `raw Gemini model discovery deadline preserves the previous snapshot`() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        val rawService = rawDiscoveryService(
+            server,
+            AgentExecutionDeadlines(geminiModelDiscovery = 100.milliseconds),
+        )
+        val beforeModels = rawService.availableModels
+        val beforeCurrent = rawService.currentModel
+        try {
+            server.enqueue(MockResponse.Builder().headersDelay(5, TimeUnit.SECONDS).build())
+
+            assertFailsWith<TimeoutCancellationException> { rawService.updateModel() }
+
+            assertEquals(beforeModels, rawService.availableModels)
+            assertEquals(beforeCurrent, rawService.currentModel)
+            Unit
+        } finally {
+            rawService.close().join()
+            server.close()
+        }
     }
 
     /**
@@ -150,7 +273,7 @@ class GeminiAgentServiceTest {
             )
             server.enqueue(
                 MockResponse.Builder().body(
-                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}]}""",
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite","supportedGenerationMethods":["generateContent"]}]}""",
                 ).build(),
             )
             releaseConnection.complete(Unit)
@@ -390,7 +513,7 @@ class GeminiAgentServiceTest {
             setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
             server.enqueue(
                 MockResponse.Builder().body(
-                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}]}""",
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite","supportedGenerationMethods":["generateContent"]}]}""",
                 ).build(),
             )
             releaseConnection.complete(Unit)
@@ -495,7 +618,7 @@ class GeminiAgentServiceTest {
             setPrivateField(candidate, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
             server.enqueue(
                 MockResponse.Builder().body(
-                    """{"models":[{"name":"models/gemini-3.5-flash-lite"}]}""",
+                    """{"models":[{"name":"models/gemini-3.5-flash-lite","supportedGenerationMethods":["generateContent"]}]}""",
                 ).build(),
             )
             releaseInitialConnection.complete(Unit)
@@ -525,12 +648,20 @@ class GeminiAgentServiceTest {
         val pager = mockk<Pager<Model>>()
         val chats = mockk<Chats>()
         val fallbackChat = mockk<Chat>()
-        val fallbackModel = Model.builder().name("models/fallback-model").build()
+        val unsupportedModel = Model.builder()
+            .name("models/embedding-model")
+            .supportedActions("embedContent")
+            .build()
+        val fallbackModel = Model.builder()
+            .name("models/fallback-model")
+            .supportedActions("generateContent")
+            .build()
         settingsRepository.saveSettings(
             AppSettings(ai = AISettings(geminiApiKey = "test-key", selectedModel = "models/gemini-3.5-flash-lite")),
         )
         every { models.list(any<ListModelsConfig>()) } returns pager
-        every { pager.iterator() } returns mutableListOf(fallbackModel).iterator()
+        every { pager.page() } returns ImmutableList.of(unsupportedModel) andThen ImmutableList.of(fallbackModel)
+        every { pager.nextPage() } returns ImmutableList.of(fallbackModel) andThenThrows IndexOutOfBoundsException()
         every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns fallbackChat
         setPrivateField("configuredApiKey", "test-key")
         injectClient(chats, models)
@@ -1521,6 +1652,25 @@ class GeminiAgentServiceTest {
             skillRepository,
             MCPClientService(testScope),
         ) { mockk() }
+    }
+
+    /** 构造不触发初始会话的原生模型发现服务，并将其传输定向到测试服务器。 */
+    private fun rawDiscoveryService(
+        server: MockWebServer,
+        deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
+    ): GeminiAgentService {
+        val testScope = CoroutineScope(EmptyCoroutineContext)
+        return GeminiAgentService(
+            testScope,
+            settingsRepository,
+            skillRepository,
+            MCPClientService(testScope),
+            deadlines,
+        ) { mockk() }.also { rawService ->
+            setPrivateField(rawService, "rawApiKey", "test-key")
+            setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
+            setPrivateField(rawService, "rawTransport", CancellableOkHttpTransport(OkHttpClient()))
+        }
     }
 
     private fun setPrivateField(name: String, value: Any?) {
