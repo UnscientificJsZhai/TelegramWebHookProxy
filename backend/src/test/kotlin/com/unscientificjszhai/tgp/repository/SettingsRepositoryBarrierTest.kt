@@ -187,53 +187,201 @@ class SettingsRepositoryBarrierTest {
     }
 
     /**
-     * 验证历史非法 HTTP 工具设置在加载时安全禁用，且仓储不会持久化新的非法目标。
+     * 验证旧代理迁移与历史非法 HTTP 工具配置同时存在时，候选无关更新不会覆盖原始字节或发布状态。
      */
     @Test
-    fun `invalid persisted HTTP tool settings fail closed and saves are validated`() {
-        val configFile = File(tempDirectory, "invalid-http-tool.json")
+    fun `legacy proxy migration preserves historical invalid HTTP tool configuration until explicit replacement`() {
+        val barrier = ModelSwitchBarrier()
+        val configFile = File(tempDirectory, "legacy-proxy-historical-invalid-http-tool.json")
         configFile.writeText(
             """
-            {
-              "ai": {
-                "httpToolSettings": {
-                  "enabled": true,
-                  "targets": [{
-                    "id": "unsafe",
-                    "scheme": "http",
-                    "host": "localhost",
-                    "port": 8080,
-                    "path": "/admin",
-                    "method": "GET"
-                  }]
-                }
-              }
-            }
+            {"telegramToken":"100:token","chatId":"old-chat","proxy":{"host":"proxy.example.com","port":8080},"ai":{"provider":"GEMINI","geminiApiKey":"key","httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}
             """.trimIndent(),
         )
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val originalBytes = configFile.readBytes().toList()
+        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val recoveredSettings = repository.settingsFlow.value
+        val recoveredSnapshot = repository.currentSettingsSnapshot()
+        val recoveredSettingsUpdate = repository.settingsUpdateFlow.value
+        val recoveredTokenUpdate = repository.telegramTokenUpdateFlow.value
+        val recoveredAi = requireNotNull(recoveredSettings.ai)
 
-        assertFalse(repository.settingsFlow.value.ai!!.httpToolSettings.enabled)
-        assertTrue(repository.settingsFlow.value.ai!!.httpToolSettings.targets.isEmpty())
-        assertFailsWith<IllegalArgumentException> {
-            repository.saveSettings(
-                AppSettings(
-                    ai = AISettings(
-                        httpToolSettings = HttpToolSettings(
-                            enabled = true,
-                            targets = listOf(
-                                HttpCallTarget(
-                                    id = "unsafe",
-                                    scheme = "http",
-                                    host = "localhost",
-                                    path = "/admin",
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            )
+        assertEquals(ProxySettings("proxy.example.com", 8080, ProxyType.HTTP), recoveredSettings.proxy)
+        assertFalse(recoveredAi.httpToolSettings.enabled)
+        assertTrue(recoveredAi.httpToolSettings.targets.isEmpty())
+        assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+        var staleTransformWasCalled = false
+        assertFailsWith<SettingsRevisionMismatchException> {
+            repository.updateSettings(expectedRevision = "0".repeat(64)) {
+                staleTransformWasCalled = true
+                it.copy(chatId = "stale-candidate")
+            }
         }
+        assertFalse(staleTransformWasCalled)
+        var transformWasCalled = false
+
+        assertFailsWith<HistoricalInvalidHttpToolConfigurationException> {
+            repository.updateSettings { current ->
+                transformWasCalled = true
+                current.copy(chatId = "candidate-change")
+            }
+        }
+
+        assertTrue(transformWasCalled)
+        assertEquals(recoveredSettings, repository.settingsFlow.value)
+        assertEquals(recoveredSnapshot, repository.currentSettingsSnapshot())
+        assertEquals(recoveredSettingsUpdate, repository.settingsUpdateFlow.value)
+        assertEquals(recoveredTokenUpdate, repository.telegramTokenUpdateFlow.value)
+        assertFalse(barrier.isSwitching)
+        assertEquals(originalBytes, configFile.readBytes().toList())
+    }
+
+    /**
+     * 验证 HTTP 历史保护与 MCP、OpenAI 历史保护相互独立；即使已授权其他保护字段，遗漏 HTTP 授权仍会失败。
+     */
+    @Test
+    fun `historical invalid HTTP tool settings require their own explicit replacement authorization`() {
+        data class HistoryCase(
+            val name: String,
+            val mcpFragment: String = "",
+            val openAiFragment: String = "",
+            val authorizesMcp: Boolean = false,
+            val authorizesOpenAiBaseUrl: Boolean = false,
+        )
+
+        val unsafeHttpToolFragment =
+            """"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}"""
+        val cases = listOf(
+            HistoryCase(name = "http-only"),
+            HistoryCase(
+                name = "http-and-mcp",
+                mcpFragment = ",\"mcpServers\":[{\"name\":\"unsafe\",\"url\":\"ftp://mcp.example.com\",\"headers\":{}}]",
+                authorizesMcp = true,
+            ),
+            HistoryCase(
+                name = "http-and-openai",
+                openAiFragment = ",\"openAiBaseUrl\":\"https://gateway.example.com/v1/%6dodels\"",
+                authorizesOpenAiBaseUrl = true,
+            ),
+            HistoryCase(
+                name = "all-three",
+                mcpFragment = ",\"mcpServers\":[{\"name\":\"unsafe\",\"url\":\"ftp://mcp.example.com\",\"headers\":{}}]",
+                openAiFragment = ",\"openAiBaseUrl\":\"https://gateway.example.com/v1/%6dodels\"",
+                authorizesMcp = true,
+                authorizesOpenAiBaseUrl = true,
+            ),
+        )
+
+        cases.forEach { case ->
+            val configFile = File(tempDirectory, "historical-invalid-http-tool-${case.name}.json")
+            configFile.writeText(
+                """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key",$unsafeHttpToolFragment${case.mcpFragment}${case.openAiFragment}}}""",
+            )
+            val originalBytes = configFile.readBytes().toList()
+            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+
+            assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+            assertEquals(case.authorizesMcp, repository.hasHistoricalInvalidMcp)
+            assertEquals(case.authorizesOpenAiBaseUrl, repository.hasHistoricalInvalidOpenAiBaseUrl)
+            assertFailsWith<HistoricalInvalidHttpToolConfigurationException> {
+                repository.updateSettings(
+                    replacesHistoricalInvalidMcpServers = case.authorizesMcp,
+                    replacesHistoricalInvalidOpenAiBaseUrl = case.authorizesOpenAiBaseUrl,
+                ) { current ->
+                    current.copy(chatId = "candidate-change")
+                }
+            }
+            assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+            assertEquals(case.authorizesMcp, repository.hasHistoricalInvalidMcp)
+            assertEquals(case.authorizesOpenAiBaseUrl, repository.hasHistoricalInvalidOpenAiBaseUrl)
+            assertEquals(originalBytes, configFile.readBytes().toList())
+        }
+    }
+
+    /** 验证显式以 fail-closed 默认 HTTP 设置修复时会耐久落盘并清除保护，而不会发布伪设置更新。 */
+    @Test
+    fun `explicit default HTTP tool repair commits without publishing a settings update`() {
+        val barrier = ModelSwitchBarrier()
+        val configFile = File(tempDirectory, "historical-invalid-http-tool-default-repair.json")
+        configFile.writeText(
+            """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
+        )
+        val originalBytes = configFile.readBytes().toList()
+        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val beforeSnapshot = repository.currentSettingsSnapshot()
+        val beforeSettingsUpdate = repository.settingsUpdateFlow.value
+        val beforeTokenUpdate = repository.telegramTokenUpdateFlow.value
+
+        val update = repository.updateSettings(replacesHistoricalInvalidHttpToolSettings = true) { current -> current }
+
+        assertEquals(beforeSnapshot, update.previous)
+        assertEquals(beforeSnapshot, update.current)
+        assertEquals(beforeSnapshot, repository.currentSettingsSnapshot())
+        assertEquals(beforeSettingsUpdate, repository.settingsUpdateFlow.value)
+        assertEquals(beforeTokenUpdate, repository.telegramTokenUpdateFlow.value)
+        assertFalse(barrier.isSwitching)
+        assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
+        assertFalse(originalBytes == configFile.readBytes().toList())
+    }
+
+    /** 验证显式 HTTP 默认修复在原子替换失败时保留历史保护标记与已发布状态。 */
+    @Test
+    fun `failed explicit HTTP tool repair retains the historical protection marker`() {
+        val configFile = File(tempDirectory, "historical-invalid-http-tool-repair-failure.json")
+        configFile.writeText(
+            """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
+        )
+        val originalBytes = configFile.readBytes().toList()
+        val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+            override fun atomicReplace(source: Path, target: Path) {
+                if (target == configFile.toPath()) {
+                    throw IOException("injected HTTP repair replace failure")
+                }
+                DefaultAtomicJsonFileOperations.atomicReplace(source, target)
+            }
+        }
+        val barrier = ModelSwitchBarrier()
+        val repository = SettingsRepository.forTesting(configFile, barrier, fileOperations)
+        val beforeSnapshot = repository.currentSettingsSnapshot()
+        val beforeSettingsUpdate = repository.settingsUpdateFlow.value
+        val beforeTokenUpdate = repository.telegramTokenUpdateFlow.value
+
+        assertFailsWith<IOException> {
+            repository.updateSettings(replacesHistoricalInvalidHttpToolSettings = true) { current -> current }
+        }
+
+        assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+        assertEquals(beforeSnapshot, repository.currentSettingsSnapshot())
+        assertEquals(beforeSettingsUpdate, repository.settingsUpdateFlow.value)
+        assertEquals(beforeTokenUpdate, repository.telegramTokenUpdateFlow.value)
+        assertFalse(barrier.isSwitching)
+        assertEquals(originalBytes, configFile.readBytes().toList())
+    }
+
+    /** 验证完整设置替换授权并清除 HTTP、MCP 与 OpenAI 的全部历史保护标记。 */
+    @Test
+    fun `saveSettings fully replaces all historical invalid AI configuration markers`() {
+        val configFile = File(tempDirectory, "all-historical-invalid-ai-settings.json")
+        configFile.writeText(
+            """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}],"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
+        )
+        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val recovered = repository.settingsFlow.value
+
+        assertTrue(repository.hasHistoricalInvalidMcp)
+        assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+        repository.saveSettings(
+            recovered.copy(
+                chatId = "fully-replaced",
+                ai = recovered.ai!!.copy(openAiBaseUrl = "https://gateway.example.com/v1"),
+            ),
+        )
+
+        assertFalse(repository.hasHistoricalInvalidMcp)
+        assertFalse(repository.hasHistoricalInvalidOpenAiBaseUrl)
+        assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
+        assertEquals("fully-replaced", repository.settingsFlow.value.chatId)
     }
 
     /**
@@ -535,13 +683,13 @@ class SettingsRepositoryBarrierTest {
         assertEquals("migrated", persisted.chatId)
     }
 
-    /** 验证类型或枚举值损坏的可选字段使用 data class 默认值，而其他合法字段保留。 */
+    /** 验证类型或枚举值损坏的可选字段使用 data class 默认值，且非语义 HTTP schema 修复不设置历史保护。 */
     @Test
     fun `invalid optional fields use schema defaults without rewriting the file`() {
         val configFile = File(tempDirectory, "optional-field-defaults.json")
         val originalContent =
             """
-            {"telegramToken":42,"chatId":"kept","ai":{"provider":"FUTURE","selectedModel":"kept-model","agentEnabled":"yes"}}
+            {"telegramToken":42,"chatId":"kept","ai":{"provider":"FUTURE","selectedModel":"kept-model","agentEnabled":"yes","httpToolSettings":"not-an-object"}}
             """.trimIndent()
         configFile.writeText(originalContent)
 
@@ -552,7 +700,13 @@ class SettingsRepositoryBarrierTest {
         assertEquals(AIProvider.GEMINI, repository.settingsFlow.value.ai?.provider)
         assertEquals("kept-model", repository.settingsFlow.value.ai?.selectedModel)
         assertFalse(repository.settingsFlow.value.ai?.agentEnabled ?: true)
+        assertEquals(HttpToolSettings(), repository.settingsFlow.value.ai?.httpToolSettings)
+        assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
         assertEquals(originalContent, configFile.readText())
+
+        repository.updateSettings { current -> current.copy(chatId = "updated") }
+
+        assertEquals("updated", repository.settingsFlow.value.chatId)
     }
 
     /**

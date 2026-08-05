@@ -102,6 +102,10 @@ class SettingsRepository private constructor(
     internal var hasHistoricalInvalidOpenAiBaseUrl = loadedSettings.hasInvalidOpenAiBaseUrl
         private set
 
+    @Volatile
+    internal var hasHistoricalInvalidHttpToolSettings = loadedSettings.hasInvalidHttpToolSettings
+        private set
+
     private val _settingsFlow = MutableStateFlow(loadedSettings.settings)
     private var settingsRevision = loadedSettings.settings.revision()
 
@@ -191,6 +195,9 @@ class SettingsRepository private constructor(
      * @param replacesHistoricalInvalidOpenAiBaseUrl 此次变换是否明确替换历史非法 OpenAI 基础地址；仅当
      * 地址字段或完整 AI 设置由请求或调用方显式提供时可传入 `true`，避免无关保存把受保护的原始值
      * 清空为默认地址。
+     * @param replacesHistoricalInvalidHttpToolSettings 此次变换是否明确替换历史非法 HTTP 工具设置；仅当
+     * `ai.httpToolSettings` 字段或完整 AI 设置由请求或调用方显式提供时可传入 `true`，避免无关保存把受保护的
+     * 原始目标清空为默认值。
      * @param transform 接收锁内最新不可变设置并返回候选完整设置的同步变换；不得递归调用本仓储的
      * 同步方法，也不得执行长时间阻塞操作。
      * @return 提交前和提交后的原子快照；无操作时两个快照相等。
@@ -202,6 +209,8 @@ class SettingsRepository private constructor(
      * 不会改变屏障、文件或任何设置流。
      * @throws HistoricalInvalidOpenAiBaseUrlConfigurationException 历史非法 OpenAI 基础地址尚未由本次变换
      * 显式替换时抛出；不会改变屏障、文件或任何设置流。
+     * @throws HistoricalInvalidHttpToolConfigurationException 历史非法 HTTP 工具设置尚未由本次变换显式替换时
+     * 抛出；不会改变屏障、文件或任何设置流。
      * @throws IllegalArgumentException 代理、HTTP 工具或 MCP 设置不合法，或历史非法代理尚未被显式替换时
      * 抛出；不会改变屏障、文件或任何设置流。
      * @throws Exception 配置无法编码、原子替换失败，或替换后的父目录耐久性无法确认时抛出。
@@ -211,6 +220,7 @@ class SettingsRepository private constructor(
         expectedRevision: String? = null,
         replacesHistoricalInvalidMcpServers: Boolean = false,
         replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
+        replacesHistoricalInvalidHttpToolSettings: Boolean = false,
         expectedGeneration: Long? = null,
         transform: (AppSettings) -> AppSettings,
     ): SettingsUpdateResult {
@@ -233,6 +243,9 @@ class SettingsRepository private constructor(
         if (hasHistoricalInvalidOpenAiBaseUrl && !replacesHistoricalInvalidOpenAiBaseUrl) {
             throw HistoricalInvalidOpenAiBaseUrlConfigurationException()
         }
+        if (hasHistoricalInvalidHttpToolSettings && !replacesHistoricalInvalidHttpToolSettings) {
+            throw HistoricalInvalidHttpToolConfigurationException()
+        }
         validateAppSettingsResourceLimits(settings)
         validateProxySettings(settings.proxy)
         settings.ai?.httpToolSettings?.let(::validateHttpToolSettings)
@@ -241,7 +254,14 @@ class SettingsRepository private constructor(
         val resolvesHistoricalInvalidMcp = hasHistoricalInvalidMcp && replacesHistoricalInvalidMcpServers
         val resolvesHistoricalInvalidOpenAiBaseUrl =
             hasHistoricalInvalidOpenAiBaseUrl && replacesHistoricalInvalidOpenAiBaseUrl
-        if (settings == previousSettings && !resolvesHistoricalInvalidMcp && !resolvesHistoricalInvalidOpenAiBaseUrl) {
+        val resolvesHistoricalInvalidHttpToolSettings =
+            hasHistoricalInvalidHttpToolSettings && replacesHistoricalInvalidHttpToolSettings
+        if (
+            settings == previousSettings &&
+            !resolvesHistoricalInvalidMcp &&
+            !resolvesHistoricalInvalidOpenAiBaseUrl &&
+            !resolvesHistoricalInvalidHttpToolSettings
+        ) {
             return SettingsUpdateResult(previousSnapshot, previousSnapshot)
         }
 
@@ -260,17 +280,31 @@ class SettingsRepository private constructor(
         }
 
         if (settings == previousSettings) {
-            // 显式以 fail-closed 后的同值列表修复历史磁盘配置时，只更新保护状态；不发布虚假的设置版本或
-            // Agent 生命周期切换。
-            hasHistoricalInvalidMcp = false
-            hasHistoricalInvalidOpenAiBaseUrl = false
+            // 显式以 fail-closed 后的同值配置修复历史磁盘配置时，只更新已成功落盘的保护状态；不发布虚假的
+            // 设置版本或 Agent 生命周期切换。
+            if (resolvesHistoricalInvalidMcp) {
+                hasHistoricalInvalidMcp = false
+            }
+            if (resolvesHistoricalInvalidOpenAiBaseUrl) {
+                hasHistoricalInvalidOpenAiBaseUrl = false
+            }
+            if (resolvesHistoricalInvalidHttpToolSettings) {
+                hasHistoricalInvalidHttpToolSettings = false
+            }
             return SettingsUpdateResult(previousSnapshot, previousSnapshot)
         }
 
         val publish = {
             hasHistoricalInvalidProxy = false
-            hasHistoricalInvalidMcp = false
-            hasHistoricalInvalidOpenAiBaseUrl = false
+            if (resolvesHistoricalInvalidMcp) {
+                hasHistoricalInvalidMcp = false
+            }
+            if (resolvesHistoricalInvalidOpenAiBaseUrl) {
+                hasHistoricalInvalidOpenAiBaseUrl = false
+            }
+            if (resolvesHistoricalInvalidHttpToolSettings) {
+                hasHistoricalInvalidHttpToolSettings = false
+            }
             if (tokenChanged) {
                 _telegramTokenUpdateFlow.value = TelegramTokenUpdate(
                     token = settings.telegramToken,
@@ -313,6 +347,7 @@ class SettingsRepository private constructor(
         updateSettings(
             replacesHistoricalInvalidMcpServers = true,
             replacesHistoricalInvalidOpenAiBaseUrl = true,
+            replacesHistoricalInvalidHttpToolSettings = true,
         ) { settings }
     }
 
@@ -423,6 +458,16 @@ class HistoricalInvalidOpenAiBaseUrlConfigurationException : IllegalArgumentExce
     "历史 OpenAI 基础地址不合法，必须显式替换该地址后才能保存设置。",
 )
 
+/**
+ * 尝试保存设置时未显式替换历史非法 HTTP 工具设置。
+ *
+ * 异常表示原始配置文件仍被保护，调用方必须在同一次完整写入或 PATCH 中明确提供
+ * `ai.httpToolSettings`，或设置 `ai` 为 `null` 后才能提交；异常不会泄露原始目标地址。
+ */
+class HistoricalInvalidHttpToolConfigurationException : IllegalArgumentException(
+    "历史 HTTP 工具配置不合法，必须显式替换 HTTP 工具设置后才能保存设置。",
+)
+
 private val LEGACY_HTTP_PROXY_TYPE_MIGRATION = JsonElementMigration(
     name = "settings-legacy-http-proxy-type",
     transform = migration@{ document ->
@@ -461,6 +506,9 @@ private fun AppSettings.toLoadedSettings(
     val hasInvalidOpenAiBaseUrl = aiSettings?.let { settings ->
         runCatching { validateOpenAiBaseUrl(settings.openAiBaseUrl) }.isFailure
     } == true
+    val hasInvalidHttpToolSettings = aiSettings?.let { settings ->
+        runCatching { validateHttpToolSettings(settings.httpToolSettings) }.isFailure
+    } == true
     val failClosedSettings = failClosedHttpToolSettings(logger).let { settings ->
         if (hasInvalidMcp && settings.ai != null) {
             logger.warn("Invalid optional settings field replaced with its default; path=$.ai.mcpServers")
@@ -481,6 +529,7 @@ private fun AppSettings.toLoadedSettings(
         hasInvalidProxy = hasInvalidProxy,
         hasInvalidMcp = hasInvalidMcp,
         hasInvalidOpenAiBaseUrl = hasInvalidOpenAiBaseUrl,
+        hasInvalidHttpToolSettings = hasInvalidHttpToolSettings,
     )
 }
 
@@ -505,6 +554,7 @@ private data class LoadedSettings(
     val hasInvalidProxy: Boolean,
     val hasInvalidMcp: Boolean = false,
     val hasInvalidOpenAiBaseUrl: Boolean = false,
+    val hasInvalidHttpToolSettings: Boolean = false,
 )
 
 /**

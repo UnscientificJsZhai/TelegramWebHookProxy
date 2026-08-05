@@ -817,6 +817,150 @@ class APIModuleTest {
     }
 
     /**
+     * 验证历史非法 HTTP 工具配置只能由原始 PATCH 中直接提供的嵌套设置或 `ai:null` 替换。
+     */
+    @Test
+    fun `settings routes require an explicit HTTP tool replacement for historical configuration`() {
+        data class RepairCase(val patch: String, val verifiesReplacement: (SettingsRepository) -> Unit)
+
+        val repairCases = listOf(
+            RepairCase(
+                patch =
+                    """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"safe","scheme":"https","host":"api.example.com","port":443,"path":"/status","method":"GET","allowedCidrs":[]}]}}}""",
+                verifiesReplacement = { repository ->
+                    assertTrue(repository.settingsFlow.value.ai!!.httpToolSettings.enabled)
+                    assertEquals("safe", repository.settingsFlow.value.ai!!.httpToolSettings.targets.single().id)
+                },
+            ),
+            RepairCase(
+                patch = """{"ai":null}""",
+                verifiesReplacement = { repository -> assertEquals(null, repository.settingsFlow.value.ai) },
+            ),
+        )
+
+        repairCases.forEachIndexed { index, repair ->
+            val temporaryDirectory = createTempDirectory("api-invalid-http-tool-history-$index").toFile()
+            try {
+                val configFile = temporaryDirectory.resolve("settings.json")
+                val historicalContent =
+                    """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}"""
+                configFile.writeText(historicalContent)
+                val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                val telegramService = mockk<TelegramService>(relaxed = true)
+                val appComponent = mockk<AppComponent>()
+                every { appComponent.settingsRepository } returns repository
+                every { appComponent.telegramService } returns telegramService
+
+                testApplication {
+                    application { configureTestApi(appComponent) }
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody("""{"chatId":"unrelated-change"}""")
+                    }.apply {
+                        val errorBody = bodyAsText()
+                        assertEquals(HttpStatusCode.Conflict, status)
+                        assertSafeErrorBody(errorBody)
+                        assertFalse(errorBody.contains("localhost"))
+                    }
+                    assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+                    assertEquals(historicalContent, configFile.readText())
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody("""{"ai":{"agentEnabled":true}}""")
+                    }.apply {
+                        assertEquals(HttpStatusCode.Conflict, status)
+                    }
+                    assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+                    assertEquals(historicalContent, configFile.readText())
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody("""{"ai":true}""")
+                    }.apply {
+                        assertEquals(HttpStatusCode.BadRequest, status)
+                    }
+                    assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody(
+                            """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"still-unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET","allowedCidrs":[]}]}}}""",
+                        )
+                    }.apply {
+                        assertEquals(HttpStatusCode.BadRequest, status)
+                    }
+                    assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
+                    assertEquals(historicalContent, configFile.readText())
+
+                    client.patch("/api/settings") {
+                        header(HttpHeaders.IfMatch, currentSettingsETag())
+                        contentType(ContentType.Application.Json)
+                        setBody(repair.patch)
+                    }.apply {
+                        assertEquals(HttpStatusCode.OK, status)
+                    }
+                }
+
+                assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
+                repair.verifiesReplacement(repository)
+                assertFalse(configFile.readText() == historicalContent)
+            } finally {
+                temporaryDirectory.deleteRecursively()
+            }
+        }
+    }
+
+    /** 验证 PUT 与兼容 POST 完整替换都会授权修复历史非法 HTTP 工具配置。 */
+    @Test
+    fun `full settings PUT and POST replace historical invalid HTTP tool configuration`() {
+        listOf("put", "post").forEachIndexed { index, method ->
+            val temporaryDirectory = createTempDirectory("api-invalid-http-tool-full-replacement-$method").toFile()
+            try {
+                val configFile = temporaryDirectory.resolve("settings.json")
+                configFile.writeText(
+                    """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
+                )
+                val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                val expected = repository.settingsFlow.value.copy(chatId = "$method-replacement-$index")
+                val telegramService = mockk<TelegramService>(relaxed = true)
+                val appComponent = mockk<AppComponent>()
+                every { appComponent.settingsRepository } returns repository
+                every { appComponent.telegramService } returns telegramService
+
+                testApplication {
+                    application { configureTestApi(appComponent) }
+
+                    val response = when (method) {
+                        "put" -> client.put("/api/settings") {
+                            header(HttpHeaders.IfMatch, currentSettingsETag())
+                            contentType(ContentType.Application.Json)
+                            setBody(completeSettingsJson.encodeToString(expected))
+                        }
+
+                        else -> client.post("/api/settings") {
+                            header(HttpHeaders.IfMatch, currentSettingsETag())
+                            contentType(ContentType.Application.Json)
+                            setBody(completeSettingsJson.encodeToString(expected))
+                        }
+                    }
+                    assertEquals(HttpStatusCode.OK, response.status)
+                }
+
+                assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
+                assertEquals(expected, repository.settingsFlow.value)
+            } finally {
+                temporaryDirectory.deleteRecursively()
+            }
+        }
+    }
+
+    /**
      * 验证完整写入拒绝顶层和嵌套未知字段、缺失嵌套字段及宽松 JSON，且错误不回显敏感请求内容。
      */
     @Test

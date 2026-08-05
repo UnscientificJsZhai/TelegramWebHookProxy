@@ -77,7 +77,7 @@ class SettingsRepositoryConcurrencyTest {
             val generationAfterCommit = barrier.latestPendingGeneration()
 
             assertFailsWith<SettingsRevisionMismatchException> {
-                repository.updateSettings(staleRevision) { it.copy(telegramToken = "should-not-save") }
+                repository.updateSettings(expectedRevision = staleRevision) { it.copy(telegramToken = "should-not-save") }
             }
             assertFailsWith<SettingsGenerationMismatchException> {
                 repository.updateSettings(expectedGeneration = staleSnapshot.generation) {

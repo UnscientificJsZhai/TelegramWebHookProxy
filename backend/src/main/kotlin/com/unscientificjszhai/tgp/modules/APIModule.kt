@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.modules
 import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.repository.HistoricalInvalidHttpToolConfigurationException
 import com.unscientificjszhai.tgp.repository.HistoricalInvalidMcpConfigurationException
 import com.unscientificjszhai.tgp.repository.HistoricalInvalidOpenAiBaseUrlConfigurationException
 import com.unscientificjszhai.tgp.repository.SettingsRevisionMismatchException
@@ -76,10 +77,11 @@ fun Application.apiModule(appComponent: AppComponent) {
                         return@patch
                     }
                     val update = call.commitSettingsUpdate(
-                        settingsRepository,
-                        expectedRevision,
-                        patch.explicitlyReplacesHistoricalMcpServers(),
-                        patch.explicitlyReplacesHistoricalOpenAiBaseUrl(),
+                        settingsRepository = settingsRepository,
+                        expectedRevision = expectedRevision,
+                        replacesHistoricalInvalidMcpServers = patch.explicitlyReplacesHistoricalMcpServers(),
+                        replacesHistoricalInvalidOpenAiBaseUrl = patch.explicitlyReplacesHistoricalOpenAiBaseUrl(),
+                        replacesHistoricalInvalidHttpToolSettings = patch.explicitlyReplacesHistoricalHttpToolSettings(),
                     ) { current ->
                         current.mergeSettingsPatch(patch)
                     } ?: return@patch
@@ -389,10 +391,11 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
         return
     }
     val update = commitSettingsUpdate(
-        settingsRepository,
-        expectedRevision,
+        settingsRepository = settingsRepository,
+        expectedRevision = expectedRevision,
         replacesHistoricalInvalidMcpServers = true,
         replacesHistoricalInvalidOpenAiBaseUrl = true,
+        replacesHistoricalInvalidHttpToolSettings = true,
     ) { settings } ?: return
     respondSettingsUpdate(update)
 }
@@ -405,6 +408,7 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
     expectedRevision: String,
     replacesHistoricalInvalidMcpServers: Boolean = false,
     replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
+    replacesHistoricalInvalidHttpToolSettings: Boolean = false,
     transform: (AppSettings) -> AppSettings,
 ): SettingsUpdateResult? {
     val update = try {
@@ -412,6 +416,7 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
             expectedRevision = expectedRevision,
             replacesHistoricalInvalidMcpServers = replacesHistoricalInvalidMcpServers,
             replacesHistoricalInvalidOpenAiBaseUrl = replacesHistoricalInvalidOpenAiBaseUrl,
+            replacesHistoricalInvalidHttpToolSettings = replacesHistoricalInvalidHttpToolSettings,
         ) { current ->
             transform(current).clearSelectedModelWhenProviderOrApiKeyChanges(current)
         }
@@ -423,6 +428,9 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
         return null
     } catch (_: HistoricalInvalidOpenAiBaseUrlConfigurationException) {
         respondSettingsError(HttpStatusCode.Conflict, "历史 OpenAI 基础地址需要在本次请求中显式替换。")
+        return null
+    } catch (_: HistoricalInvalidHttpToolConfigurationException) {
+        respondSettingsError(HttpStatusCode.Conflict, "历史 HTTP 工具配置需要在本次请求中显式替换。")
         return null
     } catch (_: IllegalArgumentException) {
         respondSettingsError(HttpStatusCode.BadRequest, "设置内容不合法。")
@@ -617,5 +625,12 @@ private fun JsonObject.explicitlyReplacesHistoricalOpenAiBaseUrl(): Boolean =
     when (val ai = this["ai"]) {
         is JsonNull -> true
         is JsonObject -> ai.containsKey("openAiBaseUrl")
+        else -> false
+    }
+
+private fun JsonObject.explicitlyReplacesHistoricalHttpToolSettings(): Boolean =
+    when (val ai = this["ai"]) {
+        is JsonNull -> true
+        is JsonObject -> ai.containsKey("httpToolSettings")
         else -> false
     }
