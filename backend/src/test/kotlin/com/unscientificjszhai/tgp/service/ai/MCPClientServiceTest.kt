@@ -459,17 +459,18 @@ class MCPClientServiceTest {
     }
 
     /**
-     * 验证候选批次超时不会在连接锁中等待挂起的旧客户端关闭。
+     * 验证候选批次超时不会在连接锁中等待挂起的客户端关闭，但终态关闭会严格等待这些已登记清理结束。
      *
-     * 旧连接和超时候选的 `close` 都不返回时，调用方仍必须在批次时限后取得连接锁；可见快照保持为空，
-     * 因而超时候选绝不能在稍后重新发布工具。
+     * 可见快照保持为空，后续连接仍能取得连接锁；而不合作客户端未离开 `close` 前，终态任务不得虚称完成。
      */
     @Test
-    fun `batch timeout releases connection lock despite hanging client cleanup`() = runBlocking {
+    fun `batch timeout releases connection lock while terminal close waits for deferred cleanup`() = runBlocking {
         val oldClient = mockk<Client>()
         val stalledCandidate = mockk<Client>()
         val clients = ArrayDeque(listOf(oldClient, stalledCandidate))
         val oldCloseStarted = CompletableDeferred<Unit>()
+        val candidateCloseStarted = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
         val candidateStarted = CompletableDeferred<Unit>()
         val service = MCPClientService(
             CoroutineScope(EmptyCoroutineContext),
@@ -486,13 +487,16 @@ class MCPClientServiceTest {
         coEvery { oldClient.listTools() } returns ListToolsResult(listOf(Tool("old_tool", ToolSchema())))
         coEvery { oldClient.close() } coAnswers {
             oldCloseStarted.complete(Unit)
-            awaitCancellation()
+            releaseCleanup.await()
         }
         coEvery { stalledCandidate.connect(any()) } coAnswers {
             candidateStarted.complete(Unit)
             awaitCancellation()
         }
-        coEvery { stalledCandidate.close() } coAnswers { awaitCancellation() }
+        coEvery { stalledCandidate.close() } coAnswers {
+            candidateCloseStarted.complete(Unit)
+            releaseCleanup.await()
+        }
 
         service.connect(listOf(oldConfig))
         service.connect(listOf(newConfig))
@@ -500,6 +504,7 @@ class MCPClientServiceTest {
         withTimeout(1.seconds) { oldCloseStarted.await() }
         withTimeout(1.seconds) { candidateStarted.await() }
         withTimeout(1.seconds) { service.connect(emptyList()) }
+        withTimeout(1.seconds) { candidateCloseStarted.await() }
 
         assertEquals(emptyList(), service.getAllTools())
         assertFailsWith<IllegalStateException> {
@@ -507,7 +512,10 @@ class MCPClientServiceTest {
         }
         coVerify(exactly = 0) { stalledCandidate.listTools() }
 
-        withTimeout(1.seconds) { service.close().join() }
+        val terminalClose = service.close()
+        assertFalse(terminalClose.isCompleted, "terminal close must wait for both deferred client closes")
+        releaseCleanup.complete(Unit)
+        withTimeout(1.seconds) { terminalClose.join() }
     }
 
     /**

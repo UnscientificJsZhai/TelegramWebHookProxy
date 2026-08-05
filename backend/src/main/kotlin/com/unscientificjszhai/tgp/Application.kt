@@ -8,7 +8,9 @@ import com.unscientificjszhai.tgp.modules.installApiErrorPages
 import com.unscientificjszhai.tgp.modules.messagePollerModule
 import com.unscientificjszhai.tgp.modules.skillAPIModule
 import com.unscientificjszhai.tgp.modules.taskSchedulerModule
+import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -23,6 +25,10 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import io.ktor.util.AttributeKey
+import java.util.concurrent.atomic.AtomicBoolean
+
+private val applicationStopOrchestratorKey = AttributeKey<AtomicBoolean>("application-stop-orchestrator")
 
 /**
  * 启动监听 `0.0.0.0:10178` 的仅 HTTP/1 Netty 服务器。
@@ -51,18 +57,20 @@ fun main() {
 /**
  * 配置应用的序列化、依赖注入、业务路由和静态资源路由。
  *
- * 此方法会注册一次 `ApplicationStopped` 监听器，以关闭
- * `TelegramService` 和当前 AI 代理；代理关闭会等待其
- * 异步资源清理完成。应由应用生命周期只调用一次。
+ * 此方法会从同一 [AppComponent] 取得轮询器、调度器、Telegram 与 AI 代理，并注册唯一的
+ * [ApplicationStopPreparing] 停止编排器。停止时先关闭两个 worker 的准入并等待其所有子协程结束，随后才
+ * 关闭 Telegram 和等待 AI 代理终态，因而关闭顺序不依赖模块监听器的订阅顺序。
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
  */
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
+    val messagePoller = appComponent.messagePoller
+    val taskSchedulerService = appComponent.taskSchedulerService
     val telegramService = appComponent.telegramService
     val agentService = appComponent.agentService
 
-    registerApplicationStopCleanup(telegramService, agentService)
+    registerApplicationStopCleanup(messagePoller, taskSchedulerService, telegramService, agentService)
 
     install(ContentNegotiation) {
         json(
@@ -101,23 +109,44 @@ fun Application.module() {
 }
 
 /**
- * 注册应用停止时的 Telegram 与 AI 代理资源清理。
+ * 注册应用停止时唯一的资源关闭编排器。
  *
- * 代理服务的异步关闭任务会在停止事件返回前完成，避免 Agent 组件持有的 MCP 连接在应用停止后继续运行。
+ * [ApplicationStopPreparing] 到达时，编排器先同步调用 [MessagePoller.requestStop] 和
+ * [TaskSchedulerService.requestStop]，再通过 `runBlocking` 与 [NonCancellable] 等待两个 worker 拥有的全部
+ * 协程终态；仅在这之后关闭 [TelegramService] 并等待 [AgentService.close] 返回的任务。重复停止事件和重复
+ * 注册均只执行一次，且不会依赖模块订阅顺序。
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
+ * @param messagePoller 应先关闭准入并等待停止的 Telegram 轮询器。
+ * @param taskSchedulerService 应先关闭准入并等待停止的定时任务调度器。
  * @param telegramService 应用停止时应关闭的 Telegram 服务。
  * @param agentService 应用停止时应关闭并等待清理完成的 AI 代理服务。
  */
 internal fun Application.registerApplicationStopCleanup(
+    messagePoller: MessagePoller,
+    taskSchedulerService: TaskSchedulerService,
     telegramService: TelegramService,
     agentService: AgentService,
 ) {
-    monitor.subscribe(ApplicationStopped) {
-        telegramService.close()
-        runBlocking {
-            withContext(NonCancellable) {
-                agentService.close()?.join()
+    synchronized(this) {
+        if (attributes.getOrNull(applicationStopOrchestratorKey) != null) {
+            return
+        }
+        val stopping = AtomicBoolean(false)
+        attributes.put(applicationStopOrchestratorKey, stopping)
+        monitor.subscribe(ApplicationStopPreparing) {
+            if (!stopping.compareAndSet(false, true)) {
+                return@subscribe
+            }
+            messagePoller.requestStop()
+            taskSchedulerService.requestStop()
+            runBlocking {
+                withContext(NonCancellable) {
+                    messagePoller.awaitStopped()
+                    taskSchedulerService.awaitStopped()
+                    telegramService.close()
+                    agentService.close()?.join()
+                }
             }
         }
     }

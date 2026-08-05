@@ -51,6 +51,8 @@ private const val AGENT_TURN_FAILURE_REPLY = "抱歉，该消息未能处理。"
  * 每个有效 token 生命周期拥有唯一的轮询会话。会话捕获 token、bot 标识、token 代次、队列、
  * 子作用域和上下文清理计时；token 更换、清空或代次变化时会先取消旧会话的在途及排队任务，
  * 再创建新会话。旧会话永远不会确认排队完成或推进偏移量。
+ * 应用在 `ApplicationStopPreparing` 中先调用 [requestStop] 关闭启动、会话安装和队列准入，再等待
+ * [awaitStopped]；[close] 仅保留为不等待的 [AutoCloseable] 兼容入口。
  *
  * @constructor 创建消息轮询服务。
  * @param parentScope 持有轮询服务的父协程作用域；取消该作用域会停止内部轮询任务。
@@ -98,7 +100,10 @@ class MessagePoller @Inject constructor(
     )
 
     private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
-    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
+
+    /** 服务拥有的根任务；其完成覆盖所有轮询会话及其不可取消收尾。 */
+    private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
+    private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + scopeJob)
     private val lifecycleLock = Any()
     private val sessionLock = ReentrantLock()
     private val agentTurnOwners = mutableMapOf<AgentTurnKey, CompletableDeferred<Unit>>()
@@ -2763,18 +2768,21 @@ class MessagePoller @Inject constructor(
             tokenUpdate.token == token && tokenUpdate.generation == generation
         }
 
-    private fun cancelCurrentSession() {
+    private fun detachAndCancelCurrentSession() {
         val session = sessionLock.withLock { currentSession.also { currentSession = null } } ?: return
         session.updateChannel.close()
-        session.scope.cancel()
+        session.consumerResume.close()
+        session.outboxSignal.close()
+        session.scope.cancel(CancellationException("Message poller stopped."))
     }
 
     /**
-     * 停止设置监听及当前轮询会话。
+     * 请求停止设置监听及当前轮询会话。
      *
-     * 关闭会取消当前会话的在途和排队任务，但不会完成旧队列的确认信号或写入其偏移量。
+     * 此方法是无等待、可重复的停止准入：返回后不会再安装 token 会话或接纳新队列项，已运行协程会被取消。
+     * 调用 [awaitStopped] 或 [closeAndJoin] 才会等待本服务根任务及其所有子协程（包括不可取消收尾）完成。
      */
-    override fun close() {
+    internal fun requestStop() {
         val jobToCancel = synchronized(lifecycleLock) {
             if (closed) {
                 return
@@ -2789,10 +2797,34 @@ class MessagePoller @Inject constructor(
         pendingReset?.initialResetCompletion?.complete(false)
         pendingReset?.retryCompletion?.complete(false)
         pendingReset?.let { modelSwitchBarrier.complete(it.barrierGeneration) }
-        cancelCurrentSession()
-        scope.cancel()
+        detachAndCancelCurrentSession()
+        scopeJob.cancel(CancellationException("Message poller stopped."))
         logger.info("Agent poller stopped.")
     }
+
+    /**
+     * 等待此前停止请求完全结束。
+     *
+     * 等待范围是本服务拥有的根任务及所有子协程；调用方应先调用 [requestStop] 或 [close]，否则活跃轮询会
+     * 继续运行，等待不会自行触发停止。重复等待安全，且不会在生命周期或会话锁内执行。
+     */
+    internal suspend fun awaitStopped() {
+        scopeJob.join()
+    }
+
+    /** 请求停止并等待本服务拥有的全部协程结束。 */
+    internal suspend fun closeAndJoin() {
+        requestStop()
+        awaitStopped()
+    }
+
+    /**
+     * 请求停止设置监听及当前轮询会话。
+     *
+     * 这是 [AutoCloseable] 兼容入口，只负责同步关闭准入和取消，不会等待在途或不可取消工作结束；需要等待时
+     * 使用内部的 [closeAndJoin]。
+     */
+    override fun close() = requestStop()
 }
 
 private fun Update.chatInfo(): ChatInfo? {

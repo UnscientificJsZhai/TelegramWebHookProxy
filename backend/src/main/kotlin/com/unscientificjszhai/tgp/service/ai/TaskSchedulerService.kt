@@ -23,6 +23,7 @@ import com.unscientificjszhai.tgp.utils.TelegramTextChunks
 import com.unscientificjszhai.tgp.utils.requireDurable
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,7 +32,6 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.plus
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -60,8 +60,9 @@ import kotlin.time.Duration.Companion.minutes
  * 持久化并按时执行面向 AI 代理的定时任务。
  *
  * 服务在创建时从 `config/schedule.json` 恢复任务并启动后台扫描；任务执行结果会发送到
- * 对应的 Telegram 会话。调用 [close] 会停止后续扫描；[start] 与 [close] 应在同一生命周期
- * 控制路径中调用。恢复时按 [ScheduledTask] schema 将损坏的可选字段回退为默认值；必填字段或 JSON 结构
+ * 对应的 Telegram 会话。应用在 `ApplicationStopPreparing` 中调用 [requestStop] 后，服务不再允许 [start]、
+ * [createTask] 或扫描准入；[close] 保留为不等待的兼容入口，调用 [awaitStopped] 或 [closeAndJoin] 才会等待
+ * 服务根任务及所有子协程终态。恢复时按 [ScheduledTask] schema 将损坏的可选字段回退为默认值；必填字段或 JSON 结构
  * 严重损坏会中断创建并保留现场。每次执行会先在状态锁内重新确认任务内容仍等于扫描快照且仍到期，
  * 随后原子持久化删除单次任务或推进循环任务，只有文件替换与目录项同步都确认耐久后才调用代理和
  * Telegram。
@@ -177,11 +178,17 @@ class TaskSchedulerService private constructor(
     )
 
     private val logger = LoggerFactory.getLogger(TaskSchedulerService::class.java)
-    private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job.Key])
+
+    /** 服务拥有的根任务；其完成覆盖扫描及已准入任务的不可取消收尾。 */
+    private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job.Key])
+    private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + scopeJob)
     private val stateLock = ReentrantLock()
     private val tasks = mutableListOf<ScheduledTask>()
     private val executingTaskIds = mutableSetOf<String>()
     private var job: Job? = null
+
+    /** 状态锁内的终态准入门；关闭后服务不可重启、建任务或扫描准入。 */
+    private var closed = false
 
     init {
         loadTasks()
@@ -225,24 +232,27 @@ class TaskSchedulerService private constructor(
     /**
      * 启动每分钟一次的后台任务扫描。
      *
-     * 已启动扫描任务时此方法不执行额外操作；扫描任务会持续到 [close] 被调用或其协程
-     * 作用域被取消。
+     * 已启动扫描任务时此方法不执行额外操作；[requestStop] 或 [close] 已关闭准入后本方法不再重启扫描。
      */
-    @Synchronized
     fun start() {
-        if (job != null) return
-        job = scope.launch {
-            while (isActive) {
-                try {
-                    scanAndExecute()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.error("Task scan failed; category={}", SafeLogging.failureCategory(e).wireName)
-                }
-                delay(1.minutes)
+        val jobToStart = stateLock.withLock {
+            if (closed || job != null) {
+                return
             }
+            scope.launch(start = CoroutineStart.LAZY) {
+                while (isActive) {
+                    try {
+                        scanAndExecute()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error("Task scan failed; category={}", SafeLogging.failureCategory(e).wireName)
+                    }
+                    delay(1.minutes)
+                }
+            }.also { job = it }
         }
+        jobToStart.start()
         logger.info("Task scheduler started.")
     }
 
@@ -259,7 +269,7 @@ class TaskSchedulerService private constructor(
      *
      * @throws CancellationException 扫描被取消时原样抛出；若任务已经预提交，取消也不会恢复该次。
      */
-    suspend fun scanAndExecute() {
+    internal suspend fun scanAndExecute() {
         val currentTime = try {
             clock.millis()
         } catch (e: ArithmeticException) {
@@ -270,11 +280,17 @@ class TaskSchedulerService private constructor(
             return
         }
         val tasksToExecute = stateLock.withLock {
+            if (closed) {
+                return
+            }
             tasks.filter { task -> task.executionTime <= currentTime && executingTaskIds.add(task.id) }
         }
 
         try {
             for (task in tasksToExecute) {
+                if (!stateLock.withLock { !closed }) {
+                    return
+                }
                 executeTask(task)
             }
         } finally {
@@ -583,6 +599,7 @@ class TaskSchedulerService private constructor(
             executionTime.calendarAnchorTimeMillisFor(loopMode, zoneId),
         )
         return stateLock.withLock {
+            check(!closed) { "Task scheduler is stopped." }
             val candidate = tasks + newTask
             persistTasks(candidate).requireDurable()
             tasks.add(newTask)
@@ -620,16 +637,47 @@ class TaskSchedulerService private constructor(
     }
 
     /**
-     * 停止后台扫描任务。
+     * 请求停止后台扫描并关闭后续调度准入。
      *
-     * 此方法不会等待已开始的任务执行结束，且可重复调用。
+     * 返回后 [start]、[createTask] 和 [scanAndExecute] 不会再接纳工作；此方法只取消已运行工作，不在状态锁内
+     * 等待它们结束。使用 [awaitStopped] 或 [closeAndJoin] 等待根任务及所有子协程完成。
      */
-    @Synchronized
-    override fun close() {
-        job?.cancel()
-        job = null
+    internal fun requestStop() {
+        val jobToCancel = stateLock.withLock {
+            if (closed) {
+                return
+            }
+            closed = true
+            job.also { job = null }
+        }
+        jobToCancel?.cancel(CancellationException("Task scheduler stopped."))
+        scopeJob.cancel(CancellationException("Task scheduler stopped."))
         logger.info("Task scheduler stopped.")
     }
+
+    /**
+     * 等待此前停止请求完全结束。
+     *
+     * 等待范围是本服务拥有的扫描根任务及全部子协程，包含不可取消收尾；调用方应先 [requestStop] 或 [close]。
+     * 重复等待安全，且不会在状态锁内执行。
+     */
+    internal suspend fun awaitStopped() {
+        scopeJob.join()
+    }
+
+    /** 请求停止并等待调度器拥有的全部协程结束。 */
+    internal suspend fun closeAndJoin() {
+        requestStop()
+        awaitStopped()
+    }
+
+    /**
+     * 请求停止后台扫描。
+     *
+     * 这是 [AutoCloseable] 兼容入口，只关闭准入并取消工作，不会等待已准入或不可取消任务完成；需要等待时使用
+     * 内部的 [closeAndJoin]。
+     */
+    override fun close() = requestStop()
 
     private fun ScheduledTask.requiresCalendarAnchor(): Boolean =
         loopMode == LoopMode.DAILY || loopMode == LoopMode.WEEKLY
