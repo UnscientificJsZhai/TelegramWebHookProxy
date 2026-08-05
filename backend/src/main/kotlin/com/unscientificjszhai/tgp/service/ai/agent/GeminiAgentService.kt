@@ -708,7 +708,8 @@ class GeminiAgentService @Inject internal constructor(
      * @return Gemini 的回复文本；模型未提供文本时返回空字符串。
      * @throws IllegalStateException 当服务已关闭或无法建立 Gemini 会话时抛出。
      * @throws ToolCallLimitExceededException 当连续工具调用达到上限时抛出。
-     * @throws AgentTurnFailedException 当单个回合或本地历史超过资源上限且本轮未提交时抛出。
+     * @throws AgentTurnFailedException 当单个回合或本地历史超过资源上限、Gemini 未以正常 `STOP` 状态完成，
+     * 或本轮未提交时抛出。
      */
     override suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
 
@@ -724,7 +725,8 @@ class GeminiAgentService @Inject internal constructor(
      * @return Gemini 的回复文本；模型未提供文本时返回空字符串。
      * @throws IllegalStateException 当服务已关闭或无法建立 Gemini 会话时抛出。
      * @throws ToolCallLimitExceededException 当连续工具调用达到上限时抛出。
-     * @throws AgentTurnFailedException 当单个回合或本地历史超过资源上限且本轮未提交时抛出。
+     * @throws AgentTurnFailedException 当单个回合或本地历史超过资源上限、Gemini 未以正常 `STOP` 状态完成，
+     * 或本轮未提交时抛出。
      */
     override suspend fun sendMessage(
         text: String?,
@@ -842,11 +844,11 @@ class GeminiAgentService @Inject internal constructor(
                         var reply: String? = null
                         while (reply == null) {
                             val candidate = requestGeminiContent(currentTransport, session, tentativeHistory)
-                            tentativeHistory += candidate
+                            tentativeHistory += candidate.content
                             normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
-                            val functionCalls = geminiFunctionCalls(candidate)
+                            val functionCalls = geminiFunctionCalls(candidate.content)
                             if (functionCalls.isEmpty()) {
-                                val completedReply = candidate["parts"]?.jsonArray
+                                val completedReply = candidate.content["parts"]?.jsonArray
                                     ?.mapNotNull { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull }
                                     ?.joinToString("")
                                     .orEmpty()
@@ -1057,12 +1059,18 @@ class GeminiAgentService @Inject internal constructor(
         JsonSerializable.toJsonString(content).toByteArray(StandardCharsets.UTF_8).size
     }
 
-    /** 发起一次 Gemini `generateContent` 调用并返回首个候选内容。 */
+    /** 已通过候选终态校验的原生 Gemini 首个候选。 */
+    private data class RawGeminiCandidate(
+        val content: JsonObject,
+        val finishReason: String,
+    )
+
+    /** 发起一次 Gemini `generateContent` 调用并返回终态为 `STOP` 的首个候选。 */
     private suspend fun requestGeminiContent(
         transport: CancellableOkHttpTransport,
         session: RawGeminiSession,
         contents: List<JsonObject>,
-    ): JsonObject {
+    ): RawGeminiCandidate {
         val apiKey = rawApiKey ?: throw IllegalStateException("Gemini API key is not initialized.")
         val baseUrl = rawBaseUrl ?: throw IllegalStateException("Gemini base URL is not initialized.")
         val model = session.model.removePrefix("models/")
@@ -1085,12 +1093,25 @@ class GeminiAgentService @Inject internal constructor(
         )
         requireGeminiSuccess(response)
         val root = JsonStructureLimits.parseToJsonElement(wireJson, response.body).jsonObject
-        return root["candidates"]?.jsonArray
-            ?.firstOrNull()
-            ?.jsonObject
-            ?.get("content")
-            ?.jsonObject
-            ?: throw IllegalStateException("Gemini response did not contain a candidate content.")
+        return requireStoppedRawGeminiCandidate(root)
+    }
+
+    /**
+     * 只接受首个候选以字符串 `STOP` 终止的原生 Gemini 响应。
+     *
+     * 该校验在候选内容写入暂存历史、解析函数调用或执行本地工具之前进行；未知、缺失和非字符串终态一律
+     * 视为未完成回合，避免部分内容被误提交。
+     */
+    private fun requireStoppedRawGeminiCandidate(response: JsonObject): RawGeminiCandidate {
+        val candidate = (response["candidates"] as? JsonArray)?.firstOrNull() as? JsonObject
+            ?: throw AgentTurnFailedException("Gemini 响应未包含候选。")
+        val finishReason = candidate["finishReason"] as? JsonPrimitive
+        if (finishReason?.isString != true || finishReason.content != "STOP") {
+            throw AgentTurnFailedException("Gemini 响应未以正常 STOP 状态完成。")
+        }
+        val content = candidate["content"] as? JsonObject
+            ?: throw AgentTurnFailedException("Gemini 响应未包含模型内容。")
+        return RawGeminiCandidate(content = content, finishReason = finishReason.content)
     }
 
     /** 抽取候选中的函数调用，保留服务器返回的调用标识。 */
@@ -1376,6 +1397,12 @@ class GeminiAgentService @Inject internal constructor(
         val history: List<Content>,
     )
 
+    /** 已通过候选终态校验的 SDK 首个候选内容与其原始内容片段。 */
+    private data class StoppedSdkGeminiCandidate(
+        val content: Content,
+        val parts: List<Part>,
+    )
+
     /**
      * 在独立候选 Chat 中完成一个 SDK 回合。
      *
@@ -1405,12 +1432,8 @@ class GeminiAgentService @Inject internal constructor(
             val response = withContext(Dispatchers.IO) {
                 candidateChat.sendMessage(requestHistory)
             }
-            val modelContent = response.candidates().getOrNull()
-                ?.firstOrNull()
-                ?.content()
-                ?.getOrNull()
-                ?: throw AgentTurnFailedException("Gemini 响应未包含模型内容。")
-            currentTurn += modelContent
+            val candidate = requireStoppedSdkGeminiCandidate(response)
+            currentTurn += candidate.content
 
             val completed = (historical + currentTurn).toMutableList()
             normalizeSdkGeminiCandidate(completed, currentSdkGeminiTurnStart(completed))
@@ -1418,9 +1441,10 @@ class GeminiAgentService @Inject internal constructor(
             historical = completed.subList(0, normalizedCurrentTurnStart).toMutableList()
             currentTurn = completed.subList(normalizedCurrentTurnStart, completed.size).toMutableList()
 
-            val functionCalls = response.functionCalls()
-            if (functionCalls.isNullOrEmpty()) {
-                return SdkCandidateTurnResult(response.text() ?: "", candidateChat, completed)
+            val functionCalls = candidate.parts.mapNotNull { part -> part.functionCall().getOrNull() }
+            if (functionCalls.isEmpty()) {
+                val reply = candidate.parts.mapNotNull { part -> part.text().getOrNull() }.joinToString("")
+                return SdkCandidateTurnResult(reply, candidateChat, completed)
             }
 
             ensureToolCallRoundIsAllowed(toolCallRounds++)
@@ -1437,6 +1461,26 @@ class GeminiAgentService @Inject internal constructor(
             historical = afterToolResults.subList(0, afterToolCurrentStart).toMutableList()
             currentTurn = afterToolResults.subList(afterToolCurrentStart, afterToolResults.size).toMutableList()
         }
+    }
+
+    /**
+     * 从 SDK 原始首个候选读取已完成的模型内容。
+     *
+     * `GenerateContentResponse` 的聚合访问器会放宽或转换终态，故此处只读取候选自身的终态、内容和内容
+     * 片段。验证必须发生在修改当前回合、归一化历史和执行任意工具之前。
+     */
+    private fun requireStoppedSdkGeminiCandidate(response: GenerateContentResponse): StoppedSdkGeminiCandidate {
+        val candidate = response.candidates().getOrNull()?.firstOrNull()
+            ?: throw AgentTurnFailedException("Gemini 响应未包含候选。")
+        if (candidate.finishReason().getOrNull()?.knownEnum() != FinishReason.Known.STOP) {
+            throw AgentTurnFailedException("Gemini 响应未以正常 STOP 状态完成。")
+        }
+        val content = candidate.content().getOrNull()
+            ?: throw AgentTurnFailedException("Gemini 响应未包含模型内容。")
+        return StoppedSdkGeminiCandidate(
+            content = content,
+            parts = content.parts().getOrNull().orEmpty(),
+        )
     }
 
     /** 执行一个 SDK 函数调用，并将可恢复错误转换为安全的函数响应。 */

@@ -7,6 +7,7 @@ import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.CancellableOkHttpTransport
+import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.AudioTranscriptionTooLargeException
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
@@ -90,12 +91,12 @@ class RawAgentTransportTest {
         assertNotNull(service.resetSession()).join()
         server.enqueue(
             MockResponse.Builder().body(
-                """{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"read_skill","args":{"id":"missing"}}}]}}]}""",
+                """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"read_skill","args":{"id":"missing"}}}]}}]}""",
             ).build(),
         )
         server.enqueue(
             MockResponse.Builder().body(
-                """{"candidates":[{"content":{"role":"model","parts":[{"text":"Gemini raw reply"}]}}]}""",
+                """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"Gemini raw reply"}]}}]}""",
             ).build(),
         )
 
@@ -115,6 +116,59 @@ class RawAgentTransportTest {
             assertTrue(toolPayload.contains("\"functionResponse\""))
             assertTrue(toolPayload.contains("\"id\":\"call-1\""))
         }
+        service.close().join()
+    }
+
+    /** 验证原生 Gemini 的部分、缺失和未知终态均不会提交候选历史，后续正常终态仍可成功。 */
+    @Test
+    fun `Gemini raw rejects every non STOP terminal state without committing history`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val service =
+            GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+
+        listOf(
+            """{"finishReason":"MAX_TOKENS","content":{"role":"model","parts":[{"text":"partial"}]}}""",
+            """{"finishReason":"SAFETY","content":{"role":"model","parts":[{"text":"partial"}]}}""",
+            """{"content":{"role":"model","parts":[{"text":"missing reason"}]}}""",
+            """{"finishReason":"FUTURE_REASON","content":{"role":"model","parts":[{"text":"unknown reason"}]}}""",
+        ).forEach { candidate ->
+            server.enqueue(MockResponse.Builder().body("""{"candidates":[$candidate]}""").build())
+
+            assertFailsWith<AgentTurnFailedException> { service.sendMessage("must rollback") }
+            assertTrue(rawHistory(service).isEmpty())
+            assertNotNull(server.takeRequest())
+        }
+
+        server.enqueue(MockResponse.Builder().body(geminiTextResponse("normal reply")).build())
+        assertEquals("normal reply", service.sendMessage("normal retry"))
+        assertEquals(2, rawHistory(service).size)
+        service.close().join()
+    }
+
+    /** 验证原生 Gemini 以异常终态返回工具调用时既不执行工具，也不会请求后续工具结果。 */
+    @Test
+    fun `Gemini raw invalid tool terminal state does not follow up`() = runBlocking {
+        settingsRepository.saveSettings(
+            AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "gemini-key")),
+        )
+        val service =
+            GeminiAgentService(scope, settingsRepository, skillRepository, MCPClientService(scope)) { mockk() }
+        installRawGeminiTransport(service)
+        assertNotNull(service.resetSession()).join()
+        server.enqueue(
+            MockResponse.Builder().body(
+                """{"candidates":[{"finishReason":"MAX_TOKENS","content":{"role":"model","parts":[{"functionCall":{"name":"missing","args":{}}}]}}]}""",
+            ).build(),
+        )
+
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("must not execute tool") }
+        assertTrue(rawHistory(service).isEmpty())
+        assertNotNull(server.takeRequest())
+        assertNull(server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS))
         service.close().join()
     }
 
@@ -318,7 +372,7 @@ class RawAgentTransportTest {
         assertNotNull(service.resetSession()).join()
         server.enqueue(
             MockResponse.Builder().body(
-                """{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"old-call","name":"missing","args":{}}}]}}]}""",
+                """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"functionCall":{"id":"old-call","name":"missing","args":{}}}]}}]}""",
             ).build(),
         )
         repeat(32) {
@@ -605,7 +659,7 @@ class RawAgentTransportTest {
         assertNotNull(service.resetSession()).join()
         server.enqueue(
             MockResponse.Builder().body(
-                """{"candidates":[{"content":{"role":"model","parts":[{"text":"schema preserved"}]}}]}""",
+                """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"schema preserved"}]}}]}""",
             ).build(),
         )
 
@@ -634,10 +688,10 @@ class RawAgentTransportTest {
     }
 
     private fun geminiTextResponse(text: String): String =
-        """{"candidates":[{"content":{"role":"model","parts":[{"text":"$text"}]}}]}"""
+        """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"$text"}]}}]}"""
 
     private fun geminiFunctionCallResponse(): String =
-        """{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"missing","args":{}}}]}}]}"""
+        """{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"functionCall":{"name":"missing","args":{}}}]}}]}"""
 
     private fun geminiContents(payload: String) = Json.parseToJsonElement(payload)
         .jsonObject["contents"]
@@ -660,6 +714,10 @@ class RawAgentTransportTest {
 
     private fun privateField(target: Any, fieldName: String): Any? =
         target.javaClass.getDeclaredField(fieldName).apply { isAccessible = true }.get(target)
+
+    @Suppress("UNCHECKED_CAST")
+    private fun rawHistory(service: GeminiAgentService): List<Any> =
+        privateField(assertNotNull(privateField(service, "rawSession")), "history") as List<Any>
 
     private fun constrainedMcpTool(): Tool = Tool(
         name = "constrained",

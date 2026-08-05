@@ -931,6 +931,87 @@ class GeminiAgentServiceTest {
         assertEquals("Function missing_two not found", functionResponses[1].response().get()["error"])
     }
 
+    /** 验证 SDK Gemini 的部分、缺失和未知终态均不会提交历史，后续 `STOP` 回合仍能正常提交。 */
+    @Test
+    fun `SDK Gemini rejects every non STOP terminal state without committing history`() = runTest {
+        val activeChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val incompleteCandidates = List(4) { mockk<Chat>() }
+        val succeedingCandidate = mockk<Chat>()
+        val incompleteReasons = listOf(
+            FinishReason(FinishReason.Known.MAX_TOKENS),
+            FinishReason(FinishReason.Known.SAFETY),
+            null,
+            FinishReason("FUTURE_REASON"),
+        )
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returnsMany
+                (incompleteCandidates + succeedingCandidate)
+        incompleteCandidates.zip(incompleteReasons).forEach { (candidateChat, finishReason) ->
+            every { candidateChat.sendMessage(any<List<Content>>()) } returns responseWithParts(
+                Part.fromText("partial reply"),
+                finishReason = finishReason,
+            )
+        }
+        every { succeedingCandidate.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.fromText("normal reply"),
+        )
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
+
+        repeat(incompleteCandidates.size) {
+            assertFailsWith<AgentTurnFailedException> { service.sendMessage("must rollback") }
+            assertSame(activeChat, privateField("chat"))
+            assertEquals(emptyList<Content>(), privateField("savedHistory"))
+        }
+
+        assertEquals("normal reply", service.sendMessage("normal retry"))
+        @Suppress("UNCHECKED_CAST")
+        assertEquals(2, (privateField("savedHistory") as List<Content>).size)
+    }
+
+    /** 验证 SDK Gemini 以异常终态返回的工具调用既不执行本地函数，也不会发起后续回合。 */
+    @Test
+    fun `SDK Gemini invalid tool terminal state does not execute or follow up`() = runTest {
+        val activeChat = mockk<Chat>()
+        val candidateChat = mockk<Chat>()
+        val chats = mockk<Chats>()
+        val executedFunctions = mutableListOf<String>()
+        val provider = object : LocalFunctionProvider() {
+            override val providedFunctions: List<FunctionDeclaration> = listOf(
+                FunctionDeclaration.builder()
+                    .name("must_not_execute")
+                    .parameters(Schema.fromJson("""{"type":"OBJECT"}"""))
+                    .build(),
+            )
+
+            override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
+                executedFunctions += functionName
+                return buildJsonObject { put("status", "executed") }
+            }
+        }
+        val functionCall = FunctionCall.builder().name("must_not_execute").args(emptyMap()).build()
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns candidateChat
+        every { candidateChat.sendMessage(any<List<Content>>()) } returns responseWithParts(
+            Part.builder().functionCall(functionCall).build(),
+            finishReason = FinishReason(FinishReason.Known.MAX_TOKENS),
+        )
+        injectClient(chats)
+        injectChat(activeChat)
+        setPrivateField("chatFunctionRouteSnapshot", LocalFunctionRouter(listOf(provider)).refresh())
+        setPrivateField("sdkSessionConfig", GenerateContentConfig.builder().build())
+        setPrivateField("savedHistory", emptyList<Content>())
+
+        assertFailsWith<AgentTurnFailedException> { service.sendMessage("must not execute tool") }
+
+        assertEquals(emptyList<String>(), executedFunctions)
+        assertSame(activeChat, privateField("chat"))
+        assertEquals(emptyList<Content>(), privateField("savedHistory"))
+        verify(exactly = 1) { chats.create(any<String>(), any<GenerateContentConfig>()) }
+        verify(exactly = 1) { candidateChat.sendMessage(any<List<Content>>()) }
+    }
+
     /** 验证工具成功但后续 Gemini 模型请求失败时，外部副作用已发生而会话历史不会提交。 */
     @Test
     fun `Gemini model failure after successful tool keeps side effect and prior history`() = runTest {
@@ -1374,12 +1455,16 @@ class GeminiAgentServiceTest {
         verify(exactly = 1) { mcpClientService.close() }
     }
 
-    private fun responseWithParts(vararg parts: Part): GenerateContentResponse =
-        GenerateContentResponse.builder().candidates(
-            Candidate.builder().content(
-                Content.builder().role("model").parts(parts.toList()).build(),
-            ).build(),
-        ).build()
+    private fun responseWithParts(
+        vararg parts: Part,
+        finishReason: FinishReason? = FinishReason(FinishReason.Known.STOP),
+    ): GenerateContentResponse {
+        val candidate = Candidate.builder().content(
+            Content.builder().role("model").parts(parts.toList()).build(),
+        )
+        finishReason?.let(candidate::finishReason)
+        return GenerateContentResponse.builder().candidates(candidate.build()).build()
+    }
 
     private fun prepareSuccessfulSwitch() {
         val chats = mockk<Chats>()
