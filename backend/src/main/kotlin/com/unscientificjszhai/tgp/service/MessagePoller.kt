@@ -1912,9 +1912,8 @@ class MessagePoller @Inject constructor(
                         chatId = authorization.chatId,
                         replyParameters = ReplyParameters(messageId = message.messageId),
                         expectedRetryCheckpointTarget = expectedRetryCheckpointTarget,
-                    ) {
-                        agentService.sendMessage(text)
-                    }
+                        request = DurableAgentRequest.Text(text),
+                    )
                 } finally {
                     typingJob.cancel()
                 }
@@ -1995,12 +1994,11 @@ class MessagePoller @Inject constructor(
                         chatId = authorization.chatId,
                         replyParameters = ReplyParameters(messageId = message.messageId),
                         expectedRetryCheckpointTarget = expectedRetryCheckpointTarget,
-                    ) {
-                        agentService.sendMessage(
+                        request = DurableAgentRequest.Voice(
                             message.caption,
                             listOf(MediaData(audioData, voice.mimeType ?: "audio/ogg")),
-                        )
-                    }
+                        ),
+                    )
                 } finally {
                     typingJob.cancel()
                 }
@@ -2020,9 +2018,12 @@ class MessagePoller @Inject constructor(
     /**
      * 执行生产 Agent 回合的不可重放持久状态机。
      *
-     * [send] 仅在成功落盘的新 IN_PROGRESS claim 后调用一次。本进程 owner 捕获到 Agent 异常时会将其显式
-     * 固化为失败 FINAL；任何没有本地 owner 的进行中记录则会由 durable 回放路径静默确认。因此重启和会话
-     * 轮换不会自动重放模型或工具副作用，同时正常运行中的用户请求仍会获得既有失败反馈。
+     * 本方法在 [AgentService.withReadyService] 的唯一屏障准入中完成授权复核、claim、发送、终态持久化和
+     * offset/outbox 提交。作用域内绝不能再次进入 [runWhenAuthorized]，也不能经由委派 [agentService] 发送，
+     * 否则模型切换若恰在两次准入之间开始会循环等待。新 IN_PROGRESS claim 后只直接调用一次已就绪底层 Agent；
+     * 本进程 owner 捕获到 Agent 异常时会将其显式固化为失败 FINAL；任何没有本地 owner 的进行中记录则会由
+     * durable 回放路径静默确认。因此重启和会话轮换不会自动重放模型或工具副作用，同时正常运行中的用户请求
+     * 仍会获得既有失败反馈。
      */
     private suspend fun runDurableAgentTurn(
         session: PollingSession,
@@ -2032,26 +2033,49 @@ class MessagePoller @Inject constructor(
         chatId: String,
         replyParameters: ReplyParameters,
         expectedRetryCheckpointTarget: Long?,
-        send: suspend () -> String,
+        request: DurableAgentRequest,
+    ): UpdateCompletion = agentService.withReadyService { readyAgent ->
+        runDurableAgentTurnWithReadyService(
+            session = session,
+            ticket = ticket,
+            authorization = authorization,
+            updateId = updateId,
+            chatId = chatId,
+            replyParameters = replyParameters,
+            expectedRetryCheckpointTarget = expectedRetryCheckpointTarget,
+            readyAgent = readyAgent,
+            request = request,
+        )
+    }
+
+    /** 在已准入的底层 Agent 上完成 durable 回合；此处不允许再次进入模型切换屏障。 */
+    private suspend fun runDurableAgentTurnWithReadyService(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        updateId: Long,
+        chatId: String,
+        replyParameters: ReplyParameters,
+        expectedRetryCheckpointTarget: Long?,
+        readyAgent: AgentService,
+        request: DurableAgentRequest,
     ): UpdateCompletion {
         val key = AgentTurnKey(session.botId, updateId)
         val owner = acquireAgentTurnOwner(key) ?: return UpdateCompletion.Retry
         try {
-            val claim = when (val result = runWhenAuthorized(session, ticket, authorization) {
-                withContext(NonCancellable) {
-                    updatesRepository.claimAgentTurn(session.botId, updateId, chatId, replyParameters)
-                }
-            }) {
-                AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
-                is AuthorizedEffect.Executed -> result.value
+            if (!isDurableAgentTurnAuthorized(session, ticket, authorization)) {
+                return UpdateCompletion.Confirmed
+            }
+            val claim = withContext(NonCancellable) {
+                updatesRepository.claimAgentTurn(session.botId, updateId, chatId, replyParameters)
             }
             return when (claim) {
                 AgentTurnClaim.CLAIMED -> {
                     val finalized = try {
-                        val reply = when (val result = runWhenAuthorized(session, ticket, authorization) { send() }) {
-                            AuthorizedEffect.Confirmed -> return UpdateCompletion.Retry
-                            is AuthorizedEffect.Executed -> result.value
-                        }.takeIf { it.isNotBlank() }
+                        // 新设置可在 claim 后持久化，但切换会等待当前 ready-agent 作用域退出。已 claim 的
+                        // 回合不可安全重放，必须继续使用本次准入取得的底层 Agent 完成，而不能再等待屏障或
+                        // 因新代次静默留下 IN_PROGRESS。
+                        val reply = request.sendWith(readyAgent).takeIf { it.isNotBlank() }
                         withContext(NonCancellable) {
                             updatesRepository.finalizeAgentTurn(session.botId, updateId, reply)
                         }
@@ -2091,6 +2115,24 @@ class MessagePoller @Inject constructor(
             return UpdateCompletion.Retry
         } finally {
             releaseAgentTurnOwner(key, owner)
+        }
+    }
+
+    /** 单次 durable Agent 回合可发送的输入；文本和语音均只调用一次已就绪底层 Agent。 */
+    private sealed interface DurableAgentRequest {
+        /** 仅包含文本的 Agent 输入。 */
+        data class Text(val text: String) : DurableAgentRequest
+
+        /** 包含语音媒体及可选配文的 Agent 输入。 */
+        data class Voice(
+            val caption: String?,
+            val mediaData: List<MediaData>,
+        ) : DurableAgentRequest
+
+        /** 直接在当前已就绪的底层服务上发送，不经由委派服务再次进入模型切换屏障。 */
+        suspend fun sendWith(readyAgent: AgentService): String = when (this) {
+            is Text -> readyAgent.sendMessage(text, emptyList())
+            is Voice -> readyAgent.sendMessage(caption, mediaData)
         }
     }
 
@@ -2662,6 +2704,30 @@ class MessagePoller @Inject constructor(
 
         /** 在同一屏障准入内复核通过并已执行 [value] 对应操作。 */
         data class Executed<T>(val value: T) : AuthorizedEffect<T>
+    }
+
+    /**
+     * 在已由 [AgentService.withReadyService] 准入的 durable Agent 回合中复核授权。
+     *
+     * 此方法刻意不进入 [ModelSwitchBarrier]：外层就绪作用域是该回合唯一的屏障准入。设置切换可以在该
+     * 作用域开始后持久化新快照，但必须等待该回合退出；所以只在 durable claim 前以当前快照复核代次、AI
+     * 配置、原消息身份和会话身份。claim 成功后的回合不可安全重放，必须在同一 ready-agent 作用域内完成。
+     * 调用方在 `false` 时不得执行新的 Agent 副作用。
+     */
+    private fun isDurableAgentTurnAuthorized(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+    ): Boolean {
+        val snapshot = settingsRepository.currentSettingsSnapshot()
+        val aiSettings = snapshot.settings.ai
+        return snapshot.generation == ticket.generation &&
+                aiSettings != null &&
+                aiSettings.agentEnabled &&
+                aiSettings.requiredApiKey().isNotBlank() &&
+                aiSettings.agentChatId == ticket.agentChatId &&
+                authorization.matches(aiSettings) &&
+                isCurrent(session)
     }
 
     /**

@@ -11,6 +11,7 @@ import com.unscientificjszhai.tgp.models.ChatInfo
 import com.unscientificjszhai.tgp.models.FileResponse
 import com.unscientificjszhai.tgp.models.GetUpdatesResponse
 import com.unscientificjszhai.tgp.models.Message
+import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.TelegramFile
 import com.unscientificjszhai.tgp.models.TelegramResponseParameters
@@ -51,6 +52,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -857,7 +859,7 @@ class MessagePollerTest {
                 assertEquals(15, fixture.updates.getData("100").lastUpdateId)
                 coVerify(exactly = 1) { fixture.agent.sendMessage("block") }
                 coVerify(exactly = 0) { fixture.agent.sendMessage("stale text") }
-                coVerify(exactly = 0) { fixture.agent.sendMessage(any(), any()) }
+                coVerify(exactly = 1) { fixture.agent.sendMessage("block", emptyList()) }
                 coVerify(exactly = 0) { fixture.telegram.getFileForToken(any(), "stale-voice") }
                 coVerify(exactly = 0) { fixture.telegram.downloadFileForToken(any(), any()) }
                 verify(exactly = 0) { fixture.agent.resetSession() }
@@ -1955,6 +1957,119 @@ class MessagePollerTest {
             delegatingAgent.close().join()
             delegatingScope.cancel()
             delegatingScope.coroutineContext[Job]?.join()
+        }
+    }
+
+    /**
+     * 验证 durable 回合只使用一次 ready-agent 准入，不会在模拟切换开始后再次进入委派屏障。
+     *
+     * 包装器在 [AgentService.withReadyService] 已取得真实委派服务的底层 Agent 后启动外部切换；它在旧的
+     * [AgentService.sendMessage] 路径则先启动同一切换、再委派给真实服务。旧实现会让外层授权屏障等待内层
+     * 委派准入形成循环；当前实现直接发送已取得的底层 Agent，并在切换解除前完成 FINAL、outbox 和 offset。
+     */
+    @Test
+    fun `model switch waits for the admitted durable agent turn to finalize`() = runBlocking {
+        val barrier = ModelSwitchBarrier()
+        val settings =
+            SettingsRepository.forTesting(tempDirectory.resolve("durable-turn-switch-settings.json"), barrier)
+        val skills = SkillRepository.forTesting(tempDirectory.resolve("durable-turn-switch-skills.json"))
+        val finalPersisted = CompletableDeferred<Unit>()
+        val outboxPersisted = CompletableDeferred<Unit>()
+        val updates = UpdatesRepository(tempDirectory.resolve("durable-turn-switch-updates.json")) { state ->
+            val botData = state.bots["100"] ?: return@UpdatesRepository
+            if (botData.agentTurnJournal.any { it.updateId == 11L && it.status.name == "FINAL" }) {
+                finalPersisted.complete(Unit)
+            }
+            if (botData.pendingTelegramReplies.any { it.updateId == 11L && it.text == "old agent reply" }) {
+                outboxPersisted.complete(Unit)
+            }
+        }
+        val telegram = mockk<TelegramService>(relaxed = true)
+        val componentFactory = mockk<AgentComponent.Factory>()
+        val oldComponent = mockk<AgentComponent>()
+        val oldAgent = mockk<OpenAIAgentService>()
+        val oldAgentSendStarted = CompletableDeferred<Unit>()
+        val releaseOldAgentSend = CompletableDeferred<Unit>()
+        val delegatingScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val wrapperScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val oldAi = AISettings(
+            provider = AIProvider.OPENAI,
+            openAiApiKey = "old-key",
+            openAiBaseUrl = "https://old.example/v1",
+            agentEnabled = true,
+            agentChatId = "123",
+        )
+        updates.saveLastUpdateId("100", 10)
+        settings.updateSettings { AppSettings(telegramToken = "100:token", ai = oldAi) }
+        every { componentFactory.create() } returns oldComponent
+        every { oldComponent.openAIAgentService } returns oldAgent
+        every { oldAgent.initializationJob() } returns null
+        every { oldAgent.close() } returns Job().apply { complete() }
+        every { oldAgent.isAiFeatureEnabled(any()) } returns true
+        coEvery { oldAgent.sendMessage("barrier protected", any()) } coAnswers {
+            oldAgentSendStarted.complete(Unit)
+            releaseOldAgentSend.await()
+            "old agent reply"
+        }
+        coEvery { telegram.getUpdatesForToken("100:token", 11, 30) } returns GetUpdatesResponse(
+            ok = true,
+            result = listOf(
+                Update(
+                    11,
+                    message = authorizedMessage(
+                        messageId = 1,
+                        chat = Chat(id = 123L, type = "private", firstName = "Authorized"),
+                        text = "barrier protected",
+                    ),
+                ),
+            ),
+        )
+        coEvery { telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
+        coEvery { telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery {
+            telegram.sendMessageForToken("100:token", "123", "old agent reply", ReplyParameters(1))
+        } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":false}""")
+
+        val delegatingAgent = DelegatingAgentService(componentFactory, settings, skills, barrier, delegatingScope)
+        val agent = SwitchInjectingAgentService(delegatingAgent, barrier, wrapperScope)
+        val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
+        poller.start()
+        try {
+            eventually { assertTrue(delegatingAgent.isAiFeatureEnabled(oldAi)) }
+            withTimeout(2.seconds) { agent.switchStarted.await() }
+            withTimeout(2.seconds) { oldAgentSendStarted.await() }
+            withTimeout(2.seconds) {
+                while (!barrier.isSwitching) {
+                    delay(10.milliseconds)
+                }
+            }
+            delay(100.milliseconds)
+            assertFalse(agent.switchCompleted.isCompleted, "switch must wait for the admitted ready-agent scope")
+            assertFalse(finalPersisted.isCompleted)
+            assertEquals(10, updates.getData("100").lastUpdateId)
+
+            releaseOldAgentSend.complete(Unit)
+            withTimeout(5.seconds) { agent.switchCompleted.await() }
+            withTimeout(5.seconds) { finalPersisted.await() }
+            withTimeout(5.seconds) { outboxPersisted.await() }
+            eventually {
+                assertEquals(11, updates.getData("100").lastUpdateId)
+                assertTrue(
+                    updates.getData("100").pendingTelegramReplies.any {
+                        it.updateId == 11L && it.text == "old agent reply"
+                    },
+                )
+                assertTrue(updates.getData("100").agentTurnJournal.none { it.updateId == 11L })
+                coVerify(exactly = 1) { oldAgent.sendMessage("barrier protected", any()) }
+            }
+        } finally {
+            releaseOldAgentSend.complete(Unit)
+            poller.close()
+            delegatingAgent.close().join()
+            delegatingScope.cancel()
+            delegatingScope.coroutineContext[Job]?.join()
+            wrapperScope.cancel()
+            wrapperScope.coroutineContext[Job]?.join()
         }
     }
 
@@ -4384,6 +4499,13 @@ class MessagePollerTest {
         val agent = mockk<AgentService>(relaxed = true)
         every { agent.isAiFeatureEnabled(any()) } returns true
         every { agent.resetSession() } returns Job().apply { complete() }
+        // 生产路径直接调用媒体重载；既有文本测试仍可只 stub 文本便利重载。
+        coEvery { agent.sendMessage(any(), any()) } coAnswers {
+            firstArg<String?>()?.let { agent.sendMessage(it) } ?: ""
+        }
+        coEvery { agent.withReadyService<Any?>(any()) } coAnswers {
+            firstArg<suspend (AgentService) -> Any?>().invoke(agent)
+        }
         return Fixture(
             barrier = barrier,
             settings = settings,
@@ -4611,4 +4733,57 @@ class MessagePollerTest {
         val agent: AgentService,
         val poller: MessagePoller,
     )
+
+    /** 在真实委派服务的两种调用路径前注入同一外部切换，用于复现嵌套屏障循环。 */
+    private class SwitchInjectingAgentService(
+        private val delegate: AgentService,
+        private val barrier: ModelSwitchBarrier,
+        private val switchScope: CoroutineScope,
+    ) : AgentService() {
+        val switchStarted = CompletableDeferred<Unit>()
+        val switchCompleted = CompletableDeferred<Unit>()
+
+        override val currentModel: String
+            get() = delegate.currentModel
+
+        override val availableModels: List<String>
+            get() = delegate.availableModels
+
+        override fun isAiFeatureEnabled(aiSettings: AISettings): Boolean = delegate.isAiFeatureEnabled(aiSettings)
+
+        override fun switchModel(modelName: String): Job? = delegate.switchModel(modelName)
+
+        override suspend fun updateModel(): ModelSnapshot? = delegate.updateModel()
+
+        override fun resetSession(): Job? = delegate.resetSession()
+
+        override fun initializationJob(): Job? = delegate.initializationJob()
+
+        override suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String {
+            beginInjectedSwitch()
+            return delegate.sendMessage(text, mediaData)
+        }
+
+        override fun close(): Job? = delegate.close()
+
+        override suspend fun <T> withReadyService(block: suspend (AgentService) -> T): T =
+            delegate.withReadyService { readyAgent ->
+                beginInjectedSwitch()
+                block(readyAgent)
+            }
+
+        private fun beginInjectedSwitch() {
+            check(!switchStarted.isCompleted) { "The test wrapper only supports one injected switch." }
+            val generation = barrier.beginExternalSwitch()
+            switchStarted.complete(Unit)
+            switchScope.launch {
+                try {
+                    barrier.awaitInFlightRequests()
+                } finally {
+                    barrier.complete(generation)
+                    switchCompleted.complete(Unit)
+                }
+            }
+        }
+    }
 }
