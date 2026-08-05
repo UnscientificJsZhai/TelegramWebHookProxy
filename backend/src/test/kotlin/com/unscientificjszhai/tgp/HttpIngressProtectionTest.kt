@@ -10,17 +10,29 @@ import io.ktor.server.routing.*
 import io.ktor.http.content.OutgoingContent
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Job
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
+import io.netty.channel.ChannelOutboundHandlerAdapter
+import io.netty.channel.ChannelPromise
 import io.netty.channel.embedded.EmbeddedChannel
+import io.netty.handler.codec.http.DefaultFullHttpRequest
 import io.netty.handler.codec.http.DefaultFullHttpResponse
+import io.netty.handler.codec.http.DefaultHttpContent
+import io.netty.handler.codec.http.DefaultHttpRequest
+import io.netty.handler.codec.http.DefaultHttpResponse
 import io.netty.handler.codec.http.HttpHeaderNames
+import io.netty.handler.codec.http.HttpMethod
+import io.netty.handler.codec.http.HttpRequest
 import io.netty.handler.codec.http.HttpResponseStatus
 import io.netty.handler.codec.http.HttpVersion
+import io.netty.handler.codec.http.LastHttpContent
+import io.netty.handler.timeout.IdleStateEvent
+import io.netty.handler.timeout.IdleStateHandler
 import io.netty.util.ReferenceCountUtil
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
@@ -84,6 +96,24 @@ class HttpIngressProtectionTest {
                 assertTrue(closedWhileWriting || socket.awaitClosed())
             }
             assertTrue(elapsed < 500.milliseconds, "header drip closed after $elapsed instead of its deadline")
+        }
+    }
+
+    /**
+     * 验证请求读取完成后，Ktor 业务处理超过 raw idle 期限仍能写出完整的最终响应。
+     */
+    @Test
+    fun `slow Ktor handler is not closed by raw idle before its response`() = withIngressServer(
+        limits = testLimits(
+            rawReadIdleTimeout = 100.milliseconds,
+            headerTimeout = 1.seconds,
+            bodyTimeout = 1.seconds,
+            requestTotalTimeout = 2.seconds,
+        ),
+    ) { port, _ ->
+        Socket("127.0.0.1", port).use { socket ->
+            socket.outputStream.writeRequest("GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+            assertEquals(HttpStatusCode.OK.value, socket.readHttpResponse().status)
         }
     }
 
@@ -526,6 +556,222 @@ class HttpIngressProtectionTest {
     }
 
     /**
+     * 验证流水线中仍有另一个最终响应未完成时，已完成响应不会使 raw idle 关闭连接。
+     */
+    @Test
+    fun `raw idle waits for every pipelined final response`() {
+        val channel = EmbeddedChannel(HttpRequestDeadlineHandler(testLimits()))
+        try {
+            channel.writeCompletedRequest("/one")
+            channel.writeCompletedRequest("/two")
+
+            assertTrue(channel.writeOutbound(okResponse()))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+
+            channel.pipeline().fireUserEventTriggered(IdleStateEvent.READER_IDLE_STATE_EVENT)
+            assertTrue(channel.isOpen)
+
+            assertTrue(channel.writeOutbound(okResponse()))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            channel.pipeline().fireUserEventTriggered(IdleStateEvent.READER_IDLE_STATE_EVENT)
+            assertFalse(channel.isOpen)
+        } finally {
+            channel.drainInboundMessages()
+            channel.drainOutboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
+    /**
+     * 验证 `100 Continue` 不会完成请求，而 [DefaultFullHttpResponse] 只会完成一次并重置
+     * keep-alive 的 raw idle 计时。
+     */
+    @Test
+    fun `continue then full final response completes once and resets raw idle`() {
+        val rawReadIdle = ResetTrackingIdleStateHandler()
+        val channel = EmbeddedChannel()
+        channel.pipeline().addLast("rawReadIdle", rawReadIdle)
+        channel.pipeline().addLast("requestDeadline", HttpRequestDeadlineHandler(testLimits()))
+        try {
+            channel.writeCompletedRequest()
+
+            assertTrue(
+                channel.writeOutbound(
+                    DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.CONTINUE),
+                ),
+            )
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(0, rawReadIdle.resetCalls)
+
+            assertTrue(channel.writeOutbound(okResponse()))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(1, rawReadIdle.resetCalls)
+        } finally {
+            channel.drainInboundMessages()
+            channel.drainOutboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
+    /**
+     * 验证普通流式最终响应会等待成功写出的终止块；响应头和中间内容都不完成请求。
+     */
+    @Test
+    fun `streaming final response completes after its successful last content`() {
+        val rawReadIdle = ResetTrackingIdleStateHandler()
+        val channel = EmbeddedChannel()
+        channel.pipeline().addLast("rawReadIdle", rawReadIdle)
+        channel.pipeline().addLast("requestDeadline", HttpRequestDeadlineHandler(testLimits()))
+        try {
+            channel.writeCompletedRequest()
+
+            assertTrue(channel.writeOutbound(DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(0, rawReadIdle.resetCalls)
+
+            assertTrue(channel.writeOutbound(DefaultHttpContent(Unpooled.copiedBuffer("part", Charsets.US_ASCII))))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(0, rawReadIdle.resetCalls)
+
+            assertTrue(channel.writeOutbound(LastHttpContent.EMPTY_LAST_CONTENT))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(1, rawReadIdle.resetCalls)
+        } finally {
+            channel.drainInboundMessages()
+            channel.drainOutboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
+    /**
+     * 验证 Netty 的非完整无正文响应仍以空 [LastHttpContent] 结束，且该结束不会遗留响应状态。
+     */
+    @Test
+    fun `no-body final response completes after empty last content`() {
+        val rawReadIdle = ResetTrackingIdleStateHandler()
+        val channel = EmbeddedChannel()
+        channel.pipeline().addLast("rawReadIdle", rawReadIdle)
+        channel.pipeline().addLast("requestDeadline", HttpRequestDeadlineHandler(testLimits()))
+        try {
+            channel.writeCompletedRequest()
+
+            assertTrue(channel.writeOutbound(DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.NO_CONTENT)))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(0, rawReadIdle.resetCalls)
+
+            assertTrue(channel.writeOutbound(LastHttpContent.EMPTY_LAST_CONTENT))
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(1, rawReadIdle.resetCalls)
+
+            channel.pipeline().fireUserEventTriggered(IdleStateEvent.READER_IDLE_STATE_EVENT)
+            assertFalse(channel.isOpen)
+        } finally {
+            channel.drainInboundMessages()
+            channel.drainOutboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
+    /**
+     * 验证 `101 Switching Protocols` 不需要 [LastHttpContent] 也会结束对应请求。
+     */
+    @Test
+    fun `switching protocols response completes without last content`() {
+        val rawReadIdle = ResetTrackingIdleStateHandler()
+        val channel = EmbeddedChannel()
+        channel.pipeline().addLast("rawReadIdle", rawReadIdle)
+        channel.pipeline().addLast("requestDeadline", HttpRequestDeadlineHandler(testLimits()))
+        try {
+            channel.writeCompletedRequest()
+
+            assertTrue(
+                channel.writeOutbound(
+                    DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.SWITCHING_PROTOCOLS),
+                ),
+            )
+            channel.drainOutboundMessages()
+            channel.runPendingTasks()
+            assertEquals(1, rawReadIdle.resetCalls)
+
+            channel.pipeline().fireUserEventTriggered(IdleStateEvent.READER_IDLE_STATE_EVENT)
+            assertFalse(channel.isOpen)
+        } finally {
+            channel.drainInboundMessages()
+            channel.drainOutboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
+    /**
+     * 验证最终响应的响应头或中间内容写入失败都会立即关闭连接，防止遗留未完成的响应计数。
+     */
+    @Test
+    fun `failed final response head or content write closes the channel`() {
+        for ((description, failingWriteNumber) in listOf("head" to 1, "content" to 2)) {
+            val channel = EmbeddedChannel(
+                FailingWriteHandler(failingWriteNumber),
+                HttpRequestDeadlineHandler(testLimits()),
+            )
+            try {
+                channel.writeCompletedRequest()
+
+                if (failingWriteNumber == 2) {
+                    assertTrue(channel.writeOutbound(DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)))
+                    channel.drainOutboundMessages()
+                }
+                assertFailsWith<IllegalStateException>("$description write must fail") {
+                    val message = if (failingWriteNumber == 1) {
+                        DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)
+                    } else {
+                        DefaultHttpContent(Unpooled.copiedBuffer("part", Charsets.US_ASCII))
+                    }
+                    channel.writeOutbound(message)
+                }
+                channel.runPendingTasks()
+                assertFalse(channel.isOpen, "$description write failure must close the channel")
+            } finally {
+                channel.drainInboundMessages()
+                channel.drainOutboundMessages()
+                channel.finishAndReleaseAll()
+            }
+        }
+    }
+
+    /**
+     * 验证前一个请求仍等待业务响应时，第二个正在读取的请求仍受 raw idle 保护。
+     */
+    @Test
+    fun `raw idle still closes a slow second request while prior response is pending`() {
+        val channel = EmbeddedChannel(HttpRequestDeadlineHandler(testLimits()))
+        try {
+            channel.writeCompletedRequest("/first")
+            channel.pipeline().fireUserEventTriggered(RequestStartMarker(System.nanoTime()))
+            assertTrue(
+                channel.writeInbound(
+                    DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/second"),
+                ),
+            )
+            channel.drainInboundMessages()
+
+            channel.pipeline().fireUserEventTriggered(IdleStateEvent.READER_IDLE_STATE_EVENT)
+            assertFalse(channel.isOpen)
+        } finally {
+            channel.drainInboundMessages()
+            channel.drainOutboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
+    /**
      * 验证复制的 server encoder 保留 Netty 对 GET、HEAD 与 CONNECT 的响应语义。
      */
     @Test
@@ -569,6 +815,10 @@ class HttpIngressProtectionTest {
                     routing {
                         get("/ok") {
                             call.respondText("ok")
+                        }
+                        get("/slow") {
+                            delay(250.milliseconds)
+                            call.respondText("slow")
                         }
                         post("/echo") {
                             call.receiveText()
@@ -617,8 +867,8 @@ class HttpIngressProtectionTest {
         override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
             observed += when (msg) {
                 is RequestStartMarker -> "marker"
-                is io.netty.handler.codec.http.HttpRequest -> "request"
-                is io.netty.handler.codec.http.LastHttpContent -> "last"
+                is HttpRequest -> "request"
+                is LastHttpContent -> "last"
                 else -> "other"
             }
             ctx.fireChannelRead(msg)
@@ -682,6 +932,50 @@ class HttpIngressProtectionTest {
         while (true) {
             val message = readInbound<Any>() ?: return
             ReferenceCountUtil.release(message)
+        }
+    }
+
+    private fun EmbeddedChannel.drainOutboundMessages() {
+        while (true) {
+            val message = readOutbound<Any>() ?: return
+            ReferenceCountUtil.release(message)
+        }
+    }
+
+    private fun EmbeddedChannel.writeCompletedRequest(uri: String = "/") {
+        pipeline().fireUserEventTriggered(RequestStartMarker(System.nanoTime()))
+        assertTrue(
+            writeInbound(
+                DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri),
+            ),
+        )
+        drainInboundMessages()
+    }
+
+    private fun okResponse() = DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)
+
+    private class ResetTrackingIdleStateHandler : IdleStateHandler(1, 0, 0) {
+        var resetCalls = 0
+
+        override fun resetReadTimeout() {
+            resetCalls++
+            super.resetReadTimeout()
+        }
+    }
+
+    private class FailingWriteHandler(
+        private val failingWriteNumber: Int = 1,
+    ) : ChannelOutboundHandlerAdapter() {
+        private var writeCount = 0
+
+        override fun write(ctx: ChannelHandlerContext, msg: Any, promise: ChannelPromise) {
+            writeCount++
+            if (writeCount == failingWriteNumber) {
+                ReferenceCountUtil.release(msg)
+                promise.setFailure(IllegalStateException("test final write failure"))
+            } else {
+                ctx.write(msg, promise)
+            }
         }
     }
 

@@ -12,10 +12,12 @@ import io.ktor.server.netty.NettyApplicationEngine
 import io.ktor.server.response.ApplicationSendPipeline
 import io.ktor.util.pipeline.PipelinePhase
 import io.netty.buffer.ByteBuf
+import io.netty.channel.ChannelDuplexHandler
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.ChannelOption
 import io.netty.channel.ChannelPipeline
+import io.netty.channel.ChannelPromise
 import io.netty.channel.CombinedChannelDuplexHandler
 import io.netty.handler.codec.http.HttpDecoderConfig
 import io.netty.handler.codec.http.HttpHeaderNames
@@ -24,6 +26,7 @@ import io.netty.handler.codec.http.HttpRequest
 import io.netty.handler.codec.http.HttpRequestDecoder
 import io.netty.handler.codec.http.HttpResponse
 import io.netty.handler.codec.http.HttpResponseEncoder
+import io.netty.handler.codec.http.HttpResponseStatus
 import io.netty.handler.codec.http.HttpServerUpgradeHandler
 import io.netty.handler.codec.http.HttpStatusClass
 import io.netty.handler.codec.http.LastHttpContent
@@ -355,16 +358,20 @@ internal class HttpConnectionAdmissionHandler(
 /**
  * 按 HTTP/1 请求边界维护绝对读取截止时间。
  *
- * [RequestStartMarker] 会同时启动请求头与请求总时限；收到 [HttpRequest] 后转为等待请求体；
- * 收到 [LastHttpContent] 后取消该请求的截止时间。原始读空闲始终是连接级上限，完整请求后的
- * keep-alive 连接也必须继续发送入站字节。
+ * [RequestStartMarker] 到 [LastHttpContent] 之间处于读取阶段：标记会同时启动请求头与请求总
+ * 时限，收到 [HttpRequest] 后转为等待请求体，收到末尾内容后取消读取截止时间。每个
+ * [HttpRequest] 都会等待一个最终 HTTP 响应；读取完成但业务处理或响应写出尚未完成时，原始读
+ * 空闲不会关闭连接。最终响应范围内的任一写入失败都会关闭连接；最后一个最终响应的终止写成功后，
+ * 原始读空闲重新从该时刻开始计算 keep-alive 等待时间。
  */
 internal class HttpRequestDeadlineHandler(
     private val limits: HttpIngressLimits,
-) : ChannelInboundHandlerAdapter() {
+) : ChannelDuplexHandler() {
     private var deadline: ScheduledFuture<*>? = null
     private var requestStartedAtNanos: Long? = null
     private var awaitingRequestStart = true
+    private var pendingFinalResponses = 0
+    private var finalResponseWriteInProgress = false
     private var generation = 0L
 
     override fun channelActive(ctx: ChannelHandlerContext) {
@@ -379,12 +386,35 @@ internal class HttpRequestDeadlineHandler(
         }
         if (msg is HttpRequest) {
             check(!awaitingRequestStart) { "HTTP request arrived without a request start marker" }
+            pendingFinalResponses++
             startBodyDeadline(ctx)
         }
         if (msg is LastHttpContent) {
             completeRequest()
         }
         ctx.fireChannelRead(msg)
+    }
+
+    override fun write(ctx: ChannelHandlerContext, msg: Any, promise: ChannelPromise) {
+        val finalResponseWrite = observeOutboundMessage(msg)
+        if (finalResponseWrite != null) {
+            promise.addListener { future ->
+                val applyWriteResult = {
+                    if (!future.isSuccess) {
+                        ctx.close()
+                    } else if (finalResponseWrite.completesResponse) {
+                        completeFinalResponse(ctx)
+                    }
+                    Unit
+                }
+                if (ctx.executor().inEventLoop()) {
+                    applyWriteResult()
+                } else {
+                    ctx.executor().execute(applyWriteResult)
+                }
+            }
+        }
+        ctx.write(msg, promise)
     }
 
     override fun channelInactive(ctx: ChannelHandlerContext) {
@@ -403,10 +433,55 @@ internal class HttpRequestDeadlineHandler(
             return
         }
         if (evt is IdleStateEvent && evt.state() == IdleState.READER_IDLE) {
-            ctx.close()
+            if (!awaitingRequestStart || pendingFinalResponses == 0) {
+                ctx.close()
+            }
             return
         }
         ctx.fireUserEventTriggered(evt)
+    }
+
+    /**
+     * 在 codec 编码前辨认最终 HTTP 响应范围内的写入。
+     *
+     * 常规 `1xx` 是临时响应，不影响请求计数；`101 Switching Protocols` 是例外，它会终结对应
+     * HTTP 请求，即使后续不会再写出 [LastHttpContent]。普通流式响应的响应头、内容块和终止块
+     * 都属于同一范围，因此每个写入失败时都必须关闭连接；只有终止块成功才能完成该响应。
+     */
+    private fun observeOutboundMessage(msg: Any): FinalResponseWrite? {
+        if (msg is HttpResponse && isFinalHttpResponse(msg)) {
+            check(!finalResponseWriteInProgress) { "a final HTTP response started before the previous response ended" }
+            val completesResponse = msg is LastHttpContent ||
+                    msg.status().code() == HttpResponseStatus.SWITCHING_PROTOCOLS.code()
+            finalResponseWriteInProgress = !completesResponse
+            return FinalResponseWrite(completesResponse)
+        }
+        if (!finalResponseWriteInProgress) {
+            return null
+        }
+        if (msg is LastHttpContent && msg !is HttpResponse) {
+            finalResponseWriteInProgress = false
+            return FinalResponseWrite(completesResponse = true)
+        }
+        return FinalResponseWrite(completesResponse = false)
+    }
+
+    private data class FinalResponseWrite(val completesResponse: Boolean)
+
+    private fun isFinalHttpResponse(response: HttpResponse): Boolean {
+        return response.status().codeClass() != HttpStatusClass.INFORMATIONAL ||
+                response.status().code() == HttpResponseStatus.SWITCHING_PROTOCOLS.code()
+    }
+
+    private fun completeFinalResponse(ctx: ChannelHandlerContext) {
+        if (pendingFinalResponses == 0) {
+            ctx.close()
+            return
+        }
+        pendingFinalResponses--
+        if (awaitingRequestStart && pendingFinalResponses == 0) {
+            (ctx.pipeline().get("rawReadIdle") as? IdleStateHandler)?.resetReadTimeout()
+        }
     }
 
     private fun startRequestHeaderDeadline(ctx: ChannelHandlerContext, startedAtNanos: Long) {
