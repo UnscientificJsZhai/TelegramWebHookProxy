@@ -23,6 +23,11 @@ import {
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import api from '../api';
+import {
+    isTelegramMessageTextWithinLimit,
+    MAX_TELEGRAM_MESSAGE_TEXT_LENGTH,
+    TELEGRAM_MESSAGE_TEXT_LIMIT_DESCRIPTION,
+} from '../messageText';
 import {fetchVersionedSettings, isSettingsConflict, patchVersionedSettings} from '../settingsClient';
 
 interface ChatInfo {
@@ -165,6 +170,11 @@ const Home: React.FC = () => {
 
         if (!text) return;
 
+        if (!isTelegramMessageTextWithinLimit(text)) {
+            setSnackbar({open: true, message: TELEGRAM_MESSAGE_TEXT_LIMIT_DESCRIPTION, severity: 'warning'});
+            return;
+        }
+
         try {
             await api.post('/send-message', {chatId: selectedChatId, text});
             setSnackbar({open: true, message: '消息发送成功！', severity: 'success'});
@@ -245,8 +255,8 @@ const Home: React.FC = () => {
                         label="消息文本"
                         value={text}
                         onChange={(e) => setText(e.target.value)}
-                        inputProps={{maxLength: 16384}}
-                        helperText="消息最大 64 KiB（按 UTF-8 字节计）"
+                        inputProps={{maxLength: MAX_TELEGRAM_MESSAGE_TEXT_LENGTH}}
+                        helperText={TELEGRAM_MESSAGE_TEXT_LIMIT_DESCRIPTION}
                         variant="outlined"
                         multiline
                         rows={4}
