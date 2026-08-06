@@ -46,6 +46,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.UnknownHostException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -92,6 +93,7 @@ class HttpCallingFunctionProvider private constructor(
     private val settingsRepository: SettingsRepository,
     private val dnsResolver: HttpToolDnsResolver,
     private val connectionObserver: HttpToolConnectionObserver,
+    private val lifecycleObserver: HttpToolLifecycleObserver,
 ) : LocalFunctionProvider(), AutoCloseable {
     /**
      * 创建受限 HTTP 函数提供者。
@@ -102,10 +104,12 @@ class HttpCallingFunctionProvider private constructor(
     constructor(
         settingsRepository: SettingsRepository,
         dnsResolver: HttpToolDnsResolver = SystemHttpToolDnsResolver,
-    ) : this(settingsRepository, dnsResolver, HttpToolConnectionObserver {})
+    ) : this(settingsRepository, dnsResolver, HttpToolConnectionObserver {}, NoOpHttpToolLifecycleObserver)
 
     private val closed = AtomicBoolean(false)
-    private val activeClients = ConcurrentHashMap.newKeySet<HttpClient>()
+    private val lifecycleLock = Any()
+    private val activeClients = mutableSetOf<HttpClient>()
+    private var closeCompletion: CountDownLatch? = null
     private val hardRequestLimit = Semaphore(MAX_HTTP_TOOL_CONCURRENCY)
     private val semaphores = ConcurrentHashMap<Int, Semaphore>()
 
@@ -188,12 +192,22 @@ class HttpCallingFunctionProvider private constructor(
         }
 
         val client = createClient(settings, target)
-        if (closed.get()) {
+        val isRegistered = synchronized(lifecycleLock) {
+            if (closed.get()) {
+                false
+            } else {
+                lifecycleObserver.afterSecondCloseCheckBeforeRegistration()
+                activeClients += client
+                true
+            }
+        }
+        if (!isRegistered) {
             client.close()
             return error(ERROR_DISABLED)
         }
-        activeClients += client
         return try {
+            lifecycleObserver.afterRegistrationBeforeRequest()
+            if (closed.get()) return error(ERROR_REQUEST_FAILED)
             val response = client.request(target.toFixedUrl()) {
                 method = when (target.method) {
                     HttpToolMethod.GET -> HttpMethod.Get
@@ -214,7 +228,9 @@ class HttpCallingFunctionProvider private constructor(
         } catch (_: Exception) {
             error(ERROR_REQUEST_FAILED)
         } finally {
-            activeClients -= client
+            synchronized(lifecycleLock) {
+                activeClients -= client
+            }
             client.close()
         }
     }
@@ -296,14 +312,43 @@ class HttpCallingFunctionProvider private constructor(
     /**
      * 关闭正在使用和后续创建的 HTTP 客户端。
      *
-     * 此方法可重复调用；关闭后不再声明或执行 HTTP 工具，并会中断仍在进行的请求。
+     * 此方法可重复调用；返回时已接受调用的客户端均已关闭。关闭后不再声明或执行 HTTP 工具，
+     * 后续调用不会进入网络请求。
      */
     override fun close() {
-        if (closed.compareAndSet(false, true)) {
-            activeClients.forEach(HttpClient::close)
-            activeClients.clear()
+        lifecycleObserver.onCloseAttempt()
+        val closeWork = synchronized(lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) {
+                ClientCloseWork(emptyList(), requireNotNull(closeCompletion), isInitialClose = false)
+            } else {
+                val completion = CountDownLatch(1)
+                closeCompletion = completion
+                ClientCloseWork(
+                    activeClients.toList().also { activeClients.clear() },
+                    completion,
+                    isInitialClose = true,
+                )
+            }
+        }
+        if (!closeWork.isInitialClose) {
+            lifecycleObserver.afterJoiningInitialCloseBeforeWaiting()
+            closeWork.completion.awaitUninterruptibly()
+            return
+        }
+
+        try {
+            lifecycleObserver.afterCloseSnapshotBeforeClosingClients()
+            closeWork.clients.forEach(HttpClient::close)
+        } finally {
+            closeWork.completion.countDown()
         }
     }
+
+    private data class ClientCloseWork(
+        val clients: List<HttpClient>,
+        val completion: CountDownLatch,
+        val isInitialClose: Boolean,
+    )
 
     private data class CallArguments(
         val targetId: String,
@@ -385,8 +430,9 @@ class HttpCallingFunctionProvider private constructor(
             settingsRepository: SettingsRepository,
             dnsResolver: HttpToolDnsResolver,
             connectionObserver: HttpToolConnectionObserver,
+            lifecycleObserver: HttpToolLifecycleObserver = NoOpHttpToolLifecycleObserver,
         ): HttpCallingFunctionProvider =
-            HttpCallingFunctionProvider(settingsRepository, dnsResolver, connectionObserver)
+            HttpCallingFunctionProvider(settingsRepository, dnsResolver, connectionObserver, lifecycleObserver)
 
         fun error(code: String): JsonObject = buildJsonObject { put("error", code) }
     }
@@ -394,6 +440,43 @@ class HttpCallingFunctionProvider private constructor(
 
 internal fun interface HttpToolConnectionObserver {
     fun onConnectStart()
+}
+
+internal interface HttpToolLifecycleObserver {
+    fun afterSecondCloseCheckBeforeRegistration()
+
+    fun afterRegistrationBeforeRequest()
+
+    fun onCloseAttempt()
+
+    fun afterJoiningInitialCloseBeforeWaiting()
+
+    fun afterCloseSnapshotBeforeClosingClients()
+}
+
+private object NoOpHttpToolLifecycleObserver : HttpToolLifecycleObserver {
+    override fun afterSecondCloseCheckBeforeRegistration() = Unit
+
+    override fun afterRegistrationBeforeRequest() = Unit
+
+    override fun onCloseAttempt() = Unit
+
+    override fun afterJoiningInitialCloseBeforeWaiting() = Unit
+
+    override fun afterCloseSnapshotBeforeClosingClients() = Unit
+}
+
+private fun CountDownLatch.awaitUninterruptibly() {
+    var interrupted = false
+    while (true) {
+        try {
+            await()
+            break
+        } catch (_: InterruptedException) {
+            interrupted = true
+        }
+    }
+    if (interrupted) Thread.currentThread().interrupt()
 }
 
 private fun HttpCallTarget.toFixedUrl(): String {

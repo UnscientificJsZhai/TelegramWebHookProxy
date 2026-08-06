@@ -10,8 +10,12 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import java.io.File
@@ -22,6 +26,7 @@ import java.net.Proxy
 import java.net.ProxySelector
 import java.net.SocketAddress
 import java.net.URI
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
@@ -32,6 +37,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * 模型 HTTP 工具的出站边界测试设计。
@@ -63,6 +69,117 @@ class HttpCallingFunctionProviderTest {
             provider.execute("call_http_api", mapOf("targetId" to "fixed"))["error"]?.toString()?.trim('"')
         )
         provider.close()
+    }
+
+    /**
+     * 验证关闭不会遗漏已通过二次状态检查但尚未登记的客户端，且关闭返回后该调用无法发起连接。
+     */
+    @Test
+    fun `close cannot miss a client paused before registration`() = runBlocking {
+        server.enqueue(response("must-not-be-requested", "text/plain"))
+        val passedSecondCloseCheck = CountDownLatch(1)
+        val releaseRegistration = CountDownLatch(1)
+        val registeredBeforeRequest = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        val firstCloseAttempted = CountDownLatch(1)
+        val secondCloseAttempted = CountDownLatch(1)
+        val secondCloseJoined = CountDownLatch(1)
+        val closeSnapshotTaken = CountDownLatch(1)
+        val releaseClientClose = CountDownLatch(1)
+        val closeAttempts = AtomicInteger()
+        val connectionAttempts = AtomicInteger()
+        val provider = providerWith(
+            enabledSettings(HttpToolMethod.GET),
+            HttpToolDnsResolver { listOf(InetAddress.getByName("127.0.0.1")) },
+            HttpToolConnectionObserver { connectionAttempts.incrementAndGet() },
+            object : HttpToolLifecycleObserver {
+                override fun afterSecondCloseCheckBeforeRegistration() {
+                    passedSecondCloseCheck.countDown()
+                    assertTrue(
+                        releaseRegistration.await(5, TimeUnit.SECONDS),
+                        "request was not released to register its client",
+                    )
+                }
+
+                override fun afterRegistrationBeforeRequest() {
+                    registeredBeforeRequest.countDown()
+                    assertTrue(
+                        releaseRequest.await(5, TimeUnit.SECONDS),
+                        "request was not released after close returned",
+                    )
+                }
+
+                override fun onCloseAttempt() {
+                    when (closeAttempts.incrementAndGet()) {
+                        1 -> firstCloseAttempted.countDown()
+                        2 -> secondCloseAttempted.countDown()
+                    }
+                }
+
+                override fun afterJoiningInitialCloseBeforeWaiting() {
+                    secondCloseJoined.countDown()
+                }
+
+                override fun afterCloseSnapshotBeforeClosingClients() {
+                    closeSnapshotTaken.countDown()
+                    assertTrue(
+                        releaseClientClose.await(5, TimeUnit.SECONDS),
+                        "client close was not released after the concurrent close joined",
+                    )
+                }
+            },
+        )
+
+        try {
+            val request = async(Dispatchers.Default) {
+                provider.execute("call_http_api", mapOf("targetId" to "fixed"))
+            }
+            var firstClosing: Job? = null
+            var secondClosing: Job? = null
+            try {
+                assertTrue(
+                    passedSecondCloseCheck.await(5, TimeUnit.SECONDS),
+                    "request did not reach the registration barrier",
+                )
+                val firstCloseJob = async(Dispatchers.Default) { provider.close() }
+                firstClosing = firstCloseJob
+                assertTrue(firstCloseAttempted.await(5, TimeUnit.SECONDS), "first close did not begin")
+                assertFalse(firstCloseJob.isCompleted, "close returned while registration held the lifecycle lock")
+
+                releaseRegistration.countDown()
+                assertTrue(
+                    registeredBeforeRequest.await(5, TimeUnit.SECONDS),
+                    "request did not stop after registering its client",
+                )
+                assertTrue(closeSnapshotTaken.await(5, TimeUnit.SECONDS), "first close did not snapshot the client")
+
+                val secondCloseJob = async(Dispatchers.Default) { provider.close() }
+                secondClosing = secondCloseJob
+                assertTrue(secondCloseAttempted.await(5, TimeUnit.SECONDS), "second close did not begin")
+                assertTrue(secondCloseJoined.await(5, TimeUnit.SECONDS), "second close did not join the first close")
+                assertFalse(secondCloseJob.isCompleted, "concurrent close returned before the client was closed")
+
+                releaseClientClose.countDown()
+                withTimeout(5.seconds) { firstCloseJob.await() }
+                withTimeout(5.seconds) { secondCloseJob.await() }
+
+                releaseRequest.countDown()
+                val result = withTimeout(5.seconds) { request.await() }
+                assertEquals("HTTP_TOOL_REQUEST_FAILED", result["error"]?.toString()?.trim('"'))
+                assertEquals(0, connectionAttempts.get())
+                assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+            } finally {
+                releaseRegistration.countDown()
+                releaseClientClose.countDown()
+                provider.close()
+                releaseRequest.countDown()
+                firstClosing?.cancel()
+                secondClosing?.cancel()
+                request.cancel()
+            }
+        } finally {
+            provider.close()
+        }
     }
 
     /**
@@ -489,6 +606,28 @@ class HttpCallingFunctionProviderTest {
         connectionObserver: HttpToolConnectionObserver,
     ): HttpCallingFunctionProvider =
         HttpCallingFunctionProvider.withConnectionObserver(repository, resolver, connectionObserver)
+
+    private fun providerWith(
+        repository: SettingsRepository,
+        resolver: HttpToolDnsResolver,
+        connectionObserver: HttpToolConnectionObserver,
+        lifecycleObserver: HttpToolLifecycleObserver,
+    ): HttpCallingFunctionProvider =
+        HttpCallingFunctionProvider.withConnectionObserver(repository, resolver, connectionObserver, lifecycleObserver)
+
+    private fun providerWith(
+        httpToolSettings: HttpToolSettings,
+        resolver: HttpToolDnsResolver,
+        connectionObserver: HttpToolConnectionObserver,
+        lifecycleObserver: HttpToolLifecycleObserver,
+    ): HttpCallingFunctionProvider {
+        val repository = SettingsRepository.forTesting(
+            File(temporaryDirectory, "settings-${System.nanoTime()}.json"),
+            ModelSwitchBarrier(),
+        )
+        repository.saveSettings(AppSettings(ai = AISettings(httpToolSettings = httpToolSettings)))
+        return providerWith(repository, resolver, connectionObserver, lifecycleObserver)
+    }
 
     private fun enabledSettings(
         method: HttpToolMethod,
