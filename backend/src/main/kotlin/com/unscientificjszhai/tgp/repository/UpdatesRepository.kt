@@ -165,17 +165,20 @@ internal sealed interface AgentTurnClaim {
  * 每个机器人内同一 [updateId] 最多保留一项。回复以至少一次语义投递：网络结果不确定或 Telegram
  * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。每次网络投递前都会先持久化
  * [deliveryAttempts]，因此进程在请求中断后可能少于该次数实际发送，但绝不会突破回退消息的投递上限。
+ * 原文首片段携带引用参数时，永久 `4xx` 会先清除引用并从同一片段重新投递原文；任何回退消息被接受或
+ * 耗尽投递次数都会终止整条回复，不能继续发送后续原文片段。
  *
  * @property updateId 生成该回复的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，且在同一机器人 outbox 中唯一。
  * @property chatId 回复目标聊天标识；不能为空。
  * @property text 要投递的非空原始回复文本；投递回退消息不会覆盖该值。
- * @property replyParameters 可选的原消息回复参数；仅原文的首个片段使用，为 `null` 时发送独立消息。
+ * @property replyParameters 可选的原消息回复参数；仅原文首片段会实际使用。该片段收到永久 `4xx` 后会先
+ * 清除参数并重试相同原文，为 `null` 时发送独立消息。
  * @property nextChunkStart 下一待投递片段在 [text] 中的 UTF-16 起点；旧文件缺少该字段时默认为 `0`。
  * @property deliveryStage 当前片段投递阶段；旧文件缺少该字段时默认为 [TelegramReplyDeliveryStage.ORIGINAL]。
  * @property deliveryAttempts 当前片段的 [deliveryStage] 已持久化投递次数；必须为非负数，切换片段或阶段时归零。
  * @property permanentRejectionCount 原文阶段连续出现的永久 `4xx` 拒绝次数；仅
- * [TelegramReplyDeliveryStage.ORIGINAL] 使用且取值只能为 `0` 或 `1`。任一可重试失败都会将其清零，
- * 旧文件缺少该字段时默认为 `0`。
+ * [TelegramReplyDeliveryStage.ORIGINAL] 使用且取值只能为 `0` 或 `1`。首片段仍带引用参数的永久拒绝会
+ * 先清除引用并将该计数归零；任一可重试失败也会将其清零，旧文件缺少该字段时默认为 `0`。
  */
 @Serializable
 data class PendingTelegramReply(
@@ -192,15 +195,16 @@ data class PendingTelegramReply(
 /**
  * 等待投递的 Telegram 回复所处的阶段。
  *
- * 原文当前片段收到两次连续的永久 `4xx` 拒绝后会切换到 [FALLBACK]；可重试失败会清除原文的连续拒绝计数。
- * 回退消息始终作为不引用原消息的独立消息发送，且不会改写原文。
+ * 原文当前片段收到两次连续的永久 `4xx` 拒绝后会切换到 [FALLBACK]；但首片段仍带引用参数时会先清除引用
+ * 重试相同原文。可重试失败会清除原文的连续拒绝计数。回退消息始终作为不引用原消息的独立消息发送，成功
+ * 或耗尽后都会终止整条原文回复。
  */
 @Serializable
 enum class TelegramReplyDeliveryStage {
     /** 投递 Agent 生成的原始回复；连续永久拒绝计数最多为 `1`。 */
     ORIGINAL,
 
-    /** 投递说明原始回复未能发送的固定回退消息。 */
+    /** 投递说明原始回复未能发送的固定回退消息；接受或耗尽后终止整条回复。 */
     FALLBACK,
 }
 
@@ -915,13 +919,13 @@ class UpdatesRepository private constructor(
      * 为一项待投递回复持久化登记下一次网络投递。
      *
      * 登记与读取、修改和文件提交在同一仓储锁内完成；文件提交失败时不会返回可发送记录。处于回退阶段且
-     * 已登记三次投递的片段会在本次调用中仅跳过该片段；若原文还有后续片段，它们会恢复为原文阶段并在下一
-     * 次调用中继续投递。
+     * 已登记三次投递的回退消息会在本次调用中基于该完整快照删除整条回复；不会推进原文 cursor 或发送后续
+     * 片段。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param updateId 要登记投递的回复所属更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
      * @return 已把 [PendingTelegramReply.deliveryAttempts] 加一并持久化的当前片段快照；不存在记录、bot 无效或
-     * 回退片段耗尽并已跳过时返回 `null`。
+     * 回退消息耗尽并已终止整条回复时返回 `null`。
      * @throws IllegalArgumentException 当 [updateId] 不在可持久化 Telegram 更新标识范围内，或存储中的目标回复违反
      * 投递阶段约束时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
@@ -945,7 +949,9 @@ class UpdatesRepository private constructor(
         if (reply.deliveryStage == TelegramReplyDeliveryStage.FALLBACK &&
             reply.deliveryAttempts >= MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
         ) {
-            saveState(state.copy(bots = state.bots + (botId to advancePendingReply(current, replyIndex, reply))))
+            val removed = removePendingReplyIfCurrent(current, reply)
+                ?: return null
+            saveState(state.copy(bots = state.bots + (botId to removed)))
             return null
         }
         require(reply.deliveryAttempts < Int.MAX_VALUE) { "reply deliveryAttempts must be below Int.MAX_VALUE." }
@@ -998,7 +1004,8 @@ class UpdatesRepository private constructor(
      * 条件确认当前已发送片段，并原子推进到下一片段或删除末片段记录。
      *
      * 只有当前 outbox 记录仍与 [expected] 完全一致时才推进，避免旧 token 的迟到成功响应确认新会话已改变
-     * 的投递状态。推进下一片段时恢复原文阶段并清零该片段的尝试和永久拒绝计数。
+     * 的投递状态。原文片段接受后推进下一片段并恢复原文阶段；回退消息接受后则删除整条回复，绝不推进
+     * 原文 cursor。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param expected 网络请求前已持久化登记的当前片段快照。
@@ -1019,19 +1026,24 @@ class UpdatesRepository private constructor(
         if (replyIndex < 0) {
             return false
         }
-        saveState(state.copy(bots = state.bots + (botId to advancePendingReply(current, replyIndex, expected))))
+        val updated = if (expected.deliveryStage == TelegramReplyDeliveryStage.FALLBACK) {
+            removePendingReplyIfCurrent(current, expected) ?: return false
+        } else {
+            advancePendingReply(current, replyIndex, expected)
+        }
+        saveState(state.copy(bots = state.bots + (botId to updated)))
         return true
     }
 
     /**
-     * 条件放弃已经耗尽投递次数的回退片段，并继续同一原文的后续片段。
+     * 条件放弃已经耗尽投递次数的回退消息，并终止整条原文回复。
      *
-     * 此方法绝不会改写 [PendingTelegramReply.text]；若当前片段是末片段才删除整个记录。调用方必须先持久化
-     * 登记到回退投递上限，避免网络中断时错误跳过尚可重试的片段。
+     * 只有当前记录仍与 [expected] 完全相等时才删除相同更新标识的回复，避免迟到失败响应删除已改变的快照。
+     * 调用方必须先持久化登记到回退投递上限，避免网络中断时错误终止尚可重试的回复。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param expected 当前已耗尽的回退片段快照。
-     * @return 已持久化跳过时为 `true`；bot 无效、快照已变化或不是耗尽回退片段时为 `false`。
+     * @return 已持久化终止整条回复时为 `true`；bot 无效、快照已变化或不是耗尽回退消息时为 `false`。
      * @throws IllegalArgumentException 当 [expected] 不满足 outbox 不变量时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
      * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
@@ -1048,12 +1060,20 @@ class UpdatesRepository private constructor(
         }
         migrateLegacyDataIfNeeded(botId)
         val current = state.bots[botId] ?: return false
-        val replyIndex = current.pendingTelegramReplies.indexOfFirst { it == expected }
-        if (replyIndex < 0) {
-            return false
-        }
-        saveState(state.copy(bots = state.bots + (botId to advancePendingReply(current, replyIndex, expected))))
+        val removed = removePendingReplyIfCurrent(current, expected) ?: return false
+        saveState(state.copy(bots = state.bots + (botId to removed)))
         return true
+    }
+
+    /** 仅当完整快照仍匹配时删除其所属更新的整条 outbox 回复。 */
+    private fun removePendingReplyIfCurrent(
+        current: UpdatesData,
+        expected: PendingTelegramReply,
+    ): UpdatesData? {
+        if (current.pendingTelegramReplies.none { it == expected }) {
+            return null
+        }
+        return current.copy(pendingTelegramReplies = current.pendingTelegramReplies.filterNot { it.updateId == expected.updateId })
     }
 
     /** 在当前片段处理完成或耗尽后构造同一更新的新 outbox 状态。 */

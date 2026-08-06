@@ -3743,9 +3743,9 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证 HTTP `400` 或合法响应正文中的 `error_code:400` 两次后，原文才切换为独立回退消息。 */
+    /** 验证首片段的 HTTP `400` 或响应正文 `error_code:400` 会先清除引用并重投原文，再按通常阈值进入回退。 */
     @Test
-    fun `outbox changes to fallback only after second permanent Telegram rejection`() = runBlocking {
+    fun `permanent rejection retries the quoted first chunk without reply parameters before fallback`() = runBlocking {
         val rejectionCases = listOf(
             "http 400" to TelegramApiResponse(HttpStatusCode.BadRequest, "not-json"),
             "body error code 400" to TelegramApiResponse(
@@ -3764,6 +3764,9 @@ class MessagePollerTest {
             coEvery { fixture.telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
             coEvery {
                 fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+            } returns rejection
+            coEvery {
+                fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
             } returns rejection andThen rejection
             coEvery {
                 fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
@@ -3771,12 +3774,43 @@ class MessagePollerTest {
 
             fixture.poller.start()
             try {
-                eventually(5.seconds) {
-                    assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
-                    coVerify(exactly = 2) {
+                eventually {
+                    val pending = fixture.updates.getPendingTelegramReplies("100").single()
+                    assertEquals(0, pending.nextChunkStart)
+                    assertEquals(TelegramReplyDeliveryStage.ORIGINAL, pending.deliveryStage)
+                    assertNull(pending.replyParameters)
+                    assertEquals(0, pending.deliveryAttempts)
+                    assertEquals(0, pending.permanentRejectionCount)
+                    coVerify(exactly = 1) {
                         fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
                     }
+                }
+                eventually(4.seconds) {
+                    val pending = fixture.updates.getPendingTelegramReplies("100").single()
+                    assertEquals(0, pending.nextChunkStart)
+                    assertEquals(TelegramReplyDeliveryStage.ORIGINAL, pending.deliveryStage)
+                    assertNull(pending.replyParameters)
+                    assertEquals(1, pending.deliveryAttempts)
+                    assertEquals(1, pending.permanentRejectionCount)
                     coVerify(exactly = 1) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
+                    }
+                }
+                eventually(5.seconds) {
+                    assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                    coVerify(exactly = 1) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+                    }
+                    coVerify(exactly = 2) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
+                    }
+                    coVerify(exactly = 1) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
+                    }
+                    coVerifyOrder {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
                         fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
                     }
                 }
@@ -3786,7 +3820,150 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证 `429` 不属于永久拒绝，原文保持原阶段重试且不会发送回退消息。 */
+    /** 验证中间原文片段即使保留历史引用参数，回退成功后也会终止整条长回复而不发送尾部。 */
+    @Test
+    fun `accepted middle fallback terminates the long reply before its tail and delivers the next update`() =
+        runBlocking {
+            val fixture = fixture()
+            val first = "a".repeat(4096)
+            val middle = "b".repeat(4096)
+            val tail = "c"
+            fixture.updates.completeAgentUpdate(
+                "100",
+                11,
+                PendingTelegramReply(11, "123", first + middle + tail, ReplyParameters(1))
+            )
+            fixture.updates.completeAgentUpdate("100", 12, PendingTelegramReply(12, "123", "next"))
+            fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+            coEvery { fixture.telegram.getUpdatesForToken("100:token", 13, 30) } returns GetUpdatesResponse(ok = true)
+            coEvery { fixture.telegram.sendMessageForToken("100:token", "123", first, ReplyParameters(1)) } returns
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+            coEvery { fixture.telegram.sendMessageForToken("100:token", "123", middle, null) } returns
+                    TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""") andThen
+                    TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
+            coEvery {
+                fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
+            } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+            coEvery { fixture.telegram.sendMessageForToken("100:token", "123", "next", null) } returns
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+
+            fixture.poller.start()
+            try {
+                eventually(4.seconds) {
+                    val pending = fixture.updates.getPendingTelegramReplies("100").single { it.updateId == 11L }
+                    assertEquals(4096, pending.nextChunkStart)
+                    assertEquals(TelegramReplyDeliveryStage.ORIGINAL, pending.deliveryStage)
+                    assertEquals(ReplyParameters(1), pending.replyParameters)
+                    assertEquals(1, pending.deliveryAttempts)
+                    assertEquals(1, pending.permanentRejectionCount)
+                }
+                eventually(6.seconds) {
+                    assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                    coVerify(exactly = 2) { fixture.telegram.sendMessageForToken("100:token", "123", middle, null) }
+                    coVerify(exactly = 1) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
+                    }
+                    coVerify(exactly = 0) { fixture.telegram.sendMessageForToken("100:token", "123", tail, null) }
+                    coVerify(exactly = 1) { fixture.telegram.sendMessageForToken("100:token", "123", "next", null) }
+                }
+            } finally {
+                fixture.poller.close()
+            }
+        }
+
+    /** 验证中间回退消息第三次失败后会终止整条长回复，而不会发送尾部且不会阻塞下一更新。 */
+    @Test
+    fun `exhausted middle fallback terminates the long reply before its tail and delivers the next update`() =
+        runBlocking {
+            val fixture = fixture()
+            val first = "a".repeat(4096)
+            val middle = "b".repeat(4096)
+            val tail = "c"
+            fixture.updates.completeAgentUpdate(
+                "100",
+                11,
+                PendingTelegramReply(11, "123", first + middle + tail, ReplyParameters(1))
+            )
+            fixture.updates.completeAgentUpdate("100", 12, PendingTelegramReply(12, "123", "next"))
+            fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+            coEvery { fixture.telegram.getUpdatesForToken("100:token", 13, 30) } returns GetUpdatesResponse(ok = true)
+            coEvery { fixture.telegram.sendMessageForToken("100:token", "123", first, ReplyParameters(1)) } returns
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+            coEvery { fixture.telegram.sendMessageForToken("100:token", "123", middle, null) } returns
+                    TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""") andThen
+                    TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
+            coEvery {
+                fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
+            } returns TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""") andThen
+                    TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""") andThen
+                    TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
+            coEvery { fixture.telegram.sendMessageForToken("100:token", "123", "next", null) } returns
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+
+            fixture.poller.start()
+            try {
+                eventually(8.seconds) {
+                    assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                    coVerify(exactly = 3) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
+                    }
+                    coVerify(exactly = 0) { fixture.telegram.sendMessageForToken("100:token", "123", tail, null) }
+                    coVerify(exactly = 1) { fixture.telegram.sendMessageForToken("100:token", "123", "next", null) }
+                }
+            } finally {
+                fixture.poller.close()
+            }
+        }
+
+    /** 验证清除首片段引用的条件替换无法持久化时，旧快照保持不变且不会提前发送无引用原文。 */
+    @Test
+    fun `failed quoted first chunk replacement retains the old snapshot without an extra send`() = runBlocking {
+        val file = tempDirectory.resolve("outbox-quoted-replacement-gate.json")
+        val updates = UpdatesRepository(file) { state ->
+            val candidate = state.bots["100"]?.pendingTelegramReplies?.singleOrNull()
+            if (
+                candidate?.deliveryStage == TelegramReplyDeliveryStage.ORIGINAL &&
+                candidate.nextChunkStart == 0 &&
+                candidate.replyParameters == null &&
+                candidate.deliveryAttempts == 0 &&
+                candidate.permanentRejectionCount == 0
+            ) {
+                throw IOException("injected quoted replacement persistence failure")
+            }
+        }
+        val fixture = fixture(updatesOverride = updates)
+        updates.completeAgentUpdate("100", 11, PendingTelegramReply(11, "123", "original", ReplyParameters(1)))
+        fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
+        coEvery {
+            fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+        } returns TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
+
+        fixture.poller.start()
+        try {
+            eventually {
+                val pending = updates.getPendingTelegramReplies("100").single()
+                assertEquals(ReplyParameters(1), pending.replyParameters)
+                assertEquals(TelegramReplyDeliveryStage.ORIGINAL, pending.deliveryStage)
+                assertEquals(0, pending.nextChunkStart)
+                assertEquals(1, pending.deliveryAttempts)
+                assertEquals(0, pending.permanentRejectionCount)
+                coVerify(exactly = 1) {
+                    fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+                }
+            }
+            delay(200)
+            assertEquals(ReplyParameters(1), updates.getPendingTelegramReplies("100").single().replyParameters)
+            coVerify(exactly = 1) {
+                fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+            }
+            coVerify(exactly = 0) { fixture.telegram.sendMessageForToken("100:token", "123", "original", null) }
+        } finally {
+            fixture.poller.close()
+        }
+    }
+
+    /** 验证 HTTP `429` 即使正文矛盾地声明 `error_code:400` 也不属于永久拒绝。 */
     @Test
     fun `outbox treats Telegram 429 as retryable instead of fallback`() = runBlocking {
         val fixture = fixture()
@@ -3799,7 +3976,7 @@ class MessagePollerTest {
         coEvery { fixture.telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
         coEvery {
             fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
-        } returns TelegramApiResponse(HttpStatusCode.TooManyRequests, """{"ok":false,"error_code":429}""") andThen
+        } returns TelegramApiResponse(HttpStatusCode.TooManyRequests, """{"ok":false,"error_code":400}""") andThen
                 TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 
         fixture.poller.start()
@@ -3816,6 +3993,9 @@ class MessagePollerTest {
                     fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
                 }
                 coVerify(exactly = 0) {
+                    fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
+                }
+                coVerify(exactly = 0) {
                     fixture.telegram.sendMessageForToken(
                         "100:token",
                         "123",
@@ -3829,9 +4009,9 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证可重试失败会清除连续永久拒绝计数，后续 `400` 仍只保留原文而不会发送回退消息。 */
+    /** 验证 `429`、`5xx`、无效响应与网络异常不会清除引用或切换为回退消息。 */
     @Test
-    fun `retryable outbox failure resets permanent rejection sequence`() = runBlocking {
+    fun `retryable outbox failures retain quoted original without fallback`() = runBlocking {
         data class RetryableFailure(
             val name: String,
             val response: TelegramApiResponse? = null,
@@ -3844,9 +4024,6 @@ class MessagePollerTest {
             RetryableFailure("malformed body", TelegramApiResponse(HttpStatusCode.OK, "not-json")),
             RetryableFailure("network", exception = SocketTimeoutException("injected timeout")),
         ).forEach { retryableFailure ->
-            val thirdSendStarted = CompletableDeferred<Unit>()
-            val releaseThirdResponse = CompletableDeferred<Unit>()
-            var sendCount = 0
             val fixture = fixture()
             fixture.updates.completeAgentUpdate(
                 "100",
@@ -3858,30 +4035,26 @@ class MessagePollerTest {
             coEvery {
                 fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
             } coAnswers {
-                when (++sendCount) {
-                    1 -> TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
-                    2 -> retryableFailure.exception?.let { throw it } ?: checkNotNull(retryableFailure.response)
-                    3 -> {
-                        thirdSendStarted.complete(Unit)
-                        releaseThirdResponse.await()
-                        TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
-                    }
-
-                    else -> error("unexpected additional original delivery for ${retryableFailure.name}")
-                }
-            }
+                retryableFailure.exception?.let { throw it } ?: checkNotNull(retryableFailure.response)
+            } andThen
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 
             fixture.poller.start()
             try {
-                withTimeout(6.seconds) { thirdSendStarted.await() }
-                releaseThirdResponse.complete(Unit)
                 eventually {
                     val pending = fixture.updates.getPendingTelegramReplies("100").single()
                     assertEquals(TelegramReplyDeliveryStage.ORIGINAL, pending.deliveryStage)
-                    assertEquals(3, pending.deliveryAttempts)
-                    assertEquals(1, pending.permanentRejectionCount)
-                    coVerify(exactly = 3) {
+                    assertEquals(ReplyParameters(1), pending.replyParameters)
+                    assertEquals(1, pending.deliveryAttempts)
+                    assertEquals(0, pending.permanentRejectionCount)
+                }
+                eventually(4.seconds) {
+                    assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+                    coVerify(exactly = 2) {
                         fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+                    }
+                    coVerify(exactly = 0) {
+                        fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
                     }
                     coVerify(exactly = 0) {
                         fixture.telegram.sendMessageForToken(
@@ -3893,7 +4066,6 @@ class MessagePollerTest {
                     }
                 }
             } finally {
-                releaseThirdResponse.complete(Unit)
                 fixture.poller.close()
             }
         }
@@ -3913,6 +4085,9 @@ class MessagePollerTest {
         coEvery { fixture.telegram.getUpdatesForToken("100:token", 13, 30) } returns GetUpdatesResponse(ok = true)
         coEvery {
             fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+        } returns TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
+        coEvery {
+            fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
         } returns TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""") andThen
                 TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false}""")
         coEvery {
@@ -3927,8 +4102,11 @@ class MessagePollerTest {
         try {
             eventually(8.seconds) {
                 assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
-                coVerify(exactly = 2) {
+                coVerify(exactly = 1) {
                     fixture.telegram.sendMessageForToken("100:token", "123", "original", ReplyParameters(1))
+                }
+                coVerify(exactly = 2) {
+                    fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
                 }
                 coVerify(exactly = 3) {
                     fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
@@ -3940,10 +4118,11 @@ class MessagePollerTest {
         }
     }
 
-    /** 验证重启后已登记三次的回退消息不会再发送，并会删除后继续投递下一项回复。 */
+    /** 验证重启后已登记三次的中间回退消息会删除整条长回复，不会发送原文尾部且下一项仍可投递。 */
     @Test
-    fun `restarted exhausted fallback is skipped before sending and next reply proceeds`() = runBlocking {
+    fun `restarted exhausted middle fallback terminates the whole reply before sending its tail`() = runBlocking {
         val file = tempDirectory.resolve("restarted-exhausted-fallback.json")
+        val source = "a".repeat(4096) + "b"
         val initialRepository = UpdatesRepository(file)
         initialRepository.completeAgentUpdate(
             "100",
@@ -3951,7 +4130,8 @@ class MessagePollerTest {
             PendingTelegramReply(
                 updateId = 11,
                 chatId = "123",
-                text = "抱歉，上一条回复未能发送。",
+                text = source,
+                nextChunkStart = 4096,
                 deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
                 deliveryAttempts = 3,
             ),
@@ -3967,6 +4147,8 @@ class MessagePollerTest {
         settings.saveSettings(AppSettings(telegramToken = "100:token"))
         barrier.complete(barrier.latestPendingGeneration())
         coEvery { telegram.getUpdatesForToken("100:token", 13, 30) } returns GetUpdatesResponse(ok = true)
+        coEvery { telegram.sendMessageForToken("100:token", "123", "b", null) } returns
+                TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
         coEvery { telegram.sendMessageForToken("100:token", "123", "next", null) } returns
                 TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 
@@ -3977,6 +4159,7 @@ class MessagePollerTest {
                 coVerify(exactly = 0) {
                     telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
                 }
+                coVerify(exactly = 0) { telegram.sendMessageForToken("100:token", "123", "b", null) }
                 coVerify(exactly = 1) { telegram.sendMessageForToken("100:token", "123", "next", null) }
             }
         } finally {

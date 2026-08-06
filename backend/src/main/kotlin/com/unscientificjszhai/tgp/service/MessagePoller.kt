@@ -1370,9 +1370,11 @@ class MessagePoller @Inject constructor(
     /**
      * 读取并尝试投递一项当前会话可见的 outbox 记录。
      *
-     * 每次网络请求前先在当前 token 代次保护下持久化当前片段的投递次数。原文片段收到第二次明确的永久
-     * `4xx` 拒绝后，原子切换为不带回复参数的固定回退消息；回退消息最多登记三次投递，耗尽后仅跳过该片段
-     * 并继续原文后续片段。网络异常、`429`、其他 HTTP 状态和无效响应正文均保留当前片段以便重试。
+     * 每次网络请求前先在当前 token 代次保护下持久化当前片段的投递次数。原文首片段携带引用参数并收到明确
+     * 的永久 `4xx` 时，先清除引用并重发相同原文；其他原文片段收到第二次永久 `4xx` 后，原子切换为固定回退
+     * 消息。回退消息被接受或最多三次投递均失败时，都会终止整条回复，绝不继续发送缺失片段后的原文尾部。
+     * 网络异常、`429`、未由有效 Telegram 响应正文声明非限流永久 `4xx` 的其他 HTTP 状态和无效响应正文均保留
+     * 当前片段以便重试。
      */
     private suspend fun deliverNextPendingReply(session: PollingSession): OutboxDelivery {
         val pendingReply = try {
@@ -1448,7 +1450,7 @@ class MessagePoller @Inject constructor(
                 }
                 if (exhaustedRemoved) {
                     logger.warn(
-                        "Telegram fallback chunk for reply {} of bot {} was rejected three times; skipping that chunk.",
+                        "Telegram fallback reply {} of bot {} was rejected three times; terminating that reply.",
                         reply.updateId,
                         session.botId,
                     )
@@ -1457,10 +1459,12 @@ class MessagePoller @Inject constructor(
                 return OutboxDelivery.RETRY
             }
             if (reply.deliveryStage == TelegramReplyDeliveryStage.ORIGINAL) {
-                val replacement = if (response?.isPermanentTelegramRejection() == true) {
-                    reply.afterPermanentTelegramRejection()
-                } else {
-                    reply.afterRetryableTelegramFailure()
+                val replacement = when {
+                    response?.isPermanentTelegramRejection() == true && reply.shouldRetryFirstChunkWithoutReplyParameters() ->
+                        reply.withoutFirstChunkReplyParameters()
+
+                    response?.isPermanentTelegramRejection() == true -> reply.afterPermanentTelegramRejection()
+                    else -> reply.afterRetryableTelegramFailure()
                 }
                 if (replacement == reply) {
                     logger.warn(
@@ -1491,6 +1495,14 @@ class MessagePoller @Inject constructor(
                 if (replacement.deliveryStage == TelegramReplyDeliveryStage.FALLBACK) {
                     logger.warn(
                         "Telegram permanently rejected outbox reply {} of bot {} twice; sending fallback next.",
+                        reply.updateId,
+                        session.botId,
+                    )
+                } else if (response?.isPermanentTelegramRejection() == true &&
+                    reply.shouldRetryFirstChunkWithoutReplyParameters()
+                ) {
+                    logger.warn(
+                        "Telegram permanently rejected the quoted first chunk for outbox reply {} of bot {}; retrying original without reply parameters.",
                         reply.updateId,
                         session.botId,
                     )
@@ -2356,8 +2368,10 @@ class MessagePoller @Inject constructor(
         }
 
     /** 返回该响应是否明确表明 Telegram 以非限流的永久 `4xx` 拒绝了请求。 */
-    private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean =
-        (status.value in 400..499 && status.value != 429) || try {
+    private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean {
+        if (status.value == 429) return false
+        if (status.value in 400..499) return true
+        return try {
             JsonStructureLimits.parseToJsonElement(Json, body)
                 .jsonObject["error_code"]
                 ?.jsonPrimitive
@@ -2367,6 +2381,7 @@ class MessagePoller @Inject constructor(
         } catch (_: Exception) {
             false
         }
+    }
 
     /** 基于一项已登记投递的原文回复，记录一次永久拒绝或切换到固定回退消息。 */
     private fun PendingTelegramReply.afterPermanentTelegramRejection(): PendingTelegramReply {
@@ -2384,6 +2399,24 @@ class MessagePoller @Inject constructor(
                 permanentRejectionCount = 0,
             )
         }
+    }
+
+    /** 判断当前快照是否是仍可清除引用并重试原文的首个原文片段。 */
+    private fun PendingTelegramReply.shouldRetryFirstChunkWithoutReplyParameters(): Boolean =
+        deliveryStage == TelegramReplyDeliveryStage.ORIGINAL &&
+                nextChunkStart == 0 &&
+                replyParameters != null
+
+    /** 清除首片段的引用参数，并把该原文片段恢复为未登记投递的初始状态。 */
+    private fun PendingTelegramReply.withoutFirstChunkReplyParameters(): PendingTelegramReply {
+        check(shouldRetryFirstChunkWithoutReplyParameters()) {
+            "only an original first chunk with reply parameters can retry without them."
+        }
+        return copy(
+            replyParameters = null,
+            deliveryAttempts = 0,
+            permanentRejectionCount = 0,
+        )
     }
 
     /** 基于一项已登记投递的原文回复，在可重试失败后清除先前的永久拒绝连续计数。 */

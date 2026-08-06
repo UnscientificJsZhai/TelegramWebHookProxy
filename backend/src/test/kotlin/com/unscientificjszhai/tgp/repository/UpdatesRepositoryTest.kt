@@ -1281,31 +1281,31 @@ class UpdatesRepositoryTest {
         assertTrue(resumed.nextChunkStart == 0 || !Character.isLowSurrogate(resumed.text[resumed.nextChunkStart]))
     }
 
-    /** 验证回退耗尽只跳过当前片段，且源文本和后续片段仍会保留。 */
+    /** 验证中间回退消息接受后会删除整条回复，而不是推进到原文后续片段。 */
     @Test
-    fun `exhausted fallback advances to later source chunk without overwriting source`() {
-        val repository = UpdatesRepository(tempDirectory.resolve("outbox-fallback-chunk.json"))
+    fun `accepted fallback removes an entire long reply without advancing its cursor`() {
+        val repository = UpdatesRepository(tempDirectory.resolve("outbox-accepted-fallback.json"))
         val source = "a".repeat(4096) + "b"
         val original = PendingTelegramReply(11, "chat", source, ReplyParameters(1))
         repository.completeAgentUpdate("100", 11, original)
+        val first = requireNotNull(repository.preparePendingTelegramReplyDelivery("100", 11))
+        assertTrue(repository.advancePendingTelegramReplyDelivery("100", first))
+        val middle = repository.getPendingTelegramReplies("100").single()
         val fallback = original.copy(
             replyParameters = null,
+            nextChunkStart = middle.nextChunkStart,
             deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
-            deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS,
+            deliveryAttempts = 1,
         )
-        assertTrue(repository.replacePendingTelegramReply("100", original, fallback))
+        assertTrue(repository.replacePendingTelegramReply("100", middle, fallback))
 
-        assertTrue(repository.discardExhaustedPendingTelegramReplyFallback("100", fallback))
-        val pending = repository.getPendingTelegramReplies("100").single()
-        assertEquals(source, pending.text)
-        assertEquals(4096, pending.nextChunkStart)
-        assertEquals(TelegramReplyDeliveryStage.ORIGINAL, pending.deliveryStage)
-        assertEquals(0, pending.deliveryAttempts)
+        assertTrue(repository.advancePendingTelegramReplyDelivery("100", fallback))
+        assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
     }
 
-    /** 验证长原文的中间片段回退耗尽后继续后续原文片段，而不是删除整条回复。 */
+    /** 验证长原文中间片段的回退耗尽后删除整条回复，而不是发送原文尾部。 */
     @Test
-    fun `exhausted fallback in a middle chunk continues the following source chunk`() {
+    fun `exhausted fallback in a middle chunk removes the entire source reply`() {
         val repository = UpdatesRepository(tempDirectory.resolve("outbox-middle-fallback-chunk.json"))
         val source = "a".repeat(4096) + "b".repeat(4096) + "c"
         repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", source))
@@ -1319,10 +1319,30 @@ class UpdatesRepositoryTest {
         assertTrue(repository.replacePendingTelegramReply("100", middle, exhaustedFallback))
 
         assertTrue(repository.discardExhaustedPendingTelegramReplyFallback("100", exhaustedFallback))
-        val following = repository.getPendingTelegramReplies("100").single()
-        assertEquals(8192, following.nextChunkStart)
-        assertEquals(TelegramReplyDeliveryStage.ORIGINAL, following.deliveryStage)
-        assertEquals("c", following.text.substring(following.nextChunkStart))
+        assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
+    }
+
+    /** 验证重启后加载到已耗尽的回退消息时会删除整条长回复，且不会前移原文 cursor。 */
+    @Test
+    fun `prepare removes a persisted exhausted fallback without advancing a long reply`() {
+        val file = tempDirectory.resolve("outbox-prepared-exhausted-fallback.json")
+        val source = "a".repeat(4096) + "b"
+        UpdatesRepository(file).completeAgentUpdate(
+            "100",
+            11,
+            PendingTelegramReply(
+                updateId = 11,
+                chatId = "chat",
+                text = source,
+                nextChunkStart = 4096,
+                deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
+                deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS,
+            ),
+        )
+
+        val repository = UpdatesRepository(file)
+        assertNull(repository.preparePendingTelegramReplyDelivery("100", 11))
+        assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
     }
 
     /** 验证持久化 cursor 不允许落在 surrogate pair 中间。 */
@@ -1391,6 +1411,42 @@ class UpdatesRepositoryTest {
         assertTrue(repository.replacePendingTelegramReply("100", stale, current))
 
         assertFalse(repository.advancePendingTelegramReplyDelivery("100", stale))
+        assertEquals(current, repository.getPendingTelegramReplies("100").single())
+    }
+
+    /** 验证迟到的回退成功响应不能删除已经变更的当前 outbox 快照。 */
+    @Test
+    fun `fallback delivery completion is compare and swap fenced`() {
+        val repository = UpdatesRepository(tempDirectory.resolve("outbox-fallback-advance-cas.json"))
+        val original = PendingTelegramReply(11, "chat", "a".repeat(4096) + "b")
+        repository.completeAgentUpdate("100", 11, original)
+        val fallback = original.copy(
+            deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
+            deliveryAttempts = 1,
+        )
+        assertTrue(repository.replacePendingTelegramReply("100", original, fallback))
+        val current = fallback.copy(deliveryAttempts = 2)
+        assertTrue(repository.replacePendingTelegramReply("100", fallback, current))
+
+        assertFalse(repository.advancePendingTelegramReplyDelivery("100", fallback))
+        assertEquals(current, repository.getPendingTelegramReplies("100").single())
+    }
+
+    /** 验证迟到的回退耗尽响应不能删除已经变更的当前 outbox 快照。 */
+    @Test
+    fun `exhausted fallback discard is compare and swap fenced`() {
+        val repository = UpdatesRepository(tempDirectory.resolve("outbox-fallback-discard-cas.json"))
+        val original = PendingTelegramReply(11, "chat", "original")
+        repository.completeAgentUpdate("100", 11, original)
+        val exhausted = original.copy(
+            deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
+            deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS,
+        )
+        assertTrue(repository.replacePendingTelegramReply("100", original, exhausted))
+        val current = exhausted.copy(deliveryAttempts = exhausted.deliveryAttempts + 1)
+        assertTrue(repository.replacePendingTelegramReply("100", exhausted, current))
+
+        assertFalse(repository.discardExhaustedPendingTelegramReplyFallback("100", exhausted))
         assertEquals(current, repository.getPendingTelegramReplies("100").single())
     }
 
