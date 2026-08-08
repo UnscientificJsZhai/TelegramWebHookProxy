@@ -2719,6 +2719,7 @@ class MessagePollerTest {
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         val processingStarted = CompletableDeferred<Unit>()
         val keepProcessing = CompletableDeferred<Unit>()
+        val commandReplySent = CompletableDeferred<Unit>()
         val cancelledReset = Job().apply { cancel() }
         fixture.updates.saveLastUpdateId("100", 10)
         fixture.saveSettings(
@@ -2731,8 +2732,10 @@ class MessagePollerTest {
             ""
         }
         every { fixture.agent.resetSession() } returns cancelledReset
-        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } returns
-                TelegramApiResponse(HttpStatusCode.OK, "")
+        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } coAnswers {
+            commandReplySent.complete(Unit)
+            TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+        }
 
         fixture.poller.start()
         try {
@@ -2753,6 +2756,7 @@ class MessagePollerTest {
                 isAccessible = true
             }.get(session))
             assertNotNull(sessionQueue(session).tryReceive().getOrNull())
+            withTimeout(2.seconds) { commandReplySent.await() }
             coVerify {
                 fixture.telegram.sendMessageForToken("100:token", "123", "会话重置失败，请稍后重试。", any())
             }
@@ -2774,6 +2778,7 @@ class MessagePollerTest {
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         val processingStarted = CompletableDeferred<Unit>()
         val keepProcessing = CompletableDeferred<Unit>()
+        val commandReplySent = CompletableDeferred<Unit>()
         fixture.updates.saveLastUpdateId("100", 10)
         fixture.saveSettings(
             AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "123")),
@@ -2785,8 +2790,10 @@ class MessagePollerTest {
             ""
         }
         every { fixture.agent.resetSession() } returns Job().apply { complete() }
-        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } returns
-                TelegramApiResponse(HttpStatusCode.OK, "")
+        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } coAnswers {
+            commandReplySent.complete(Unit)
+            TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+        }
 
         fixture.poller.start()
         try {
@@ -2804,6 +2811,7 @@ class MessagePollerTest {
             assertNull(session.javaClass.getDeclaredField("lastAiReplyAtMillis").apply { isAccessible = true }
                 .get(session))
             assertTrue(sessionQueue(session).tryReceive().isFailure)
+            withTimeout(2.seconds) { commandReplySent.await() }
             coVerify {
                 fixture.telegram.sendMessageForToken("100:token", "123", "会话已重置，待处理消息已清空。", any())
             }
