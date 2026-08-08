@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.modules
 import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -220,7 +221,7 @@ class APIModuleTest {
     fun `settings write routes enforce resource limits without side effects`() =
         withTestApi { repository, _, configFile ->
             val original = AppSettings(telegramToken = "100:original", chatId = "old-chat", ai = AISettings())
-            repository.saveSettings(original)
+            repository.replaceSettingsForTest(original)
             val originalContent = configFile.readText()
             val oversizedContext = "密".repeat(21_846)
 
@@ -258,7 +259,7 @@ class APIModuleTest {
     @Test
     fun `settings API rejects deep raw JSON before DTO decode`() = withTestApi { repository, _, configFile ->
         val original = AppSettings(telegramToken = "100:original")
-        repository.saveSettings(original)
+        repository.replaceSettingsForTest(original)
         val originalContent = configFile.readText()
         val deepJson = buildString {
             repeat(65) { append("{\"next\":") }
@@ -514,7 +515,7 @@ class APIModuleTest {
                 telegramToken = "100:token",
                 ai = AISettings(provider = AIProvider.GEMINI, agentEnabled = true, geminiApiKey = "gemini-key"),
             )
-            repository.saveSettings(geminiSettings)
+            repository.replaceSettingsForTest(geminiSettings)
             val openAiSettings = geminiSettings.copy(
                 ai = geminiSettings.ai!!.copy(
                     provider = AIProvider.OPENAI,
@@ -541,7 +542,7 @@ class APIModuleTest {
     fun `invalid settings requests return bad request without side effects`() =
         withTestApi { repository, telegramService, configFile ->
             val original = AppSettings(telegramToken = "100:original", chatId = "old-chat")
-            repository.saveSettings(original)
+            repository.replaceSettingsForTest(original)
             val originalContent = configFile.readText()
 
             val revision = currentSettingsETag()
@@ -906,7 +907,7 @@ class APIModuleTest {
         withTestApi { repository, _, _ ->
             val original =
                 AppSettings(telegramToken = "100:stored-secret", ai = AISettings(geminiApiKey = "stored-key"))
-            repository.saveSettings(original)
+            repository.replaceSettingsForTest(original)
             val revision = currentSettingsETag()
 
             client.put("/api/settings") {
@@ -979,7 +980,7 @@ class APIModuleTest {
                     ),
                 ),
             )
-            repository.saveSettings(original)
+            repository.replaceSettingsForTest(original)
             val revision = currentSettingsETag()
 
             client.patch("/api/settings") {
@@ -1075,7 +1076,7 @@ class APIModuleTest {
                     agentEnabled = true,
                 ),
             )
-            repository.saveSettings(original)
+            repository.replaceSettingsForTest(original)
             val staleRevision = currentSettingsETag()
 
             val afterKeyPatch = client.patch("/api/settings") {
@@ -1149,7 +1150,7 @@ class APIModuleTest {
             proxy = ProxySettings("proxy.example.com", 1080, ProxyType.HTTP, username = null, password = null),
             ai = AISettings(),
         )
-        repository.saveSettings(original)
+        repository.replaceSettingsForTest(original)
 
         val getResponse = client.get("/api/settings")
         assertEquals(HttpStatusCode.OK, getResponse.status)

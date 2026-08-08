@@ -310,25 +310,6 @@ class SettingsRepository private constructor(
     }
 
     /**
-     * 仅供模块内既有测试构造完整设置；生产写入必须使用 [updateSettings]。
-     *
-     * 此兼容入口直接委托统一的锁内变换，不提供独立写入路径。
-     *
-     * @param settings 要替换的完整测试设置。
-     */
-    @Deprecated(
-        "生产代码请使用 updateSettings 在锁内基于最新快照变换。",
-        ReplaceWith("updateSettings { settings }"),
-    )
-    internal fun saveSettings(settings: AppSettings) {
-        updateSettings(
-            replacesHistoricalInvalidMcpServers = true,
-            replacesHistoricalInvalidOpenAiBaseUrl = true,
-            replacesHistoricalInvalidHttpToolSettings = true,
-        ) { settings }
-    }
-
-    /**
      * 与 Telegram token 变更线性化地执行同步状态提交。
      *
      * token 实际变更的保存会持有同一锁直至发布新的 [telegramTokenUpdateFlow] 值；调用方

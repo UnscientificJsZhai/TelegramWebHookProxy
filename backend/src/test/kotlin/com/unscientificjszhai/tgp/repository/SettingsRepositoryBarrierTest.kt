@@ -57,42 +57,42 @@ class SettingsRepositoryBarrierTest {
                 selectedModel = "gpt-first",
             ),
         )
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
         val initialGeneration = barrier.latestPendingGeneration()
         barrier.complete(initialGeneration)
 
         settings = settings.copy(ai = settings.ai!!.copy(globalContext = "new context"))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
         barrier.complete(barrier.latestPendingGeneration())
 
         settings = settings.copy(ai = settings.ai!!.copy(agentChatId = "new-agent-chat"))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
         barrier.complete(barrier.latestPendingGeneration())
 
         settings = settings.copy(ai = settings.ai!!.copy(selectedModel = "gpt-next"))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
         barrier.complete(barrier.latestPendingGeneration())
 
         settings = settings.copy(ai = settings.ai!!.copy(geminiApiKey = "unused-key"))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertFalse(barrier.isSwitching)
 
         settings = settings.copy(ai = settings.ai!!.copy(openAiBaseUrl = "https://example.invalid/v1"))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
         barrier.complete(barrier.latestPendingGeneration())
 
         settings = settings.copy(proxy = ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
         barrier.complete(barrier.latestPendingGeneration())
 
         settings = settings.copy(ai = settings.ai!!.copy(agentEnabled = false))
-        repository.saveSettings(settings)
+        repository.replaceSettingsForTest(settings)
         assertTrue(barrier.isSwitching)
     }
 
@@ -107,10 +107,10 @@ class SettingsRepositoryBarrierTest {
             telegramToken = "100:token-a",
             ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key", agentEnabled = true),
         )
-        repository.saveSettings(initial)
+        repository.replaceSettingsForTest(initial)
         barrier.complete(barrier.latestPendingGeneration())
 
-        repository.saveSettings(initial.copy(telegramToken = "200:token-b"))
+        repository.replaceSettingsForTest(initial.copy(telegramToken = "200:token-b"))
 
         assertTrue(barrier.isSwitching)
         assertNotNull(repository.settingsUpdateFlow.value.switchGeneration)
@@ -125,10 +125,10 @@ class SettingsRepositoryBarrierTest {
         val barrier = ModelSwitchBarrier()
         val repository = SettingsRepository.forTesting(File(tempDirectory, "http-tool-barrier.json"), barrier)
         val initial = AppSettings(ai = AISettings(agentEnabled = true, geminiApiKey = "key"))
-        repository.saveSettings(initial)
+        repository.replaceSettingsForTest(initial)
         barrier.complete(barrier.latestPendingGeneration())
 
-        repository.saveSettings(
+        repository.replaceSettingsForTest(
             initial.copy(
                 ai = initial.ai!!.copy(
                     httpToolSettings = HttpToolSettings(
@@ -155,10 +155,10 @@ class SettingsRepositoryBarrierTest {
                 mcpServers = listOf(MCPServerConfig("first", "https://first.example/mcp")),
             ),
         )
-        repository.saveSettings(initial)
+        repository.replaceSettingsForTest(initial)
         barrier.complete(barrier.latestPendingGeneration())
 
-        repository.saveSettings(
+        repository.replaceSettingsForTest(
             initial.copy(
                 ai = initial.ai!!.copy(
                     mcpServers = listOf(MCPServerConfig("second", "https://second.example/mcp")),
@@ -343,7 +343,7 @@ class SettingsRepositoryBarrierTest {
 
     /** 验证完整设置替换授权并清除 HTTP、MCP 与 OpenAI 的全部历史保护标记。 */
     @Test
-    fun `saveSettings fully replaces all historical invalid AI configuration markers`() {
+    fun `replaceSettingsForTest fully replaces all historical invalid AI configuration markers`() {
         val configFile = File(tempDirectory, "all-historical-invalid-ai-settings.json")
         configFile.writeText(
             """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}],"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
@@ -354,7 +354,7 @@ class SettingsRepositoryBarrierTest {
         assertTrue(repository.hasHistoricalInvalidMcp)
         assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
         assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
-        repository.saveSettings(
+        repository.replaceSettingsForTest(
             recovered.copy(
                 chatId = "fully-replaced",
                 ai = recovered.ai!!.copy(openAiBaseUrl = "https://gateway.example.com/v1"),
@@ -379,12 +379,12 @@ class SettingsRepositoryBarrierTest {
         val initialSettings = AppSettings(
             ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "key", agentEnabled = true),
         )
-        repository.saveSettings(initialSettings)
+        repository.replaceSettingsForTest(initialSettings)
         val firstUpdate = repository.settingsUpdateFlow.value
         val generation = firstUpdate.switchGeneration
 
         val latestSettings = initialSettings.copy(chatId = "new-chat-id")
-        repository.saveSettings(latestSettings)
+        repository.replaceSettingsForTest(latestSettings)
         val latestUpdate = repository.settingsUpdateFlow.value
 
         assertEquals(latestSettings, latestUpdate.settings)
@@ -408,13 +408,13 @@ class SettingsRepositoryBarrierTest {
             ),
         )
 
-        repository.saveSettings(firstSettings)
+        repository.replaceSettingsForTest(firstSettings)
         val firstGeneration = repository.settingsUpdateFlow.value.switchGeneration
 
         val latestSettings = firstSettings.copy(
             ai = firstSettings.ai!!.copy(selectedModel = "gemini-next"),
         )
-        repository.saveSettings(latestSettings)
+        repository.replaceSettingsForTest(latestSettings)
         val latestUpdate = repository.settingsUpdateFlow.value
 
         assertEquals(latestSettings, latestUpdate.settings)
@@ -534,7 +534,7 @@ class SettingsRepositoryBarrierTest {
         val repository = SettingsRepository.forTesting(File(tempDirectory, "external-generation.json"), barrier)
         val authenticationGeneration = barrier.beginExternalSwitch()
 
-        repository.saveSettings(
+        repository.replaceSettingsForTest(
             AppSettings(ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "key", agentEnabled = true)),
         )
         val settingsGeneration = repository.settingsUpdateFlow.value.switchGeneration
@@ -562,7 +562,7 @@ class SettingsRepositoryBarrierTest {
         tempDirectory.writeText("not a directory")
 
         assertFailsWith<IOException> {
-            repository.saveSettings(AppSettings(ai = AISettings(agentEnabled = true)))
+            repository.replaceSettingsForTest(AppSettings(ai = AISettings(agentEnabled = true)))
         }
         assertFalse(barrier.isSwitching)
     }
@@ -576,13 +576,13 @@ class SettingsRepositoryBarrierTest {
             SettingsRepository.forTesting(File(tempDirectory, "token-generation.json"), ModelSwitchBarrier())
         val initialGeneration = repository.telegramTokenUpdateFlow.value.generation
 
-        repository.saveSettings(AppSettings(telegramToken = "100:A"))
+        repository.replaceSettingsForTest(AppSettings(telegramToken = "100:A"))
         val firstGeneration = repository.telegramTokenUpdateFlow.value.generation
-        repository.saveSettings(AppSettings(telegramToken = ""))
+        repository.replaceSettingsForTest(AppSettings(telegramToken = ""))
         val emptyGeneration = repository.telegramTokenUpdateFlow.value.generation
-        repository.saveSettings(AppSettings(telegramToken = "100:A"))
+        repository.replaceSettingsForTest(AppSettings(telegramToken = "100:A"))
         val restoredGeneration = repository.telegramTokenUpdateFlow.value.generation
-        repository.saveSettings(AppSettings(telegramToken = "100:A", chatId = "unchanged-token"))
+        repository.replaceSettingsForTest(AppSettings(telegramToken = "100:A", chatId = "unchanged-token"))
 
         assertEquals(initialGeneration + 1, firstGeneration)
         assertEquals(firstGeneration + 1, emptyGeneration)
@@ -599,7 +599,7 @@ class SettingsRepositoryBarrierTest {
         val configFile = File(tempDirectory, "invalid-proxy-settings.json")
         val repository = SettingsRepository.forTesting(configFile, barrier)
         val initialSettings = AppSettings(telegramToken = "100:original", chatId = "original-chat")
-        repository.saveSettings(initialSettings)
+        repository.replaceSettingsForTest(initialSettings)
         barrier.complete(barrier.latestPendingGeneration())
         val originalContent = configFile.readText()
         val originalSettingsUpdate = repository.settingsUpdateFlow.value
@@ -613,7 +613,7 @@ class SettingsRepositoryBarrierTest {
             ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
         ).forEach { invalidProxy ->
             assertFailsWith<IllegalArgumentException> {
-                repository.saveSettings(initialSettings.copy(proxy = invalidProxy))
+                repository.replaceSettingsForTest(initialSettings.copy(proxy = invalidProxy))
             }
         }
 
@@ -710,7 +710,7 @@ class SettingsRepositoryBarrierTest {
         val originalTokenUpdate = repository.telegramTokenUpdateFlow.value
 
         assertFailsWith<IllegalArgumentException> {
-            repository.saveSettings(originalSettings.copy(chatId = "copied-settings-chat"))
+            repository.replaceSettingsForTest(originalSettings.copy(chatId = "copied-settings-chat"))
         }
 
         assertEquals(originalSettings, repository.settingsFlow.value)
@@ -724,7 +724,7 @@ class SettingsRepositoryBarrierTest {
             chatId = "resolved-chat",
             proxy = ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS),
         )
-        repository.saveSettings(resolvedSettings)
+        repository.replaceSettingsForTest(resolvedSettings)
 
         assertEquals(resolvedSettings, repository.settingsFlow.value)
         assertFalse(repository.hasHistoricalInvalidProxy)
@@ -754,12 +754,12 @@ class SettingsRepositoryBarrierTest {
             assertEquals(null, repository.settingsFlow.value.proxy)
             assertTrue(repository.hasHistoricalInvalidProxy)
             assertFailsWith<IllegalArgumentException> {
-                repository.saveSettings(repository.settingsFlow.value.copy(chatId = "new-chat"))
+                repository.replaceSettingsForTest(repository.settingsFlow.value.copy(chatId = "new-chat"))
             }
             assertEquals(originalContent, configFile.readText())
 
             val replacement = repository.settingsFlow.value.copy(proxy = replacementProxy)
-            repository.saveSettings(replacement)
+            repository.replaceSettingsForTest(replacement)
             assertEquals(replacement, repository.settingsFlow.value)
             assertFalse(repository.hasHistoricalInvalidProxy)
         }
@@ -888,7 +888,7 @@ class SettingsRepositoryBarrierTest {
         val originalContent = configFile.readText()
 
         assertFailsWith<IOException> {
-            repository.saveSettings(
+            repository.replaceSettingsForTest(
                 initial.copy(
                     telegramToken = "200:new",
                     ai = AISettings(agentEnabled = true),
@@ -927,7 +927,7 @@ class SettingsRepositoryBarrierTest {
         directorySyncAvailable = false
 
         assertFailsWith<JsonStorageDurabilityUnknownException> {
-            repository.saveSettings(requested)
+            repository.replaceSettingsForTest(requested)
         }
 
         assertEquals(initial, repository.settingsFlow.value)
