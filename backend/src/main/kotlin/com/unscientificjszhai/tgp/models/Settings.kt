@@ -6,6 +6,7 @@ import java.net.InetAddress
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import kotlin.collections.ArrayDeque
 
 /**
  * 应用运行所需的持久化设置。

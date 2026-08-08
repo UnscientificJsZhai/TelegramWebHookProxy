@@ -1,6 +1,6 @@
 package com.unscientificjszhai.tgp.di
 
-import io.ktor.server.testing.testApplication
+import io.ktor.server.testing.*
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertNotSame

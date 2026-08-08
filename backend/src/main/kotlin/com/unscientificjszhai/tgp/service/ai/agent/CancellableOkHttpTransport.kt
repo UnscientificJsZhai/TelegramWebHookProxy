@@ -1,11 +1,7 @@
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import kotlinx.coroutines.suspendCancellableCoroutine
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.*
 import okio.Buffer
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -105,7 +101,7 @@ internal const val MAX_RAW_RESPONSE_BYTES = 1024 * 1024
 /** 上游原生 AI 响应在解压后的实际读取字节超过上限。 */
 internal class UpstreamResponseTooLargeException : IOException("上游响应超过 1 MiB 限制。")
 
-private fun okhttp3.ResponseBody.readUtf8AtMost(limit: Int): String {
+private fun ResponseBody.readUtf8AtMost(limit: Int): String {
     if (contentLength() > limit) throw UpstreamResponseTooLargeException()
     val source = source()
     val buffer = Buffer()

@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {parseMcpHeaders, validateMcpServers, type MCPServerConfig} from './mcpSettingsValidation';
+import {type MCPServerConfig, parseMcpHeaders, validateMcpServers} from './mcpSettingsValidation';
 import {isValidProxyAuthentication, withProxyType} from './proxySettings';
 
 const safeServer = (overrides: Partial<MCPServerConfig> = {}): MCPServerConfig => ({

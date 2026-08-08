@@ -1,7 +1,7 @@
 package com.unscientificjszhai.tgp.service
 
-import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.AIProvider
+import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
@@ -12,24 +12,17 @@ import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
 import io.ktor.client.*
 import io.ktor.client.engine.mock.*
 import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.request.HttpRequestData
-import io.ktor.client.request.HttpResponseData
+import io.ktor.client.request.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
-import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.*
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import java.util.concurrent.CountDownLatch
 import kotlin.io.path.createTempDirectory
-import kotlin.test.AfterTest
-import kotlin.test.Test
-import kotlin.test.assertContentEquals
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.seconds
+import kotlin.test.*
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Telegram HTTP 客户端代理切换与关闭生命周期的测试设计。

@@ -4,7 +4,7 @@ import com.google.genai.types.FunctionDeclaration
 import com.openai.models.FunctionDefinition
 import kotlinx.serialization.json.JsonObject
 import org.slf4j.LoggerFactory
-import java.util.Collections
+import java.util.*
 import kotlin.jvm.optionals.getOrNull
 
 /**

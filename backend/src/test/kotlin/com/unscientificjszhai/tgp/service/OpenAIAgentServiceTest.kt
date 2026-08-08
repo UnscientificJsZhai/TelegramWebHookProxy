@@ -11,12 +11,7 @@ import com.openai.models.models.ModelListPage
 import com.openai.services.blocking.ChatService
 import com.openai.services.blocking.ModelService
 import com.openai.services.blocking.chat.ChatCompletionService
-import com.unscientificjszhai.tgp.models.AIProvider
-import com.unscientificjszhai.tgp.models.AISettings
-import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.models.MCPServerConfig
-import com.unscientificjszhai.tgp.models.MediaData
-import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
@@ -27,11 +22,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
 import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
-import io.mockk.coEvery
-import io.mockk.coVerify
-import io.mockk.every
-import io.mockk.mockk
-import io.mockk.verify
+import io.mockk.*
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject

@@ -2,22 +2,19 @@ package com.unscientificjszhai.tgp.service.ai.function
 
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
-import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_SCHEMA_BYTES
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.McpToolResultTooLargeException
 import com.unscientificjszhai.tgp.service.ai.validateMcpToolResult
-import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 import java.math.BigDecimal
 import java.security.MessageDigest
-import java.util.Base64
-import java.util.Collections
-import java.util.ArrayDeque
-import java.util.IdentityHashMap
+import java.util.*
 
 /**
  * 为 MCP 服务器工具生成模型可见安全别名的策略。

@@ -6,8 +6,8 @@ import com.openai.core.JsonValue
 import com.openai.models.FunctionDefinition
 import com.openai.models.FunctionParameters
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
-import kotlinx.serialization.json.*
-import java.util.ArrayDeque
+import kotlinx.serialization.json.JsonObject
+import java.util.*
 import kotlin.jvm.optionals.getOrNull
 
 /**

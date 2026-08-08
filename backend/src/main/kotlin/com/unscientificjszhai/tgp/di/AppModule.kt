@@ -1,8 +1,8 @@
 package com.unscientificjszhai.tgp.di
 
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.DelegatingAgentService
-import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import dagger.Module
 import dagger.Provides
 import io.ktor.server.application.*

@@ -1,30 +1,30 @@
-import React, {useState, useEffect, useRef} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
-    TextField,
+    Alert,
+    Box,
     Button,
     Checkbox,
-    FormControlLabel,
-    Select,
-    MenuItem,
-    FormControl,
-    InputLabel,
-    Box,
-    Typography,
-    Grid,
-    Paper,
     CircularProgress,
-    Snackbar,
-    Alert,
-    IconButton,
     Divider,
-    type SelectChangeEvent
+    FormControl,
+    FormControlLabel,
+    Grid,
+    IconButton,
+    InputLabel,
+    MenuItem,
+    Paper,
+    Select,
+    type SelectChangeEvent,
+    Snackbar,
+    TextField,
+    Typography
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
 import {useNavigate} from 'react-router-dom';
 import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from '../settingsClient';
-import {parseMcpHeaders, validateMcpServers, type MCPServerConfig} from './mcpSettingsValidation';
-import {isValidProxyAuthentication, withProxyType, type ProxySettings, type ProxyType} from './proxySettings';
+import {type MCPServerConfig, parseMcpHeaders, validateMcpServers} from './mcpSettingsValidation';
+import {isValidProxyAuthentication, type ProxySettings, type ProxyType, withProxyType} from './proxySettings';
 
 interface AISettings {
     provider: 'GEMINI' | 'OPENAI';

@@ -1,7 +1,7 @@
 package com.unscientificjszhai.tgp.utils
 
 import java.text.BreakIterator
-import java.util.Locale
+import java.util.*
 
 /** Telegram `sendMessage` 单段文本允许的最大 UTF-16 code unit 数。 */
 internal const val MAX_TELEGRAM_MESSAGE_TEXT_LENGTH = 4096

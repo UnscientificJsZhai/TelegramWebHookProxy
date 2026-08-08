@@ -18,32 +18,21 @@ import io.ktor.client.plugins.sse.*
 import io.ktor.client.request.*
 import io.modelcontextprotocol.kotlin.sdk.client.Client
 import io.modelcontextprotocol.kotlin.sdk.client.StreamableHttpClientTransport
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
-import io.modelcontextprotocol.kotlin.sdk.types.EmbeddedResource
-import io.modelcontextprotocol.kotlin.sdk.types.Implementation
-import io.modelcontextprotocol.kotlin.sdk.types.ListToolsRequest
-import io.modelcontextprotocol.kotlin.sdk.types.PaginatedRequestParams
-import io.modelcontextprotocol.kotlin.sdk.types.Tool
+import io.modelcontextprotocol.kotlin.sdk.types.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import org.slf4j.LoggerFactory
+import kotlinx.serialization.json.*
 import okhttp3.Interceptor
 import okhttp3.ResponseBody
 import okio.Buffer
 import okio.ForwardingSource
 import okio.buffer
-import java.io.IOException
+import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.nio.charset.StandardCharsets
-import java.util.ArrayDeque
-import java.util.IdentityHashMap
+import java.util.*
 import javax.inject.Inject
 
 /**

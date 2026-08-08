@@ -1,18 +1,14 @@
 package com.unscientificjszhai.tgp
 
 import io.ktor.http.*
+import io.ktor.http.content.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import io.ktor.http.content.OutgoingContent
-import io.ktor.utils.io.ByteReadChannel
-import io.ktor.utils.io.ByteWriteChannel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.Job
+import io.ktor.utils.io.*
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
@@ -20,37 +16,27 @@ import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.ChannelOutboundHandlerAdapter
 import io.netty.channel.ChannelPromise
 import io.netty.channel.embedded.EmbeddedChannel
-import io.netty.handler.codec.http.DefaultFullHttpRequest
-import io.netty.handler.codec.http.DefaultFullHttpResponse
-import io.netty.handler.codec.http.DefaultHttpContent
-import io.netty.handler.codec.http.DefaultHttpRequest
-import io.netty.handler.codec.http.DefaultHttpResponse
-import io.netty.handler.codec.http.HttpHeaderNames
+import io.netty.handler.codec.http.*
 import io.netty.handler.codec.http.HttpMethod
-import io.netty.handler.codec.http.HttpRequest
-import io.netty.handler.codec.http.HttpResponseStatus
-import io.netty.handler.codec.http.HttpVersion
-import io.netty.handler.codec.http.LastHttpContent
 import io.netty.handler.timeout.IdleStateEvent
 import io.netty.handler.timeout.IdleStateHandler
 import io.netty.util.ReferenceCountUtil
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import kotlin.coroutines.CoroutineContext
+import kotlin.test.*
+import kotlin.time.Duration.Companion.INFINITE
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
-import kotlin.time.Duration.Companion.INFINITE
 import kotlin.time.measureTime
-import kotlin.coroutines.CoroutineContext
 
 /**
  * Netty HTTP/1 入站读取保护的套接字级测试设计。

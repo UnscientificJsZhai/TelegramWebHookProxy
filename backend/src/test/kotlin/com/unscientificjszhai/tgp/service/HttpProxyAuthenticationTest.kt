@@ -2,21 +2,13 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
-import okhttp3.Credentials
-import okhttp3.OkHttpClient
-import okhttp3.Protocol
-import okhttp3.Request
-import okhttp3.Response
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import okhttp3.*
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
-import kotlin.test.AfterTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
-import kotlin.test.assertNull
+import kotlin.test.*
 
 /** HTTP 代理 Basic 认证器的挑战与重试保护测试。 */
 class HttpProxyAuthenticationTest {

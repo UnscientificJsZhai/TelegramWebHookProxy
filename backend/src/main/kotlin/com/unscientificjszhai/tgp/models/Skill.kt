@@ -1,8 +1,8 @@
 package com.unscientificjszhai.tgp.models
 
 import kotlinx.serialization.Serializable
-import kotlin.random.Random
 import java.nio.charset.StandardCharsets
+import kotlin.random.Random
 
 /** 技能标识允许的完整正则表达式。 */
 const val SKILL_ID_PATTERN = "^[A-Za-z0-9_-]{1,64}$"

@@ -2,11 +2,7 @@ package com.unscientificjszhai.tgp.models
 
 import com.unscientificjszhai.tgp.utils.ConfigJson
 import kotlinx.serialization.json.jsonObject
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
+import kotlin.test.*
 
 /**
  * 应用与 AI 设置序列化兼容性的测试设计。

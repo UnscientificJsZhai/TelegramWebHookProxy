@@ -15,12 +15,7 @@ import io.mockk.verify
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
-import kotlin.test.BeforeTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
+import kotlin.test.*
 
 /** 验证模型技能函数只能读取已批准技能并创建待审批草稿。 */
 class SkillFunctionProviderTest {

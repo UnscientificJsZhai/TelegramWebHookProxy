@@ -7,12 +7,12 @@ import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import io.mockk.coVerify
 import io.mockk.mockk
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import javax.inject.Provider
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.io.path.createTempDirectory
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.runBlocking
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals

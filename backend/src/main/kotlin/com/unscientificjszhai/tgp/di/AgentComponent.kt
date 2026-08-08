@@ -1,8 +1,8 @@
 package com.unscientificjszhai.tgp.di
 
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
-import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import dagger.Subcomponent
 
 /**

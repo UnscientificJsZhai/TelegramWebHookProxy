@@ -6,53 +6,34 @@ import com.google.genai.JsonSerializable
 import com.google.genai.Models
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.di.AgentScope
-import com.unscientificjszhai.tgp.models.AIProvider
-import com.unscientificjszhai.tgp.models.AISettings
-import com.unscientificjszhai.tgp.models.MediaData
-import com.unscientificjszhai.tgp.models.ProxySettings
+import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
-import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
+import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
-import com.unscientificjszhai.tgp.utils.SafeLogging
-import com.unscientificjszhai.tgp.utils.JsonStructureLimits
-import com.unscientificjszhai.tgp.service.ai.function.HttpCallingFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.*
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
-import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouteSnapshot
-import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
-import com.unscientificjszhai.tgp.service.ai.function.McpFunctionProvider
-import com.unscientificjszhai.tgp.service.ai.function.ScheduleTaskFunctionProvider
-import com.unscientificjszhai.tgp.service.ai.function.SkillFunctionProvider
+import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.SafeLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
+import kotlinx.serialization.json.*
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.nio.charset.StandardCharsets
 import java.time.Duration
-import java.util.ArrayDeque
+import java.util.*
 import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
@@ -1029,7 +1010,7 @@ class GeminiAgentService @Inject internal constructor(
                 add(buildJsonObject {
                     put("inlineData", buildJsonObject {
                         put("mimeType", media.mimeType)
-                        put("data", java.util.Base64.getEncoder().encodeToString(media.data))
+                        put("data", Base64.getEncoder().encodeToString(media.data))
                     })
                 })
             }

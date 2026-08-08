@@ -5,12 +5,7 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
-import kotlin.test.AfterTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertIs
-import kotlin.test.assertTrue
+import kotlin.test.*
 
 /**
  * 原子 JSON 主文件读写的故障注入测试。

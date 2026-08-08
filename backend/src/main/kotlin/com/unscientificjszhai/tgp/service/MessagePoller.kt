@@ -1,47 +1,29 @@
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.SettingsGenerationMismatchException
-import com.unscientificjszhai.tgp.repository.PendingTelegramReply
-import com.unscientificjszhai.tgp.repository.TelegramReplyDeliveryStage
-import com.unscientificjszhai.tgp.repository.UpdatesRepository
-import com.unscientificjszhai.tgp.repository.AgentTurnClaim
-import com.unscientificjszhai.tgp.repository.AgentTurnJournalEntry
-import com.unscientificjszhai.tgp.repository.AgentTurnJournalStatus
-import com.unscientificjszhai.tgp.repository.MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
-import com.unscientificjszhai.tgp.repository.RetryCheckpoint
-import com.unscientificjszhai.tgp.repository.RetryCheckpointCommitResult
-import com.unscientificjszhai.tgp.repository.RetryCheckpointGapResult
-import com.unscientificjszhai.tgp.repository.RetryCheckpointRecordResult
-import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
-import com.unscientificjszhai.tgp.repository.isPersistableTelegramUpdateId
+import com.unscientificjszhai.tgp.repository.*
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.utils.TelegramTextChunks
-import io.ktor.http.isSuccess
+import io.ktor.http.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.time.Duration
 import kotlin.concurrent.withLock
+import kotlin.random.Random
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
-import kotlin.random.Random
 
 private const val TELEGRAM_REPLY_FALLBACK_MESSAGE = "抱歉，上一条回复未能发送。"
 private const val AGENT_TURN_FAILURE_REPLY = "抱歉，该消息未能处理。"

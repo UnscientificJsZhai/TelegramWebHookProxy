@@ -1,32 +1,32 @@
-import React, {useState, useEffect, useCallback} from 'react';
+import React, {useCallback, useEffect, useState} from 'react';
 import {
+    Alert,
     Box,
     Button,
+    Card,
+    CardActions,
+    CardContent,
+    Chip,
     Container,
     Dialog,
     DialogActions,
     DialogContent,
     DialogTitle,
-    IconButton,
-    Paper,
-    TextField,
-    Typography,
-    Snackbar,
-    Alert,
-    Card,
-    CardContent,
-    CardActions,
-    Chip,
     Grid,
-    Pagination
+    IconButton,
+    Pagination,
+    Paper,
+    Snackbar,
+    TextField,
+    Typography
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import AddIcon from '@mui/icons-material/Add';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import {useNavigate} from 'react-router-dom';
-import {approveSkill, deleteSkill, getSkills, revokeSkill, saveSkill} from '../api';
 import type {Skill, SkillDraft} from '../api';
+import {approveSkill, deleteSkill, getSkills, revokeSkill, saveSkill} from '../api';
 
 const SkillPage: React.FC = () => {
     const navigate = useNavigate();

@@ -1,29 +1,22 @@
 package com.unscientificjszhai.tgp.service.ai
 
 import com.unscientificjszhai.tgp.models.MCPServerConfig
-import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
 import io.modelcontextprotocol.kotlin.sdk.client.Client
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
-import io.modelcontextprotocol.kotlin.sdk.types.EmbeddedResource
-import io.modelcontextprotocol.kotlin.sdk.types.ListToolsRequest
-import io.modelcontextprotocol.kotlin.sdk.types.ListToolsResult
-import io.modelcontextprotocol.kotlin.sdk.types.TextResourceContents
-import io.modelcontextprotocol.kotlin.sdk.types.Tool
-import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
+import io.modelcontextprotocol.kotlin.sdk.types.*
 import kotlinx.coroutines.*
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.*
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody
+import okio.Buffer
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -31,9 +24,6 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
-import okhttp3.ResponseBody
-import okhttp3.MediaType.Companion.toMediaType
-import okio.Buffer
 
 /**
  * MCP 客户端连接更新与终态关闭行为的测试设计。
