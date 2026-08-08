@@ -268,22 +268,6 @@ class TelegramService private constructor(
         }
     }
 
-    /**
-     * 向指定聊天发送临时聊天动作。
-     *
-     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
-     * `sendChatAction` 请求；捕获后的在途请求可使用该令牌完成。
-     *
-     * @param chatId 目标聊天标识，不能为空。
-     * @param action Telegram 支持的聊天动作名称，不能为空，例如 `typing`。
-     * @return 已完整读取、不再依赖 HTTP 客户端的 Telegram 响应快照。
-     * @throws IllegalStateException 当前机器人令牌为空时抛出。
-     */
-    suspend fun sendChatAction(
-        chatId: String,
-        action: String,
-    ): TelegramApiResponse = sendChatActionForToken(currentTelegramToken(), chatId, action)
-
     /** 供轮询会话使用，以会话捕获的 token 发送聊天动作。 */
     internal suspend fun sendChatActionForToken(
         token: String,
@@ -300,25 +284,6 @@ class TelegramService private constructor(
             }.toTelegramApiResponse()
         }
     }
-
-    /**
-     * 拉取机器人更新。
-     *
-     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
-     * `getUpdates` 请求；捕获后的在途请求可使用该令牌完成。
-     *
-     * 每次请求都会固定附带 `limit=10`，避免 Telegram 受 1 MiB 响应上限截断大型积压批次后在同一
-     * 偏移量反复失败。
-     *
-     * @param offset 可选的起始更新标识；为 `null` 时不传递该请求参数。
-     * @param timeout 可选的长轮询等待秒数；为 `null` 时不传递该请求参数。
-     * @return Telegram 返回的更新结果；`result` 可能为空列表。
-     * @throws IllegalStateException 当前机器人令牌为空时抛出。
-     */
-    suspend fun getUpdates(
-        offset: Long? = null,
-        timeout: Int? = null,
-    ): GetUpdatesResponse = getUpdatesForToken(currentTelegramToken(), offset, timeout)
 
     /**
      * 供轮询会话使用，以会话捕获的 token 拉取最多 10 项更新。
@@ -347,18 +312,6 @@ class TelegramService private constructor(
         }
     }
 
-    /**
-     * 获取 Telegram 文件元数据。
-     *
-     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起
-     * `getFile` 请求；捕获后的在途请求可使用该令牌完成。
-     *
-     * @param fileId Telegram 分配的文件唯一标识，不能为空。
-     * @return Telegram 返回的文件元数据；响应中的文件路径可能为 `null`。
-     * @throws IllegalStateException 当前机器人令牌为空时抛出。
-     */
-    suspend fun getFile(fileId: String): FileResponse = getFileForToken(currentTelegramToken(), fileId)
-
     /** 供轮询会话使用，以会话捕获的 token 获取文件元数据。 */
     internal suspend fun getFileForToken(token: String, fileId: String): FileResponse {
         requireTelegramToken(token)
@@ -377,19 +330,6 @@ class TelegramService private constructor(
         JsonStructureLimits.validateUtf8(bytes)
         return telegramJson.decodeFromString(bytes.decodeToString())
     }
-
-    /**
-     * 下载 Telegram 文件的完整字节内容。
-     *
-     * 请求开始时在 Telegram token 生命周期锁内捕获当前设置中的机器人令牌，再在锁外发起文件下载
-     * 请求；捕获后的在途请求可使用该令牌完成。
-     *
-     * @param filePath Telegram 返回的相对文件路径，不能为空。
-     * @return 仅在 Telegram 文件下载响应为 HTTP `2xx` 时返回下载得到的字节数组；空文件返回空数组。
-     * @throws IllegalStateException 当前机器人令牌为空，或文件下载响应不是 HTTP `2xx` 时抛出；后者的异常消息仅包含数值 HTTP 状态码。
-     * @throws TelegramPayloadTooLargeException HTTP `2xx` 响应解压后的实际字节数超过文件下载上限时抛出。
-     */
-    suspend fun downloadFile(filePath: String): ByteArray = downloadFileForToken(currentTelegramToken(), filePath)
 
     /** 供轮询会话使用，以会话捕获的 token 下载文件。 */
     internal suspend fun downloadFileForToken(token: String, filePath: String): ByteArray {

@@ -1692,75 +1692,6 @@ class MessagePoller @Inject constructor(
         "抱歉，该消息处理超时（超过10分钟）。",
     )
 
-    /**
-     * 将一条更新加入当前活跃会话的处理队列。
-     *
-     * 仅当 AI 功能可用、消息来自 `private` 聊天，且聊天标识和 Telegram `from` 发送者标识均与
-     * 当前 AI 设置的 `agentChatId` 一致时，更新才会入队。AI 接纳判定会等待共享模型切换屏障放行，
-     * 并在放行后重新读取设置；这样设置已发布但代理尚未替换时不会确认偏移量。未授权、未启用或缺少
-     * 当前提供商密钥的更新会被确认，但不会触发命令、语音下载、AI 调用或 Telegram 回复。代理在
-     * 稳定设置下仍不可用或检查失败时会保留更新供下一次轮询重试。当前没有有效会话时同样不会产生副作用。
-     * 队列满时会在屏障外使用该会话捕获的 token 回复失败提示；只有 Telegram 返回 HTTP `2xx` 且 API
-     * `ok` 为 `true` 时才确认该更新，否则由下一次轮询重试。
-     *
-     * @param update 要检查的 Telegram 更新；不含可处理消息时不会入队。
-     */
-    suspend fun handleUpdate(update: Update) {
-        activeSession()?.let { enqueueUpdate(it, update) }
-    }
-
-    /**
-     * 仅供测试把更新放入当前队列。
-     *
-     * 此方法与生产入口使用完全相同的 durable Agent 协议；不能用它绕过 journal 或 outbox。当前没有有效
-     * 会话时不产生副作用。
-     *
-     * @param update 要加入测试队列的 Telegram 更新；不含可处理消息时不会入队。
-     */
-    internal suspend fun enqueueUpdateForTesting(update: Update) {
-        activeSession()?.let { enqueueUpdate(it, update) }
-    }
-
-    /**
-     * 仅供测试使用完整 Telegram 更新执行命令。
-     *
-     * 该入口与生产入队一致地在屏障内验证私聊、发送者、当前 AI 设置和可用性，并创建不可伪造的内部票据；
-     * 它只是不经过队列，便于测试 `/reset` 对已有队列工作的结算语义。
-     */
-    internal suspend fun handleCommandForTesting(update: Update) {
-        val session = activeSession() ?: return
-        val message = update.message ?: return
-        val text = message.text?.takeIf { it.startsWith("/") } ?: return
-        val authorization = message.toAuthorizedMessageContext()
-        val ticket = modelSwitchBarrier.runWhenReady {
-            if (!isCurrent(session)) {
-                return@runWhenReady null
-            }
-            val snapshot = settingsRepository.currentSettingsSnapshot()
-            val aiSettings = snapshot.settings.ai ?: return@runWhenReady null
-            if (
-                !aiSettings.agentEnabled ||
-                aiSettings.requiredApiKey().isBlank() ||
-                !authorization.matches(aiSettings)
-            ) {
-                return@runWhenReady null
-            }
-            val available = try {
-                agentService.isAiFeatureEnabled(aiSettings)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                false
-            }
-            if (!available) {
-                null
-            } else {
-                AdmissionTicket(aiSettings.agentChatId, snapshot.generation)
-            }
-        } ?: return
-        handleAuthorizedCommand(session, ticket, authorization, update.updateId, null, text)
-    }
-
     private suspend fun enqueueUpdate(
         session: PollingSession,
         update: Update,
@@ -2819,10 +2750,6 @@ class MessagePoller @Inject constructor(
         action: String,
     ): AuthorizedEffect<TelegramApiResponse?> = runWhenAuthorized(session, ticket, authorization) {
         telegramService.sendChatActionForToken(session.token, authorization.chatId, action)
-    }
-
-    private fun activeSession(): PollingSession? = sessionLock.withLock {
-        currentSession?.takeIf { !closed && isTokenGenerationCurrent(it) }
     }
 
     private fun isCurrent(session: PollingSession): Boolean = sessionLock.withLock {

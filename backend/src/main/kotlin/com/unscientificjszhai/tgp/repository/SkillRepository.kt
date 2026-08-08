@@ -106,16 +106,6 @@ class SkillRepository private constructor(
     }
 
     /**
-     * 读取管理端可见的全部技能摘要，包括待审批草稿。
-     *
-     * @return 技能摘要列表，顺序与配置文件一致；没有可读取的技能时为空列表。
-     * @throws SkillStorageIsolationException 主文件存在可解析但标识非法或重复的历史数据时抛出。
-     */
-    fun getSkillSummaries(): List<SkillBrief> = storageLock.withLock {
-        readSkillsForRead().map { SkillBrief(it.id, it.description) }
-    }
-
-    /**
      * 读取可安全提供给模型的已批准技能摘要。
      *
      * @return 仅包含 [SkillStatus.APPROVED] 技能的摘要列表，顺序与配置文件一致；没有已批准技能时为空列表。

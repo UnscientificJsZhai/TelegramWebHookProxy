@@ -53,21 +53,6 @@ class BotCommandReconciler private constructor(
         telegramService: TelegramService,
     ) : this(parentScope, settingsRepository, telegramService, { duration -> delay(duration) }, Unit)
 
-    /**
-     * 为确定性退避测试创建命令协调器。
-     *
-     * @param parentScope 持有订阅与唯一 worker 的测试作用域。
-     * @param settingsRepository 提供带单调版本的不可变设置快照。
-     * @param telegramService 唯一执行 Telegram 命令写入的服务。
-     * @param retryDelay 等待失败重试的挂起函数；接收范围在 `1` 秒至 `1` 分钟内的非负时长，取消时必须及时返回。
-     */
-    internal constructor(
-        parentScope: CoroutineScope,
-        settingsRepository: SettingsRepository,
-        telegramService: TelegramService,
-        retryDelay: suspend (Duration) -> Unit,
-    ) : this(parentScope, settingsRepository, telegramService, retryDelay, Unit)
-
     private data class CommandTarget(
         val token: String,
         val provider: AIProvider?,

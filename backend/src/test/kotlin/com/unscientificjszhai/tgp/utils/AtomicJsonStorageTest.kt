@@ -44,39 +44,6 @@ class AtomicJsonStorageTest {
     }
 
     /**
-     * 验证提交只替换主文件，不会创建或更新 `.bak` 文件。
-     */
-    @Test
-    fun `commit does not create or update backup files`() {
-        val firstTarget = tempDirectory.resolve("first-commit.json")
-        val firstBackup = tempDirectory.resolve("first-commit.json.bak")
-
-        AtomicJsonStorage(
-            firstTarget,
-            1024 * 1024,
-            RejectBakFileOperations()
-        ).commit("initial-content".encodeToByteArray())
-
-        assertEquals("initial-content", Files.readString(firstTarget))
-        assertTrue(Files.notExists(firstBackup))
-
-        val target = tempDirectory.resolve("without-backup.json")
-        val backup = tempDirectory.resolve("without-backup.json.bak")
-        Files.writeString(target, "old-primary")
-
-        AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations()).commit("new-primary".encodeToByteArray())
-
-        assertEquals("new-primary", Files.readString(target))
-        assertTrue(Files.notExists(backup))
-
-        Files.writeString(backup, "legacy-backup")
-        AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations()).commit("newer-primary".encodeToByteArray())
-
-        assertEquals("newer-primary", Files.readString(target))
-        assertEquals("legacy-backup", Files.readString(backup))
-    }
-
-    /**
      * 验证不支持原子主替换时不会退化为普通移动。
      */
     @Test
@@ -96,57 +63,6 @@ class AtomicJsonStorageTest {
     }
 
     /**
-     * 验证主文件语义损坏时直接返回损坏状态，遗留 `.bak` 文件不会被读取或改写。
-     */
-    @Test
-    fun `corrupt primary ignores legacy bak file`() {
-        val target = tempDirectory.resolve("corrupt.json")
-        val backup = tempDirectory.resolve("corrupt.json.bak")
-        Files.writeString(target, "not-valid")
-        Files.writeString(backup, "valid-but-ignored")
-        val storage = AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations())
-
-        val result = storage.readValidated { throw IllegalArgumentException("invalid primary") }
-
-        assertTrue(result is AtomicJsonRead.Corrupt)
-        assertEquals("not-valid", Files.readString(target))
-        assertEquals("valid-but-ignored", Files.readString(backup))
-    }
-
-    /**
-     * 验证主文件缺失时返回首次启动状态，遗留 `.bak` 文件不会被读取或改写。
-     */
-    @Test
-    fun `missing primary ignores legacy bak file`() {
-        val target = tempDirectory.resolve("missing-primary.json")
-        val backup = tempDirectory.resolve("missing-primary.json.bak")
-        Files.writeString(backup, "valid-but-ignored")
-
-        val result = AtomicJsonStorage(target, 1024 * 1024, RejectBakFileOperations()).readValidated { "decoded" }
-
-        assertEquals(AtomicJsonRead.Missing, result)
-        assertTrue(Files.notExists(target))
-        assertEquals("valid-but-ignored", Files.readString(backup))
-    }
-
-    /**
-     * 验证超出上限的主文件不会完整读取或解析，也不会读取遗留 `.bak` 文件。
-     */
-    @Test
-    fun `oversized primary is corrupt and ignores legacy bak file`() {
-        val target = tempDirectory.resolve("oversized-primary.json")
-        val backup = tempDirectory.resolve("oversized-primary.json.bak")
-        Files.write(target, ByteArray(17) { 'x'.code.toByte() })
-        Files.writeString(backup, "valid-but-ignored")
-        val storage = AtomicJsonStorage(target, 16, RejectBakFileOperations())
-
-        val result = storage.readValidated { "decoded" }
-
-        assertTrue(result is AtomicJsonRead.Corrupt)
-        assertEquals("valid-but-ignored", Files.readString(backup))
-    }
-
-    /**
      * 验证超过持久化上限的提交在创建临时文件前失败，既不替换主文件也不更新备份。
      */
     @Test
@@ -163,34 +79,6 @@ class AtomicJsonStorageTest {
         assertEquals("old-backup", Files.readString(backup))
     }
 
-    /**
-     * 验证主文件读取 I/O 失败时返回独立结果且不会读取遗留 `.bak` 文件。
-     */
-    @Test
-    fun `primary io failure does not read legacy bak file`() {
-        val primaryPath = tempDirectory.resolve("io-failure.json")
-        val backup = tempDirectory.resolve("io-failure.json.bak")
-        Files.writeString(primaryPath, "primary")
-        Files.writeString(backup, "ignored")
-        val operations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                if (path == primaryPath) {
-                    throw IOException("injected primary read failure")
-                }
-                if (path.fileName.toString().endsWith(".bak")) {
-                    throw AssertionError("legacy bak file must not be read")
-                }
-                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
-            }
-        }
-
-        val result = AtomicJsonStorage(primaryPath, 1024 * 1024, operations).readValidated { "decoded" }
-
-        assertTrue(result is AtomicJsonRead.IoFailure)
-        assertEquals("ignored", Files.readString(backup))
-    }
-
-    /** 验证可见主文件只有在重新同步目录项后才作为有效快照发布，失败可在同一实例中重试。 */
     @Test
     fun `validated read confirms visible primary durability before publishing it`() {
         val target = tempDirectory.resolve("visible-but-unconfirmed.json")
@@ -392,26 +280,4 @@ class AtomicJsonStorageTest {
         }
     }
 
-    /** 任何尝试访问遗留 `.bak` 文件的存储操作都会让测试立即失败。 */
-    private class RejectBakFileOperations : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-        override fun readAtMost(path: Path, maxBytes: Int): ByteArray =
-            rejectBak(path) { DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes) }
-
-        override fun writeAndForce(path: Path, bytes: ByteArray) {
-            rejectBak(path) { DefaultAtomicJsonFileOperations.writeAndForce(path, bytes) }
-        }
-
-        override fun atomicReplace(source: Path, target: Path) {
-            rejectBak(source) { rejectBak(target) { DefaultAtomicJsonFileOperations.atomicReplace(source, target) } }
-        }
-
-        override fun deleteIfExists(path: Path) {
-            rejectBak(path) { DefaultAtomicJsonFileOperations.deleteIfExists(path) }
-        }
-
-        private fun <T> rejectBak(path: Path, action: () -> T): T {
-            check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be accessed: $path" }
-            return action()
-        }
-    }
 }

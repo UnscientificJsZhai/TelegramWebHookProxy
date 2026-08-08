@@ -80,8 +80,6 @@ internal class HttpConnectionAdmission(maxConnections: Int) {
     fun release() {
         permits.release()
     }
-
-    internal fun availablePermits(): Int = permits.availablePermits()
 }
 
 /**

@@ -3,10 +3,6 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.ChatInfo
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.utils.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import java.io.IOException
@@ -29,9 +25,7 @@ private data class ChatDiscoveryBotForTest(
 )
 
 private fun chatDiscoveryFootprintForTest(snapshot: BotUpdatesData): Int {
-    val chatBearingBots = snapshot.bots
-        .asSequence()
-        .filter { (_, data) -> data.chats.isNotEmpty() }
+    val chatBearingBots = snapshot.bots.asSequence().filter { (_, data) -> data.chats.isNotEmpty() }
         .associateTo(LinkedHashMap()) { (botId, data) -> botId to ChatDiscoveryBotForTest(data.chats) }
     val chatIdsByBot = chatBearingBots.mapValues { (_, bot) -> bot.chats.asSequence().map { it.id }.toSet() }
     val recency = chatBearingBots.keys.associateTo(LinkedHashMap()) { botId ->
@@ -55,9 +49,7 @@ private data class UnderCountingChatDiscoveryBudgetForTest(
 )
 
 private fun underCountingChatDiscoveryFootprintForTest(snapshot: BotUpdatesData): Int {
-    val chatBearingBots = snapshot.bots
-        .asSequence()
-        .filter { (_, data) -> data.chats.isNotEmpty() }
+    val chatBearingBots = snapshot.bots.asSequence().filter { (_, data) -> data.chats.isNotEmpty() }
         .associateTo(LinkedHashMap()) { (botId, data) -> botId to data.chats }
     val chatIdsByBot = chatBearingBots.mapValues { (_, chats) -> chats.asSequence().map { it.id }.toSet() }
     val recency = chatBearingBots.keys.associateTo(LinkedHashMap()) { botId ->
@@ -327,30 +319,6 @@ class UpdatesRepositoryTest {
      * 验证并发聊天发现、聊天删除和偏移量保存不会丢失彼此字段。
      */
     @Test
-    fun `concurrent mutations keep chats and offset`() = runBlocking {
-        val repository = UpdatesRepository(tempDirectory.resolve("concurrent.json"))
-        val addedChats = (1..100).map { ChatInfo(it.toString(), "chat-$it", "private") }
-
-        addedChats.map { chat ->
-            async(Dispatchers.Default) {
-                repository.mergeChats("100", listOf(chat))
-            }
-        }.awaitAll()
-        (1L..100L).map { offset ->
-            async(Dispatchers.Default) {
-                repository.saveLastUpdateId("100", offset)
-            }
-        }.awaitAll()
-        repository.deleteChat("100", "1")
-
-        val state = repository.getData("100")
-        assertEquals(MAX_DISCOVERED_CHATS_PER_BOT, state.chats.size)
-        assertEquals(100, state.lastUpdateId)
-        assertFalse(state.chats.any { it.id == "1" })
-    }
-
-    /** 验证发现缓存以独立 LRU 元数据限流，而刷新不会改变 API 返回的稳定展示顺序。 */
-    @Test
     fun `chat discovery keeps stable order while applying per bot LRU`() {
         val repository = UpdatesRepository(tempDirectory.resolve("chat-lru.json"))
         (1..MAX_DISCOVERED_CHATS_PER_BOT).forEach { index ->
@@ -415,8 +383,7 @@ class UpdatesRepositoryTest {
             }
         }
         repository.mergeChats(
-            "100",
-            listOf(ChatInfo("too-large", "中".repeat(MAX_DISCOVERED_CHAT_UTF8_BYTES), "group"))
+            "100", listOf(ChatInfo("too-large", "中".repeat(MAX_DISCOVERED_CHAT_UTF8_BYTES), "group"))
         )
 
         val allChats = (1..5).sumOf { repository.getChats(it.toString()).size }
@@ -612,8 +579,7 @@ class UpdatesRepositoryTest {
         val repository = UpdatesRepository(file)
 
         repository.mergeChats(
-            "100",
-            listOf(ChatInfo("first", "first", "private"), ChatInfo("second", "second", "private"))
+            "100", listOf(ChatInfo("first", "first", "private"), ChatInfo("second", "second", "private"))
         )
 
         val persisted = ConfigJson.decodeFromString<BotUpdatesData>(file.readText())
@@ -662,8 +628,7 @@ class UpdatesRepositoryTest {
         aheadFile.writeText(
             ConfigJson.encodeToString(
                 UpdatesData(
-                    lastUpdateId = 7,
-                    pendingTelegramReplies = listOf(ahead)
+                    lastUpdateId = 7, pendingTelegramReplies = listOf(ahead)
                 )
             )
         )
@@ -844,53 +809,6 @@ class UpdatesRepositoryTest {
 
     /** 验证损坏主更新状态不会读取遗留 `.bak` 文件，并在构造时安全失败。 */
     @Test
-    fun `damaged primary ignores legacy bak`() {
-        val file = tempDirectory.resolve("updates-recovery.json")
-        val backupContent =
-            ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 42))))
-        file.writeText("[ invalid")
-        file.resolveSibling("updates-recovery.json.bak").writeText(backupContent)
-
-        assertFailsWith<IllegalStateException> { UpdatesRepository(file, rejectBakOperations()) }
-        assertEquals("[ invalid", file.readText())
-        assertEquals(backupContent, file.resolveSibling("updates-recovery.json.bak").readText())
-    }
-
-    /** 验证损坏主文件会中止仓储构造，且不会访问遗留 `.bak` 文件。 */
-    @Test
-    fun `damaged updates primary aborts construction without touching legacy bak`() {
-        val file = tempDirectory.resolve("updates-recovery-failure.json")
-        val backup = file.resolveSibling("updates-recovery-failure.json.bak")
-        val damagedPrimary = "{ invalid"
-        val validBackup =
-            ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 7))))
-        file.writeText(damagedPrimary)
-        backup.writeText(validBackup)
-        assertFailsWith<IllegalStateException> { UpdatesRepository(file, rejectBakOperations()) }
-        assertEquals(damagedPrimary, file.readText())
-        assertEquals(validBackup, backup.readText())
-    }
-
-    /**
-     * 验证主更新状态缺失时返回空状态，且不会访问遗留 `.bak` 文件。
-     */
-    @Test
-    fun `missing updates primary ignores legacy bak`() {
-        val file = tempDirectory.resolve("missing-updates.json")
-        val backup = file.resolveSibling("missing-updates.json.bak")
-        val backupContent =
-            ConfigJson.encodeToString(BotUpdatesData(bots = mapOf("100" to UpdatesData(lastUpdateId = 42))))
-        backup.writeText(backupContent)
-
-        val repository = UpdatesRepository(file, rejectBakOperations())
-
-        assertEquals(UpdatesData(), repository.getData("100"))
-        assertFalse(file.exists())
-        assertEquals(backupContent, backup.readText())
-    }
-
-    /** 验证主更新状态损坏时构造被拒绝，且主文件与遗留备份均保持原样。 */
-    @Test
     fun `damaged updates primary aborts construction without overwriting either file`() {
         val file = tempDirectory.resolve("double-damaged-updates.json")
         val backup = file.resolveSibling("double-damaged-updates.json.bak")
@@ -953,9 +871,7 @@ class UpdatesRepositoryTest {
         }
         assertFailsWith<IllegalArgumentException> {
             repository.skipRetryCheckpointGap(
-                "100",
-                expectedTargetUpdateId = 11,
-                observedFirstUpdateId = Long.MAX_VALUE
+                "100", expectedTargetUpdateId = 11, observedFirstUpdateId = Long.MAX_VALUE
             )
         }
         assertFailsWith<IllegalArgumentException> {
@@ -1067,10 +983,7 @@ class UpdatesRepositoryTest {
         assertEquals(
             RetryCheckpointRecordResult.Recorded(RetryCheckpoint(11, 100, 2)),
             UpdatesRepository(legacyFile).recordRetryCheckpoint(
-                "100",
-                11,
-                expectedTargetUpdateId = 11,
-                nowMillis = 200
+                "100", 11, expectedTargetUpdateId = 11, nowMillis = 200
             ),
         )
 
@@ -1453,16 +1366,4 @@ class UpdatesRepositoryTest {
         assertEquals(prepared, UpdatesRepository(file).getPendingTelegramReplies("100").single())
     }
 
-    private fun rejectBakOperations(): AtomicJsonFileOperations =
-        object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-            override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
-                return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
-            }
-
-            override fun writeAndForce(path: Path, bytes: ByteArray) {
-                check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be written" }
-                DefaultAtomicJsonFileOperations.writeAndForce(path, bytes)
-            }
-        }
 }

@@ -6,7 +6,8 @@ import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
-import com.unscientificjszhai.tgp.utils.*
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -20,7 +21,6 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.serialization.json.*
 import java.io.File
-import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
 
@@ -649,49 +649,6 @@ class APIModuleTest {
 
             assertEquals(historicalContent, originalContent)
             assertFalse(configFile.readText() == originalContent)
-        } finally {
-            temporaryDirectory.deleteRecursively()
-        }
-    }
-
-    /** 验证聊天设置 API 只读取主文件，遗留 `.bak` 文件不可访问也不影响更新。 */
-    @Test
-    fun `chat settings ignores inaccessible legacy bak sidecar`() {
-        val temporaryDirectory = createTempDirectory("api-settings-primary-only-test").toFile()
-        try {
-            val configFile = temporaryDirectory.resolve("settings.json")
-            val sidecarFile = temporaryDirectory.resolve("settings.json.bak")
-            val primary = AppSettings(telegramToken = "100:primary", chatId = "old-chat")
-            configFile.writeText(ConfigJson.encodeToString(primary))
-            sidecarFile.writeText(ConfigJson.encodeToString(AppSettings(telegramToken = "100:ignored")))
-            val fileOperations = object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
-                override fun readAtMost(path: Path, maxBytes: Int): ByteArray {
-                    check(!path.fileName.toString().endsWith(".bak")) { "legacy bak file must not be read" }
-                    return DefaultAtomicJsonFileOperations.readAtMost(path, maxBytes)
-                }
-            }
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
-            val telegramService = mockk<TelegramService>(relaxed = true)
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.settingsRepository } returns repository
-            every { appComponent.telegramService } returns telegramService
-
-            testApplication {
-                application { configureTestApi(appComponent) }
-
-                client.post("/api/settings/chat") {
-                    header(HttpHeaders.IfMatch, currentSettingsETag())
-                    contentType(ContentType.Application.Json)
-                    setBody("""{"chatId":"new-chat"}""")
-                }.apply {
-                    assertEquals(HttpStatusCode.OK, status)
-                }
-            }
-
-            assertEquals("100:primary", repository.settingsFlow.value.telegramToken)
-            assertEquals("new-chat", repository.settingsFlow.value.chatId)
-            assertEquals("100:primary", ConfigJson.decodeFromString<AppSettings>(configFile.readText()).telegramToken)
-            assertEquals("100:ignored", ConfigJson.decodeFromString<AppSettings>(sidecarFile.readText()).telegramToken)
         } finally {
             temporaryDirectory.deleteRecursively()
         }

@@ -954,7 +954,7 @@ class OpenAIAgentService @Inject internal constructor(
             (JsonStructureLimits.parseToJsonElement(json, arguments) as? JsonObject)?.toMap()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
@@ -981,16 +981,8 @@ class OpenAIAgentService @Inject internal constructor(
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
-        }
-
-    /**
-     * 根据当前模型构建 Chat Completions 请求参数。
-     */
-    internal suspend fun createChatCompletionParams(tools: List<ChatCompletionTool>): ChatCompletionCreateParams =
-        sessionMutex.withLock {
-            createChatCompletionParams(tools, history.toList())
         }
 
     /**
