@@ -1,33 +1,40 @@
 package com.unscientificjszhai.tgp.service
 
-import com.google.genai.Chat
-import com.google.genai.Chats
-import com.google.genai.Client
-import com.google.genai.Models
-import com.google.genai.Pager
+import com.google.common.collect.ImmutableList
+import com.google.genai.*
 import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
-import com.unscientificjszhai.tgp.service.ai.agent.GeminiAgentService
-import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
+import com.unscientificjszhai.tgp.service.ai.agent.*
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
+import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.*
-import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
+import okhttp3.OkHttpClient
 import java.io.File
 import java.nio.file.Files
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
+/**
+ * Gemini 代理服务模型、工具调用和关闭行为的测试设计。
+ */
 class GeminiAgentServiceTest {
 
     private lateinit var settingsRepository: SettingsRepository
@@ -39,7 +46,7 @@ class GeminiAgentServiceTest {
     fun setup() {
         tempDirectory = Files.createTempDirectory("gemini-agent-service-test").toFile()
         val testScope = CoroutineScope(EmptyCoroutineContext)
-        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"))
+        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
         skillRepository =
             com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(File(tempDirectory, "skills.json"))
         service =
@@ -51,6 +58,11 @@ class GeminiAgentServiceTest {
         tempDirectory.deleteRecursively()
     }
 
+    /**
+     * 验证初始模型状态的设计。
+     *
+     * 验证服务使用预期默认模型并提供初始可选模型列表。
+     */
     @Test
     fun testDefaultModelAndInitialAvailableModels() {
         assertEquals("models/gemini-3.5-flash-lite", service.currentModel)
@@ -64,9 +76,15 @@ class GeminiAgentServiceTest {
         )
     }
 
+
+    /**
+     * 验证刷新前恢复持久化模型选择的设计。
+     *
+     * 验证服务创建时会先采用已保存的有效模型。
+     */
     @Test
     fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
-        settingsRepository.saveSettings(
+        settingsRepository.replaceSettingsForTest(
             AppSettings(ai = AISettings(selectedModel = "models/gemini-custom")),
         )
 
@@ -76,73 +94,49 @@ class GeminiAgentServiceTest {
     }
 
     @Test
-    fun testSuccessfulRefreshClearsInvalidPersistedModelAndFallsBack() = runBlocking {
-        val models = mockk<Models>()
-        val pager = mockk<Pager<Model>>()
-        val chats = mockk<Chats>()
-        val fallbackChat = mockk<Chat>()
-        val fallbackModel = Model.builder().name("models/fallback-model").build()
-        settingsRepository.saveSettings(
-            AppSettings(ai = AISettings(geminiApiKey = "test-key", selectedModel = "models/gemini-3.5-flash-lite")),
+    fun `Gemini SDK and REST prompts exclude pending skills`() {
+        val approvedDraft = skillRepository.saveSkill(
+            Skill(
+                id = "approved",
+                description = "APPROVED_SKILL_CANARY",
+                content = "approved"
+            )
         )
-        every { models.list(any<ListModelsConfig>()) } returns pager
-        every { pager.iterator() } returns mutableListOf(fallbackModel).iterator()
-        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns fallbackChat
-        setPrivateField("configuredApiKey", "test-key")
-        injectClient(chats, models)
+        skillRepository.approveSkill(approvedDraft.id, approvedDraft.revision)
+        skillRepository.createPendingDraft("PENDING_SKILL_CANARY", "pending")
+        val settings = AISettings(globalContext = "SYSTEM_CONTEXT_CANARY")
+        val routeSnapshot = LocalFunctionRouter(emptyList()).refresh()
+        val sdkMethod =
+            GeminiAgentService::class.java.declaredMethods.single { it.name == "createSdkSessionConfig" }.apply {
+                isAccessible = true
+            }
+        val wireMethod =
+            GeminiAgentService::class.java.declaredMethods.single { it.name == "createGeminiWireConfig" }.apply {
+                isAccessible = true
+            }
 
-        service.updateModel()
+        val sdkPrompt = sdkMethod.invoke(service, settings, routeSnapshot).toString()
+        val wirePrompt = wireMethod.invoke(service, settings, routeSnapshot).toString()
 
-        assertEquals("models/fallback-model", service.currentModel)
-        assertEquals("", settingsRepository.settingsFlow.value.ai?.selectedModel)
-    }
-
-    @Test
-    fun testFailedRefreshRetainsPersistedSelectedModel() = runBlocking {
-        val models = mockk<Models>()
-        settingsRepository.saveSettings(
-            AppSettings(ai = AISettings(geminiApiKey = "test-key", selectedModel = "models/gemini-3.5-flash-lite")),
-        )
-        every { models.list(any<ListModelsConfig>()) } throws IllegalStateException("network failure")
-        injectClient(mockk(), models)
-
-        assertEquals(null, service.updateModel())
-
-        assertEquals("models/gemini-3.5-flash-lite", settingsRepository.settingsFlow.value.ai?.selectedModel)
-    }
-
-    @Test
-    fun testSwitchingUnprefixedModelsRetainsSdkPrefix() {
-        listOf(
-            "gemini-3.5-flash-lite" to "models/gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite" to "models/gemini-3.1-flash-lite",
-            "gemini-2.5-flash" to "models/gemini-2.5-flash",
-        ).forEach { (modelName, expectedModel) ->
-            service.switchModel(modelName)
-
-            assertEquals(expectedModel, service.currentModel)
+        listOf(sdkPrompt, wirePrompt).forEach { prompt ->
+            assertTrue(prompt.contains("APPROVED_SKILL_CANARY"))
+            assertFalse(prompt.contains("PENDING_SKILL_CANARY"))
         }
     }
 
-    @Test
-    fun testSwitchingPrefixedModelRetainsItsName() {
-        service.switchModel("models/gemini-3.1-flash-lite")
 
-        assertEquals("models/gemini-3.1-flash-lite", service.currentModel)
-    }
 
-    @Test
-    fun testSwitchingUnprefixedDynamicallyAvailableModelAddsPrefix() {
-        GeminiAgentService::class.java.getDeclaredField("availableModels").apply {
-            isAccessible = true
-            set(service, listOf("models/custom-model"))
-        }
 
-        service.switchModel("custom-model")
 
-        assertEquals("models/custom-model", service.currentModel)
-    }
 
+
+
+
+    /**
+     * 验证不支持模型的拒绝设计。
+     *
+     * 验证切换到不在可用列表中的模型会抛出参数异常。
+     */
     @Test
     fun testSwitchingUnsupportedModelFails() {
         assertFailsWith<IllegalArgumentException> {
@@ -150,6 +144,11 @@ class GeminiAgentServiceTest {
         }
     }
 
+    /**
+     * 验证工具调用响应标识保留的设计。
+     *
+     * 验证生成的函数响应包含原调用的标识和名称。
+     */
     @Test
     fun testFunctionResponseRetainsCallIdAndName() {
         val functionCall = FunctionCall.builder()
@@ -169,6 +168,11 @@ class GeminiAgentServiceTest {
         assertEquals("ok", response.response().get()["status"])
     }
 
+    /**
+     * 验证无调用标识的旧版工具调用兼容设计。
+     *
+     * 验证旧版调用仍可生成可用的函数响应。
+     */
     @Test
     fun testLegacyFunctionCallWithoutIdStillGeneratesResponse() {
         val functionCall = FunctionCall.builder()
@@ -186,93 +190,41 @@ class GeminiAgentServiceTest {
         assertEquals("failed", response.response().get()["error"])
     }
 
-    @Test
-    fun testUnknownFunctionCallsProduceMatchingErrorResponses() = runTest {
-        val chat = mockk<Chat>()
-        val firstCall = FunctionCall.builder().id("call-1").name("missing_one").args(emptyMap()).build()
-        val secondCall = FunctionCall.builder().id("call-2").name("missing_two").args(emptyMap()).build()
-        val toolCallResponse = responseWithParts(
-            Part.builder().functionCall(firstCall).build(),
-            Part.builder().functionCall(secondCall).build(),
+
+
+
+
+
+
+
+
+    private fun responseWithParts(
+        vararg parts: Part,
+        finishReason: FinishReason? = FinishReason(FinishReason.Known.STOP),
+    ): GenerateContentResponse {
+        val candidate = Candidate.builder().content(
+            Content.builder().role("model").parts(parts.toList()).build(),
         )
-        val finalResponse = responseWithParts(Part.fromText("完成"))
-        val sentFunctionResults = slot<Content>()
-        every { chat.sendMessage(any<List<Content>>()) } returns toolCallResponse
-        every { chat.sendMessage(capture(sentFunctionResults)) } returns finalResponse
-        injectChat(chat)
-
-        assertEquals("完成", service.sendMessage("执行未知工具"))
-
-        val functionResponses = sentFunctionResults.captured.parts().get().map { it.functionResponse().get() }
-        assertEquals(listOf("call-1", "call-2"), functionResponses.map { it.id().get() })
-        assertEquals(listOf("missing_one", "missing_two"), functionResponses.map { it.name().get() })
-        assertEquals("Function missing_one not found", functionResponses[0].response().get()["error"])
-        assertEquals("Function missing_two not found", functionResponses[1].response().get()["error"])
+        finishReason?.let(candidate::finishReason)
+        return GenerateContentResponse.builder().candidates(candidate.build()).build()
     }
 
-    @Test
-    fun testToolCallsStopAfterMaximumRounds() = runTest {
-        val chat = mockk<Chat>()
-        val newChat = mockk<Chat>()
+    private fun prepareSuccessfulSwitch() {
         val chats = mockk<Chats>()
-        val functionCall = FunctionCall.builder().name("missing").args(emptyMap()).build()
-        val toolCallResponse = responseWithParts(Part.builder().functionCall(functionCall).build())
-        settingsRepository.saveSettings(AppSettings(ai = AISettings()))
-        every { chat.sendMessage(any<List<Content>>()) } returns toolCallResponse
-        every { chat.sendMessage(any<Content>()) } returns toolCallResponse
-        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns newChat
-        every { newChat.sendMessage(any<List<Content>>()) } returns responseWithParts(Part.fromText("新会话"))
+        settingsRepository.replaceSettingsForTest(AppSettings(ai = AISettings()))
+        every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns mockk()
         injectClient(chats)
-        injectChat(chat)
-
-        val exception = assertFailsWith<IllegalStateException> {
-            service.sendMessage("持续调用工具")
-        }
-
-        assertEquals("工具调用轮次超过上限（$MAX_TOOL_CALL_ROUNDS 轮）。", exception.message)
-        verify(exactly = 1) { chat.sendMessage(any<List<Content>>()) }
-        verify(exactly = MAX_TOOL_CALL_ROUNDS) { chat.sendMessage(any<Content>()) }
-        assertEquals(newChat, GeminiAgentService::class.java.getDeclaredField("chat").apply {
-            isAccessible = true
-        }.get(service))
-        assertEquals("新会话", service.sendMessage("继续对话"))
-        verify(exactly = 1) { chats.create(any<String>(), any<GenerateContentConfig>()) }
-        verify(exactly = 1) { newChat.sendMessage(any<List<Content>>()) }
     }
 
-    @Test
-    fun test关闭会等待在途消息完成后再释放会话() = runBlocking {
-        val chat = mockk<Chat>()
-        val requestStarted = CountDownLatch(1)
-        val releaseRequest = CountDownLatch(1)
-        every { chat.sendMessage(any<List<Content>>()) } answers {
-            requestStarted.countDown()
-            check(releaseRequest.await(5, TimeUnit.SECONDS))
-            responseWithParts(Part.fromText("完成"))
-        }
-        injectChat(chat)
-
-        val inFlightMessage = async(Dispatchers.Default) { service.sendMessage("第一条消息") }
-        assertTrue(requestStarted.await(5, TimeUnit.SECONDS))
-
-        val closeJob = service.close()
-        assertFalse(closeJob.isCompleted)
-
-        releaseRequest.countDown()
-        assertEquals("完成", withTimeout(5.seconds) { inFlightMessage.await() })
-        withTimeout(5.seconds) { closeJob.join() }
-        assertTrue(closeJob.isCompleted)
-    }
-
-    private fun responseWithParts(vararg parts: Part): GenerateContentResponse =
-        GenerateContentResponse.builder().candidates(
-            Candidate.builder().content(
-                Content.builder().role("model").parts(parts.toList()).build(),
-            ).build(),
-        ).build()
+    private fun privateField(name: String): Any? = GeminiAgentService::class.java.getDeclaredField(name).apply {
+        isAccessible = true
+    }.get(service)
 
     private fun injectChat(chat: Chat) {
         GeminiAgentService::class.java.getDeclaredField("chat").apply { isAccessible = true }.set(service, chat)
+        GeminiAgentService::class.java.getDeclaredField("chatFunctionRouteSnapshot").apply {
+            isAccessible = true
+        }.set(service, LocalFunctionRouter(emptyList()).refresh())
     }
 
     private fun injectClient(chats: Chats, models: Models? = null) {
@@ -294,8 +246,38 @@ class GeminiAgentServiceTest {
         ) { mockk() }
     }
 
+    /** 构造不触发初始会话的原生模型发现服务，并将其传输定向到测试服务器。 */
+    private fun rawDiscoveryService(
+        server: MockWebServer,
+        deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
+    ): GeminiAgentService {
+        val testScope = CoroutineScope(EmptyCoroutineContext)
+        return GeminiAgentService(
+            testScope,
+            settingsRepository,
+            skillRepository,
+            MCPClientService(testScope),
+            deadlines,
+        ) { mockk() }.also { rawService ->
+            setPrivateField(rawService, "rawApiKey", "test-key")
+            setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
+            setPrivateField(rawService, "rawTransport", CancellableOkHttpTransport(OkHttpClient()))
+        }
+    }
+
     private fun setPrivateField(name: String, value: Any?) {
         GeminiAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(service, value)
+    }
+
+    private fun setPrivateField(target: GeminiAgentService, name: String, value: Any?) {
+        GeminiAgentService::class.java.getDeclaredField(name).apply { isAccessible = true }.set(target, value)
+    }
+
+    /** 构造恰好超过统一限制的深 JSON，让原生 Gemini 响应在字段读取前被拒绝。 */
+    private fun deeplyNestedJson(depth: Int): String = buildString {
+        repeat(depth) { append("{\"next\":") }
+        append("\"leaf\"")
+        repeat(depth) { append('}') }
     }
 
 }

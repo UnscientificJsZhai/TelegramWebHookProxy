@@ -1,43 +1,30 @@
-import React, { useState, useEffect } from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
-    TextField,
+    Alert,
+    Box,
     Button,
     Checkbox,
-    FormControlLabel,
-    Select,
-    MenuItem,
-    FormControl,
-    InputLabel,
-    Box,
-    Typography,
-    Grid,
-    Paper,
     CircularProgress,
-    Snackbar,
-    Alert,
-    IconButton,
     Divider,
-    type SelectChangeEvent
+    FormControl,
+    FormControlLabel,
+    Grid,
+    IconButton,
+    InputLabel,
+    MenuItem,
+    Paper,
+    Select,
+    type SelectChangeEvent,
+    Snackbar,
+    TextField,
+    Typography
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AddIcon from '@mui/icons-material/Add';
-import { useNavigate } from 'react-router-dom';
-import api from '../api';
-
-interface ProxySettings {
-    host: string;
-    port: number;
-    type: string;
-    username?: string;
-    password?: string;
-}
-
-interface MCPServerConfig {
-    name: string;
-    url: string;
-    headers: Record<string, string>;
-    _headerString?: string;
-}
+import {useNavigate} from 'react-router-dom';
+import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from '../settingsClient';
+import {type MCPServerConfig, parseMcpHeaders, validateMcpServers} from './mcpSettingsValidation';
+import {isValidProxyAuthentication, type ProxySettings, type ProxyType, withProxyType} from './proxySettings';
 
 interface AISettings {
     provider: 'GEMINI' | 'OPENAI';
@@ -51,6 +38,14 @@ interface AISettings {
     autoCleanContextIntervalMinutes: number;
     silentContextCleanup: boolean;
     mcpServers: MCPServerConfig[];
+    httpToolSettings: HttpToolSettings;
+}
+
+interface HttpToolSettings {
+    enabled: boolean;
+    targets: unknown[];
+    requestTimeoutMillis: number;
+    maxConcurrentRequests: number;
 }
 
 interface AppSettings {
@@ -71,50 +66,82 @@ const defaultAiSettings: AISettings = {
     globalContext: '',
     autoCleanContextIntervalMinutes: 0,
     silentContextCleanup: false,
-    mcpServers: []
+    mcpServers: [],
+    httpToolSettings: {
+        enabled: false,
+        targets: [],
+        requestTimeoutMillis: 10000,
+        maxConcurrentRequests: 2
+    }
 };
+
+const normalizeSettings = (settings: AppSettings): AppSettings => ({
+    ...settings,
+    proxy: settings.proxy ? {
+        ...settings.proxy,
+        username: settings.proxy.username ?? null,
+        password: settings.proxy.password ?? null
+    } : null,
+    ai: settings.ai ? {
+        ...defaultAiSettings,
+        ...settings.ai,
+        mcpServers: settings.ai.mcpServers || [],
+        httpToolSettings: {
+            ...defaultAiSettings.httpToolSettings,
+            ...settings.ai.httpToolSettings
+        }
+    } : null
+});
 
 const Settings: React.FC = () => {
     const navigate = useNavigate();
     const [settings, setSettings] = useState<AppSettings | null>(null);
+    const [settingsRevision, setSettingsRevision] = useState<string | null>(null);
+    const [saving, setSaving] = useState(false);
+    const savingRef = useRef(false);
     const [autoCleanIntervalInput, setAutoCleanIntervalInput] = useState('0');
     const [autoCleanIntervalError, setAutoCleanIntervalError] = useState(false);
-    const [snackbar, setSnackbar] = useState<{ open: boolean, message: string, severity: 'success' | 'error' | 'info' } | null>(null);
+    const [snackbar, setSnackbar] = useState<{
+        open: boolean,
+        message: string,
+        severity: 'success' | 'error' | 'info'
+    } | null>(null);
 
     useEffect(() => {
-        api.get<AppSettings>('/settings')
+        fetchVersionedSettings<AppSettings>()
             .then(response => {
-                const normalizedSettings = {
-                    ...response.data,
-                    ai: response.data.ai ? {
-                        ...defaultAiSettings,
-                        ...response.data.ai,
-                        mcpServers: response.data.ai.mcpServers || []
-                    } : null
-                };
+                const normalizedSettings = normalizeSettings(response.settings);
+                const etag = response.etag;
                 setSettings(normalizedSettings);
+                setSettingsRevision(etag);
                 setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
                 setAutoCleanIntervalError(false);
+                if (!etag) {
+                    setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
+                }
             })
             .catch(error => {
                 console.error('Failed to fetch settings:', error);
-                setSnackbar({ open: true, message: '获取设置失败', severity: 'error' });
+                setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
             });
     }, []);
 
     const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         if (!settings) return;
-        const { name, value } = event.target;
+        const {name, value} = event.target;
         const [section, field] = name.split('.');
 
         if (section === 'proxy') {
             setSettings(prev => {
                 if (!prev || !prev.proxy) return prev;
+                const proxyValue = field === 'port'
+                    ? Number(value)
+                    : ((field === 'username' || field === 'password') && value === '' ? null : value);
                 return {
                     ...prev,
                     proxy: {
                         ...prev.proxy,
-                        [field]: value
+                        [field]: proxyValue
                     }
                 };
             });
@@ -174,7 +201,7 @@ const Settings: React.FC = () => {
 
     const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         if (!settings) return;
-        const { name, checked } = event.target;
+        const {name, checked} = event.target;
         const [section, field] = name.split('.');
 
         if (section === 'ai') {
@@ -200,7 +227,9 @@ const Settings: React.FC = () => {
                 proxy: {
                     host: '127.0.0.1',
                     port: 7890,
-                    type: 'HTTP'
+                    type: 'HTTP',
+                    username: null,
+                    password: null
                 }
             }));
         } else {
@@ -210,25 +239,22 @@ const Settings: React.FC = () => {
             }));
         }
     };
-    
+
     const handleProxyTypeChange = (event: SelectChangeEvent) => {
         if (!settings) return;
-        const { value } = event.target;
+        const value = event.target.value as ProxyType;
         setSettings(prev => {
             if (!prev || !prev.proxy) return prev;
             return {
                 ...prev,
-                proxy: {
-                    ...prev.proxy,
-                    type: value
-                }
+                proxy: withProxyType(prev.proxy, value)
             };
         });
     };
 
     const handleAiProviderChange = (event: SelectChangeEvent) => {
         if (!settings) return;
-        const { value } = event.target;
+        const {value} = event.target;
         setSettings(prev => {
             if (!prev) return prev;
             const ai = prev.ai || defaultAiSettings;
@@ -268,7 +294,7 @@ const Settings: React.FC = () => {
                 ...prev,
                 ai: {
                     ...ai,
-                    mcpServers: [...currentServers, { name: '', url: '', headers: {} }]
+                    mcpServers: [...currentServers, {name: '', url: '', headers: {}}]
                 }
             };
         });
@@ -297,7 +323,7 @@ const Settings: React.FC = () => {
             if (!prev) return prev;
             const ai = prev.ai || defaultAiSettings;
             const updatedServers = [...(ai.mcpServers || [])];
-            updatedServers[index] = { ...updatedServers[index], [field]: value };
+            updatedServers[index] = {...updatedServers[index], [field]: value};
             return {
                 ...prev,
                 ai: {
@@ -310,27 +336,18 @@ const Settings: React.FC = () => {
 
     const handleMCPHeaderChange = (index: number, headerString: string) => {
         if (!settings) return;
-        
+
         setSettings(prev => {
             if (!prev) return prev;
             const ai = prev.ai || defaultAiSettings;
             const updatedServers = [...(ai.mcpServers || [])];
-            
-            let parsedHeaders = updatedServers[index].headers;
-            try {
-                if (headerString.trim() !== '') {
-                    parsedHeaders = JSON.parse(headerString);
-                } else {
-                    parsedHeaders = {};
-                }
-            } catch {
-                // Ignore parsing errors, keep old headers object but update the string
-            }
 
-            updatedServers[index] = { 
-                ...updatedServers[index], 
+            const parsedHeaders = parseMcpHeaders(headerString) ?? updatedServers[index].headers;
+
+            updatedServers[index] = {
+                ...updatedServers[index],
                 headers: parsedHeaders,
-                _headerString: headerString 
+                _headerString: headerString
             };
 
             return {
@@ -343,10 +360,26 @@ const Settings: React.FC = () => {
         });
     };
 
-    const handleSave = () => {
-        if (!settings) return;
+    const handleSave = async () => {
+        if (!settings || savingRef.current) return;
+        if (!settingsRevision) {
+            setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
+            return;
+        }
         if ((settings.ai?.autoCleanContextIntervalMinutes || 0) > 0 && autoCleanIntervalError) {
-            setSnackbar({ open: true, message: '清理间隔必须是正整数', severity: 'error' });
+            setSnackbar({open: true, message: '清理间隔必须是正整数', severity: 'error'});
+            return;
+        }
+        if (!isValidProxyAuthentication(settings.proxy)) {
+            setSnackbar({
+                open: true,
+                message: 'HTTP 代理用户名和密码必须同时填写；SOCKS 代理不支持认证。',
+                severity: 'error'
+            });
+            return;
+        }
+        if (!validateMcpServers(settings.ai?.mcpServers || [])) {
+            setSnackbar({open: true, message: 'MCP 服务器配置不合法，请检查名称、URL 和请求头。', severity: 'error'});
             return;
         }
 
@@ -356,36 +389,56 @@ const Settings: React.FC = () => {
             ai: settings.ai ? {
                 ...settings.ai,
                 mcpServers: settings.ai.mcpServers.map((server) => {
-                    const serverToSave = { ...server };
+                    const serverToSave = {...server};
                     delete serverToSave._headerString;
                     return serverToSave;
                 })
             } : null
         };
 
-        api.post('/settings', settingsToSave)
-            .then(() => {
-                setSnackbar({ open: true, message: '设置保存成功！', severity: 'success' });
-            })
-            .catch(error => {
-                console.error('Failed to save settings:', error);
-                setSnackbar({ open: true, message: '保存设置失败', severity: 'error' });
+        savingRef.current = true;
+        setSaving(true);
+        try {
+            const response = await saveVersionedSettings<AppSettings>(settingsToSave, settingsRevision);
+            const normalizedSettings = normalizeSettings(response.settings);
+            const etag = response.etag;
+            setSettings(normalizedSettings);
+            setSettingsRevision(etag);
+            setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
+            setAutoCleanIntervalError(false);
+            setSnackbar({
+                open: true,
+                message: etag ? '设置保存成功！' : '设置已保存，但获取设置修订值失败，请刷新页面',
+                severity: etag ? 'success' : 'error'
             });
+        } catch (error: unknown) {
+            console.error('Failed to save settings:', error);
+            setSnackbar({
+                open: true,
+                message: isSettingsConflict(error)
+                    ? '配置已被其他操作修改，请刷新页面后重试'
+                    : '保存设置失败',
+                severity: 'error'
+            });
+        } finally {
+            savingRef.current = false;
+            setSaving(false);
+        }
     };
 
     const handleCloseSnackbar = () => {
         setSnackbar(null);
     };
-    
+
     if (!settings) {
-        return <CircularProgress />;
+        return <CircularProgress/>;
     }
 
     const ai = settings.ai || defaultAiSettings;
     const autoCleanEnabled = (ai.autoCleanContextIntervalMinutes || 0) > 0;
 
     return (
-        <Paper elevation={3} sx={{ p: 4 }}>
+        <Paper elevation={3} sx={{p: 4}}>
             <Typography variant="h4" gutterBottom>
                 设置
             </Typography>
@@ -407,14 +460,14 @@ const Settings: React.FC = () => {
                 </Grid>
 
                 <Grid size={{xs: 12}}>
-                    <Divider sx={{ my: 2 }} />
+                    <Divider sx={{my: 2}}/>
                     <Typography variant="h5" gutterBottom>
                         AI 代理设置
                     </Typography>
                 </Grid>
 
                 <Grid size={{xs: 12}}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Box sx={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
                         <FormControlLabel
                             control={
                                 <Checkbox
@@ -463,6 +516,7 @@ const Settings: React.FC = () => {
                                     type="password"
                                     value={ai.geminiApiKey}
                                     onChange={handleChange}
+                                    inputProps={{maxLength: 512}}
                                     variant="outlined"
                                 />
                             </Grid>
@@ -476,6 +530,7 @@ const Settings: React.FC = () => {
                                         type="password"
                                         value={ai.openAiApiKey}
                                         onChange={handleChange}
+                                        inputProps={{maxLength: 512}}
                                         variant="outlined"
                                     />
                                 </Grid>
@@ -486,6 +541,7 @@ const Settings: React.FC = () => {
                                         name="ai.openAiBaseUrl"
                                         value={ai.openAiBaseUrl}
                                         onChange={handleChange}
+                                        inputProps={{maxLength: 2048}}
                                         variant="outlined"
                                         placeholder="https://api.openai.com/v1"
                                         helperText="留空则使用默认地址。可用于配置国内代理或中转接口。"
@@ -493,24 +549,25 @@ const Settings: React.FC = () => {
                                 </Grid>
                             </>
                         )}
-                        
+
                         <Grid size={{xs: 12}}>
-                            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                            <Box sx={{display: 'flex', gap: 2, alignItems: 'center'}}>
                                 <TextField
                                     fullWidth
-                                    label="监听 Chat ID"
+                                    label="授权用户私聊 ID"
                                     name="ai.agentChatId"
                                     value={ai.agentChatId}
                                     onChange={handleChange}
+                                    inputProps={{maxLength: 64}}
                                     variant="outlined"
-                                    helperText="AI 将只在此 Chat ID 的会话中回复消息，且可以响应 /reset"
+                                    helperText="AI 仅处理私聊，且发送者 ID 与 Chat ID 都必须匹配此 ID。默认 Chat ID 仅在它是同一用户的私聊 ID 时可填入。"
                                 />
-                                <Button 
-                                    variant="outlined" 
+                                <Button
+                                    variant="outlined"
                                     onClick={handleCopyChatId}
-                                    sx={{ whiteSpace: 'nowrap', height: 'fit-content', mt: -3 }}
+                                    sx={{whiteSpace: 'nowrap', height: 'fit-content', mt: -3}}
                                 >
-                                    填入发送消息ID
+                                    填入默认 Chat ID（仅私聊）
                                 </Button>
                             </Box>
                         </Grid>
@@ -522,9 +579,11 @@ const Settings: React.FC = () => {
                                 name="ai.globalContext"
                                 value={ai.globalContext}
                                 onChange={handleChange}
+                                inputProps={{maxLength: 16384}}
                                 variant="outlined"
                                 multiline
                                 rows={4}
+                                helperText="最大 64 KiB（按 UTF-8 字节计）"
                             />
                         </Grid>
 
@@ -538,7 +597,7 @@ const Settings: React.FC = () => {
                                 }}
                             >
                                 <FormControlLabel
-                                    sx={{ pb: '23px' }}
+                                    sx={{pb: '23px'}}
                                     control={
                                         <Checkbox
                                             checked={autoCleanEnabled}
@@ -556,12 +615,12 @@ const Settings: React.FC = () => {
                                     variant="outlined"
                                     disabled={!autoCleanEnabled}
                                     error={autoCleanIntervalError}
-                                    slotProps={{ htmlInput: { min: 1, step: 1 } }}
+                                    slotProps={{htmlInput: {min: 1, step: 1}}}
                                     helperText={autoCleanIntervalError ? '请输入正整数' : '关闭开关可停用自动清理'}
-                                    sx={{ width: { xs: '100%', sm: 240 } }}
+                                    sx={{width: {xs: '100%', sm: 240}}}
                                 />
                                 <FormControlLabel
-                                    sx={{ pb: '23px' }}
+                                    sx={{pb: '23px'}}
                                     control={
                                         <Checkbox
                                             checked={ai.silentContextCleanup || false}
@@ -580,7 +639,7 @@ const Settings: React.FC = () => {
                                 MCP 服务器配置
                             </Typography>
                             {ai.mcpServers?.map((server, index) => (
-                                <Paper key={index} variant="outlined" sx={{ p: 2, mb: 2 }}>
+                                <Paper key={index} variant="outlined" sx={{p: 2, mb: 2}}>
                                     <Grid container spacing={2} alignItems="center">
                                         <Grid size={{xs: 12, md: 3}}>
                                             <TextField
@@ -610,28 +669,24 @@ const Settings: React.FC = () => {
                                                 onChange={(e) => handleMCPHeaderChange(index, e.target.value)}
                                                 variant="outlined"
                                                 size="small"
-                                                error={(() => {
-                                                    try {
-                                                        const toParse = server._headerString !== undefined ? server._headerString : JSON.stringify(server.headers || {});
-                                                        if (toParse.trim() !== '') JSON.parse(toParse);
-                                                        return false;
-                                                    } catch {
-                                                        return true;
-                                                    }
-                                                })() as unknown as boolean}
+                                                error={!validateMcpServers([{
+                                                    ...server,
+                                                    name: 'header-validation',
+                                                    url: 'https://mcp.example.com'
+                                                }])}
                                             />
                                         </Grid>
-                                        <Grid size={{xs: 12, md: 1}} sx={{ textAlign: 'center' }}>
+                                        <Grid size={{xs: 12, md: 1}} sx={{textAlign: 'center'}}>
                                             <IconButton color="error" onClick={() => handleRemoveMCPServer(index)}>
-                                                <DeleteIcon />
+                                                <DeleteIcon/>
                                             </IconButton>
                                         </Grid>
                                     </Grid>
                                 </Paper>
                             ))}
-                            <Button 
-                                variant="outlined" 
-                                startIcon={<AddIcon />} 
+                            <Button
+                                variant="outlined"
+                                startIcon={<AddIcon/>}
                                 onClick={handleAddMCPServer}
                             >
                                 添加 MCP 服务器
@@ -642,7 +697,7 @@ const Settings: React.FC = () => {
 
 
                 <Grid size={{xs: 12}}>
-                    <Divider sx={{ my: 2 }} />
+                    <Divider sx={{my: 2}}/>
                     <Typography variant="h5" gutterBottom>
                         代理设置
                     </Typography>
@@ -694,7 +749,14 @@ const Settings: React.FC = () => {
                                 </Select>
                             </FormControl>
                         </Grid>
-                            <Grid size={{xs: 12, sm: 6}}>
+                        {settings.proxy.type === 'SOCKS' && (
+                            <Grid size={{xs: 12}}>
+                                <Typography color="text.secondary" variant="body2">
+                                    SOCKS 代理不支持用户名和密码认证。
+                                </Typography>
+                            </Grid>
+                        )}
+                        <Grid size={{xs: 12, sm: 6}}>
                             <TextField
                                 fullWidth
                                 label="用户名（可选）"
@@ -721,7 +783,12 @@ const Settings: React.FC = () => {
                 )}
                 <Grid size={{xs: 12}}>
                     <Box mt={2}>
-                        <Button variant="contained" color="primary" onClick={handleSave}>
+                        <Button
+                            variant="contained"
+                            color="primary"
+                            onClick={handleSave}
+                            disabled={saving || !settingsRevision}
+                        >
                             保存设置
                         </Button>
                     </Box>
@@ -737,9 +804,9 @@ const Settings: React.FC = () => {
                     open={snackbar.open}
                     autoHideDuration={6000}
                     onClose={handleCloseSnackbar}
-                    anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+                    anchorOrigin={{vertical: 'bottom', horizontal: 'center'}}
                 >
-                    <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: '100%' }}>
+                    <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{width: '100%'}}>
                         {snackbar.message}
                     </Alert>
                 </Snackbar>
