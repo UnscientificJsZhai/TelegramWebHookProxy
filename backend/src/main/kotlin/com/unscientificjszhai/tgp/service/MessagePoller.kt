@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.*
+import com.unscientificjszhai.tgp.service.ai.agent.AgentAvailabilityState
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -11,6 +12,7 @@ import com.unscientificjszhai.tgp.utils.TelegramTextChunks
 import io.ktor.http.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
 import java.io.IOException
@@ -328,6 +330,12 @@ class MessagePoller @Inject constructor(
 
         /** 队满提示未被 Telegram 接受，必须保留当前及后续更新以便重试。 */
         data object Retry : UpdateAdmission
+
+        /** 当前设置已授权消息，但 Agent 正在恢复；必须持久化检查点后等待该序列变化。 */
+        data class WaitingForAgent(
+            val observedSequence: Long,
+            val observedSettingsVersion: Long,
+        ) : UpdateAdmission
     }
 
     /** 屏障放行后的本地接纳判定；队满通知必须在屏障外发送。 */
@@ -337,6 +345,12 @@ class MessagePoller @Inject constructor(
 
         /** 稳定配置与当前代理不一致，必须保留偏移量等待后续轮询。 */
         data object Retry : BarrierAdmission
+
+        /** Agent 初始化或恢复尚未结束；轮询器应停止调用 getUpdates 并等待状态变化。 */
+        data class WaitingForAgent(
+            val observedSequence: Long,
+            val observedSettingsVersion: Long,
+        ) : BarrierAdmission
 
         /** 更新已提交给当前会话的消费者队列。 */
         data class Enqueued(val completion: CompletableDeferred<UpdateCompletion>) : BarrierAdmission
@@ -361,6 +375,10 @@ class MessagePoller @Inject constructor(
         data object Stopped : PollingAttempt
         data class ApiFailure(val response: GetUpdatesResponse) : PollingAttempt
         data object LocalRetry : PollingAttempt
+        data class WaitingForAgent(
+            val observedSequence: Long,
+            val observedSettingsVersion: Long,
+        ) : PollingAttempt
     }
 
     /**
@@ -480,6 +498,10 @@ class MessagePoller @Inject constructor(
     @Volatile
     internal var beforeModelSelectionPersistForTesting: (() -> Unit)? = null
 
+    /** 仅供回归测试在 `/model` 已取得单次 ready-agent 准入后触发确定性的设置切换竞争。 */
+    @Volatile
+    internal var beforeModelRefreshForTesting: (() -> Unit)? = null
+
     /**
      * 在 token 生命周期锁和会话锁内安装尚未启动的轮询会话。
      *
@@ -569,6 +591,20 @@ class MessagePoller @Inject constructor(
                         }
                     }
 
+                    is PollingAttempt.WaitingForAgent -> {
+                        // This is not a Telegram failure: keep both counters and polling backoff untouched. The
+                        // checkpoint is already durable, and the StateFlow predicate prevents a lost wakeup if the
+                        // Agent changed immediately before collection began.
+                        if (!awaitAgentAvailabilityChange(
+                                session,
+                                attempt.observedSequence,
+                                attempt.observedSettingsVersion,
+                            )
+                        ) {
+                            return
+                        }
+                    }
+
                     is PollingAttempt.ApiFailure -> {
                         if (!handleApiFailure(session, attempt.response)) {
                             return
@@ -592,10 +628,42 @@ class MessagePoller @Inject constructor(
     }
 
     /**
+     * 等待恢复状态出现有意义的变化，不在非 READY 的每个重试转换后重新拉取同一 Telegram 更新。
+     *
+     * 同一设置版本内的 INITIALIZING/RETRY_SCHEDULED/BLOCKED 转换只更新观察序列并继续等待；READY、
+     * DISABLED、CLOSED 或任意设置版本变化会返回主循环，让同一 offset 按最新授权重新判断。
+     */
+    private suspend fun awaitAgentAvailabilityChange(
+        session: PollingSession,
+        observedSequence: Long,
+        observedSettingsVersion: Long,
+    ): Boolean {
+        var sequence = observedSequence
+        while (isCurrent(session)) {
+            val snapshot = agentService.availability.first { state -> state.sequence != sequence }
+            if (!isCurrent(session)) return false
+            if (settingsRepository.currentSettingsSnapshot().generation != observedSettingsVersion) return true
+            when (snapshot.state) {
+                AgentAvailabilityState.READY,
+                AgentAvailabilityState.DISABLED,
+                    -> return true
+
+                AgentAvailabilityState.CLOSED -> return false
+                AgentAvailabilityState.INITIALIZING,
+                AgentAvailabilityState.RETRY_SCHEDULED,
+                AgentAvailabilityState.BLOCKED,
+                    -> sequence = snapshot.sequence
+            }
+        }
+        return false
+    }
+
+    /**
      * 执行一次初始化或正常长轮询；每轮都从持久化快照决定唯一请求偏移量。
      *
      * 尚未解决的 [RetryCheckpoint] 优先于经检查加一的 `lastUpdateId + 1`。检查点存在时禁止 `-1` 初始化，并且只有
-     * 成功确认其精确目标、durable 调和或已审计的 Telegram gap 才能在同一次文件提交中清除它。
+     * 成功确认其精确目标、durable 调和或已审计的 Telegram gap 才能在同一次文件提交中清除它。`-1` 初始化
+     * 返回的最新更新同样经过普通授权、durable claim 和 Agent 等待流程，绝不再作为偏移量基线直接丢弃。
      */
     private suspend fun pollOnce(session: PollingSession): PollingAttempt {
         if (!isCurrent(session)) {
@@ -605,14 +673,12 @@ class MessagePoller @Inject constructor(
             ?: return PollingAttempt.Stopped
         var lastStoredId = snapshot.lastUpdateId
         val initialRetryCheckpoint = snapshot.retryCheckpoint
-        if (lastStoredId == 0L && initialRetryCheckpoint == null && !session.initialOffsetResolved) {
+        val resolvingInitialOffset =
+            lastStoredId == 0L && initialRetryCheckpoint == null && !session.initialOffsetResolved
+        val (targetUpdateId, response) = if (resolvingInitialOffset) {
             val initialResponse = telegramService.getUpdatesForToken(session.token, offset = -1, timeout = 0)
-            if (!isCurrent(session)) {
-                return PollingAttempt.Stopped
-            }
-            if (!initialResponse.ok) {
-                return PollingAttempt.ApiFailure(initialResponse)
-            }
+            if (!isCurrent(session)) return PollingAttempt.Stopped
+            if (!initialResponse.ok) return PollingAttempt.ApiFailure(initialResponse)
             if (initialResponse.result.any { !isPersistableTelegramUpdateId(it.updateId) }) {
                 logger.error(
                     "Initial Telegram response for bot {} contains an update ID outside the persistable offset range; retrying without a checkpoint.",
@@ -620,26 +686,18 @@ class MessagePoller @Inject constructor(
                 )
                 return PollingAttempt.LocalRetry
             }
-            if (initialResponse.result.isNotEmpty()) {
-                lastStoredId = initialResponse.result.maxOf { it.updateId }
-                val initialized = writeForCurrent(session) {
-                    updatesRepository.confirmProcessedUpdate(session.botId, lastStoredId, expectedRetryTarget = null)
-                } ?: return PollingAttempt.Stopped
-                if (initialized != RetryCheckpointCommitResult.Committed) {
-                    return PollingAttempt.LocalRetry
-                }
-                logger.info("Initialized lastUpdateId for bot {} to {}", session.botId, lastStoredId)
-            }
             session.initialOffsetResolved = true
-            return PollingAttempt.Succeeded
+            val firstReturnedId = initialResponse.result.minOfOrNull { it.updateId }
+                ?: return PollingAttempt.Succeeded
+            firstReturnedId to initialResponse
+        } else {
+            val target = initialRetryCheckpoint?.targetUpdateId ?: Math.addExact(lastStoredId, 1L)
+            target to telegramService.getUpdatesForToken(
+                session.token,
+                offset = target,
+                timeout = 30,
+            )
         }
-
-        val targetUpdateId = initialRetryCheckpoint?.targetUpdateId ?: Math.addExact(lastStoredId, 1L)
-        val response = telegramService.getUpdatesForToken(
-            session.token,
-            offset = targetUpdateId,
-            timeout = 30,
-        )
         if (!isCurrent(session)) {
             return PollingAttempt.Stopped
         }
@@ -710,6 +768,7 @@ class MessagePoller @Inject constructor(
         val discoveredChats = LinkedHashMap<String, ChatInfo>()
         var mustRetry = false
         var retryUpdateId: Long? = null
+        var waitingForAgent: UpdateAdmission.WaitingForAgent? = null
         for (update in response.result.asSequence().filter { it.updateId > lastStoredId }) {
             try {
                 val expectedRetryTarget = retryCheckpoint?.targetUpdateId?.takeIf { it == update.updateId }
@@ -736,6 +795,14 @@ class MessagePoller @Inject constructor(
                     UpdateAdmission.Retry -> {
                         mustRetry = true
                         retryUpdateId = update.updateId
+                        waitingForAgent = null
+                        break
+                    }
+
+                    is UpdateAdmission.WaitingForAgent -> {
+                        mustRetry = true
+                        retryUpdateId = update.updateId
+                        waitingForAgent = admission
                         break
                     }
                 }
@@ -749,6 +816,7 @@ class MessagePoller @Inject constructor(
                 )
                 mustRetry = true
                 retryUpdateId = update.updateId
+                waitingForAgent = null
                 break
             }
         }
@@ -789,6 +857,7 @@ class MessagePoller @Inject constructor(
                         if (confirmed != RetryCheckpointCommitResult.Committed) {
                             mustRetry = true
                             retryUpdateId = updateId
+                            waitingForAgent = null
                             break
                         }
                         lastStoredId = updateId
@@ -798,13 +867,19 @@ class MessagePoller @Inject constructor(
                 UpdateCompletion.Retry -> {
                     mustRetry = true
                     retryUpdateId = updateId
+                    waitingForAgent = null
                     break
                 }
             }
         }
         return when {
             !isCurrent(session) -> PollingAttempt.Stopped
-            mustRetry -> persistLocalRetryCheckpoint(session, checkNotNull(retryUpdateId))
+            mustRetry -> persistLocalRetryCheckpoint(
+                session,
+                checkNotNull(retryUpdateId),
+                waitingForAgent,
+            )
+
             else -> PollingAttempt.Succeeded
         }
     }
@@ -864,15 +939,16 @@ class MessagePoller @Inject constructor(
     }
 
     /**
-     * 在返回本地重试前，先以当前仓储快照条件写入检查点。
+     * 在返回本地重试或 Agent 等待前，先以当前仓储快照条件写入检查点。
      *
      * 如果另一条路径已经改变目标，本方法不覆盖它；下一轮从新的持久化快照重新选择 offset。文件写入失败时
-     * 保持仓储原样，但仍返回 [PollingAttempt.LocalRetry]，使轮询循环先恢复等待中的消费者再退避，避免其
-     * 永久卡在 [PollingSession.consumerResume]。
+     * 保持仓储原样时返回 [PollingAttempt.LocalRetry]，使轮询循环恢复等待中的消费者后按本地故障退避；
+     * 只有检查点成功提交且 [waitingForAgent] 非空时才返回 [PollingAttempt.WaitingForAgent]。
      */
     private fun persistLocalRetryCheckpoint(
         session: PollingSession,
         targetUpdateId: Long,
+        waitingForAgent: UpdateAdmission.WaitingForAgent? = null,
     ): PollingAttempt = try {
         val currentData = readForCurrent(session) {
             updatesRepository.getData(session.botId)
@@ -889,14 +965,23 @@ class MessagePoller @Inject constructor(
                 nowMillis = System.currentTimeMillis(),
             )
         } ?: return PollingAttempt.Stopped
-        if (recorded is RetryCheckpointRecordResult.Stale) {
-            logger.info(
-                "Retry checkpoint changed before recording bot {} target {}; rereading durable state.",
-                session.botId,
-                targetUpdateId,
-            )
+        when (recorded) {
+            RetryCheckpointRecordResult.Stale -> {
+                logger.info(
+                    "Retry checkpoint changed before recording bot {} target {}; rereading durable state.",
+                    session.botId,
+                    targetUpdateId,
+                )
+                PollingAttempt.LocalRetry
+            }
+
+            is RetryCheckpointRecordResult.Recorded -> waitingForAgent?.let { waiting ->
+                PollingAttempt.WaitingForAgent(
+                    observedSequence = waiting.observedSequence,
+                    observedSettingsVersion = waiting.observedSettingsVersion,
+                )
+            } ?: PollingAttempt.LocalRetry
         }
-        PollingAttempt.LocalRetry
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
@@ -1764,6 +1849,14 @@ class MessagePoller @Inject constructor(
                 return@runWhenReady BarrierAdmission.Confirmed
             }
 
+            val availabilityBeforeCheck = agentService.availability.value
+            if (availabilityBeforeCheck.state.isAgentRecoveryWaitState()) {
+                return@runWhenReady BarrierAdmission.WaitingForAgent(
+                    observedSequence = availabilityBeforeCheck.sequence,
+                    observedSettingsVersion = snapshot.generation,
+                )
+            }
+
             val aiAvailable = try {
                 agentService.isAiFeatureEnabled(aiSettings)
             } catch (e: CancellationException) {
@@ -1777,6 +1870,15 @@ class MessagePoller @Inject constructor(
                 return@runWhenReady BarrierAdmission.Retry
             }
             if (!aiAvailable) {
+                // The state can change between the first snapshot and the readiness check. Capture it again so the
+                // poller waits on the exact sequence that explains this fail-closed result.
+                val unavailable = agentService.availability.value
+                if (unavailable.state.isAgentRecoveryWaitState()) {
+                    return@runWhenReady BarrierAdmission.WaitingForAgent(
+                        observedSequence = unavailable.sequence,
+                        observedSettingsVersion = snapshot.generation,
+                    )
+                }
                 logger.warn(
                     "AI remains unavailable after the model switch barrier for update {}; preserving its offset for retry.",
                     update.updateId,
@@ -1809,6 +1911,11 @@ class MessagePoller @Inject constructor(
         return when (admission) {
             BarrierAdmission.Confirmed -> UpdateAdmission.Confirmed
             BarrierAdmission.Retry -> UpdateAdmission.Retry
+            is BarrierAdmission.WaitingForAgent -> UpdateAdmission.WaitingForAgent(
+                observedSequence = admission.observedSequence,
+                observedSettingsVersion = admission.observedSettingsVersion,
+            )
+
             is BarrierAdmission.Enqueued -> UpdateAdmission.Enqueued(admission.completion)
             is BarrierAdmission.QueueFull -> notifyQueueFull(
                 session,
@@ -2460,8 +2567,14 @@ class MessagePoller @Inject constructor(
                         )
                     }
                 } else {
-                    val modelSnapshot = when (val result =
-                        runWhenAuthorized(session, ticket, authorization) { agentService.updateModel() }) {
+                    val modelSnapshot = when (val result = runWhenAuthorizedWithReadyAgent(
+                        session,
+                        ticket,
+                        authorization,
+                    ) { readyAgent ->
+                        beforeModelRefreshForTesting?.invoke()
+                        readyAgent.updateModel()
+                    }) {
                         AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
                         is AuthorizedEffect.Executed -> result.value
                     }
@@ -2731,6 +2844,35 @@ class MessagePoller @Inject constructor(
         }
     }
 
+    /**
+     * 在委派服务的单次就绪准入内复核授权并直接操作已选中的底层 Agent。
+     *
+     * 此路径用于本身需要 [AgentService.withReadyService] 的操作。若先通过 [runWhenAuthorized] 进入模型屏障，
+     * 再递归调用委派服务的就绪准入，设置切换可能夹在两次准入之间并形成互相等待。
+     */
+    private suspend fun <T> runWhenAuthorizedWithReadyAgent(
+        session: PollingSession,
+        ticket: AdmissionTicket,
+        authorization: AuthorizedMessageContext,
+        action: suspend (AgentService) -> T,
+    ): AuthorizedEffect<T> = agentService.withReadyService { readyAgent ->
+        val snapshot = settingsRepository.currentSettingsSnapshot()
+        val aiSettings = snapshot.settings.ai
+        if (
+            snapshot.generation != ticket.generation ||
+            aiSettings == null ||
+            !aiSettings.agentEnabled ||
+            aiSettings.requiredApiKey().isBlank() ||
+            aiSettings.agentChatId != ticket.agentChatId ||
+            !authorization.matches(aiSettings) ||
+            !isCurrent(session)
+        ) {
+            AuthorizedEffect.Confirmed
+        } else {
+            AuthorizedEffect.Executed(action(readyAgent))
+        }
+    }
+
     /** 在授权仍有效时发送 Telegram 回复。 */
     private suspend fun sendAuthorizedMessage(
         session: PollingSession,
@@ -2862,6 +3004,18 @@ class MessagePoller @Inject constructor(
      * 使用内部的 [closeAndJoin]。
      */
     override fun close() = requestStop()
+}
+
+private fun AgentAvailabilityState.isAgentRecoveryWaitState(): Boolean = when (this) {
+    AgentAvailabilityState.INITIALIZING,
+    AgentAvailabilityState.RETRY_SCHEDULED,
+    AgentAvailabilityState.BLOCKED,
+        -> true
+
+    AgentAvailabilityState.DISABLED,
+    AgentAvailabilityState.READY,
+    AgentAvailabilityState.CLOSED,
+        -> false
 }
 
 private fun Update.chatInfo(): ChatInfo? {

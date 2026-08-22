@@ -27,7 +27,7 @@ internal class CancellableOkHttpTransport(
      * 执行一个原生可取消的 HTTP 请求。
      *
      * @param request 要执行的完整 OkHttp 请求。
-     * @return 响应状态、响应头和已读取的响应体；调用方无需也不能再关闭响应体。
+     * @return 响应状态、响应头和成功响应的受限正文；非成功响应正文为空且永不读取。调用方无需也不能再关闭响应体。
      * @throws IllegalStateException 当传输层已经关闭时抛出。
      * @throws IOException 当请求被取消、连接失败或读取响应失败时抛出。
      */
@@ -60,7 +60,14 @@ internal class CancellableOkHttpTransport(
                         val result = HttpResult(
                             statusCode = it.code,
                             headers = it.headers.toMultimap(),
-                            body = it.body.readUtf8AtMost(MAX_RAW_RESPONSE_BYTES),
+                            // Error bodies are never needed for recovery decisions and may be attacker-controlled or
+                            // arbitrarily large. Preserve the already-known status/headers without reading or storing
+                            // the body so providers can still classify 401/429/5xx and Retry-After exactly.
+                            body = if (it.isSuccessful) {
+                                it.body.readUtf8AtMost(MAX_RAW_RESPONSE_BYTES)
+                            } else {
+                                ""
+                            },
                         )
                         if (continuation.isActive) {
                             continuation.resume(result)

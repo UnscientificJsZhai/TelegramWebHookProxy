@@ -1,9 +1,13 @@
 package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.models.AISettings
+import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.SkillBrief
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 一次模型列表刷新得到的一致性快照。
@@ -15,6 +19,45 @@ data class ModelSnapshot(
     val currentModel: String,
     val availableModels: List<String>,
 )
+
+/** 显式候选初始化的安全结果；失败值不包含上游正文、URL 或凭据。 */
+sealed interface AgentInitializationResult {
+    data object Ready : AgentInitializationResult
+    data class Failed(val failure: AgentFailure) : AgentInitializationResult
+}
+
+/** 委派 Agent 对当前设置版本的可用状态。 */
+enum class AgentAvailabilityState {
+    DISABLED,
+    INITIALIZING,
+    RETRY_SCHEDULED,
+    BLOCKED,
+    READY,
+    CLOSED,
+}
+
+/**
+ * 可供无丢失唤醒地观察 Agent 可用性变化的不可变快照。
+ *
+ * [nextAttemptAtMillis] 使用恢复控制器的单调时钟，仅用于同一进程内诊断，不能持久化或解释为墙上时间。
+ */
+data class AgentAvailabilitySnapshot(
+    val state: AgentAvailabilityState,
+    val sequence: Long,
+    val settingsVersion: Long,
+    val provider: AIProvider? = null,
+    val attempt: Int = 0,
+    val failure: AgentFailure? = null,
+    val nextAttemptAtMillis: Long? = null,
+)
+
+private val ALWAYS_READY_AGENT_AVAILABILITY = MutableStateFlow(
+    AgentAvailabilitySnapshot(
+        state = AgentAvailabilityState.READY,
+        sequence = 0,
+        settingsVersion = -1,
+    ),
+).asStateFlow()
 
 internal const val MAX_TOOL_CALL_ROUNDS = 10
 internal const val MAX_TOOL_CALLS_PER_MODEL_RESPONSE = 8
@@ -105,6 +148,12 @@ internal fun ensureToolCallCountIsAllowed(responseCount: Int, completedTurnCount
  */
 abstract class AgentService {
     /**
+     * 当前服务的可用性。普通直接实现始终视为就绪；委派实现会覆盖为真实恢复状态流。
+     */
+    open val availability: StateFlow<AgentAvailabilitySnapshot>
+        get() = ALWAYS_READY_AGENT_AVAILABILITY
+
+    /**
      * 获取当前会话实际使用的模型名称。
      */
     abstract val currentModel: String
@@ -156,15 +205,12 @@ abstract class AgentService {
     abstract fun resetSession(): Job?
 
     /**
-     * 获取服务创建时必须完成的初始化任务。
+     * 显式执行此候选发布前的单次初始化。
      *
-     * 调用方可等待该任务后再发布服务实例；任务被取消表示该实例的初始化任务未完成。实现可将可选
-     * 依赖（例如单个 MCP 服务器）的连接错误降级处理，此类错误不会单独使任务取消。没有额外初始化
-     * 步骤的服务返回 `null`。
-     *
-     * @return 创建时的初始化任务；无需等待额外初始化时返回 `null`。
+     * 普通本地实现无需额外初始化并立即返回 [AgentInitializationResult.Ready]；提供商实现通过
+     * [ProviderAgentService] 保证每个实例最多执行一次真实初始化。
      */
-    open fun initializationJob(): Job? = null
+    open suspend fun initializeForPublication(): AgentInitializationResult = AgentInitializationResult.Ready
 
     /**
      * 发送文本消息并获取回复。
@@ -243,20 +289,4 @@ abstract class AgentService {
             ""
         }
     }
-}
-
-/**
- * 等待代理服务完成创建时的就绪步骤。
- *
- * 此函数等待 [AgentService.initializationJob]；初始化任务被取消时返回 `false`，没有初始化任务的服务
- * 立即返回 `true`。实现已降级处理的可选依赖错误不属于此失败条件。调用方可据此在不关闭旧服务的
- * 前提下决定是否发布替代实例。
- *
- * @receiver 要检查的代理服务。
- * @return 初始化成功且服务可发布时返回 `true`；初始化任务被取消时返回 `false`。
- */
-internal suspend fun AgentService.awaitReady(): Boolean {
-    val job = initializationJob() ?: return true
-    job.join()
-    return !job.isCancelled
 }
