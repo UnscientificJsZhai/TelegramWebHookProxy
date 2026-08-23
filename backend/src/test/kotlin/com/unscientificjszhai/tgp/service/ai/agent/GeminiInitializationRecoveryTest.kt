@@ -3,19 +3,18 @@ package com.unscientificjszhai.tgp.service.ai.agent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import io.mockk.mockk
 import kotlinx.coroutines.*
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import java.io.File
 import java.nio.file.Files
-import javax.inject.Provider
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -35,12 +34,12 @@ class GeminiInitializationRecoveryTest {
                     .body("gemini-response-body-secret".padEnd(MAX_RAW_RESPONSE_BYTES + 1, 'x'))
                     .build(),
             )
-            val settingsRepository = SettingsRepository.forTesting(
+            val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
                 File(directory, "settings.json"),
                 ModelSwitchBarrier(),
             )
             val apiKey = "gemini-api-key-secret"
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.GEMINI,
@@ -51,11 +50,11 @@ class GeminiInitializationRecoveryTest {
             )
             val service = GeminiAgentService(
                 parentScope = scope,
-                settingsRepository = settingsRepository,
+                settingsChangeCoordinator = settingsChangeCoordinator,
                 skillRepository = SkillRepository.forTesting(File(directory, "skills.json")),
                 mcpClientService = MCPClientService(scope),
                 deadlines = AgentExecutionDeadlines(),
-                taskSchedulerServiceProvider = Provider<TaskSchedulerService> { mockk() },
+                scheduledTaskService = mockk<ScheduledTaskService>(),
                 baseUrlOverrideForTesting = server.url("/v1beta").toString().trimEnd('/'),
             )
 

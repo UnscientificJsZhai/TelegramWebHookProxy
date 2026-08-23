@@ -1,6 +1,5 @@
 package com.unscientificjszhai.tgp.modules
 
-import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.PageResult
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.models.SkillStatus
@@ -22,11 +21,9 @@ import kotlinx.serialization.Serializable
  * 模型工具不调用这些路由，只能创建待审批草稿。该方法会向接收者追加路由，并在处理请求时读写技能仓库。
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
- * @param appComponent 提供技能仓库的应用级组件。
+ * @param skillRepository 提供技能读写与审批状态转换。
  */
-fun Application.skillAPIModule(appComponent: AppComponent) {
-    val skillRepository = appComponent.skillRepository
-
+fun Application.skillAPIModule(skillRepository: SkillRepository) {
     routing {
         route("/api/skills") {
             install(RequestBodyLimit) { bodyLimit { ResourceLimits.SKILL_REQUEST_BYTES } }
@@ -141,6 +138,14 @@ private suspend fun ApplicationCall.strictDecimalQueryParameter(
 
 private val DECIMAL_INTEGER = Regex("[0-9]+")
 
+/**
+ * 创建或更新受管技能的请求。
+ *
+ * @property id 更新时指定的技能标识；创建时可省略。
+ * @property description 技能用途说明。
+ * @property content 技能正文。
+ * @property revision 条件更新使用的当前修订号。
+ */
 @Serializable
 private data class ManagedSkillRequest(
     val id: String? = null,
@@ -149,6 +154,11 @@ private data class ManagedSkillRequest(
     val revision: Long? = null,
 )
 
+/**
+ * 技能审批状态转换请求。
+ *
+ * @property revision 必须匹配的当前技能修订号。
+ */
 @Serializable
 private data class SkillTransitionRequest(
     val revision: Long,
@@ -163,7 +173,15 @@ private suspend fun ApplicationCall.respondSkillConflict(message: String) {
     respond(HttpStatusCode.Conflict, mapOf("error" to message))
 }
 
-/** 面向 HTTP 管理端的完整技能表示；审批字段不使用默认值，确保响应始终包含它们。 */
+/**
+ * 面向 HTTP 管理端的完整技能表示；审批字段不使用默认值，确保响应始终包含它们。
+ *
+ * @property id 技能标识。
+ * @property description 技能用途说明。
+ * @property content 技能正文。
+ * @property status 当前审批状态。
+ * @property revision 当前单调修订号。
+ */
 @Serializable
 private data class SkillApiResponse(
     val id: String,

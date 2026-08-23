@@ -2,8 +2,6 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.SettingsUpdate
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -28,13 +26,13 @@ private val MAX_COMMAND_RETRY_DELAY = 1.minutes
  *
  * @constructor 创建绑定应用协程作用域的命令协调器。
  * @param parentScope 持有订阅与唯一 worker 的应用级作用域；取消该作用域会停止协调。
- * @param settingsRepository 提供带单调版本的不可变设置快照。
+ * @param settingsChangeCoordinator 提供带单调版本的不可变设置快照。
  * @param telegramService 唯一执行 Telegram 命令写入的服务。
  */
 @Singleton
 class BotCommandReconciler private constructor(
     parentScope: CoroutineScope,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val telegramService: TelegramService,
     private val retryDelay: suspend (Duration) -> Unit,
     @Suppress("UNUSED_PARAMETER") testConstructorMarker: Unit,
@@ -43,21 +41,33 @@ class BotCommandReconciler private constructor(
      * 创建使用生产退避策略的应用级命令协调器。
      *
      * @param parentScope 持有订阅与唯一 worker 的应用级作用域；取消该作用域会停止协调。
-     * @param settingsRepository 提供带单调版本的不可变设置快照。
+     * @param settingsChangeCoordinator 提供带单调版本的不可变设置快照。
      * @param telegramService 唯一执行 Telegram 命令写入的服务。
      */
     @Inject
     constructor(
         parentScope: CoroutineScope,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         telegramService: TelegramService,
-    ) : this(parentScope, settingsRepository, telegramService, { duration -> delay(duration) }, Unit)
+    ) : this(parentScope, settingsChangeCoordinator, telegramService, { duration -> delay(duration) }, Unit)
 
+    /**
+     * 一个设置版本期望写入 Telegram 的命令目标。
+     *
+     * @property token 目标 Telegram Bot token。
+     * @property provider 应暴露命令的 AI 提供商；`null` 表示清空命令。
+     */
     private data class CommandTarget(
         val token: String,
         val provider: AIProvider?,
     )
 
+    /**
+     * 带设置版本的命令收敛目标。
+     *
+     * @property version 生成目标的单调设置版本。
+     * @property command 要写入的命令目标；`null` 表示当前 token 不可用。
+     */
     private data class ReconciliationTarget(
         val version: Long,
         val command: CommandTarget?,
@@ -86,10 +96,10 @@ class BotCommandReconciler private constructor(
                 return
             }
             started = true
-            publishTargetLocked(settingsRepository.settingsUpdateFlow.value.toReconciliationTarget())
+            publishTargetLocked(settingsChangeCoordinator.settingsUpdateFlow.value.toReconciliationTarget())
             scope.launch { reconcileLoop() }
             settingsJob = scope.launch {
-                settingsRepository.settingsUpdateFlow.collect { update ->
+                settingsChangeCoordinator.settingsUpdateFlow.collect { update ->
                     publishTarget(update.toReconciliationTarget())
                 }
             }

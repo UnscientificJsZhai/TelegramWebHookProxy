@@ -2,10 +2,8 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.di.AgentComponent
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.agent.*
 import io.ktor.http.HttpStatusCode
 import io.mockk.coEvery
@@ -32,11 +30,11 @@ class MessagePollerAgentRecoveryTest {
         val directory = Files.createTempDirectory("poller-model-single-admission").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
         val barrier = ModelSwitchBarrier()
-        val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+        val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
         val skillRepository = SkillRepository.forTesting(File(directory, "skills.json"))
         val updatesRepository = UpdatesRepository(File(directory, "updates.json"))
         val token = "110:model-token"
-        settingsRepository.replaceSettingsForTest(
+        settingsChangeCoordinator.replaceSettingsForTest(
             AppSettings(
                 telegramToken = token,
                 ai = AISettings(
@@ -74,7 +72,7 @@ class MessagePollerAgentRecoveryTest {
         }
         val delegating = DelegatingAgentService(
             factory,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             barrier,
             scope,
@@ -104,7 +102,7 @@ class MessagePollerAgentRecoveryTest {
                 parentScope = scope,
                 telegramService = telegram,
                 agentService = delegating,
-                settingsRepository = settingsRepository,
+                settingsChangeCoordinator = settingsChangeCoordinator,
                 updatesRepository = updatesRepository,
                 modelSwitchBarrier = barrier,
                 processingTimeout = 5.seconds,
@@ -113,9 +111,9 @@ class MessagePollerAgentRecoveryTest {
             ).also { service ->
                 service.beforeModelRefreshForTesting = {
                     if (switched.compareAndSet(false, true)) {
-                        settingsRepository.replaceSettingsForTest(
-                            settingsRepository.settingsFlow.value.copy(
-                                ai = settingsRepository.settingsFlow.value.ai!!.copy(
+                        settingsChangeCoordinator.replaceSettingsForTest(
+                            settingsChangeCoordinator.settingsFlow.value.copy(
+                                ai = settingsChangeCoordinator.settingsFlow.value.ai!!.copy(
                                     globalContext = "switch during admitted refresh",
                                 ),
                             ),
@@ -144,10 +142,10 @@ class MessagePollerAgentRecoveryTest {
         val directory = Files.createTempDirectory("poller-agent-bootstrap-recovery").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
         val barrier = ModelSwitchBarrier()
-        val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+        val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
         val updatesRepository = UpdatesRepository(File(directory, "updates.json"))
         val token = "111:test-token"
-        settingsRepository.replaceSettingsForTest(
+        settingsChangeCoordinator.replaceSettingsForTest(
             AppSettings(
                 telegramToken = token,
                 ai = AISettings(
@@ -160,7 +158,7 @@ class MessagePollerAgentRecoveryTest {
         )
         barrier.completeThrough(barrier.latestPendingGeneration())
 
-        val agent = RecoveringAgentService(settingsRepository.currentSettingsSnapshot().generation)
+        val agent = RecoveringAgentService(settingsChangeCoordinator.currentSettingsSnapshot().generation)
         val telegram = mockk<TelegramService>()
         val bootstrapCalls = AtomicInteger()
         val regularCalls = AtomicInteger()
@@ -190,7 +188,7 @@ class MessagePollerAgentRecoveryTest {
             parentScope = scope,
             telegramService = telegram,
             agentService = agent,
-            settingsRepository = settingsRepository,
+            settingsChangeCoordinator = settingsChangeCoordinator,
             updatesRepository = updatesRepository,
             modelSwitchBarrier = barrier,
             processingTimeout = 5.seconds,
@@ -231,10 +229,10 @@ class MessagePollerAgentRecoveryTest {
         val directory = Files.createTempDirectory("poller-agent-recovery").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
         val barrier = ModelSwitchBarrier()
-        val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+        val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
         val updatesRepository = UpdatesRepository(File(directory, "updates.json"))
         val token = "123:test-token"
-        settingsRepository.replaceSettingsForTest(
+        settingsChangeCoordinator.replaceSettingsForTest(
             AppSettings(
                 telegramToken = token,
                 ai = AISettings(
@@ -248,7 +246,7 @@ class MessagePollerAgentRecoveryTest {
         barrier.completeThrough(barrier.latestPendingGeneration())
         updatesRepository.saveLastUpdateId("123", 100)
 
-        val settingsVersion = settingsRepository.currentSettingsSnapshot().generation
+        val settingsVersion = settingsChangeCoordinator.currentSettingsSnapshot().generation
         val agent = RecoveringAgentService(settingsVersion)
         val telegram = mockk<TelegramService>()
         val getUpdatesCalls = AtomicInteger()
@@ -274,7 +272,7 @@ class MessagePollerAgentRecoveryTest {
             parentScope = scope,
             telegramService = telegram,
             agentService = agent,
-            settingsRepository = settingsRepository,
+            settingsChangeCoordinator = settingsChangeCoordinator,
             updatesRepository = updatesRepository,
             modelSwitchBarrier = barrier,
             processingTimeout = 5.seconds,
@@ -317,10 +315,10 @@ class MessagePollerAgentRecoveryTest {
         val directory = Files.createTempDirectory("poller-agent-authorization-change").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
         val barrier = ModelSwitchBarrier()
-        val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+        val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
         val updatesRepository = UpdatesRepository(File(directory, "updates.json"))
         val token = "456:test-token"
-        settingsRepository.replaceSettingsForTest(
+        settingsChangeCoordinator.replaceSettingsForTest(
             AppSettings(
                 telegramToken = token,
                 ai = AISettings(
@@ -333,7 +331,7 @@ class MessagePollerAgentRecoveryTest {
         )
         barrier.completeThrough(barrier.latestPendingGeneration())
         updatesRepository.saveLastUpdateId("456", 100)
-        val agent = RecoveringAgentService(settingsRepository.currentSettingsSnapshot().generation)
+        val agent = RecoveringAgentService(settingsChangeCoordinator.currentSettingsSnapshot().generation)
         val telegram = mockk<TelegramService>()
         val getUpdatesCalls = AtomicInteger()
         val update = Update(
@@ -353,7 +351,7 @@ class MessagePollerAgentRecoveryTest {
             parentScope = scope,
             telegramService = telegram,
             agentService = agent,
-            settingsRepository = settingsRepository,
+            settingsChangeCoordinator = settingsChangeCoordinator,
             updatesRepository = updatesRepository,
             modelSwitchBarrier = barrier,
             processingTimeout = 5.seconds,
@@ -367,9 +365,9 @@ class MessagePollerAgentRecoveryTest {
                         updatesRepository.getData("456").retryCheckpoint?.targetUpdateId == 101L
             }
 
-            settingsRepository.replaceSettingsForTest(
-                settingsRepository.settingsFlow.value.copy(
-                    ai = settingsRepository.settingsFlow.value.ai!!.copy(agentChatId = "99"),
+            settingsChangeCoordinator.replaceSettingsForTest(
+                settingsChangeCoordinator.settingsFlow.value.copy(
+                    ai = settingsChangeCoordinator.settingsFlow.value.ai!!.copy(agentChatId = "99"),
                 ),
             )
             barrier.completeThrough(barrier.latestPendingGeneration())
@@ -394,11 +392,12 @@ class MessagePollerAgentRecoveryTest {
             val directory = Files.createTempDirectory("poller-agent-token-change").toFile()
             val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
             val barrier = ModelSwitchBarrier()
-            val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+            val settingsChangeCoordinator =
+                SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
             val updatesRepository = UpdatesRepository(File(directory, "updates.json"))
             val oldToken = "789:old-token"
             val newToken = "789:new-token"
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     telegramToken = oldToken,
                     ai = AISettings(
@@ -412,7 +411,7 @@ class MessagePollerAgentRecoveryTest {
             barrier.completeThrough(barrier.latestPendingGeneration())
             updatesRepository.saveLastUpdateId("789", 100)
 
-            val agent = RecoveringAgentService(settingsRepository.currentSettingsSnapshot().generation)
+            val agent = RecoveringAgentService(settingsChangeCoordinator.currentSettingsSnapshot().generation)
             val telegram = mockk<TelegramService>()
             val oldTokenCalls = AtomicInteger()
             val newTokenCalls = AtomicInteger()
@@ -442,7 +441,7 @@ class MessagePollerAgentRecoveryTest {
                 parentScope = scope,
                 telegramService = telegram,
                 agentService = agent,
-                settingsRepository = settingsRepository,
+                settingsChangeCoordinator = settingsChangeCoordinator,
                 updatesRepository = updatesRepository,
                 modelSwitchBarrier = barrier,
                 processingTimeout = 5.seconds,
@@ -456,8 +455,8 @@ class MessagePollerAgentRecoveryTest {
                             updatesRepository.getData("789").retryCheckpoint?.targetUpdateId == 101L
                 }
 
-                settingsRepository.replaceSettingsForTest(
-                    settingsRepository.settingsFlow.value.copy(telegramToken = newToken),
+                settingsChangeCoordinator.replaceSettingsForTest(
+                    settingsChangeCoordinator.settingsFlow.value.copy(telegramToken = newToken),
                 )
                 barrier.completeThrough(barrier.latestPendingSettingsGeneration())
 

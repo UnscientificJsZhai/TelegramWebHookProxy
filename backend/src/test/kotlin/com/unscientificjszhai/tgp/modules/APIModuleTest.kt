@@ -1,9 +1,8 @@
 package com.unscientificjszhai.tgp.modules
 
-import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -18,7 +17,6 @@ import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.testing.*
 import io.mockk.coEvery
 import io.mockk.coVerify
-import io.mockk.every
 import io.mockk.mockk
 import kotlinx.serialization.json.*
 import java.io.File
@@ -600,16 +598,13 @@ class APIModuleTest {
             val historicalContent =
                 """{"telegramToken":"100:token","chatId":"old-chat","proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"}}"""
             configFile.writeText(historicalContent)
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
             val originalContent = configFile.readText()
             val recoveredSettings = repository.settingsFlow.value
             val telegramService = mockk<TelegramService>(relaxed = true)
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.settingsRepository } returns repository
-            every { appComponent.telegramService } returns telegramService
 
             testApplication {
-                application { configureTestApi(appComponent) }
+                application { configureTestApi(repository, telegramService) }
 
                 client.post("/api/settings/chat") {
                     header(HttpHeaders.IfMatch, currentSettingsETag())
@@ -666,16 +661,13 @@ class APIModuleTest {
             val historicalContent =
                 """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}]}}"""
             configFile.writeText(historicalContent)
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
             val recoveredSettings = repository.settingsFlow.value
             val recoveredUpdate = repository.settingsUpdateFlow.value
             val telegramService = mockk<TelegramService>(relaxed = true)
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.settingsRepository } returns repository
-            every { appComponent.telegramService } returns telegramService
 
             testApplication {
-                application { configureTestApi(appComponent) }
+                application { configureTestApi(repository, telegramService) }
 
                 client.post("/api/settings/chat") {
                     header(HttpHeaders.IfMatch, currentSettingsETag())
@@ -719,14 +711,11 @@ class APIModuleTest {
                 val historicalContent =
                     """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","agentEnabled":true}}"""
                 configFile.writeText(historicalContent)
-                val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
                 val telegramService = mockk<TelegramService>(relaxed = true)
-                val appComponent = mockk<AppComponent>()
-                every { appComponent.settingsRepository } returns repository
-                every { appComponent.telegramService } returns telegramService
 
                 testApplication {
-                    application { configureTestApi(appComponent) }
+                    application { configureTestApi(repository, telegramService) }
 
                     client.patch("/api/settings") {
                         header(HttpHeaders.IfMatch, currentSettingsETag())
@@ -760,7 +749,13 @@ class APIModuleTest {
      */
     @Test
     fun `settings routes require an explicit HTTP tool replacement for historical configuration`() {
-        data class RepairCase(val patch: String, val verifiesReplacement: (SettingsRepository) -> Unit)
+        /**
+         * 一种历史非法 HTTP 工具配置修复方式。
+         *
+         * @property patch 提交给设置路由的 merge patch。
+         * @property verifiesReplacement 验证协调器最终设置的断言。
+         */
+        data class RepairCase(val patch: String, val verifiesReplacement: (SettingsChangeCoordinator) -> Unit)
 
         val repairCases = listOf(
             RepairCase(
@@ -784,14 +779,11 @@ class APIModuleTest {
                 val historicalContent =
                     """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}"""
                 configFile.writeText(historicalContent)
-                val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
                 val telegramService = mockk<TelegramService>(relaxed = true)
-                val appComponent = mockk<AppComponent>()
-                every { appComponent.settingsRepository } returns repository
-                every { appComponent.telegramService } returns telegramService
 
                 testApplication {
-                    application { configureTestApi(appComponent) }
+                    application { configureTestApi(repository, telegramService) }
 
                     client.patch("/api/settings") {
                         header(HttpHeaders.IfMatch, currentSettingsETag())
@@ -865,15 +857,12 @@ class APIModuleTest {
                 configFile.writeText(
                     """{"telegramToken":"100:token","chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
                 )
-                val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
                 val expected = repository.settingsFlow.value.copy(chatId = "$method-replacement-$index")
                 val telegramService = mockk<TelegramService>(relaxed = true)
-                val appComponent = mockk<AppComponent>()
-                every { appComponent.settingsRepository } returns repository
-                every { appComponent.telegramService } returns telegramService
 
                 testApplication {
-                    application { configureTestApi(appComponent) }
+                    application { configureTestApi(repository, telegramService) }
 
                     val response = when (method) {
                         "put" -> client.put("/api/settings") {
@@ -1171,18 +1160,15 @@ class APIModuleTest {
         assertEquals(original, repository.settingsFlow.value)
     }
 
-    private fun withTestApi(test: suspend ApplicationTestBuilder.(SettingsRepository, TelegramService, File) -> Unit) {
+    private fun withTestApi(test: suspend ApplicationTestBuilder.(SettingsChangeCoordinator, TelegramService, File) -> Unit) {
         val temporaryDirectory = createTempDirectory("api-settings-test").toFile()
         try {
             val configFile = temporaryDirectory.resolve("settings.json")
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
             val telegramService = mockk<TelegramService>(relaxed = true)
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.settingsRepository } returns repository
-            every { appComponent.telegramService } returns telegramService
 
             testApplication {
-                application { configureTestApi(appComponent) }
+                application { configureTestApi(repository, telegramService) }
                 test(repository, telegramService, configFile)
             }
         } finally {
@@ -1190,12 +1176,15 @@ class APIModuleTest {
         }
     }
 
-    private fun Application.configureTestApi(appComponent: AppComponent) {
+    private fun Application.configureTestApi(
+        settingsChangeCoordinator: SettingsChangeCoordinator,
+        telegramService: TelegramService,
+    ) {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
         installApiErrorPages()
-        apiModule(appComponent)
+        apiModule(settingsChangeCoordinator, telegramService)
     }
 
     private fun assertSafeErrorBody(body: String) {

@@ -1,4 +1,4 @@
-package com.unscientificjszhai.tgp.repository
+package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -11,9 +11,9 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.*
 
 /**
- * 设置仓储与模型切换屏障协作的测试设计。
+ * 设置变更协调器与模型切换屏障协作的回归测试。
  */
-class SettingsRepositoryBarrierTest {
+class SettingsChangeCoordinatorTest {
     private val tempDirectory = createTempDirectory("settings-barrier-test").toFile()
 
     @AfterTest
@@ -34,7 +34,7 @@ class SettingsRepositoryBarrierTest {
             Files.write(configFile.toPath(), original)
 
             assertFailsWith<IllegalStateException> {
-                SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+                SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
             }
             assertEquals(original.toList(), Files.readAllBytes(configFile.toPath()).toList())
         }
@@ -48,7 +48,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `only agent lifecycle settings open a model switch barrier`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), barrier)
+        val repository = SettingsChangeCoordinator.forTesting(File(tempDirectory, "settings.json"), barrier)
         var settings = AppSettings(
             ai = AISettings(
                 provider = AIProvider.OPENAI,
@@ -102,7 +102,8 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `Telegram token changes open a model switch barrier before settings publication`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "telegram-token-barrier.json"), barrier)
+        val repository =
+            SettingsChangeCoordinator.forTesting(File(tempDirectory, "telegram-token-barrier.json"), barrier)
         val initial = AppSettings(
             telegramToken = "100:token-a",
             ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "openai-key", agentEnabled = true),
@@ -123,7 +124,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `HTTP tool settings changes open a model switch barrier`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "http-tool-barrier.json"), barrier)
+        val repository = SettingsChangeCoordinator.forTesting(File(tempDirectory, "http-tool-barrier.json"), barrier)
         val initial = AppSettings(ai = AISettings(agentEnabled = true, geminiApiKey = "key"))
         repository.replaceSettingsForTest(initial)
         barrier.complete(barrier.latestPendingGeneration())
@@ -147,7 +148,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `MCP server settings changes open a model switch barrier`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "mcp-server-barrier.json"), barrier)
+        val repository = SettingsChangeCoordinator.forTesting(File(tempDirectory, "mcp-server-barrier.json"), barrier)
         val initial = AppSettings(
             ai = AISettings(
                 agentEnabled = true,
@@ -182,7 +183,7 @@ class SettingsRepositoryBarrierTest {
             """.trimIndent(),
         )
         val originalBytes = configFile.readBytes().toList()
-        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier)
         val recoveredSettings = repository.settingsFlow.value
         val recoveredSnapshot = repository.currentSettingsSnapshot()
         val recoveredSettingsUpdate = repository.settingsUpdateFlow.value
@@ -224,6 +225,15 @@ class SettingsRepositoryBarrierTest {
      */
     @Test
     fun `historical invalid HTTP tool settings require their own explicit replacement authorization`() {
+        /**
+         * 一组历史非法可选字段及其独立替换授权。
+         *
+         * @property name 用于临时目录和失败定位的场景名称。
+         * @property mcpFragment 可选的历史非法 MCP JSON 片段。
+         * @property openAiFragment 可选的历史非法 OpenAI 基础地址 JSON 片段。
+         * @property authorizesMcp 是否显式授权替换 MCP 配置。
+         * @property authorizesOpenAiBaseUrl 是否显式授权替换 OpenAI 基础地址。
+         */
         data class HistoryCase(
             val name: String,
             val mcpFragment: String = "",
@@ -261,7 +271,7 @@ class SettingsRepositoryBarrierTest {
                 """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key",$unsafeHttpToolFragment${case.mcpFragment}${case.openAiFragment}}}""",
             )
             val originalBytes = configFile.readBytes().toList()
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
             assertTrue(repository.hasHistoricalInvalidHttpToolSettings)
             assertEquals(case.authorizesMcp, repository.hasHistoricalInvalidMcp)
@@ -290,7 +300,7 @@ class SettingsRepositoryBarrierTest {
             """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
         )
         val originalBytes = configFile.readBytes().toList()
-        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier)
         val beforeSnapshot = repository.currentSettingsSnapshot()
         val beforeSettingsUpdate = repository.settingsUpdateFlow.value
         val beforeTokenUpdate = repository.telegramTokenUpdateFlow.value
@@ -324,7 +334,7 @@ class SettingsRepositoryBarrierTest {
             }
         }
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(configFile, barrier, fileOperations)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier, fileOperations)
         val beforeSnapshot = repository.currentSettingsSnapshot()
         val beforeSettingsUpdate = repository.settingsUpdateFlow.value
         val beforeTokenUpdate = repository.telegramTokenUpdateFlow.value
@@ -348,7 +358,7 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText(
             """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}],"httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}}""",
         )
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
         val recovered = repository.settingsFlow.value
 
         assertTrue(repository.hasHistoricalInvalidMcp)
@@ -375,7 +385,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `unrelated save carries an open generation to its latest settings snapshot`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), barrier)
+        val repository = SettingsChangeCoordinator.forTesting(File(tempDirectory, "settings.json"), barrier)
         val initialSettings = AppSettings(
             ai = AISettings(provider = AIProvider.GEMINI, geminiApiKey = "key", agentEnabled = true),
         )
@@ -399,7 +409,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `latest lifecycle snapshot releases conflated earlier generations`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), barrier)
+        val repository = SettingsChangeCoordinator.forTesting(File(tempDirectory, "settings.json"), barrier)
         val firstSettings = AppSettings(
             ai = AISettings(
                 provider = AIProvider.GEMINI,
@@ -436,7 +446,7 @@ class SettingsRepositoryBarrierTest {
         val originalContent =
             """{"chatId":"old-chat","ai":{"provider":"OPENAI","openAiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/%6dodels","agentEnabled":true}}"""
         configFile.writeText(originalContent)
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
         assertTrue(repository.hasHistoricalInvalidOpenAiBaseUrl)
         assertEquals("https://gateway.example.com/v1/%6dodels", repository.settingsFlow.value.ai?.openAiBaseUrl)
@@ -466,7 +476,7 @@ class SettingsRepositoryBarrierTest {
             """{"ai":{"provider":"GEMINI","geminiApiKey":"key","openAiBaseUrl":"https://gateway.example.com/v1/chat/%63ompletions","agentEnabled":true}}"""
         configFile.writeText(originalContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
         assertEquals(AIProvider.GEMINI, repository.settingsFlow.value.ai?.provider)
         assertEquals("key", repository.settingsFlow.value.ai?.geminiApiKey)
@@ -499,7 +509,7 @@ class SettingsRepositoryBarrierTest {
             sidecarFile.writeText(sidecarContent)
 
             assertFailsWith<IllegalStateException> {
-                SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+                SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
             }
             assertEquals(primaryContent, configFile.readText())
             assertEquals(sidecarContent, sidecarFile.readText())
@@ -519,7 +529,7 @@ class SettingsRepositoryBarrierTest {
         sidecarFile.writeText(historicalContent)
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
         }
         assertEquals("{ damaged", configFile.readText())
         assertEquals(historicalContent, sidecarFile.readText())
@@ -531,7 +541,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `settings snapshot excludes an earlier external barrier generation`() {
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(File(tempDirectory, "external-generation.json"), barrier)
+        val repository = SettingsChangeCoordinator.forTesting(File(tempDirectory, "external-generation.json"), barrier)
         val authenticationGeneration = barrier.beginExternalSwitch()
 
         repository.replaceSettingsForTest(
@@ -556,7 +566,7 @@ class SettingsRepositoryBarrierTest {
     fun `a failed settings write cancels its switch generation`() {
         val barrier = ModelSwitchBarrier()
         val configFile = File(tempDirectory, "settings.json")
-        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier)
 
         tempDirectory.deleteRecursively()
         tempDirectory.writeText("not a directory")
@@ -573,7 +583,7 @@ class SettingsRepositoryBarrierTest {
     @Test
     fun `telegram token generation records rapid restoration without unrelated changes`() {
         val repository =
-            SettingsRepository.forTesting(File(tempDirectory, "token-generation.json"), ModelSwitchBarrier())
+            SettingsChangeCoordinator.forTesting(File(tempDirectory, "token-generation.json"), ModelSwitchBarrier())
         val initialGeneration = repository.telegramTokenUpdateFlow.value.generation
 
         repository.replaceSettingsForTest(AppSettings(telegramToken = "100:A"))
@@ -597,7 +607,7 @@ class SettingsRepositoryBarrierTest {
     fun `invalid proxy save has no side effects`() {
         val barrier = ModelSwitchBarrier()
         val configFile = File(tempDirectory, "invalid-proxy-settings.json")
-        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier)
         val initialSettings = AppSettings(telegramToken = "100:original", chatId = "original-chat")
         repository.replaceSettingsForTest(initialSettings)
         barrier.complete(barrier.latestPendingGeneration())
@@ -635,7 +645,7 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText(originalContent)
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
         }
         assertEquals(originalContent, configFile.readText())
     }
@@ -650,7 +660,7 @@ class SettingsRepositoryBarrierTest {
             """.trimIndent()
         configFile.writeText(originalContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
         assertEquals(
             ProxySettings("proxy.example.com", 8080, ProxyType.HTTP),
@@ -676,7 +686,7 @@ class SettingsRepositoryBarrierTest {
             """.trimIndent()
         configFile.writeText(originalContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
         assertEquals("", repository.settingsFlow.value.telegramToken)
         assertEquals("kept", repository.settingsFlow.value.chatId)
@@ -704,7 +714,7 @@ class SettingsRepositoryBarrierTest {
             {"telegramToken":"100:token","chatId":"chat","proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"},"ai":{"provider":"GEMINI","geminiApiKey":"key"}}
             """.trimIndent()
         configFile.writeText(originalContent)
-        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier)
         val originalSettings = repository.settingsFlow.value
         val originalSettingsUpdate = repository.settingsUpdateFlow.value
         val originalTokenUpdate = repository.telegramTokenUpdateFlow.value
@@ -749,7 +759,7 @@ class SettingsRepositoryBarrierTest {
             val configFile = File(tempDirectory, "historical-proxy-credentials-$index.json")
             val originalContent = """{"telegramToken":"100:token","chatId":"chat","proxy":$proxyJson}"""
             configFile.writeText(originalContent)
-            val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
             assertEquals(null, repository.settingsFlow.value.proxy)
             assertTrue(repository.hasHistoricalInvalidProxy)
@@ -777,7 +787,7 @@ class SettingsRepositoryBarrierTest {
             {"telegramToken":"100:token","chatId":"chat","ai":{"provider":"OPENAI","openAiApiKey":"key","agentEnabled":true,"mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}]}}
             """.trimIndent()
         configFile.writeText(originalContent)
-        val repository = SettingsRepository.forTesting(configFile, barrier)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier)
         val recoveredSettings = repository.settingsFlow.value
 
         assertEquals(AIProvider.OPENAI, recoveredSettings.ai?.provider)
@@ -819,7 +829,7 @@ class SettingsRepositoryBarrierTest {
         sidecarFile.writeText(sidecarContent)
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
         }
         assertEquals("{ invalid", configFile.readText())
         assertEquals(sidecarContent, sidecarFile.readText())
@@ -837,7 +847,7 @@ class SettingsRepositoryBarrierTest {
             """.trimIndent()
         configFile.writeText(originalContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
 
         assertEquals("100:token", repository.settingsFlow.value.telegramToken)
         assertEquals("chat", repository.settingsFlow.value.chatId)
@@ -859,7 +869,7 @@ class SettingsRepositoryBarrierTest {
         File(tempDirectory, "recover-settings.json.bak").writeText(backupContent)
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
         }
         assertEquals("{ invalid", configFile.readText())
         assertEquals(backupContent, File(tempDirectory, "recover-settings.json.bak").readText())
@@ -882,7 +892,7 @@ class SettingsRepositoryBarrierTest {
             }
         }
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(configFile, barrier, fileOperations)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier, fileOperations)
         val originalSettingsUpdate = repository.settingsUpdateFlow.value
         val originalTokenUpdate = repository.telegramTokenUpdateFlow.value
         val originalContent = configFile.readText()
@@ -921,7 +931,7 @@ class SettingsRepositoryBarrierTest {
             }
         }
         val barrier = ModelSwitchBarrier()
-        val repository = SettingsRepository.forTesting(configFile, barrier, fileOperations)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, barrier, fileOperations)
         val originalSettingsUpdate = repository.settingsUpdateFlow.value
         val originalTokenUpdate = repository.telegramTokenUpdateFlow.value
         directorySyncAvailable = false
@@ -949,7 +959,7 @@ class SettingsRepositoryBarrierTest {
         configFile.writeText(damagedPrimary)
         backupFile.writeText(validBackup)
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
         }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
@@ -965,7 +975,7 @@ class SettingsRepositoryBarrierTest {
         val backupContent = "{\n  \"telegramToken\": \"100:backup\",\n  \"chatId\": \"backup-chat\"\n}\n"
         backupFile.writeText(backupContent)
 
-        val repository = SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
 
         assertEquals(AppSettings(), repository.settingsFlow.value)
         assertFalse(configFile.exists())
@@ -983,7 +993,7 @@ class SettingsRepositoryBarrierTest {
         backupFile.writeText(damagedBackup)
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
         }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(damagedBackup, backupFile.readText())
@@ -998,7 +1008,7 @@ class SettingsRepositoryBarrierTest {
         backupFile.writeText("{\"telegramToken\":\"100:ignored\"}")
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), rejectBakOperations())
         }
         assertEquals("{ invalid", configFile.readText())
         assertEquals("{\"telegramToken\":\"100:ignored\"}", backupFile.readText())
@@ -1027,14 +1037,14 @@ class SettingsRepositoryBarrierTest {
         }
 
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
         }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
 
         blockPrimaryRead = false
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
         }
         assertEquals(damagedPrimary, configFile.readText())
         assertEquals(validBackup, backupFile.readText())
@@ -1058,7 +1068,7 @@ class SettingsRepositoryBarrierTest {
             }
         }
         assertFailsWith<IllegalStateException> {
-            SettingsRepository.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
+            SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier(), fileOperations)
         }
         assertEquals("{ invalid", configFile.readText())
         assertEquals(sidecarContent, sidecarFile.readText())

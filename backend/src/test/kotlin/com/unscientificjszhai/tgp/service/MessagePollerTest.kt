@@ -323,7 +323,7 @@ class MessagePollerTest {
     @Test
     fun `close while waiting for readiness never creates a polling session`() = runBlocking {
         val barrier = ModelSwitchBarrier()
-        val settings = SettingsRepository.forTesting(tempDirectory.resolve("close-race-settings.json"), barrier)
+        val settings = SettingsChangeCoordinator.forTesting(tempDirectory.resolve("close-race-settings.json"), barrier)
         val updates = UpdatesRepository(tempDirectory.resolve("close-race-updates.json"))
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
@@ -456,7 +456,8 @@ class MessagePollerTest {
             throw IOException("injected delivery state write failure")
         }
         val barrier = ModelSwitchBarrier()
-        val settings = SettingsRepository.forTesting(tempDirectory.resolve("failed-outbox-settings.json"), barrier)
+        val settings =
+            SettingsChangeCoordinator.forTesting(tempDirectory.resolve("failed-outbox-settings.json"), barrier)
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
         val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
@@ -536,7 +537,7 @@ class MessagePollerTest {
     ): Fixture {
         val barrier = ModelSwitchBarrier()
         val settings =
-            SettingsRepository.forTesting(tempDirectory.resolve("settings-${System.nanoTime()}.json"), barrier)
+            SettingsChangeCoordinator.forTesting(tempDirectory.resolve("settings-${System.nanoTime()}.json"), barrier)
         val updates = updatesOverride ?: UpdatesRepository(tempDirectory.resolve("updates-${System.nanoTime()}.json"))
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = mockk<AgentService>(relaxed = true)
@@ -578,7 +579,7 @@ class MessagePollerTest {
 
     private fun Fixture.saveSettings(settings: AppSettings) {
         // 既有轮询测试以 `agentEnabled` 表示可用的默认 Gemini 测试配置；缺少密钥的行为由专门用例使用
-        // SettingsRepository 直接设置，以免该便利方法掩盖禁用分支。
+        // SettingsChangeCoordinator 直接设置，以免该便利方法掩盖禁用分支。
         val enabledTestSettings = settings.copy(
             ai = settings.ai?.let { aiSettings ->
                 if (
@@ -614,7 +615,7 @@ class MessagePollerTest {
      * 一次消息轮询测试使用的完整依赖集合。
      *
      * @property barrier 测试控制的共享模型切换屏障。
-     * @property settings 使用临时文件的设置仓储。
+     * @property settings 使用临时文件设置存储的设置变更协调器。
      * @property updates 使用临时文件的更新仓储。
      * @property telegram 测试替身 Telegram 服务。
      * @property agent 测试替身 Agent 服务。
@@ -622,7 +623,7 @@ class MessagePollerTest {
      */
     private data class Fixture(
         val barrier: ModelSwitchBarrier,
-        val settings: SettingsRepository,
+        val settings: SettingsChangeCoordinator,
         val updates: UpdatesRepository,
         val telegram: TelegramService,
         val agent: AgentService,

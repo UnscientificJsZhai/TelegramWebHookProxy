@@ -2,8 +2,8 @@ package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.di.AgentComponent
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.SettingsUpdate
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.SettingsUpdate
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.utils.SafeLogging
@@ -28,27 +28,13 @@ import javax.inject.Singleton
 @Singleton
 class DelegatingAgentService @Inject internal constructor(
     private val agentComponentFactory: AgentComponent.Factory,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     skillRepository: SkillRepository,
     private val modelSwitchBarrier: ModelSwitchBarrier,
     parentScope: CoroutineScope,
     @Suppress("UNUSED_PARAMETER")
     deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
 ) : AgentService() {
-    @Deprecated("请通过依赖注入构造 DelegatingAgentService，以显式共享 ModelSwitchBarrier。")
-    constructor(
-        agentComponentFactory: AgentComponent.Factory,
-        settingsRepository: SettingsRepository,
-        skillRepository: SkillRepository,
-        parentScope: CoroutineScope,
-    ) : this(
-        agentComponentFactory,
-        settingsRepository,
-        skillRepository,
-        settingsRepository.modelSwitchBarrier,
-        parentScope,
-    )
-
     private val logger = LoggerFactory.getLogger(DelegatingAgentService::class.java)
     private val lifecycleLock = Any()
     private val cleanupLock = Any()
@@ -70,6 +56,15 @@ class DelegatingAgentService @Inject internal constructor(
     private var closeCompletion: CompletableDeferred<Unit>? = null
     private var closeJob: Job? = null
 
+    /**
+     * 一个设置版本期望使用的完整 Agent 配置。
+     *
+     * @property settingsVersion 生成配置的单调设置版本。
+     * @property provider 目标 AI 提供商。
+     * @property apiKey 目标提供商凭据。
+     * @property baseUrl 目标提供商基础地址。
+     * @property proxySettings 目标网络代理设置。
+     */
     private data class AgentConfiguration(
         val settingsVersion: Long,
         val provider: AIProvider,
@@ -81,6 +76,14 @@ class DelegatingAgentService @Inject internal constructor(
             get() = NetworkIdentity(provider, apiKey, baseUrl, proxySettings)
     }
 
+    /**
+     * 决定 Agent 组件能否复用的网络身份。
+     *
+     * @property provider 目标 AI 提供商。
+     * @property apiKey 目标提供商凭据。
+     * @property baseUrl 目标提供商基础地址。
+     * @property proxySettings 目标网络代理设置。
+     */
     private data class NetworkIdentity(
         val provider: AIProvider,
         val apiKey: String,
@@ -88,17 +91,38 @@ class DelegatingAgentService @Inject internal constructor(
         val proxySettings: ProxySettings?,
     )
 
+    /**
+     * 带生命周期 epoch 的 Agent 收敛目标。
+     *
+     * @property epoch 创建目标时的服务生命周期代次。
+     * @property settingsUpdate 触发目标的设置事件。
+     * @property configuration 需要构建或复用的 Agent 配置。
+     */
     private data class AgentTarget(
         val epoch: Long,
         val settingsUpdate: SettingsUpdate,
         val configuration: AgentConfiguration,
     )
 
+    /**
+     * 尚未提交为当前 Agent 的候选组件与服务。
+     *
+     * @property component 持有候选服务依赖的 Dagger 子组件。
+     * @property service 候选 Agent 服务。
+     */
     private data class AgentCandidate(
         val component: AgentComponent,
         val service: AgentService,
     )
 
+    /**
+     * 首次关闭调用原子摘取的待清理资源。
+     *
+     * @property completion 所有关闭调用共享的完成信号。
+     * @property settingsJob 设置订阅任务。
+     * @property terminalTransitionJob 当前 Agent 终态转换任务。
+     * @property currentService 关闭开始时的当前 Agent 服务。
+     */
     private data class ClosingResources(
         val completion: CompletableDeferred<Unit>,
         val settingsJob: Job?,
@@ -137,7 +161,7 @@ class DelegatingAgentService @Inject internal constructor(
 
     init {
         settingsJob = combine(
-            settingsRepository.settingsUpdateFlow,
+            settingsChangeCoordinator.settingsUpdateFlow,
             skillRepository.skillsUpdateEvent.onStart { emit(Unit) },
         ) { settingsUpdate, _ -> settingsUpdate }
             .onEach(::submitLifecycleTarget)
@@ -173,7 +197,7 @@ class DelegatingAgentService @Inject internal constructor(
         }
         if (
             configuration.provider == AIProvider.OPENAI &&
-            settingsRepository.hasHistoricalInvalidOpenAiBaseUrl
+            settingsChangeCoordinator.hasHistoricalInvalidOpenAiBaseUrl
         ) {
             recoveryController.block(
                 provider = configuration.provider,
@@ -293,7 +317,7 @@ class DelegatingAgentService @Inject internal constructor(
                 desiredConfiguration == target.configuration
 
     private fun isSettingsVersionCurrent(settingsVersion: Long): Boolean =
-        settingsRepository.settingsUpdateFlow.value.version == settingsVersion
+        settingsChangeCoordinator.settingsUpdateFlow.value.version == settingsVersion
 
     private fun AISettings.requiredApiKey(): String = when (provider) {
         AIProvider.OPENAI -> openAiApiKey
@@ -368,7 +392,7 @@ class DelegatingAgentService @Inject internal constructor(
             ?: throw AgentConfigurationNotReadyException()
 
     override fun isAiFeatureEnabled(aiSettings: AISettings): Boolean {
-        val settingsUpdate = settingsRepository.settingsUpdateFlow.value
+        val settingsUpdate = settingsChangeCoordinator.settingsUpdateFlow.value
         val configuration = settingsUpdate.toAgentConfigurationOrNull() ?: return false
         if (settingsUpdate.settings.ai != aiSettings) return false
         val service = synchronized(lifecycleLock) {
@@ -398,9 +422,13 @@ class DelegatingAgentService @Inject internal constructor(
         return service?.resetSession() ?: CompletableDeferred(Unit).also { it.complete(Unit) }
     }
 
-    /** 返回精确应用仓储当前设置的发布服务；技能重建或任意设置切换期间始终返回 `null`。 */
+    /**
+     * 返回精确应用设置变更协调器当前状态的发布服务。
+     *
+     * @return 当前设置对应且已发布就绪的服务；技能重建或任意设置切换期间返回 `null`。
+     */
     private fun readyServiceForCurrentSettingsOrNull(): AgentService? {
-        val settingsUpdate = settingsRepository.settingsUpdateFlow.value
+        val settingsUpdate = settingsChangeCoordinator.settingsUpdateFlow.value
         val configuration = settingsUpdate.toAgentConfigurationOrNull() ?: return null
         return synchronized(lifecycleLock) {
             _currentService?.takeIf { service ->
@@ -412,7 +440,7 @@ class DelegatingAgentService @Inject internal constructor(
 
     override suspend fun <T> withReadyService(block: suspend (AgentService) -> T): T =
         modelSwitchBarrier.runWhenReady {
-            val settingsUpdate = settingsRepository.settingsUpdateFlow.value
+            val settingsUpdate = settingsChangeCoordinator.settingsUpdateFlow.value
             val configuration = settingsUpdate.toAgentConfigurationOrNull()
                 ?: throw AgentConfigurationNotReadyException()
             val service = synchronized(lifecycleLock) {
@@ -422,7 +450,7 @@ class DelegatingAgentService @Inject internal constructor(
         }
 
     private fun isReadyForCurrentSettings(configuration: AgentConfiguration, service: AgentService): Boolean =
-        settingsRepository.settingsUpdateFlow.value.let { current ->
+        settingsChangeCoordinator.settingsUpdateFlow.value.let { current ->
             current.version == configuration.settingsVersion && synchronized(lifecycleLock) {
                 isReadyForCapturedSettingsLocked(configuration, service) &&
                         isSettingsVersionCurrent(configuration.settingsVersion)

@@ -8,12 +8,12 @@ import com.openai.models.chat.completions.*
 import com.openai.models.models.Model
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.function.*
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
@@ -36,7 +36,6 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.*
 import javax.inject.Inject
-import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
 
 /**
@@ -47,20 +46,20 @@ import kotlin.jvm.optionals.getOrNull
  * 传输、HTTP 工具客户端与 MCP 连接均已释放。
  *
  * @param parentScope 服务任务所属的父协程作用域。
- * @param settingsRepository 提供 OpenAI、MCP 和代理设置的仓库。
+ * @param settingsChangeCoordinator 提供 OpenAI、MCP 和代理设置快照及条件写入。
  * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
  * @param mcpClientService 管理会话可调用的 MCP 工具连接。
- * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ * @param scheduledTaskService 提供定时任务 CRUD 和持久化；不包含 worker 或 Agent 依赖。
  * @param deadlines 限制候选初始化与其 MCP 批次的总体执行时间。
  */
 @AgentScope
 class OpenAIAgentService @Inject internal constructor(
     parentScope: CoroutineScope,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
     private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
-    taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
+    scheduledTaskService: ScheduledTaskService,
 ) : ProviderAgentService() {
     private companion object {
         const val DEFAULT_MODEL = "gpt-5.6-luna"
@@ -85,11 +84,11 @@ class OpenAIAgentService @Inject internal constructor(
         encodeDefaults = true
     }
 
-    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsRepository)
+    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsChangeCoordinator)
     private var localFunctionProviders = listOf(
         httpCallingFunctionProvider,
         McpFunctionProvider(mcpClientService),
-        ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
+        ScheduleTaskFunctionProvider(scheduledTaskService, settingsChangeCoordinator),
         SkillFunctionProvider(skillRepository),
     )
     private var localFunctionRouter = LocalFunctionRouter(localFunctionProviders)
@@ -152,7 +151,7 @@ class OpenAIAgentService @Inject internal constructor(
         aiSettings.agentEnabled && aiSettings.openAiApiKey.isNotBlank()
 
     init {
-        val aiSettings = settingsRepository.settingsFlow.value.ai
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai
         if (aiSettings?.provider == AIProvider.OPENAI) {
             restoreSelectedModel(aiSettings.selectedModel)
         }
@@ -175,7 +174,7 @@ class OpenAIAgentService @Inject internal constructor(
     /** 显式建立首轮 OpenAI 会话、MCP 工具快照和模型列表。 */
     override suspend fun performPublicationInitialization() {
         withTimeout(deadlines.candidateInitialization) {
-            val settings = settingsRepository.settingsFlow.value
+            val settings = settingsChangeCoordinator.settingsFlow.value
             val aiSettings = settings.ai
                 ?.takeIf { it.provider == AIProvider.OPENAI && isAiFeatureEnabled(it) }
                 ?: throw IllegalArgumentException("OpenAI agent configuration is incomplete.")
@@ -367,7 +366,7 @@ class OpenAIAgentService @Inject internal constructor(
             return null
         }
         history.clear()
-        val aiSettings = settingsRepository.settingsFlow.value.ai
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai
         val mcpConnectionJob = aiSettings?.let { startMcpConnection(it.mcpServers) }
             ?: run {
                 cancelCurrentMcpConnection()
@@ -1012,7 +1011,7 @@ class OpenAIAgentService @Inject internal constructor(
      * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
      */
     private fun clearPersistedSelectedModel(invalidModel: String) {
-        settingsRepository.updateSettings { settings ->
+        settingsChangeCoordinator.updateSettings { settings ->
             val aiSettings = settings.ai
             if (
                 aiSettings?.provider == AIProvider.OPENAI &&

@@ -3,9 +3,9 @@ package com.unscientificjszhai.tgp.service.ai.agent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope
@@ -37,13 +37,13 @@ class OpenAIInitializationRecoveryTest {
                     .body("response-body-secret".padEnd(MAX_RAW_RESPONSE_BYTES + 1, 'x'))
                     .build(),
             )
-            val settingsRepository = SettingsRepository.forTesting(
+            val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
                 File(directory, "settings.json"),
                 ModelSwitchBarrier(),
             )
             val apiKey = "api-key-secret"
             val baseUrl = server.url("/v1").toString().trimEnd('/')
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.OPENAI,
@@ -56,10 +56,11 @@ class OpenAIInitializationRecoveryTest {
             val skillRepository = SkillRepository.forTesting(File(directory, "skills.json"))
             val service = OpenAIAgentService(
                 scope,
-                settingsRepository,
+                settingsChangeCoordinator,
                 skillRepository,
                 MCPClientService(scope),
-            ) { mockk() }
+                scheduledTaskService = mockk(),
+            )
 
             val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
 
@@ -92,11 +93,11 @@ class OpenAIInitializationRecoveryTest {
                     .body("{\"data\":[]}")
                     .build(),
             )
-            val settingsRepository = SettingsRepository.forTesting(
+            val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
                 File(directory, "settings.json"),
                 ModelSwitchBarrier(),
             )
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.OPENAI,
@@ -108,10 +109,11 @@ class OpenAIInitializationRecoveryTest {
             )
             val service = OpenAIAgentService(
                 scope,
-                settingsRepository,
+                settingsChangeCoordinator,
                 SkillRepository.forTesting(File(directory, "skills.json")),
                 MCPClientService(scope),
-            ) { mockk() }
+                scheduledTaskService = mockk(),
+            )
 
             val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
 
@@ -139,11 +141,11 @@ class OpenAIInitializationRecoveryTest {
                     .body("""{"data":[{"id":"","object":"model","created":0,"owned_by":"test"}]}""")
                     .build(),
             )
-            val settingsRepository = SettingsRepository.forTesting(
+            val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
                 File(directory, "settings.json"),
                 ModelSwitchBarrier(),
             )
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.OPENAI,
@@ -155,10 +157,11 @@ class OpenAIInitializationRecoveryTest {
             )
             val service = OpenAIAgentService(
                 scope,
-                settingsRepository,
+                settingsChangeCoordinator,
                 SkillRepository.forTesting(File(directory, "skills.json")),
                 MCPClientService(scope),
-            ) { mockk() }
+                scheduledTaskService = mockk(),
+            )
 
             val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
 

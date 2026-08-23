@@ -4,9 +4,9 @@ import com.unscientificjszhai.tgp.di.AgentComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import io.mockk.mockk
 import kotlinx.coroutines.*
@@ -48,9 +48,10 @@ class DelegatingAgentRecoveryIntegrationTest {
                     .build(),
             )
             val barrier = ModelSwitchBarrier()
-            val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+            val settingsChangeCoordinator =
+                SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
             val skillRepository = SkillRepository.forTesting(File(directory, "skills.json"))
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.OPENAI,
@@ -64,13 +65,13 @@ class DelegatingAgentRecoveryIntegrationTest {
             val factory = object : AgentComponent.Factory {
                 override fun create(): AgentComponent = TestAgentComponent(
                     scope,
-                    settingsRepository,
+                    settingsChangeCoordinator,
                     skillRepository,
                 ).also(components::add)
             }
             delegating = DelegatingAgentService(
                 factory,
-                settingsRepository,
+                settingsChangeCoordinator,
                 skillRepository,
                 barrier,
                 scope,
@@ -90,7 +91,7 @@ class DelegatingAgentRecoveryIntegrationTest {
             assertEquals(2, ready.attempt)
             assertEquals(2, components.size)
             assertEquals(2, server.requestCount)
-            assertTrue(delegating.isAiFeatureEnabled(settingsRepository.settingsFlow.value.ai!!))
+            assertTrue(delegating.isAiFeatureEnabled(settingsChangeCoordinator.settingsFlow.value.ai!!))
         } finally {
             delegating?.close()?.join()
             parentJob.cancelAndJoin()
@@ -118,9 +119,10 @@ class DelegatingAgentRecoveryIntegrationTest {
                     .build(),
             )
             val barrier = ModelSwitchBarrier()
-            val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+            val settingsChangeCoordinator =
+                SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
             val skillRepository = SkillRepository.forTesting(File(directory, "skills.json"))
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.OPENAI,
@@ -133,13 +135,13 @@ class DelegatingAgentRecoveryIntegrationTest {
             val factory = object : AgentComponent.Factory {
                 override fun create(): AgentComponent = TestAgentComponent(
                     scope,
-                    settingsRepository,
+                    settingsChangeCoordinator,
                     skillRepository,
                 )
             }
             delegating = DelegatingAgentService(
                 factory,
-                settingsRepository,
+                settingsChangeCoordinator,
                 skillRepository,
                 barrier,
                 scope,
@@ -161,9 +163,9 @@ class DelegatingAgentRecoveryIntegrationTest {
             }
             entered.await()
 
-            settingsRepository.replaceSettingsForTest(
-                settingsRepository.settingsFlow.value.copy(
-                    ai = settingsRepository.settingsFlow.value.ai!!.copy(agentEnabled = false),
+            settingsChangeCoordinator.replaceSettingsForTest(
+                settingsChangeCoordinator.settingsFlow.value.copy(
+                    ai = settingsChangeCoordinator.settingsFlow.value.ai!!.copy(agentEnabled = false),
                 ),
             )
             withTimeout(5.seconds) {
@@ -176,7 +178,7 @@ class DelegatingAgentRecoveryIntegrationTest {
             withTimeout(5.seconds) {
                 while (barrier.isSwitching) delay(10)
             }
-            assertFalse(delegating.isAiFeatureEnabled(settingsRepository.settingsFlow.value.ai!!))
+            assertFalse(delegating.isAiFeatureEnabled(settingsChangeCoordinator.settingsFlow.value.ai!!))
         } finally {
             delegating?.close()?.join()
             parentJob.cancelAndJoin()
@@ -187,21 +189,23 @@ class DelegatingAgentRecoveryIntegrationTest {
 
     private class TestAgentComponent(
         scope: CoroutineScope,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         skillRepository: SkillRepository,
     ) : AgentComponent {
         override val mcpClientService = MCPClientService(scope)
         override val geminiAgentService = GeminiAgentService(
             scope,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             mcpClientService,
-        ) { mockk() }
+            scheduledTaskService = mockk(),
+        )
         override val openAIAgentService = OpenAIAgentService(
             scope,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             mcpClientService,
-        ) { mockk() }
+            scheduledTaskService = mockk(),
+        )
     }
 }

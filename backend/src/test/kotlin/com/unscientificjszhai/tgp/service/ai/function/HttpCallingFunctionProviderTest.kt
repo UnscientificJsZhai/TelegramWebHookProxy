@@ -2,8 +2,8 @@ package com.unscientificjszhai.tgp.service.ai.function
 
 import com.sun.net.httpserver.HttpServer
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
@@ -36,14 +36,6 @@ class HttpCallingFunctionProviderTest {
     }
 
 
-
-
-
-
-
-
-
-
     /**
      * 验证 `/23` 前缀匹配恰好覆盖 `2001::/23`，不会把紧邻的正常全球单播地址纳入拒绝范围。
      */
@@ -54,16 +46,11 @@ class HttpCallingFunctionProviderTest {
     }
 
 
-
-
-
-
-
     private fun providerWith(
         httpToolSettings: HttpToolSettings,
         resolver: HttpToolDnsResolver = HttpToolDnsResolver { listOf(InetAddress.getByName("127.0.0.1")) },
     ): HttpCallingFunctionProvider {
-        val repository = SettingsRepository.forTesting(
+        val repository = SettingsChangeCoordinator.forTesting(
             File(temporaryDirectory, "settings-${System.nanoTime()}.json"),
             ModelSwitchBarrier(),
         )
@@ -72,14 +59,14 @@ class HttpCallingFunctionProviderTest {
     }
 
     private fun providerWith(
-        repository: SettingsRepository,
+        repository: SettingsChangeCoordinator,
         resolver: HttpToolDnsResolver,
         connectionObserver: HttpToolConnectionObserver,
     ): HttpCallingFunctionProvider =
         HttpCallingFunctionProvider.withConnectionObserver(repository, resolver, connectionObserver)
 
     private fun providerWith(
-        repository: SettingsRepository,
+        repository: SettingsChangeCoordinator,
         resolver: HttpToolDnsResolver,
         connectionObserver: HttpToolConnectionObserver,
         lifecycleObserver: HttpToolLifecycleObserver,
@@ -92,7 +79,7 @@ class HttpCallingFunctionProviderTest {
         connectionObserver: HttpToolConnectionObserver,
         lifecycleObserver: HttpToolLifecycleObserver,
     ): HttpCallingFunctionProvider {
-        val repository = SettingsRepository.forTesting(
+        val repository = SettingsChangeCoordinator.forTesting(
             File(temporaryDirectory, "settings-${System.nanoTime()}.json"),
             ModelSwitchBarrier(),
         )

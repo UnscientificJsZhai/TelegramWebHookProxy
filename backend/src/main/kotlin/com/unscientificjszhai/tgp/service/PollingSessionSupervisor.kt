@@ -95,7 +95,7 @@ private sealed interface PollingAttempt {
  * @param runtime 持有根任务、当前会话和唯一会话锁的共享运行时。
  * @param telegramService 执行 Telegram 轮询请求的服务。
  * @param agentService 提供 Agent 可用性与会话重置的服务。
- * @param settingsRepository 提供 token 更新流、设置代次和生命周期锁的仓储。
+ * @param settingsChangeCoordinator 提供 token 更新流、设置代次和生命周期锁的协调器。
  * @param updatesRepository 持久化轮询 offset、检查点、聊天与 Agent journal 的仓储。
  * @param modelSwitchBarrier 在 token 切换或认证失败期间关闭 Agent 准入的共享屏障。
  * @param admissionPolicy 接纳单条 Telegram 更新的策略。
@@ -108,7 +108,7 @@ internal class PollingSessionSupervisor(
     private val runtime: MessagePollingRuntime,
     private val telegramService: TelegramService,
     private val agentService: AgentService,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val updatesRepository: UpdatesRepository,
     private val modelSwitchBarrier: ModelSwitchBarrier,
     private val admissionPolicy: UpdateAdmissionPolicy,
@@ -145,7 +145,7 @@ internal class PollingSessionSupervisor(
                     if (runtime.closed) {
                         return@launch
                     }
-                    settingsRepository.telegramTokenUpdateFlow.collect { tokenUpdate ->
+                    settingsChangeCoordinator.telegramTokenUpdateFlow.collect { tokenUpdate ->
                         currentCoroutineContext().ensureActive()
                         if (!runtime.closed) {
                             replaceSession(tokenUpdate.token, tokenUpdate.generation)
@@ -164,7 +164,7 @@ internal class PollingSessionSupervisor(
         if (runtime.closed) {
             return
         }
-        val replacement = settingsRepository.withTelegramTokenLifecycleLock {
+        val replacement = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             runtime.withSessionLock {
                 when {
                     runtime.closed || !runtime.isTokenGenerationCurrent(token, generation) -> SessionReplacement.NoOp
@@ -268,7 +268,7 @@ internal class PollingSessionSupervisor(
             consumerResume = Channel(capacity = Channel.CONFLATED),
             outboxSignal = Channel(capacity = Channel.CONFLATED),
         )
-        val barrierGenerationToRelease = settingsRepository.withTelegramTokenLifecycleLock {
+        val barrierGenerationToRelease = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             runtime.withSessionLock {
                 if (
                     runtime.closed ||
@@ -390,7 +390,7 @@ internal class PollingSessionSupervisor(
         while (runtime.isCurrent(session)) {
             val snapshot = agentService.availability.first { state -> state.sequence != sequence }
             if (!runtime.isCurrent(session)) return false
-            if (settingsRepository.currentSettingsSnapshot().generation != observedSettingsVersion) return true
+            if (settingsChangeCoordinator.currentSettingsSnapshot().generation != observedSettingsVersion) return true
             when (snapshot.state) {
                 AgentAvailabilityState.READY,
                 AgentAvailabilityState.DISABLED,
@@ -856,7 +856,7 @@ internal class PollingSessionSupervisor(
      * @param session 收到认证失败且可能需要终止的当前轮询会话。
      */
     private fun terminateAuthenticationFailedSession(session: PollingSession) {
-        val pendingReset = settingsRepository.withTelegramTokenLifecycleLock {
+        val pendingReset = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             runtime.withSessionLock {
                 if (!runtime.closed && runtime.currentSession === session && runtime.isTokenGenerationCurrent(session)) {
                     // 认证失败也必须在摘除会话前关闭 Agent 准入，避免并发请求使用即将清除的上下文。
@@ -1034,7 +1034,7 @@ internal class PollingSessionSupervisor(
         token: String,
         generation: Long,
     ) {
-        val shouldReleaseBarrier = settingsRepository.withTelegramTokenLifecycleLock {
+        val shouldReleaseBarrier = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             runtime.withSessionLock {
                 if (
                     !runtime.closed &&

@@ -8,12 +8,12 @@ import com.google.genai.types.*
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.models.ProxyType
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.function.*
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
@@ -35,7 +35,6 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.*
 import javax.inject.Inject
-import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
 
 /**
@@ -46,39 +45,39 @@ import kotlin.jvm.optionals.getOrNull
  * MCP 连接均已释放。
  *
  * @param parentScope 服务任务所属的父协程作用域。
- * @param settingsRepository 提供 Gemini、MCP 和代理设置的仓库。
+ * @param settingsChangeCoordinator 提供 Gemini、MCP 和代理设置快照及条件写入。
  * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
  * @param mcpClientService 管理会话可调用的 MCP 工具连接。
- * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ * @param scheduledTaskService 提供定时任务 CRUD 和持久化；不包含 worker 或 Agent 依赖。
  * @param deadlines 限制候选初始化、模型发现及其 MCP 批次的总体执行时间。
  */
 @AgentScope
 class GeminiAgentService @Inject internal constructor(
     parentScope: CoroutineScope,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
     private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
-    taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
+    scheduledTaskService: ScheduledTaskService,
 ) : ProviderAgentService() {
     /** 仅供模拟 HTTP 服务测试覆盖固定 Gemini 根地址；生产构造器始终保持为 `null`。 */
     private var baseUrlOverrideForTesting: String? = null
 
     internal constructor(
         parentScope: CoroutineScope,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         skillRepository: SkillRepository,
         mcpClientService: MCPClientService,
         deadlines: AgentExecutionDeadlines,
-        taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
+        scheduledTaskService: ScheduledTaskService,
         baseUrlOverrideForTesting: String,
     ) : this(
         parentScope,
-        settingsRepository,
+        settingsChangeCoordinator,
         skillRepository,
         mcpClientService,
         deadlines,
-        taskSchedulerServiceProvider,
+        scheduledTaskService,
     ) {
         this.baseUrlOverrideForTesting = baseUrlOverrideForTesting
     }
@@ -101,11 +100,11 @@ class GeminiAgentService @Inject internal constructor(
     private var closeJob: Job? = null
     private var closeCompletion: CompletableDeferred<Unit>? = null
 
-    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsRepository)
+    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsChangeCoordinator)
     private val localFunctionProviders = listOf(
         httpCallingFunctionProvider,
         McpFunctionProvider(mcpClientService),
-        ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
+        ScheduleTaskFunctionProvider(scheduledTaskService, settingsChangeCoordinator),
         SkillFunctionProvider(skillRepository),
     )
     private val localFunctionRouter = LocalFunctionRouter(localFunctionProviders)
@@ -139,6 +138,8 @@ class GeminiAgentService @Inject internal constructor(
      * 一次会话候选重置的全序身份。
      *
      * 代次在启动协程前分配；较早候选即使较晚取得 [sessionMutex]，也不能提交并覆盖较新的重置请求。
+     *
+     * @property generation 候选重置的单调代次。
      */
     private data class ResetAttempt(val generation: Long)
 
@@ -159,6 +160,9 @@ class GeminiAgentService @Inject internal constructor(
      *
      * 该身份只在 [sessionMutex] 保护下发布和清除。即使候选重置无法启动，仍会发布 `job == null` 的
      * 身份，使后续发送拒绝使用旧会话而不是降级放行。
+     *
+     * @property attempt 触发恢复的候选重置身份。
+     * @property job 执行恢复的任务；候选无法启动时为 `null`。
      */
     private data class ToolLimitRecovery(
         val attempt: ResetAttempt,
@@ -180,7 +184,14 @@ class GeminiAgentService @Inject internal constructor(
     private var configuredApiKey: String? = null
     private var configuredProxy: ProxySettings? = null
 
-    /** 由本服务维护、仅在成功回合后提交的 Gemini 会话快照。 */
+    /**
+     * 由本服务维护、仅在成功回合后提交的 Gemini 会话快照。
+     *
+     * @property model 会话实际使用的 Gemini 模型。
+     * @property config 发送 REST 请求使用的生成配置。
+     * @property functionRouteSnapshot 会话创建时绑定的本地函数路由快照。
+     * @property history 已提交的 Gemini REST 对话历史。
+     */
     private data class RawGeminiSession(
         val model: String,
         val config: JsonObject,
@@ -217,7 +228,7 @@ class GeminiAgentService @Inject internal constructor(
         aiSettings.agentEnabled && aiSettings.geminiApiKey.isNotBlank()
 
     init {
-        val aiSettings = settingsRepository.settingsFlow.value.ai
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai
         if (aiSettings?.provider == AIProvider.GEMINI) {
             restoreSelectedModel(aiSettings.selectedModel)
         }
@@ -231,7 +242,7 @@ class GeminiAgentService @Inject internal constructor(
      */
     override suspend fun performPublicationInitialization() {
         withTimeout(deadlines.candidateInitialization) {
-            val settings = settingsRepository.settingsFlow.value
+            val settings = settingsChangeCoordinator.settingsFlow.value
             val aiSettings = settings.ai
                 ?.takeIf { it.provider == AIProvider.GEMINI && isAiFeatureEnabled(it) }
                 ?: throw IllegalArgumentException("Gemini agent configuration is incomplete.")
@@ -304,6 +315,12 @@ class GeminiAgentService @Inject internal constructor(
         return if (configured.endsWith("/v1beta")) configured else "$configured/v1beta"
     }
 
+    /**
+     * 按最新选择线性化的模型切换请求。
+     *
+     * @property model 规范化后的目标模型名称。
+     * @property version 模型选择的单调版本。
+     */
     private data class ModelSwitchRequest(
         val model: String,
         val version: Long,
@@ -399,7 +416,7 @@ class GeminiAgentService @Inject internal constructor(
         if (fallbackJob != null) {
             awaitPublicationJob(fallbackJob)
             refreshResult.second?.let { invalidModel ->
-                if (settingsRepository.hasHistoricalInvalidOpenAiBaseUrl) {
+                if (settingsChangeCoordinator.hasHistoricalInvalidOpenAiBaseUrl) {
                     logger.info("Keeping the persisted Gemini model selection while a historical OpenAI base URL is protected.")
                 } else {
                     clearPersistedSelectedModel(invalidModel)
@@ -461,7 +478,7 @@ class GeminiAgentService @Inject internal constructor(
             return null
         }
 
-        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai ?: return null
         return scope.launch(CoroutineExceptionHandler { _, error ->
             logger.debug("Gemini session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
         }) {
@@ -523,7 +540,7 @@ class GeminiAgentService @Inject internal constructor(
         attempt: ResetAttempt,
     ): Job? {
         val currentTransport = rawTransport ?: return null
-        val aiSettings = settingsRepository.settingsFlow.value.ai ?: return null
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai ?: return null
         return scope.launch(CoroutineExceptionHandler { _, error ->
             logger.debug("Gemini raw session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
         }) {
@@ -750,8 +767,18 @@ class GeminiAgentService @Inject internal constructor(
 
         data object Unavailable : SendAdmission
 
+        /**
+         * 发送前必须等待普通会话重置。
+         *
+         * @property job 当前会话重置任务。
+         */
         data class AwaitReset(val job: Job) : SendAdmission
 
+        /**
+         * 发送前必须等待工具超限恢复。
+         *
+         * @property recovery 当前工具超限恢复身份。
+         */
         data class AwaitRecovery(val recovery: ToolLimitRecovery) : SendAdmission
     }
 
@@ -1098,7 +1125,12 @@ class GeminiAgentService @Inject internal constructor(
         JsonSerializable.toJsonString(content).toByteArray(StandardCharsets.UTF_8).size
     }
 
-    /** 已通过候选终态校验的原生 Gemini 首个候选。 */
+    /**
+     * 已通过候选终态校验的原生 Gemini 首个候选。
+     *
+     * @property content 候选返回的 Gemini 内容对象。
+     * @property finishReason 候选终止原因。
+     */
     private data class RawGeminiCandidate(
         val content: JsonObject,
         val finishReason: String,
@@ -1222,6 +1254,13 @@ class GeminiAgentService @Inject internal constructor(
 
     /** 将 Gemini schema 显式转换为 JSON 时使用的非递归后序工作项。 */
     private sealed interface GeminiSchemaWork {
+        /**
+         * 等待访问并转换的 schema 节点。
+         *
+         * @property schema 待转换的 Gemini schema。
+         * @property depth 当前节点深度。
+         * @property sink 接收转换后 JSON 对象的回调。
+         */
         data class Visit(
             val schema: Schema,
             val depth: Int,
@@ -1484,7 +1523,7 @@ class GeminiAgentService @Inject internal constructor(
 
                             val userContent = Content.builder().role("user").parts(parts).build()
                             val config = sdkSessionConfig ?: run {
-                                val aiSettings = settingsRepository.settingsFlow.value.ai
+                                val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai
                                     ?: throw AgentTurnFailedException("Gemini SDK 会话缺少可重建的配置。")
                                 createSdkSessionConfig(aiSettings, activeChat.second)
                             }
@@ -1530,14 +1569,25 @@ class GeminiAgentService @Inject internal constructor(
         }
     }
 
-    /** 候选 SDK Chat 的最终回复与已按预算规范化的完整本地历史。 */
+    /**
+     * 候选 SDK Chat 的最终回复与已按预算规范化的完整本地历史。
+     *
+     * @property reply 候选回合生成的最终文本。
+     * @property chat 已执行候选回合的 SDK Chat。
+     * @property history 已按预算规范化的完整对话历史。
+     */
     private data class SdkCandidateTurnResult(
         val reply: String,
         val chat: Chat,
         val history: List<Content>,
     )
 
-    /** 已通过候选终态校验的 SDK 首个候选内容与其原始内容片段。 */
+    /**
+     * 已通过候选终态校验的 SDK 首个候选内容与其原始内容片段。
+     *
+     * @property content 候选返回的 SDK 内容对象。
+     * @property parts [content] 中的原始内容片段。
+     */
     private data class StoppedSdkGeminiCandidate(
         val content: Content,
         val parts: List<Part>,
@@ -1678,7 +1728,7 @@ class GeminiAgentService @Inject internal constructor(
      * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
      */
     private fun clearPersistedSelectedModel(invalidModel: String) {
-        settingsRepository.updateSettings { settings ->
+        settingsChangeCoordinator.updateSettings { settings ->
             val aiSettings = settings.ai
             if (
                 aiSettings?.provider == AIProvider.GEMINI &&

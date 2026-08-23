@@ -3,7 +3,6 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.repository.AgentTurnJournalEntry
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -192,14 +191,14 @@ internal enum class QueueOfferResult {
  * MessagePoller 的唯一共享并发运行时。
  *
  * 此类只拥有根任务、当前会话状态和需要线性化的门控；业务编排均位于协作者。所有需要同时持有两把锁的
- * 路径都固定先取得 SettingsRepository 的 token 生命周期锁，再取得这里唯一的 session lock。
+ * 路径都固定先取得 [SettingsChangeCoordinator] 的 token 生命周期锁，再取得这里唯一的 session lock。
  *
  * @param parentScope 根任务继承的应用协程作用域。
- * @param settingsRepository 提供 token 生命周期锁和当前 token 代次的设置仓储。
+ * @param settingsChangeCoordinator 提供 token 生命周期锁和当前 token 代次的设置协调器。
  */
 internal class MessagePollingRuntime(
     parentScope: CoroutineScope,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
 ) {
     /** 监督所有轮询会话任务的根任务。 */
     val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
@@ -254,7 +253,7 @@ internal class MessagePollingRuntime(
      * @return 操作已执行时返回 `true`；会话已失效时返回 `false`。
      */
     fun saveForCurrent(session: PollingSession, save: () -> Unit): Boolean =
-        settingsRepository.withTelegramTokenLifecycleLock {
+        settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession !== session || !isTokenGenerationCurrent(session)) {
                     false
@@ -273,7 +272,7 @@ internal class MessagePollingRuntime(
      * @return 写入结果；会话已失效时返回 `null`。
      */
     fun <T> writeForCurrent(session: PollingSession, write: () -> T): T? =
-        settingsRepository.withTelegramTokenLifecycleLock {
+        settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession !== session || !isTokenGenerationCurrent(session)) {
                     null
@@ -291,7 +290,7 @@ internal class MessagePollingRuntime(
      * @return 读取结果；会话已失效时返回 `null`。
      */
     fun <T> readForCurrent(session: PollingSession, read: () -> T): T? =
-        settingsRepository.withTelegramTokenLifecycleLock {
+        settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (currentSession === session && isTokenGenerationCurrent(session)) read() else null
             }
@@ -305,7 +304,7 @@ internal class MessagePollingRuntime(
      * @return 入队、队满或会话失效的精确结果。
      */
     fun offerUpdateForCurrent(session: PollingSession, queuedWork: QueuedWork): QueueOfferResult =
-        settingsRepository.withTelegramTokenLifecycleLock {
+        settingsChangeCoordinator.withTelegramTokenLifecycleLock {
             sessionLock.withLock {
                 if (closed || currentSession !== session || !isTokenGenerationCurrent(session)) {
                     QueueOfferResult.NOT_CURRENT
@@ -335,7 +334,7 @@ internal class MessagePollingRuntime(
     }
 
     /**
-     * 判断会话携带的 token 与代次是否仍匹配设置仓储。
+     * 判断会话携带的 token 与代次是否仍匹配设置变更协调器的当前状态。
      *
      * @param session 待复核的轮询会话。
      * @return token 和代次仍当前时返回 `true`。
@@ -344,14 +343,14 @@ internal class MessagePollingRuntime(
         isTokenGenerationCurrent(session.token, session.generation)
 
     /**
-     * 判断给定 token 与代次是否仍匹配设置仓储。
+     * 判断给定 token 与代次是否仍匹配设置变更协调器的当前状态。
      *
      * @param token 待复核的 Telegram Bot token。
      * @param generation 待复核的设置代次。
      * @return token 和代次均与最新设置一致时返回 `true`。
      */
     fun isTokenGenerationCurrent(token: String, generation: Long): Boolean =
-        settingsRepository.telegramTokenUpdateFlow.value.let { tokenUpdate ->
+        settingsChangeCoordinator.telegramTokenUpdateFlow.value.let { tokenUpdate ->
             tokenUpdate.token == token && tokenUpdate.generation == generation
         }
 }

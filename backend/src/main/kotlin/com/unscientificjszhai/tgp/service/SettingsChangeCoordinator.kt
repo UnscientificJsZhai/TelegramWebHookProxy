@@ -1,14 +1,14 @@
-package com.unscientificjszhai.tgp.repository
+package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
+import com.unscientificjszhai.tgp.repository.SettingsStore
+import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.*
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -17,68 +17,57 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.concurrent.withLock
 
-@Singleton
 /**
- * 持久化应用设置，并向观察者发布最新设置快照。
+ * 协调应用设置的条件写入、生命周期屏障与运行时事件发布。
  *
- * 构造时会按 Kotlin serialization schema 加载配置：旧代理结构会先迁移，可选损坏字段使用其构造默认值，
- * JSON 结构、必填字段或文件 I/O 严重损坏会中断构造。保存仅在文件和目录项均确认耐久后发布设置；涉及 AI
- * 代理生命周期的设置变更会登记屏障代次，以便代理在完成切换前避免使用过期配置。
+ * 持久化细节由 [SettingsStore] 独占。本类在同一同步临界区内执行 CAS、业务校验和耐久提交，并且只在
+ * 提交成功后发布设置、Telegram token 生命周期和 Agent 生命周期事件。
+ *
+ * @param settingsStore 负责 schema 读取、迁移与耐久写入的设置存储。
+ * @param modelSwitchBarrier 协调设置变更与 Agent 请求准入的共享模型屏障。
  */
-class SettingsRepository private constructor(
-    configFile: File,
-    /**
-     * 与此仓储发布的设置更新对应的共享模型切换屏障。
-     *
-     * 兼容构造器和测试装配必须复用此实例，避免将同一仓储的观察者接到不同屏障。
-     */
-    internal val modelSwitchBarrier: ModelSwitchBarrier,
-    fileOperations: AtomicJsonFileOperations,
+@Singleton
+class SettingsChangeCoordinator @Inject constructor(
+    private val settingsStore: SettingsStore,
+    private val modelSwitchBarrier: ModelSwitchBarrier,
 ) {
-    /**
-     * 创建使用默认配置文件的设置仓储。
-     *
-     * @constructor 创建使用 `config/settings.json` 的仓储；首次保存时由统一存储创建目录并确认其目录项耐久。
-     * @param modelSwitchBarrier 协调 AI 代理配置切换的屏障，必须由同一应用作用域共享。
-     * @throws IllegalStateException 设置文件结构、必填字段或业务资源边界严重损坏，或文件无法读取时抛出。
-     */
-    @Inject
-    constructor(modelSwitchBarrier: ModelSwitchBarrier) : this(
-        File("config/settings.json"),
-        modelSwitchBarrier,
-        DefaultAtomicJsonFileOperations,
-    )
-
     companion object {
+        /**
+         * 为临时配置文件、故障注入和显式模型屏障创建设置协调器。
+         *
+         * @param configFile 测试使用的设置 JSON 文件。
+         * @param modelSwitchBarrier 测试控制的共享模型切换屏障。
+         * @param fileOperations 原子 JSON 存储使用的文件操作实现。
+         * @return 使用指定依赖的设置变更协调器。
+         */
         internal fun forTesting(
             configFile: File,
             modelSwitchBarrier: ModelSwitchBarrier,
             fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
-        ): SettingsRepository = SettingsRepository(configFile, modelSwitchBarrier, fileOperations)
+        ): SettingsChangeCoordinator = SettingsChangeCoordinator(
+            SettingsStore.forTesting(configFile, fileOperations),
+            modelSwitchBarrier,
+        )
     }
 
-    private val logger = LoggerFactory.getLogger(SettingsRepository::class.java)
-    private val storage = SchemaValidatedJsonStorage(
-        storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SETTINGS_BYTES, fileOperations),
-        serializer = AppSettings.serializer(),
-        migrations = listOf(LEGACY_HTTP_PROXY_TYPE_MIGRATION),
-        validator = ::validateAppSettingsResourceLimits,
-        logger = logger,
-    )
-    private val loadedSettings = loadSettings()
+    private val loadedSettings = settingsStore.load()
 
+    /** 原始设置文件是否包含尚未被显式替换的非法代理设置。 */
     @Volatile
     internal var hasHistoricalInvalidProxy = loadedSettings.hasInvalidProxy
         private set
 
+    /** 原始设置文件是否包含尚未被显式替换的非法 MCP 服务器列表。 */
     @Volatile
     internal var hasHistoricalInvalidMcp = loadedSettings.hasInvalidMcp
         private set
 
+    /** 原始设置文件是否包含尚未被显式替换的非法 OpenAI 基础地址。 */
     @Volatile
     internal var hasHistoricalInvalidOpenAiBaseUrl = loadedSettings.hasInvalidOpenAiBaseUrl
         private set
 
+    /** 原始设置文件是否包含尚未被显式替换的非法 HTTP 工具设置。 */
     @Volatile
     internal var hasHistoricalInvalidHttpToolSettings = loadedSettings.hasInvalidHttpToolSettings
         private set
@@ -101,6 +90,8 @@ class SettingsRepository private constructor(
     private val _settingsUpdateFlow = MutableStateFlow(
         SettingsUpdate(settings = _settingsFlow.value, version = 0, switchGeneration = null),
     )
+
+    /** 带单调版本及覆盖屏障代次的只读设置事件流。 */
     internal val settingsUpdateFlow: StateFlow<SettingsUpdate> = _settingsUpdateFlow.asStateFlow()
     private var settingsVersion = 0L
 
@@ -113,33 +104,12 @@ class SettingsRepository private constructor(
     private val _telegramTokenUpdateFlow = MutableStateFlow(
         TelegramTokenUpdate(token = _settingsFlow.value.telegramToken, generation = 0),
     )
+
+    /** 带不可合并生命周期代次的 Telegram token 事件流。 */
     internal val telegramTokenUpdateFlow: StateFlow<TelegramTokenUpdate> =
         _telegramTokenUpdateFlow.asStateFlow()
     private var telegramTokenGeneration = 0L
     private val telegramTokenLifecycleLock = ReentrantLock()
-
-    private fun loadSettings(): LoadedSettings {
-        return when (val read = storage.read()) {
-            AtomicJsonRead.Missing -> LoadedSettings(AppSettings(), hasInvalidProxy = false)
-            is AtomicJsonRead.Valid -> read.value.toLoadedSettings(logger)
-            is AtomicJsonRead.Corrupt -> {
-                logger.error(
-                    "Settings file is severely damaged; application startup is aborted; category={}",
-                    SafeLogging.failureCategory(read.cause).wireName,
-                )
-                throw IllegalStateException("设置文件严重损坏，应用无法安全启动。", read.cause)
-            }
-
-            is AtomicJsonRead.IoFailure -> {
-                logger.error(
-                    "Unable to read settings file; application startup is aborted; category={}",
-                    SafeLogging.failureCategory(read.cause).wireName,
-                )
-                throw IllegalStateException("设置文件无法读取，应用无法安全启动。", read.cause)
-            }
-
-        }
-    }
 
     /**
      * 原子读取当前设置及其内容修订值。
@@ -175,7 +145,7 @@ class SettingsRepository private constructor(
      * @param replacesHistoricalInvalidHttpToolSettings 此次变换是否明确替换历史非法 HTTP 工具设置；仅当
      * `ai.httpToolSettings` 字段或完整 AI 设置由请求或调用方显式提供时可传入 `true`，避免无关保存把受保护的
      * 原始目标清空为默认值。
-     * @param transform 接收锁内最新不可变设置并返回候选完整设置的同步变换；不得递归调用本仓储的
+     * @param transform 接收锁内最新不可变设置并返回候选完整设置的同步变换；不得递归调用本协调器的
      * 同步方法，也不得执行长时间阻塞操作。
      * @return 提交前和提交后的原子快照；无操作时两个快照相等。
      * @throws SettingsRevisionMismatchException [expectedRevision] 与锁内当前修订值不一致时抛出；
@@ -250,7 +220,7 @@ class SettingsRepository private constructor(
         }
 
         try {
-            storage.commit(settings).requireDurable()
+            settingsStore.commit(settings)
         } catch (e: Exception) {
             modelSwitchBarrier.cancel(switchGeneration)
             throw e
@@ -363,7 +333,7 @@ class SettingsRepository private constructor(
  * @property settings 完整不可变应用设置。
  * @property revision 由 [settings] 的规范 JSON 计算的 64 位小写十六进制 SHA-256。
  * @property generation 从 `0` 开始、仅在设置实际变更时递增的单调代次；与 [settings] 和 [revision]
- * 在同一仓储锁内读取，可用于条件写入和授权租约失效判定。
+ * 在同一协调器锁内读取，可用于条件写入和授权租约失效判定。
  */
 data class SettingsSnapshot(
     val settings: AppSettings,
@@ -426,71 +396,6 @@ class HistoricalInvalidHttpToolConfigurationException : IllegalArgumentException
     "历史 HTTP 工具配置不合法，必须显式替换 HTTP 工具设置后才能保存设置。",
 )
 
-private val LEGACY_HTTP_PROXY_TYPE_MIGRATION = JsonElementMigration(
-    name = "settings-legacy-http-proxy-type",
-    transform = migration@{ document ->
-        val settings = document as? JsonObject ?: return@migration document
-        val proxy = settings["proxy"] as? JsonObject ?: return@migration document
-        if ("type" in proxy) {
-            return@migration document
-        }
-        val migratedProxy = JsonObject(proxy + ("type" to JsonPrimitive(ProxyType.HTTP.name)))
-        JsonObject(settings + ("proxy" to migratedProxy))
-    },
-)
-
-private fun ProxySettings?.isInvalidProxy(): Boolean = runCatching {
-    validateProxySettings(this)
-}.isFailure
-
-private fun AppSettings.failClosedHttpToolSettings(logger: Logger): AppSettings {
-    val aiSettings = ai ?: return this
-    return if (runCatching { validateHttpToolSettings(aiSettings.httpToolSettings) }.isSuccess) {
-        this
-    } else {
-        logger.warn("Invalid optional settings field replaced with its default; path=$.ai.httpToolSettings")
-        copy(ai = aiSettings.copy(httpToolSettings = HttpToolSettings()))
-    }
-}
-
-private fun AppSettings.toLoadedSettings(
-    logger: Logger,
-    hasInvalidProxy: Boolean = proxy.isInvalidProxy(),
-): LoadedSettings {
-    val aiSettings = ai
-    val hasInvalidMcp = aiSettings?.mcpServers?.let { configs ->
-        runCatching { validateMcpServerConfigs(configs) }.isFailure
-    } == true
-    val hasInvalidOpenAiBaseUrl = aiSettings?.let { settings ->
-        runCatching { validateOpenAiBaseUrl(settings.openAiBaseUrl) }.isFailure
-    } == true
-    val hasInvalidHttpToolSettings = aiSettings?.let { settings ->
-        runCatching { validateHttpToolSettings(settings.httpToolSettings) }.isFailure
-    } == true
-    val failClosedSettings = failClosedHttpToolSettings(logger).let { settings ->
-        if (hasInvalidMcp && settings.ai != null) {
-            logger.warn("Invalid optional settings field replaced with its default; path=$.ai.mcpServers")
-            settings.copy(ai = settings.ai.copy(mcpServers = emptyList()))
-        } else {
-            settings
-        }
-    }.let { settings ->
-        if (hasInvalidProxy) {
-            logger.warn("Invalid optional settings field replaced with its default; path=$.proxy")
-            settings.copy(proxy = null)
-        } else {
-            settings
-        }
-    }
-    return LoadedSettings(
-        settings = failClosedSettings,
-        hasInvalidProxy = hasInvalidProxy,
-        hasInvalidMcp = hasInvalidMcp,
-        hasInvalidOpenAiBaseUrl = hasInvalidOpenAiBaseUrl,
-        hasInvalidHttpToolSettings = hasInvalidHttpToolSettings,
-    )
-}
-
 private fun AppSettings.revision(): String =
     MessageDigest.getInstance("SHA-256")
         .digest(ConfigJson.encodeToJsonElement(this).canonicalized().toString().toByteArray(StandardCharsets.UTF_8))
@@ -506,14 +411,6 @@ private fun JsonElement.canonicalized(): JsonElement = when (this) {
     is JsonArray -> JsonArray(map(JsonElement::canonicalized))
     else -> this
 }
-
-private data class LoadedSettings(
-    val settings: AppSettings,
-    val hasInvalidProxy: Boolean,
-    val hasInvalidMcp: Boolean = false,
-    val hasInvalidOpenAiBaseUrl: Boolean = false,
-    val hasInvalidHttpToolSettings: Boolean = false,
-)
 
 /**
  * Telegram token 生命周期的不可合并标识。
@@ -551,13 +448,14 @@ internal class ActiveTelegramBotUnavailableException : IllegalStateException(
  *
  * [switchGeneration] 是该快照覆盖的最高待处理设置生命周期屏障代次。因此，完成该
  * 快照时只能释放截至并包含此值的设置代次；认证清理等外部代次必须由其所有者单独完成。
+ *
+ * @property settings 当前完整设置快照。
+ * @property version 从 `0` 开始单调递增的设置版本号。
+ * @property switchGeneration 此快照覆盖的最高待处理设置屏障代次；没有待处理设置代次时为 `null`。
  */
 internal data class SettingsUpdate(
-    /** 当前完整设置快照。 */
     val settings: AppSettings,
-    /** 单调递增的设置版本号，从 `0` 开始。 */
     val version: Long,
-    /** 此快照覆盖的最高待处理设置屏障代次；没有待处理设置代次时为 `null`。 */
     val switchGeneration: Long?,
 )
 

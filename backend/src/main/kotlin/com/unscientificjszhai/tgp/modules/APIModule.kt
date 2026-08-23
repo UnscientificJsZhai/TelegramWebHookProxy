@@ -1,9 +1,14 @@
 package com.unscientificjszhai.tgp.modules
 
-import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.repository.*
+import com.unscientificjszhai.tgp.service.HistoricalInvalidHttpToolConfigurationException
+import com.unscientificjszhai.tgp.service.HistoricalInvalidMcpConfigurationException
+import com.unscientificjszhai.tgp.service.HistoricalInvalidOpenAiBaseUrlConfigurationException
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.SettingsRevisionMismatchException
+import com.unscientificjszhai.tgp.service.SettingsUpdateResult
+import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import com.unscientificjszhai.tgp.utils.ResourceLimits
@@ -28,27 +33,28 @@ import java.nio.charset.StandardCharsets
  * 该方法会向接收者追加路由，并在处理请求时读写设置、聊天记录和 Telegram 服务。
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
- * @param appComponent 提供路由所需应用级依赖的组件。
+ * @param settingsChangeCoordinator 提供设置读取与条件写入。
+ * @param telegramService 提供聊天记录与 Telegram 消息操作。
  */
-fun Application.apiModule(appComponent: AppComponent) {
-    val settingsRepository = appComponent.settingsRepository
-    val telegramService = appComponent.telegramService
-
+fun Application.apiModule(
+    settingsChangeCoordinator: SettingsChangeCoordinator,
+    telegramService: TelegramService,
+) {
     routing {
         route("/api") {
             get("/settings") {
-                val snapshot = settingsRepository.currentSettingsSnapshot()
+                val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
                 call.response.headers.append(HttpHeaders.ETag, snapshot.revision.toStrongETag())
                 call.respondCompleteSettings(snapshot.settings)
             }
             route("/settings") {
                 install(RequestBodyLimit) { bodyLimit { ResourceLimits.SETTINGS_REQUEST_BYTES } }
                 put {
-                    call.handleFullSettingsUpdate(settingsRepository)
+                    call.handleFullSettingsUpdate(settingsChangeCoordinator)
                 }
                 // 保留既有 POST 路径，且与 PUT 使用相同的严格完整替换契约。
                 post {
-                    call.handleFullSettingsUpdate(settingsRepository)
+                    call.handleFullSettingsUpdate(settingsChangeCoordinator)
                 }
                 patch {
                     val expectedRevision = call.requiredSettingsRevision() ?: return@patch
@@ -62,7 +68,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                         return@patch
                     }
                     val update = call.commitSettingsUpdate(
-                        settingsRepository = settingsRepository,
+                        settingsChangeCoordinator = settingsChangeCoordinator,
                         expectedRevision = expectedRevision,
                         replacesHistoricalInvalidMcpServers = patch.explicitlyReplacesHistoricalMcpServers(),
                         replacesHistoricalInvalidOpenAiBaseUrl = patch.explicitlyReplacesHistoricalOpenAiBaseUrl(),
@@ -89,7 +95,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                         return@post
                     }
                     val update =
-                        call.commitSettingsUpdate(settingsRepository, expectedRevision) { current ->
+                        call.commitSettingsUpdate(settingsChangeCoordinator, expectedRevision) { current ->
                             current.copy(chatId = chatId)
                         } ?: return@post
                     call.respondSettingsUpdate(update)
@@ -149,7 +155,7 @@ fun Application.apiModule(appComponent: AppComponent) {
                     }
 
                     try {
-                        val snapshot = settingsRepository.currentSettingsSnapshot()
+                        val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
                         val chatId = (requestChatId ?: "").ifBlank { snapshot.settings.chatId }
                         if (chatId.isBlank()) {
                             call.respondApiInputError("Chat ID is required")
@@ -225,6 +231,12 @@ private val STRONG_ETAG = Regex("\"([0-9a-f]{64})\"")
 private sealed interface IfMatchResult {
     data object Missing : IfMatchResult
     data object Invalid : IfMatchResult
+
+    /**
+     * 解析成功的强实体标签。
+     *
+     * @property revision 实体标签携带的设置修订值。
+     */
     data class Valid(val revision: String) : IfMatchResult
 }
 
@@ -309,9 +321,19 @@ private val MCP_SERVER_FIELDS = setOf("name", "url", "headers")
 private val HTTP_TOOL_SETTINGS_FIELDS = setOf("enabled", "targets", "requestTimeoutMillis", "maxConcurrentRequests")
 private val HTTP_CALL_TARGET_FIELDS = setOf("id", "scheme", "host", "port", "path", "method", "allowedCidrs")
 
+/**
+ * 兼容聊天设置更新请求。
+ *
+ * @property chatId 要保存的 Telegram 聊天标识。
+ */
 @Serializable
 private data class ChatSettingsRequest(val chatId: String)
 
+/**
+ * 设置 API 的稳定错误响应。
+ *
+ * @property error 面向调用方的错误说明。
+ */
 @Serializable
 private data class SettingsErrorResponse(val error: String)
 
@@ -362,7 +384,7 @@ private suspend fun ApplicationCall.requiredSettingsRevision(): String? = when (
 
 /** 处理严格完整替换的 PUT 与兼容 POST 设置请求。 */
 private suspend fun ApplicationCall.handleFullSettingsUpdate(
-    settingsRepository: SettingsRepository,
+    settingsChangeCoordinator: SettingsChangeCoordinator,
 ) {
     val expectedRevision = requiredSettingsRevision() ?: return
     val request = readSettingsJsonObject() ?: return
@@ -376,7 +398,7 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
         return
     }
     val update = commitSettingsUpdate(
-        settingsRepository = settingsRepository,
+        settingsChangeCoordinator = settingsChangeCoordinator,
         expectedRevision = expectedRevision,
         replacesHistoricalInvalidMcpServers = true,
         replacesHistoricalInvalidOpenAiBaseUrl = true,
@@ -386,10 +408,10 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
 }
 
 /**
- * 在仓储的锁内提交设置变换，并为 PUT、PATCH 与兼容聊天更新统一应用模型选择。
+ * 在协调器的锁内提交设置变换，并为 PUT、PATCH 与兼容聊天更新统一应用模型选择。
  */
 private suspend fun ApplicationCall.commitSettingsUpdate(
-    settingsRepository: SettingsRepository,
+    settingsChangeCoordinator: SettingsChangeCoordinator,
     expectedRevision: String,
     replacesHistoricalInvalidMcpServers: Boolean = false,
     replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
@@ -397,7 +419,7 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
     transform: (AppSettings) -> AppSettings,
 ): SettingsUpdateResult? {
     val update = try {
-        settingsRepository.updateSettings(
+        settingsChangeCoordinator.updateSettings(
             expectedRevision = expectedRevision,
             replacesHistoricalInvalidMcpServers = replacesHistoricalInvalidMcpServers,
             replacesHistoricalInvalidOpenAiBaseUrl = replacesHistoricalInvalidOpenAiBaseUrl,

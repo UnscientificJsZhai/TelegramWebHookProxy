@@ -2,9 +2,9 @@ package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.di.AgentComponent
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
+import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
@@ -98,16 +98,16 @@ class DelegatingAgentLifecycleGuardTest {
             }
             val service = fixture.delegating(factory)
             delegating = service
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
 
             fixture.updateGlobalContext("first rebuild")
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
             fixture.updateGlobalContext("second rebuild")
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
             assertEquals(3, created.get())
 
             fixture.updateGlobalContext("must wait for retirement capacity")
-            val targetVersion = fixture.settingsRepository.currentSettingsSnapshot().generation
+            val targetVersion = fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation
             withTimeout(5.seconds) {
                 service.availability.first {
                     it.settingsVersion == targetVersion && it.state == AgentAvailabilityState.INITIALIZING
@@ -117,7 +117,7 @@ class DelegatingAgentLifecycleGuardTest {
             assertEquals(3, created.get())
 
             retiredCloseGates.getValue(1).complete(Unit)
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
             assertEquals(4, created.get())
 
             retiredCloseGates.getValue(2).complete(Unit)
@@ -161,21 +161,21 @@ class DelegatingAgentLifecycleGuardTest {
             }
             val service = fixture.delegating(factory)
             delegating = service
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
 
             fixture.updateGlobalContext("publish replacement")
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
             fixture.updateGlobalContext("create failed candidate")
             withTimeout(5.seconds) {
                 service.availability.first {
-                    it.settingsVersion == fixture.settingsRepository.currentSettingsSnapshot().generation &&
+                    it.settingsVersion == fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation &&
                             it.state == AgentAvailabilityState.RETRY_SCHEDULED
                 }
             }
             assertEquals(3, created.get())
 
             fixture.updateGlobalContext("must wait for shared cleanup capacity")
-            val targetVersion = fixture.settingsRepository.currentSettingsSnapshot().generation
+            val targetVersion = fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation
             withTimeout(5.seconds) {
                 service.availability.first {
                     it.settingsVersion == targetVersion && it.state == AgentAvailabilityState.INITIALIZING
@@ -185,7 +185,7 @@ class DelegatingAgentLifecycleGuardTest {
             assertEquals(3, created.get())
 
             retiredClose.complete(Unit)
-            awaitReadyForCurrentSettings(service, fixture.settingsRepository)
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
             assertEquals(4, created.get())
         } finally {
             retiredClose.complete(Unit)
@@ -200,11 +200,11 @@ class DelegatingAgentLifecycleGuardTest {
         private val parentJob = SupervisorJob(parentScope.coroutineContext[Job])
         private val scope = CoroutineScope(parentScope.coroutineContext + parentJob)
         val barrier = ModelSwitchBarrier()
-        val settingsRepository = SettingsRepository.forTesting(File(directory, "settings.json"), barrier)
+        val settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
         val skillRepository = SkillRepository.forTesting(File(directory, "skills.json"))
 
         fun installEnabledSettings() {
-            settingsRepository.replaceSettingsForTest(
+            settingsChangeCoordinator.replaceSettingsForTest(
                 AppSettings(
                     ai = AISettings(
                         provider = AIProvider.OPENAI,
@@ -216,9 +216,9 @@ class DelegatingAgentLifecycleGuardTest {
         }
 
         fun updateGlobalContext(value: String) {
-            settingsRepository.replaceSettingsForTest(
-                settingsRepository.settingsFlow.value.copy(
-                    ai = settingsRepository.settingsFlow.value.ai!!.copy(globalContext = value),
+            settingsChangeCoordinator.replaceSettingsForTest(
+                settingsChangeCoordinator.settingsFlow.value.copy(
+                    ai = settingsChangeCoordinator.settingsFlow.value.ai!!.copy(globalContext = value),
                 ),
             )
         }
@@ -237,7 +237,7 @@ class DelegatingAgentLifecycleGuardTest {
 
         fun delegating(factory: AgentComponent.Factory): DelegatingAgentService = DelegatingAgentService(
             factory,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             barrier,
             scope,
@@ -266,9 +266,9 @@ class DelegatingAgentLifecycleGuardTest {
 
     private suspend fun awaitReadyForCurrentSettings(
         delegating: DelegatingAgentService,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
     ) {
-        val version = settingsRepository.currentSettingsSnapshot().generation
+        val version = settingsChangeCoordinator.currentSettingsSnapshot().generation
         withTimeout(5.seconds) {
             delegating.availability.first {
                 it.settingsVersion == version && it.state == AgentAvailabilityState.READY

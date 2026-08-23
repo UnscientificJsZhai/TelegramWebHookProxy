@@ -6,7 +6,6 @@ import com.unscientificjszhai.tgp.models.Chat
 import com.unscientificjszhai.tgp.models.Message
 import com.unscientificjszhai.tgp.models.User
 import com.unscientificjszhai.tgp.models.Voice
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentAvailabilitySnapshot
 import com.unscientificjszhai.tgp.service.ai.agent.AgentAvailabilityState
@@ -49,7 +48,7 @@ internal abstract class MessagePollerFacadeTestSupport {
     ): Fixture {
         val barrier = ModelSwitchBarrier()
         val settings =
-            SettingsRepository.forTesting(tempDirectory.resolve("settings-${System.nanoTime()}.json"), barrier)
+            SettingsChangeCoordinator.forTesting(tempDirectory.resolve("settings-${System.nanoTime()}.json"), barrier)
         val updates = updatesOverride ?: UpdatesRepository(tempDirectory.resolve("updates-${System.nanoTime()}.json"))
         val telegram = mockk<TelegramService>(relaxed = true)
         val agent = agentOverride ?: mockk<AgentService>(relaxed = true).also { service ->
@@ -154,7 +153,7 @@ internal abstract class MessagePollerFacadeTestSupport {
      * 一次 facade 测试使用的完整依赖集合。
      *
      * @property barrier 测试控制的共享模型切换屏障。
-     * @property settings 使用临时文件的设置仓储。
+     * @property settings 使用临时文件设置存储的设置变更协调器。
      * @property updates 使用临时文件的更新仓储。
      * @property telegram 测试替身 Telegram 服务。
      * @property agent 测试替身 Agent 服务。
@@ -162,7 +161,7 @@ internal abstract class MessagePollerFacadeTestSupport {
      */
     protected data class Fixture(
         val barrier: ModelSwitchBarrier,
-        val settings: SettingsRepository,
+        val settings: SettingsChangeCoordinator,
         val updates: UpdatesRepository,
         val telegram: TelegramService,
         val agent: AgentService,

@@ -7,7 +7,6 @@ import com.unscientificjszhai.tgp.models.Message
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.repository.AgentTurnJournalStatus
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentAvailabilityState
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
@@ -90,7 +89,7 @@ private sealed interface BarrierAdmission {
  * @param runtime 提供当前会话复核与线性化队列操作的共享运行时。
  * @param telegramService 发送准入反馈与聊天动作的 Telegram 服务。
  * @param agentService 提供 Agent 就绪状态、可用性检查和 ready 准入的服务。
- * @param settingsRepository 提供最新 AI 设置与设置代次的仓储。
+ * @param settingsChangeCoordinator 提供最新 AI 设置与设置代次的协调器。
  * @param updatesRepository 查询 durable Agent journal 的仓储。
  * @param modelSwitchBarrier 协调模型切换与副作用准入的共享屏障。
  * @param logger 记录准入与反馈结果的日志器。
@@ -99,7 +98,7 @@ internal class UpdateAdmissionPolicy(
     private val runtime: MessagePollingRuntime,
     private val telegramService: TelegramService,
     private val agentService: AgentService,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val updatesRepository: UpdatesRepository,
     private val modelSwitchBarrier: ModelSwitchBarrier,
     private val logger: Logger,
@@ -168,7 +167,7 @@ internal class UpdateAdmissionPolicy(
                 return@runWhenReady BarrierAdmission.Confirmed
             }
 
-            val snapshot = settingsRepository.currentSettingsSnapshot()
+            val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
             val aiSettings = snapshot.settings.ai
                 ?: return@runWhenReady BarrierAdmission.Confirmed
             if (
@@ -314,7 +313,7 @@ internal class UpdateAdmissionPolicy(
         ticket: AdmissionTicket,
         authorization: AuthorizedMessageContext,
     ): Boolean {
-        val snapshot = settingsRepository.currentSettingsSnapshot()
+        val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
         val aiSettings = snapshot.settings.ai
         return snapshot.generation == ticket.generation &&
                 aiSettings != null &&
@@ -340,7 +339,7 @@ internal class UpdateAdmissionPolicy(
         authorization: AuthorizedMessageContext,
         action: suspend (AppSettings) -> T,
     ): AuthorizedEffect<T> = modelSwitchBarrier.runWhenReady {
-        val snapshot = settingsRepository.currentSettingsSnapshot()
+        val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
         val aiSettings = snapshot.settings.ai
         if (
             snapshot.generation != ticket.generation ||
@@ -372,7 +371,7 @@ internal class UpdateAdmissionPolicy(
         authorization: AuthorizedMessageContext,
         action: suspend (AgentService) -> T,
     ): AuthorizedEffect<T> = agentService.withReadyService { readyAgent ->
-        val snapshot = settingsRepository.currentSettingsSnapshot()
+        val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
         val aiSettings = snapshot.settings.ai
         if (
             snapshot.generation != ticket.generation ||

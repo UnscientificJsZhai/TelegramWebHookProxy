@@ -3,33 +3,32 @@ package com.unscientificjszhai.tgp.service.ai.function
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.models.LoopMode
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.serialization.json.*
 import java.time.*
 import java.time.format.DateTimeFormatter
 import java.time.format.ResolverStyle
-import javax.inject.Provider
 
 /**
  * 提供创建、查询和取消 AI 定时任务的模型函数。
  *
- * 所有任务操作均委托给 [TaskSchedulerService]。Agent 回合中创建任务时使用准入时固定的代理会话；
+ * 所有任务操作均委托给 [ScheduledTaskService]。Agent 回合中创建任务时使用准入时固定的代理会话；
  * 直接调用创建任务时使用当前 AI 设置中的代理会话标识。到期实例由调度器在
  * Agent 与 Telegram 副作用前原子预消费：单次任务删除，循环任务推进到一个未来时刻；因此崩溃、失败或取消
  * 不会重放该次，但提交与副作用之间中断可能遗漏一次执行。绝对时间和日/周循环均解释为服务器时区，错过的
  * 循环周期不会逐期追赶。
  *
- * @param taskSchedulerService 延迟提供定时任务调度服务，以避免初始化循环依赖。
- * @param settingsRepository 为没有 Agent 回合上下文的直接调用提供代理会话标识的设置仓库。
+ * @param scheduledTaskService 直接提供定时任务 CRUD 和持久化。
+ * @param settingsChangeCoordinator 为没有 Agent 回合上下文的直接调用提供当前代理会话标识。
  * @param clock 提供当前时间及默认时区的时钟；默认使用系统时钟。
  * @param zoneId 解释和展示绝对执行时间的时区；必须与 [clock] 的时区相同，默认使用该时区。
  */
 class ScheduleTaskFunctionProvider(
-    private val taskSchedulerService: Provider<TaskSchedulerService>,
-    private val settingsRepository: SettingsRepository,
+    private val scheduledTaskService: ScheduledTaskService,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val clock: Clock = Clock.systemDefaultZone(),
     private val zoneId: ZoneId = clock.zone,
 ) : LocalFunctionProvider() {
@@ -173,7 +172,7 @@ class ScheduleTaskFunctionProvider(
             }
 
         val taskId = try {
-            taskSchedulerService.get().createTask(instruction, executionTime, loopMode, agentChatId)
+            scheduledTaskService.createTask(instruction, executionTime, loopMode, agentChatId)
         } catch (e: Exception) {
             return buildJsonObject {
                 put("error", "Failed to persist scheduled task: ${e.message ?: e::class.simpleName}")
@@ -190,7 +189,7 @@ class ScheduleTaskFunctionProvider(
     }
 
     private fun listScheduledTasks(): JsonObject {
-        val tasks = taskSchedulerService.get().listTasks().map {
+        val tasks = scheduledTaskService.listTasks().map {
             buildJsonObject {
                 put("id", it.id)
                 put("instruction", it.instruction)
@@ -210,7 +209,7 @@ class ScheduleTaskFunctionProvider(
     ): JsonObject {
         val taskId = args["taskId"] as? String ?: return buildJsonObject { put("error", "Missing taskId") }
         val success = try {
-            taskSchedulerService.get().cancelTask(taskId)
+            scheduledTaskService.cancelTask(taskId)
         } catch (e: Exception) {
             return buildJsonObject {
                 put("error", "Failed to persist task cancellation: ${e.message ?: e::class.simpleName}")
@@ -258,7 +257,7 @@ class ScheduleTaskFunctionProvider(
         executionContext: AgentToolExecutionContext?,
     ): String? =
         when (executionContext) {
-            null -> settingsRepository.settingsFlow.value.ai?.agentChatId
+            null -> settingsChangeCoordinator.settingsFlow.value.ai?.agentChatId
             else -> executionContext.taskAgentChatId
         }
 }

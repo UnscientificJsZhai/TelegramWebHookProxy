@@ -1,7 +1,5 @@
 package com.unscientificjszhai.tgp.service
 
-import com.unscientificjszhai.tgp.repository.SettingsGenerationMismatchException
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import kotlinx.coroutines.CancellationException
 import org.slf4j.Logger
@@ -13,7 +11,7 @@ import org.slf4j.Logger
  * @param cleanupCoordinator 管理 Agent 上下文重置和清理计时的协调器。
  * @param outboxWorker 持久化命令回复的 outbox worker。
  * @param agentService 提供模型查询与上下文重置的 Agent 服务。
- * @param settingsRepository 持久化模型选择的设置仓储。
+ * @param settingsChangeCoordinator 持久化模型选择的设置变更协调器。
  * @param logger 记录命令处理结果的日志器。
  */
 internal class BotCommandHandler(
@@ -21,7 +19,7 @@ internal class BotCommandHandler(
     private val cleanupCoordinator: ContextCleanupCoordinator,
     private val outboxWorker: TelegramReplyOutboxWorker,
     private val agentService: AgentService,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val logger: Logger,
 ) {
     /** 在测试中于模型选择持久化前执行的竞争注入点。 */
@@ -215,10 +213,10 @@ internal class BotCommandHandler(
      *
      * @param selectedModel 已验证可用的模型名称。
      * @param expectedGeneration 必须仍匹配的设置代次。
-     * @return 设置仓储提交的新旧快照。
+     * @return 设置变更协调器提交的新旧快照。
      */
     private fun persistSelectedModel(selectedModel: String, expectedGeneration: Long) =
-        settingsRepository.updateSettings(expectedGeneration = expectedGeneration) { settings ->
+        settingsChangeCoordinator.updateSettings(expectedGeneration = expectedGeneration) { settings ->
             val aiSettings = checkNotNull(settings.ai) { "AI configuration is unavailable." }
             settings.copy(ai = aiSettings.copy(selectedModel = selectedModel))
         }

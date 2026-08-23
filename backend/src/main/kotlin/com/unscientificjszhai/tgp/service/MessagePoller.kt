@@ -1,6 +1,5 @@
 package com.unscientificjszhai.tgp.service
 
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
@@ -41,7 +40,7 @@ private data class MessagePollingTuning(
  * @param parentScope 轮询根任务继承的应用协程作用域。
  * @param telegramService 执行 Telegram API 请求的服务。
  * @param agentService 执行消息回合和上下文重置的 Agent 服务。
- * @param settingsRepository 提供设置快照、token 代次和生命周期锁的仓储。
+ * @param settingsChangeCoordinator 提供设置快照、token 代次和生命周期锁的协调器。
  * @param updatesRepository 持久化 offset、重试检查点、Agent journal 与回复 outbox 的仓储。
  * @param modelSwitchBarrier 协调模型切换与 Agent 请求准入的共享屏障。
  * @param tuning 单项处理时限与轮询退避策略。
@@ -51,7 +50,7 @@ class MessagePoller private constructor(
     parentScope: CoroutineScope,
     telegramService: TelegramService,
     agentService: AgentService,
-    settingsRepository: SettingsRepository,
+    settingsChangeCoordinator: SettingsChangeCoordinator,
     updatesRepository: UpdatesRepository,
     modelSwitchBarrier: ModelSwitchBarrier,
     tuning: MessagePollingTuning,
@@ -63,7 +62,7 @@ class MessagePoller private constructor(
      * @param parentScope 轮询根任务继承的应用协程作用域。
      * @param telegramService 执行 Telegram API 请求的服务。
      * @param agentService 执行消息回合和上下文重置的 Agent 服务。
-     * @param settingsRepository 提供设置快照、token 代次和生命周期锁的仓储。
+     * @param settingsChangeCoordinator 提供设置快照、token 代次和生命周期锁的协调器。
      * @param updatesRepository 持久化轮询与回复状态的仓储。
      * @param modelSwitchBarrier 协调模型切换与 Agent 请求准入的共享屏障。
      */
@@ -72,14 +71,14 @@ class MessagePoller private constructor(
         parentScope: CoroutineScope,
         telegramService: TelegramService,
         agentService: AgentService,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
         modelSwitchBarrier: ModelSwitchBarrier,
     ) : this(
         parentScope,
         telegramService,
         agentService,
-        settingsRepository,
+        settingsChangeCoordinator,
         updatesRepository,
         modelSwitchBarrier,
         MessagePollingTuning(
@@ -96,38 +95,12 @@ class MessagePoller private constructor(
     )
 
     /**
-     * 创建兼容未显式传入共享屏障的轮询器。
-     *
-     * @constructor 使用 [SettingsRepository.modelSwitchBarrier] 的兼容入口。
-     * @param parentScope 轮询根任务继承的应用协程作用域。
-     * @param telegramService 执行 Telegram API 请求的服务。
-     * @param agentService 执行消息回合和上下文重置的 Agent 服务。
-     * @param settingsRepository 提供设置与共享模型切换屏障的仓储。
-     * @param updatesRepository 持久化轮询与回复状态的仓储。
-     */
-    @Deprecated("请显式传入与 SettingsRepository 共享的 ModelSwitchBarrier。")
-    constructor(
-        parentScope: CoroutineScope,
-        telegramService: TelegramService,
-        agentService: AgentService,
-        settingsRepository: SettingsRepository,
-        updatesRepository: UpdatesRepository,
-    ) : this(
-        parentScope,
-        telegramService,
-        agentService,
-        settingsRepository,
-        updatesRepository,
-        settingsRepository.modelSwitchBarrier,
-    )
-
-    /**
      * 创建使用确定性超时和退避策略的测试入口。
      *
      * @param parentScope 轮询根任务继承的测试协程作用域。
      * @param telegramService 执行 Telegram API 请求的服务。
      * @param agentService 执行消息回合和上下文重置的 Agent 服务。
-     * @param settingsRepository 提供设置快照和 token 生命周期锁的仓储。
+     * @param settingsChangeCoordinator 提供设置快照和 token 生命周期锁的协调器。
      * @param updatesRepository 持久化轮询与回复状态的仓储。
      * @param modelSwitchBarrier 协调模型切换与 Agent 请求准入的共享屏障。
      * @param processingTimeout 单项队列工作的最大处理时间。
@@ -138,7 +111,7 @@ class MessagePoller private constructor(
         parentScope: CoroutineScope,
         telegramService: TelegramService,
         agentService: AgentService,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
         modelSwitchBarrier: ModelSwitchBarrier,
         processingTimeout: Duration,
@@ -148,53 +121,19 @@ class MessagePoller private constructor(
         parentScope,
         telegramService,
         agentService,
-        settingsRepository,
+        settingsChangeCoordinator,
         updatesRepository,
         modelSwitchBarrier,
         MessagePollingTuning(processingTimeout, retryDelay, retryJitter),
     )
 
-    /**
-     * 创建兼容未显式传入共享屏障的测试入口。
-     *
-     * @param parentScope 轮询根任务继承的测试协程作用域。
-     * @param telegramService 执行 Telegram API 请求的服务。
-     * @param agentService 执行消息回合和上下文重置的 Agent 服务。
-     * @param settingsRepository 提供设置与共享模型切换屏障的仓储。
-     * @param updatesRepository 持久化轮询与回复状态的仓储。
-     * @param processingTimeout 单项队列工作的最大处理时间。
-     * @param retryDelay 执行轮询退避等待的函数。
-     * @param retryJitter 为本地退避生成附加抖动的函数。
-     */
-    @Deprecated("新的测试应显式传入与 SettingsRepository 共享的 ModelSwitchBarrier。")
-    internal constructor(
-        parentScope: CoroutineScope,
-        telegramService: TelegramService,
-        agentService: AgentService,
-        settingsRepository: SettingsRepository,
-        updatesRepository: UpdatesRepository,
-        processingTimeout: Duration,
-        retryDelay: suspend (Duration) -> Unit = { delay(it) },
-        retryJitter: (Duration) -> Duration = { Duration.ZERO },
-    ) : this(
-        parentScope,
-        telegramService,
-        agentService,
-        settingsRepository,
-        updatesRepository,
-        settingsRepository.modelSwitchBarrier,
-        processingTimeout,
-        retryDelay,
-        retryJitter,
-    )
-
     private val logger = LoggerFactory.getLogger(MessagePoller::class.java)
-    private val runtime = MessagePollingRuntime(parentScope, settingsRepository)
+    private val runtime = MessagePollingRuntime(parentScope, settingsChangeCoordinator)
     private val admissionPolicy = UpdateAdmissionPolicy(
         runtime,
         telegramService,
         agentService,
-        settingsRepository,
+        settingsChangeCoordinator,
         updatesRepository,
         modelSwitchBarrier,
         logger,
@@ -217,7 +156,7 @@ class MessagePoller private constructor(
         cleanupCoordinator,
         outboxWorker,
         agentService,
-        settingsRepository,
+        settingsChangeCoordinator,
         logger,
     )
     private val processor = AgentTurnProcessor(
@@ -236,7 +175,7 @@ class MessagePoller private constructor(
         runtime,
         telegramService,
         agentService,
-        settingsRepository,
+        settingsChangeCoordinator,
         updatesRepository,
         modelSwitchBarrier,
         admissionPolicy,
