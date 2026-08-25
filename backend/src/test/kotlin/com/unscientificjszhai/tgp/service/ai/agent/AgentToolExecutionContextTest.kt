@@ -4,7 +4,7 @@ import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.HttpCallTarget
 import com.unscientificjszhai.tgp.models.HttpToolSettings
-import com.unscientificjszhai.tgp.repository.SettingsUpdate
+import com.unscientificjszhai.tgp.service.SettingsUpdate
 import kotlin.test.Test
 import kotlin.test.assertEquals
 

@@ -72,11 +72,13 @@ jobs:
       contents: read
       checks: write
       pull-requests: write
+      security-events: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Setup Java
@@ -94,3 +96,10 @@ jobs:
           upload-result: true
           artifact-name: qodana-report
           cache-default-branch-only: true
+
+      - name: Upload Qodana SARIF to GitHub Code Scanning
+        if: ${{ !cancelled() }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ runner.temp }}/qodana/results/qodana.sarif.json
+          category: qodana-jvm

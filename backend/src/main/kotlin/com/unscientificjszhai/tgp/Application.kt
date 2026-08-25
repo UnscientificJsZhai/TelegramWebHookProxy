@@ -7,7 +7,7 @@ import com.unscientificjszhai.tgp.modules.*
 import com.unscientificjszhai.tgp.service.BotCommandReconciler
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -34,6 +34,11 @@ private val applicationLogger = LoggerFactory.getLogger("ApplicationLifecycle")
 private val defaultApplicationShutdownTimeout = 20.seconds
 
 private sealed interface ApplicationShutdownStep<out T> {
+    /**
+     * 在停止预算内完成的步骤。
+     *
+     * @property value 停止步骤返回的值。
+     */
     data class Completed<T>(val value: T) : ApplicationShutdownStep<T>
     data object Failed : ApplicationShutdownStep<Nothing>
     data object NotAwaited : ApplicationShutdownStep<Nothing>
@@ -138,7 +143,7 @@ fun main() {
 /**
  * 配置应用的序列化、依赖注入、业务路由和静态资源路由。
  *
- * 此方法会从同一 [AppComponent] 取得轮询器、调度器、Telegram 与 AI 代理，并注册唯一的
+ * 此方法会从同一 [AppComponent] 取得轮询器、定时任务 worker、Telegram 与 AI 代理，并注册唯一的
  * [ApplicationStopPreparing] 停止编排器。停止时先同步关闭三个 worker 的准入；在总停止预算内再等待其子协程
  * 结束，并串行关闭 Telegram 和 AI 代理。因而关闭顺序不依赖模块监听器的订阅顺序。
  *
@@ -147,7 +152,7 @@ fun main() {
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
     val messagePoller = appComponent.messagePoller
-    val taskSchedulerService = appComponent.taskSchedulerService
+    val scheduledTaskWorker = appComponent.scheduledTaskWorker
     val botCommandReconciler = appComponent.botCommandReconciler
     val telegramService = appComponent.telegramService
     val agentService = appComponent.agentService
@@ -155,7 +160,7 @@ fun Application.module() {
     botCommandReconciler.start()
     registerApplicationStopCleanup(
         messagePoller,
-        taskSchedulerService,
+        scheduledTaskWorker,
         botCommandReconciler,
         telegramService,
         agentService,
@@ -174,10 +179,10 @@ fun Application.module() {
     installApiErrorPages()
     installProtocolUpgradeRejection()
 
-    apiModule(appComponent)
-    skillAPIModule(appComponent)
-    messagePollerModule(appComponent)
-    taskSchedulerModule(appComponent)
+    apiModule(appComponent.settingsChangeCoordinator, telegramService)
+    skillAPIModule(appComponent.skillRepository)
+    messagePollerModule(messagePoller)
+    taskSchedulerModule(scheduledTaskWorker)
 
     routing {
         get("/license") {
@@ -201,7 +206,7 @@ fun Application.module() {
  * 注册应用停止时唯一的资源关闭编排器。
  *
  * [ApplicationStopPreparing] 到达时，编排器先同步调用 [MessagePoller.requestStop]、
- * [TaskSchedulerService.requestStop] 和 [BotCommandReconciler.requestStop] 关闭全部 worker 准入，再在从停止
+ * [ScheduledTaskWorker.requestStop] 和 [BotCommandReconciler.requestStop] 关闭全部 worker 准入，再在从停止
  * 请求前开始计算的总预算内依次等待 worker、关闭 Telegram、关闭 Agent，并等待 Agent 终态。等待和关闭均在与
  * 监听器解耦的 IO waiter 中隔离；正常情况下 Telegram 关闭返回后才启动 Agent 关闭。Telegram 关闭超时后会记录
  * 固定的顺序降级日志并独立启动 Agent 关闭，避免一个同步阻塞的客户端阻止后续资源清理。预算耗尽后仍会尽力触发
@@ -210,7 +215,7 @@ fun Application.module() {
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
  * @param messagePoller 应先关闭准入并等待停止的 Telegram 轮询器。
- * @param taskSchedulerService 应先关闭准入并等待停止的定时任务调度器。
+ * @param scheduledTaskWorker 应先关闭准入并等待停止的定时任务 worker。
  * @param botCommandReconciler 应先关闭准入并等待停止的 Telegram 命令协调器。
  * @param telegramService 应用停止时应关闭的 Telegram 服务。
  * @param agentService 应用停止时应关闭并等待清理完成的 AI 代理服务。
@@ -218,7 +223,7 @@ fun Application.module() {
  */
 internal fun Application.registerApplicationStopCleanup(
     messagePoller: MessagePoller,
-    taskSchedulerService: TaskSchedulerService,
+    scheduledTaskWorker: ScheduledTaskWorker,
     botCommandReconciler: BotCommandReconciler,
     telegramService: TelegramService,
     agentService: AgentService,
@@ -237,7 +242,7 @@ internal fun Application.registerApplicationStopCleanup(
             }
             val startedAt = TimeSource.Monotonic.markNow()
             requestApplicationWorkerStop("message-poller") { messagePoller.requestStop() }
-            requestApplicationWorkerStop("task-scheduler") { taskSchedulerService.requestStop() }
+            requestApplicationWorkerStop("task-scheduler") { scheduledTaskWorker.requestStop() }
             requestApplicationWorkerStop("bot-command-reconciler") { botCommandReconciler.requestStop() }
             runBlocking {
                 awaitApplicationShutdownStep(
@@ -251,7 +256,7 @@ internal fun Application.registerApplicationStopCleanup(
                     shutdownTimeout,
                     stage = "await-worker",
                     component = "task-scheduler",
-                ) { taskSchedulerService.awaitStopped() }
+                ) { scheduledTaskWorker.awaitStopped() }
                 awaitApplicationShutdownStep(
                     startedAt,
                     shutdownTimeout,

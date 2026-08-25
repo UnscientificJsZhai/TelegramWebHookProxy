@@ -1,6 +1,5 @@
 package com.unscientificjszhai.tgp.modules
 
-import com.unscientificjszhai.tgp.di.AppComponent
 import com.unscientificjszhai.tgp.models.PageResult
 import com.unscientificjszhai.tgp.models.Skill
 import com.unscientificjszhai.tgp.repository.SkillRepository
@@ -11,8 +10,6 @@ import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.testing.*
-import io.mockk.every
-import io.mockk.mockk
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -38,11 +35,9 @@ class SkillAPIModuleTest {
         val temporaryDirectory = createTempDirectory("skill-api-module-test").toFile()
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 // 1. 初始状态：获取空列表
                 client.get("/api/skills").apply {
@@ -103,11 +98,9 @@ class SkillAPIModuleTest {
         val temporaryDirectory = createTempDirectory("skill-api-resource-limit-test").toFile()
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
@@ -130,11 +123,9 @@ class SkillAPIModuleTest {
         val temporaryDirectory = createTempDirectory("skill-api-body-limit-test").toFile()
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
@@ -155,11 +146,9 @@ class SkillAPIModuleTest {
         val temporaryDirectory = createTempDirectory("skill-api-malformed-json-test").toFile()
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 client.post("/api/skills") {
                     contentType(ContentType.Application.Json)
@@ -185,11 +174,9 @@ class SkillAPIModuleTest {
         val temporaryDirectory = createTempDirectory("skill-api-id-validation-test").toFile()
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 client.post("/api/skills") {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
@@ -221,11 +208,9 @@ class SkillAPIModuleTest {
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
             skillRepository.saveSkill(Skill(id = "safe", description = "safe", content = "safe"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 client.delete("/api/skills/safe?x=1").apply {
                     assertEquals(HttpStatusCode.BadRequest, status)
@@ -252,11 +237,9 @@ class SkillAPIModuleTest {
             val invalidSkills = """[{"id":"safe?legacy","description":"invalid","content":"invalid"}]"""
             skillsFile.writeText(invalidSkills)
             val skillRepository = SkillRepository.forTesting(skillsFile)
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 val getResponse = client.get("/api/skills")
                 val postResponse = client.post("/api/skills") {
@@ -285,11 +268,9 @@ class SkillAPIModuleTest {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
             skillRepository.saveSkill(Skill(id = "first", description = "first", content = "first"))
             skillRepository.saveSkill(Skill(id = "second", description = "second", content = "second"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
 
                 client.get("/api/skills?page=2147483647&size=50").apply {
                     assertEquals(HttpStatusCode.OK, status)
@@ -326,11 +307,9 @@ class SkillAPIModuleTest {
         val temporaryDirectory = createTempDirectory("skill-api-approval-test").toFile()
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
                 val created = client.post("/api/skills") {
                     contentType(ContentType.Application.Json)
                     setBody("""{"description":"trusted","content":"safe","status":"APPROVED"}""")
@@ -386,12 +365,10 @@ class SkillAPIModuleTest {
         try {
             val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
             val pending = skillRepository.saveSkill(Skill(id = "pending", description = "pending", content = "pending"))
-            val appComponent = mockk<AppComponent>()
-            every { appComponent.skillRepository } returns skillRepository
             val oversizedBody = """{"revision":0,"padding":"${"x".repeat(128 * 1024)}"}"""
 
             testApplication {
-                application { configureSkillApi(appComponent) }
+                application { configureSkillApi(skillRepository) }
                 listOf("approve", "revoke").forEach { action ->
                     client.post("/api/skills/${pending.id}/$action") {
                         contentType(ContentType.Application.Json)
@@ -406,11 +383,11 @@ class SkillAPIModuleTest {
         }
     }
 
-    private fun Application.configureSkillApi(appComponent: AppComponent) {
+    private fun Application.configureSkillApi(skillRepository: SkillRepository) {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
         installApiErrorPages()
-        skillAPIModule(appComponent)
+        skillAPIModule(skillRepository)
     }
 }

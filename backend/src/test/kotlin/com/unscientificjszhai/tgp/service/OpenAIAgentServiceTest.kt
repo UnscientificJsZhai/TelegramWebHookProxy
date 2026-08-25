@@ -12,9 +12,7 @@ import com.openai.services.blocking.ChatService
 import com.openai.services.blocking.ModelService
 import com.openai.services.blocking.chat.ChatCompletionService
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
@@ -38,7 +36,7 @@ import kotlin.test.*
  */
 class OpenAIAgentServiceTest {
 
-    private lateinit var settingsRepository: SettingsRepository
+    private lateinit var settingsChangeCoordinator: SettingsChangeCoordinator
     private lateinit var skillRepository: SkillRepository
     private lateinit var service: OpenAIAgentService
     private lateinit var tempDirectory: File
@@ -47,14 +45,18 @@ class OpenAIAgentServiceTest {
     fun setup() {
         tempDirectory = Files.createTempDirectory("openai-agent-service-test").toFile()
         val testScope = CoroutineScope(EmptyCoroutineContext)
-        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
+        settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
+            File(tempDirectory, "settings.json"),
+            ModelSwitchBarrier(),
+        )
         skillRepository = SkillRepository.forTesting(File(tempDirectory, "skills.json"))
         service = OpenAIAgentService(
             testScope,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             MCPClientService(testScope),
-        ) { mockk() }
+            scheduledTaskService = mockk(),
+        )
     }
 
     @AfterTest
@@ -100,7 +102,7 @@ class OpenAIAgentServiceTest {
      */
     @Test
     fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
-        settingsRepository.replaceSettingsForTest(
+        settingsChangeCoordinator.replaceSettingsForTest(
             AppSettings(ai = AISettings(provider = AIProvider.OPENAI, selectedModel = "gpt-4o")),
         )
 
@@ -108,24 +110,6 @@ class OpenAIAgentServiceTest {
 
         assertEquals("gpt-4o", restoredService.currentModel)
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     private fun injectClient(client: OpenAIClient) = injectClient(service, client)
@@ -138,10 +122,11 @@ class OpenAIAgentServiceTest {
         val testScope = CoroutineScope(EmptyCoroutineContext)
         return OpenAIAgentService(
             testScope,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             mcpClientService ?: MCPClientService(testScope),
-        ) { mockk() }
+            scheduledTaskService = mockk(),
+        )
     }
 
     private fun setPrivateField(name: String, value: Any?) {

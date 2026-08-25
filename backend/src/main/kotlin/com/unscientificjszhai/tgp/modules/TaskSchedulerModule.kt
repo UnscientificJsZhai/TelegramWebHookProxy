@@ -1,6 +1,6 @@
 package com.unscientificjszhai.tgp.modules
 
-import com.unscientificjszhai.tgp.di.AppComponent
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import io.ktor.server.application.*
 
 /**
@@ -10,9 +10,9 @@ import io.ktor.server.application.*
  * 独立生命周期监听器，以免关闭顺序依赖订阅顺序。
  *
  * @receiver 已创建且尚未停止的 Ktor 应用实例。
- * @param appComponent 提供定时任务服务的应用级组件。
+ * @param scheduledTaskWorker 要启动的应用级定时任务 worker。
  */
 @Suppress("UnusedReceiverParameter")
-fun Application.taskSchedulerModule(appComponent: AppComponent) {
-    appComponent.taskSchedulerService.start()
+fun Application.taskSchedulerModule(scheduledTaskWorker: ScheduledTaskWorker) {
+    scheduledTaskWorker.start()
 }

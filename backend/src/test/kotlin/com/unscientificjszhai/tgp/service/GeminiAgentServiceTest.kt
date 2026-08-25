@@ -6,8 +6,6 @@ import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.Skill
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.*
@@ -37,7 +35,7 @@ import kotlin.time.Duration.Companion.seconds
  */
 class GeminiAgentServiceTest {
 
-    private lateinit var settingsRepository: SettingsRepository
+    private lateinit var settingsChangeCoordinator: SettingsChangeCoordinator
     private lateinit var skillRepository: com.unscientificjszhai.tgp.repository.SkillRepository
     private lateinit var service: GeminiAgentService
     private lateinit var tempDirectory: File
@@ -46,11 +44,19 @@ class GeminiAgentServiceTest {
     fun setup() {
         tempDirectory = Files.createTempDirectory("gemini-agent-service-test").toFile()
         val testScope = CoroutineScope(EmptyCoroutineContext)
-        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
+        settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
+            File(tempDirectory, "settings.json"),
+            ModelSwitchBarrier(),
+        )
         skillRepository =
             com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(File(tempDirectory, "skills.json"))
-        service =
-            GeminiAgentService(testScope, settingsRepository, skillRepository, MCPClientService(testScope)) { mockk() }
+        service = GeminiAgentService(
+            testScope,
+            settingsChangeCoordinator,
+            skillRepository,
+            MCPClientService(testScope),
+            scheduledTaskService = mockk(),
+        )
     }
 
     @AfterTest
@@ -84,7 +90,7 @@ class GeminiAgentServiceTest {
      */
     @Test
     fun testServiceRestoresPersistedSelectedModelBeforeRefreshing() {
-        settingsRepository.replaceSettingsForTest(
+        settingsChangeCoordinator.replaceSettingsForTest(
             AppSettings(ai = AISettings(selectedModel = "models/gemini-custom")),
         )
 
@@ -123,13 +129,6 @@ class GeminiAgentServiceTest {
             assertFalse(prompt.contains("PENDING_SKILL_CANARY"))
         }
     }
-
-
-
-
-
-
-
 
 
     /**
@@ -191,13 +190,6 @@ class GeminiAgentServiceTest {
     }
 
 
-
-
-
-
-
-
-
     private fun responseWithParts(
         vararg parts: Part,
         finishReason: FinishReason? = FinishReason(FinishReason.Known.STOP),
@@ -211,7 +203,7 @@ class GeminiAgentServiceTest {
 
     private fun prepareSuccessfulSwitch() {
         val chats = mockk<Chats>()
-        settingsRepository.replaceSettingsForTest(AppSettings(ai = AISettings()))
+        settingsChangeCoordinator.replaceSettingsForTest(AppSettings(ai = AISettings()))
         every { chats.create(any<String>(), any<GenerateContentConfig>()) } returns mockk()
         injectClient(chats)
     }
@@ -240,10 +232,11 @@ class GeminiAgentServiceTest {
         val testScope = CoroutineScope(EmptyCoroutineContext)
         return GeminiAgentService(
             testScope,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             MCPClientService(testScope),
-        ) { mockk() }
+            scheduledTaskService = mockk(),
+        )
     }
 
     /** 构造不触发初始会话的原生模型发现服务，并将其传输定向到测试服务器。 */
@@ -254,11 +247,12 @@ class GeminiAgentServiceTest {
         val testScope = CoroutineScope(EmptyCoroutineContext)
         return GeminiAgentService(
             testScope,
-            settingsRepository,
+            settingsChangeCoordinator,
             skillRepository,
             MCPClientService(testScope),
             deadlines,
-        ) { mockk() }.also { rawService ->
+            scheduledTaskService = mockk(),
+        ).also { rawService ->
             setPrivateField(rawService, "rawApiKey", "test-key")
             setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
             setPrivateField(rawService, "rawTransport", CancellableOkHttpTransport(OkHttpClient()))

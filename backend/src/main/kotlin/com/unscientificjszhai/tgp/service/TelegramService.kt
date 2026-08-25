@@ -1,7 +1,6 @@
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.repository.botIdFromTelegramToken
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
@@ -51,7 +50,7 @@ data class TelegramApiResponse(
  */
 class TelegramService private constructor(
     parentScope: CoroutineScope,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val updatesRepository: UpdatesRepository,
     private val clientFactory: (ProxySettings?) -> HttpClient,
     private val clientInstalledObserver: (ProxySettings?) -> Unit,
@@ -62,30 +61,30 @@ class TelegramService private constructor(
      *
      * @constructor 创建使用默认 Ktor HTTP 客户端的服务。
      * @param parentScope 持有设置订阅协程的父作用域；取消该作用域会停止订阅。
-     * @param settingsRepository 提供机器人令牌和代理设置的仓储。
+     * @param settingsChangeCoordinator 提供机器人令牌与代理设置快照和变更事件。
      * @param updatesRepository 提供本地已保存聊天信息的仓储。
      */
     @Inject
     constructor(
         parentScope: CoroutineScope,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
-    ) : this(parentScope, settingsRepository, updatesRepository, ::createDefaultClient, {}, Unit)
+    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, ::createDefaultClient, {}, Unit)
 
     internal constructor(
         parentScope: CoroutineScope,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
-    ) : this(parentScope, settingsRepository, updatesRepository, clientFactory, {}, Unit)
+    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, clientFactory, {}, Unit)
 
     internal constructor(
         parentScope: CoroutineScope,
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
         clientInstalledObserver: (ProxySettings?) -> Unit,
-    ) : this(parentScope, settingsRepository, updatesRepository, clientFactory, clientInstalledObserver, Unit)
+    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, clientFactory, clientInstalledObserver, Unit)
 
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private val logger = LoggerFactory.getLogger(TelegramService::class.java)
@@ -97,14 +96,14 @@ class TelegramService private constructor(
     private val settingsSubscription: Job
 
     init {
-        val initialSettings = settingsRepository.settingsFlow.value
+        val initialSettings = settingsChangeCoordinator.settingsFlow.value
         val initialProxy = telegramProxyOrNull(
             proxy = initialSettings.proxy,
-            hasHistoricalInvalidProxy = settingsRepository.hasHistoricalInvalidProxy,
+            hasHistoricalInvalidProxy = settingsChangeCoordinator.hasHistoricalInvalidProxy,
         )
         activeClient = ClientLease(createClient(initialProxy))
         installedProxy = initialProxy
-        settingsSubscription = settingsRepository.settingsFlow
+        settingsSubscription = settingsChangeCoordinator.settingsFlow
             .onEach { newSettings ->
                 try {
                     updateProxyClient(newSettings)
@@ -120,7 +119,7 @@ class TelegramService private constructor(
     private fun updateProxyClient(newSettings: AppSettings) {
         val desiredProxy = telegramProxyOrNull(
             proxy = newSettings.proxy,
-            hasHistoricalInvalidProxy = settingsRepository.hasHistoricalInvalidProxy,
+            hasHistoricalInvalidProxy = settingsChangeCoordinator.hasHistoricalInvalidProxy,
         )
         val needsRecreate = synchronized(clientLock) {
             desiredProxy != installedProxy
@@ -408,7 +407,7 @@ class TelegramService private constructor(
      * @return 当前机器人已保存的聊天信息列表；没有有效令牌或没有保存聊天时为空列表。
      */
     fun getSavedChats(): List<ChatInfo> {
-        val botId = settingsRepository.settingsFlow.value.telegramToken.botIdFromTelegramToken()
+        val botId = settingsChangeCoordinator.settingsFlow.value.telegramToken.botIdFromTelegramToken()
             ?: return emptyList()
         return updatesRepository.getChats(botId)
     }
@@ -422,7 +421,7 @@ class TelegramService private constructor(
      */
     fun deleteChat(chatId: String) {
         updatesRepository.deleteChat(
-            botId = settingsRepository.settingsFlow.value.telegramToken.botIdFromTelegramToken() ?: return,
+            botId = settingsChangeCoordinator.settingsFlow.value.telegramToken.botIdFromTelegramToken() ?: return,
             chatId = chatId,
         )
     }
@@ -440,8 +439,8 @@ class TelegramService private constructor(
      *
      * @return 请求开始时当前设置中的 Telegram token；可能为空。
      */
-    private fun currentTelegramToken(): String = settingsRepository.withTelegramTokenLifecycleLock {
-        settingsRepository.settingsFlow.value.telegramToken
+    private fun currentTelegramToken(): String = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
+        settingsChangeCoordinator.settingsFlow.value.telegramToken
     }
 
     private suspend fun HttpResponse.toTelegramApiResponse(): TelegramApiResponse =

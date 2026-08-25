@@ -2,7 +2,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.validateHttpToolSettings
-import com.unscientificjszhai.tgp.repository.SettingsUpdate
+import com.unscientificjszhai.tgp.service.SettingsUpdate
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 

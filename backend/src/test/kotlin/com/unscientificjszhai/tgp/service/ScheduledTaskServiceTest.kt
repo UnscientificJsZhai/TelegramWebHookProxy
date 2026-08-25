@@ -1,69 +1,40 @@
 package com.unscientificjszhai.tgp.service
 
-import ch.qos.logback.classic.Logger
-import ch.qos.logback.classic.spi.ILoggingEvent
-import ch.qos.logback.core.read.ListAppender
-import com.unscientificjszhai.tgp.models.AISettings
-import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.ScheduledTask
-import com.unscientificjszhai.tgp.repository.SettingsRepository
-import com.unscientificjszhai.tgp.repository.replaceSettingsForTest
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
-import com.unscientificjszhai.tgp.service.ai.agent.AgentService
-import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
-import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.calculateNextExecutionTime
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
-import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
-import io.ktor.http.*
-import io.mockk.coEvery
-import io.mockk.coVerify
-import io.mockk.mockk
-import kotlinx.coroutines.CoroutineScope
-import org.slf4j.LoggerFactory
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
-import java.time.Clock
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
-import javax.inject.Provider
-import kotlin.coroutines.EmptyCoroutineContext
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
 
 /**
- * 定时任务服务创建、取消和执行行为的测试设计。
+ * 定时任务 CRUD、持久化与预消费事务的测试设计。
  */
-class TaskSchedulerServiceTest {
+class ScheduledTaskServiceTest {
 
-    private lateinit var telegramService: TelegramService
-    private lateinit var agentService: AgentService
-    private lateinit var settingsRepository: SettingsRepository
-    private lateinit var service: TaskSchedulerService
+    private lateinit var service: ScheduledTaskService
     private val tempDirectory = createTempDirectory("task-scheduler-test").toFile()
     private val scheduleFile = File(tempDirectory, "schedule.json")
 
     @BeforeTest
     fun setup() {
-        telegramService = mockk()
-        agentService = mockk()
-        allowReadyServiceScope(agentService)
-
-        val agentProvider = Provider { agentService }
-        val testScope = CoroutineScope(EmptyCoroutineContext)
-        settingsRepository = SettingsRepository.forTesting(File(tempDirectory, "settings.json"), ModelSwitchBarrier())
-        settingsRepository.replaceSettingsForTest(enabledSettings())
-
-        service = TaskSchedulerService(testScope, telegramService, agentProvider, settingsRepository, scheduleFile)
+        service = ScheduledTaskService(scheduleFile)
     }
 
     @AfterTest
     fun teardown() {
-        service.close()
         tempDirectory.deleteRecursively()
     }
 
@@ -98,7 +69,6 @@ class TaskSchedulerServiceTest {
     /** 调度入口拒绝非法 UTF-8 与未知 v1 版本，启动失败前不改写可供恢复的原始字节。 */
     @Test
     fun `scheduler load preserves malformed UTF8 and future version bytes`() {
-        service.close()
         val cases = listOf(
             "malformed-utf8" to ("[{\"id\":\"".encodeToByteArray() + byteArrayOf(0xc3.toByte()) + "\"}]".encodeToByteArray()),
             "future-version" to """{"schemaVersion":2,"data":[]}""".encodeToByteArray(),
@@ -133,25 +103,13 @@ class TaskSchedulerServiceTest {
     }
 
 
-
-
-
-
     /**
      * 验证创建和取消在主文件替换失败时不会变更内存任务列表。
      */
     @Test
     fun `create and cancel keep memory unchanged when persistence fails`() {
         val failingOperations = primaryReplaceFailingOperations()
-        service.close()
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
-            scheduleFile,
-            failingOperations,
-        )
+        service = ScheduledTaskService(scheduleFile, failingOperations)
 
         assertFailsWith<IOException> {
             service.createTask("will fail", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
@@ -159,32 +117,16 @@ class TaskSchedulerServiceTest {
         assertTrue(service.listTasks().isEmpty())
 
         val cancelScheduleFile = File(tempDirectory, "cancel-schedule.json")
-        service.close()
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
-            cancelScheduleFile,
-        )
+        service = ScheduledTaskService(cancelScheduleFile)
         val taskId = service.createTask("persisted", System.currentTimeMillis() + 10_000, LoopMode.ONCE, "12345")
 
-        service.close()
-        service = TaskSchedulerService(
-            CoroutineScope(EmptyCoroutineContext),
-            telegramService,
-            Provider { agentService },
-            settingsRepository,
+        service = ScheduledTaskService(
             cancelScheduleFile,
             primaryReplaceFailingOperations(cancelScheduleFile),
         )
         assertFailsWith<IOException> { service.cancelTask(taskId) }
         assertEquals(listOf(taskId), service.listTasks().map { it.id })
     }
-
-
-
-
 
 
     /**
@@ -225,31 +167,20 @@ class TaskSchedulerServiceTest {
     }
 
 
-
-
     @Test
     fun `schedule schema repairs optional fields and rejects damaged required fields`() {
         scheduleFile.writeText(
             """[{"id":"repair","instruction":"ok","executionTime":1,"loopMode":"ONCE","agentChatId":"12345","calendarAnchorTimeMillis":"invalid"}]""",
         )
-        service.close()
         service = newService(scheduleFile)
 
         assertNull(service.listTasks().single().calendarAnchorTimeMillis)
 
-        service.close()
         scheduleFile.writeText(
             """[{"id":"fatal","executionTime":1,"loopMode":"ONCE","agentChatId":"12345"}]""",
         )
         assertFailsWith<IllegalStateException> { newService(scheduleFile) }
     }
-
-
-
-
-
-
-
 
 
     /** 深层调度文件必须在 DTO 解码前被标记为损坏，且不会被后续写入覆盖。 */
@@ -260,22 +191,13 @@ class TaskSchedulerServiceTest {
             append("\"leaf\"")
             repeat(65) { append('}') }
         }
-        service.close()
         scheduleFile.writeText(deepJson)
 
         assertFailsWith<IllegalStateException> {
-            TaskSchedulerService(
-                CoroutineScope(EmptyCoroutineContext),
-                telegramService,
-                Provider { agentService },
-                settingsRepository,
-                scheduleFile,
-            )
+            ScheduledTaskService(scheduleFile)
         }
         assertEquals(deepJson, scheduleFile.readText())
     }
-
-
 
 
     /**
@@ -288,7 +210,6 @@ class TaskSchedulerServiceTest {
         val backupFile = File(tempDirectory, "schedule.json.bak")
         assertFalse(backupFile.exists())
 
-        service.close()
         service = newService(scheduleFile, primaryReplaceFailingOperations())
 
         assertFailsWith<IOException> {
@@ -300,21 +221,63 @@ class TaskSchedulerServiceTest {
         assertEquals(1, service.listTasks().size)
     }
 
+    @Test
+    fun `precommit samples fresh time only after acquiring the task state lock`() {
+        val blockingOperations = BlockingDirectorySyncFileOperations()
+        service = ScheduledTaskService(scheduleFile, blockingOperations)
+        val expectedId = service.createTask("due", 1L, LoopMode.ONCE, "chat-a")
+        val expected = service.listTasks().single { it.id == expectedId }
+        blockingOperations.blockNextDirectorySync = true
+
+        val writerFailure = AtomicReference<Throwable?>()
+        val writer = thread(name = "scheduled-task-lock-holder") {
+            runCatching {
+                service.createTask("writer", Long.MAX_VALUE, LoopMode.ONCE, "chat-a")
+            }.exceptionOrNull()?.let(writerFailure::set)
+        }
+        assertTrue(blockingOperations.directorySyncEntered.await(5, TimeUnit.SECONDS))
+
+        val precommitStarted = CountDownLatch(1)
+        val timeSampled = CountDownLatch(1)
+        val precommitFailure = AtomicReference<Throwable?>()
+        val precommitted = AtomicReference<ScheduledTask?>()
+        val precommit = thread(name = "scheduled-task-precommit") {
+            precommitStarted.countDown()
+            runCatching {
+                service.precommitExecution(expected) {
+                    timeSampled.countDown()
+                    expected.executionTime
+                }
+            }.onSuccess(precommitted::set)
+                .exceptionOrNull()
+                ?.let(precommitFailure::set)
+        }
+        assertTrue(precommitStarted.await(5, TimeUnit.SECONDS))
+
+        try {
+            assertFalse(
+                timeSampled.await(200, TimeUnit.MILLISECONDS),
+                "The fresh clock must not be sampled while another persistence transaction owns the state lock.",
+            )
+        } finally {
+            blockingOperations.releaseDirectorySync.countDown()
+        }
+
+        writer.join(5_000)
+        precommit.join(5_000)
+        assertFalse(writer.isAlive)
+        assertFalse(precommit.isAlive)
+        writerFailure.get()?.let { throw it }
+        precommitFailure.get()?.let { throw it }
+        assertEquals(expected, precommitted.get())
+        assertTrue(timeSampled.await(0, TimeUnit.MILLISECONDS))
+    }
+
     private fun newService(
         file: File,
         fileOperations: AtomicJsonFileOperations = DefaultAtomicJsonFileOperations,
-        clock: Clock = Clock.systemDefaultZone(),
         zoneId: ZoneId = ZoneId.systemDefault(),
-    ): TaskSchedulerService = TaskSchedulerService(
-        CoroutineScope(EmptyCoroutineContext),
-        telegramService,
-        Provider { agentService },
-        settingsRepository,
-        file,
-        fileOperations,
-        clock = clock,
-        zoneId = zoneId,
-    )
+    ): ScheduledTaskService = ScheduledTaskService(file, fileOperations, zoneId)
 
     private fun primaryReplaceFailingOperations(targetFile: File = scheduleFile): AtomicJsonFileOperations =
         object : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
@@ -326,37 +289,23 @@ class TaskSchedulerServiceTest {
             }
         }
 
-    /** 可在测试中切换目录同步故障的文件操作。 */
-    private class ToggleDirectorySyncFileOperations(
-        var failDirectorySync: Boolean,
-    ) : AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+    private class BlockingDirectorySyncFileOperations :
+        AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {
+        @Volatile
+        var blockNextDirectorySync = false
+        val directorySyncEntered = CountDownLatch(1)
+        val releaseDirectorySync = CountDownLatch(1)
+
         override fun forceDirectory(path: Path) {
-            if (failDirectorySync) {
-                throw IOException("injected directory sync failure")
+            if (blockNextDirectorySync) {
+                blockNextDirectorySync = false
+                directorySyncEntered.countDown()
+                check(releaseDirectorySync.await(5, TimeUnit.SECONDS)) {
+                    "Timed out waiting to release the injected directory sync."
+                }
             }
             DefaultAtomicJsonFileOperations.forceDirectory(path)
         }
     }
 
-    private fun successfulTelegramResponse(): TelegramApiResponse =
-        TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
-
-    /** 让普通 Mock Agent 模拟 [AgentService] 默认的同步就绪作用域。 */
-    private fun allowReadyServiceScope(agent: AgentService) {
-        coEvery { agent.withReadyService<Any?>(any()) } coAnswers {
-            firstArg<suspend (AgentService) -> Any?>().invoke(agent)
-        }
-    }
-
 }
-
-private const val BOT_A_TOKEN = "100:token-a"
-private const val BOT_B_TOKEN = "200:token-b"
-
-private fun enabledSettings(
-    token: String = BOT_A_TOKEN,
-    agentChatId: String = "12345",
-): AppSettings = AppSettings(
-    telegramToken = token,
-    ai = AISettings(agentEnabled = true, agentChatId = agentChatId),
-)

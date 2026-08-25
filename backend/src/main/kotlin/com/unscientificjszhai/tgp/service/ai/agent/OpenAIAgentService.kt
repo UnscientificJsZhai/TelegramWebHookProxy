@@ -8,12 +8,12 @@ import com.openai.models.chat.completions.*
 import com.openai.models.models.Model
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.function.*
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
@@ -36,31 +36,31 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.*
 import javax.inject.Inject
-import javax.inject.Provider
 import kotlin.jvm.optionals.getOrNull
 
 /**
  * 基于 OpenAI API 维护对话会话并执行模型工具调用的 AI 代理服务。
  *
- * 服务在创建时根据当前设置初始化 OpenAI 兼容协议的原生可取消 HTTP 传输；会话重置会同步 MCP 工具和技能提示词。
- * 调用 [close] 返回的任务完成后，服务持有的 HTTP 传输、HTTP 工具客户端与 MCP 连接均已释放。
+ * 构造器只恢复本地模型选择；[initializeForPublication] 才根据当前设置创建 OpenAI 兼容协议的原生可取消
+ * HTTP 传输、同步 MCP 工具和技能提示词并发现模型。调用 [close] 返回的任务完成后，服务持有的 HTTP
+ * 传输、HTTP 工具客户端与 MCP 连接均已释放。
  *
  * @param parentScope 服务任务所属的父协程作用域。
- * @param settingsRepository 提供 OpenAI、MCP 和代理设置的仓库。
+ * @param settingsChangeCoordinator 提供 OpenAI、MCP 和代理设置快照及条件写入。
  * @param skillRepository 提供会话系统提示词所需技能摘要的仓库。
  * @param mcpClientService 管理会话可调用的 MCP 工具连接。
- * @param taskSchedulerServiceProvider 延迟提供定时任务调度服务，以避免初始化循环依赖。
+ * @param scheduledTaskService 提供定时任务 CRUD 和持久化；不包含 worker 或 Agent 依赖。
  * @param deadlines 限制候选初始化与其 MCP 批次的总体执行时间。
  */
 @AgentScope
 class OpenAIAgentService @Inject internal constructor(
     parentScope: CoroutineScope,
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val skillRepository: SkillRepository,
     private val mcpClientService: MCPClientService,
     private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
-    taskSchedulerServiceProvider: Provider<TaskSchedulerService>,
-) : AgentService() {
+    scheduledTaskService: ScheduledTaskService,
+) : ProviderAgentService() {
     private companion object {
         const val DEFAULT_MODEL = "gpt-5.6-luna"
         const val TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
@@ -73,8 +73,6 @@ class OpenAIAgentService @Inject internal constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + serviceJob)
     private val closingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleLock = Any()
-    private val initializationCleanupLock = Any()
-    private val initializationCleanupJobs = mutableSetOf<Job>()
 
     @Volatile
     private var closed = false
@@ -86,11 +84,11 @@ class OpenAIAgentService @Inject internal constructor(
         encodeDefaults = true
     }
 
-    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsRepository)
+    private val httpCallingFunctionProvider = HttpCallingFunctionProvider(settingsChangeCoordinator)
     private var localFunctionProviders = listOf(
         httpCallingFunctionProvider,
         McpFunctionProvider(mcpClientService),
-        ScheduleTaskFunctionProvider(taskSchedulerServiceProvider, settingsRepository),
+        ScheduleTaskFunctionProvider(scheduledTaskService, settingsChangeCoordinator),
         SkillFunctionProvider(skillRepository),
     )
     private var localFunctionRouter = LocalFunctionRouter(localFunctionProviders)
@@ -119,10 +117,6 @@ class OpenAIAgentService @Inject internal constructor(
     /** 等待会话锁的最新模型选择；只有对应版本的任务可以提交它。 */
     private var desiredModel = DEFAULT_MODEL
     private var modelSelectionVersion = 0L
-    private var initialModelUpdateJob: Job? = null
-
-    @Volatile
-    private var initialMcpConnectionJob: Job? = null
     private var configuredApiKey: String? = null
     private var configuredBaseUrl: String? = null
     private var configuredProxy: ProxySettings? = null
@@ -157,35 +151,9 @@ class OpenAIAgentService @Inject internal constructor(
         aiSettings.agentEnabled && aiSettings.openAiApiKey.isNotBlank()
 
     init {
-        val settings = settingsRepository.settingsFlow.value
-        val aiSettings = settings.ai
-        val proxySettings = settings.proxy
-
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai
         if (aiSettings?.provider == AIProvider.OPENAI) {
             restoreSelectedModel(aiSettings.selectedModel)
-        }
-
-        if (aiSettings != null && aiSettings.provider == AIProvider.OPENAI && isAiFeatureEnabled(aiSettings)) {
-            try {
-                configuredApiKey = aiSettings.openAiApiKey
-                configuredBaseUrl = aiSettings.openAiBaseUrl
-                configuredProxy = proxySettings
-                rawApiKey = aiSettings.openAiApiKey
-                rawBaseUrl = openAiBaseUrlForRequests(aiSettings.openAiBaseUrl)
-                rawTransport = CancellableOkHttpTransport(createOpenAIHttpClient(proxySettings))
-
-                val initialResetJob = resetSession() ?: failedInitializationJob()
-                initialModelUpdateJob = createInitialModelUpdateJob(initialResetJob)
-                initialMcpConnectionJob =
-                    createInitialReadinessJob(initialResetJob, checkNotNull(initialModelUpdateJob))
-                logger.info("OpenAI client initialized.")
-            } catch (e: Exception) {
-                logger.error("Failed to initialize OpenAI client; category={}", SafeLogging.failureCategory(e).wireName)
-                client = null
-                rawTransport?.close()
-                rawTransport = null
-                initialMcpConnectionJob = failedInitializationJob()
-            }
         }
     }
 
@@ -203,88 +171,29 @@ class OpenAIAgentService @Inject internal constructor(
         return builder.build()
     }
 
-    /**
-     * 获取创建时首轮 OpenAI 会话、MCP 连接与模型发现的组合就绪任务。
-     *
-     * 有效 OpenAI 配置会在构造时启动该任务；任务正常完成表示初始会话、MCP 工具快照与模型发现均已
-     * 完成，且模型快照非空、模型列表非空并包含当前模型。任一阶段失败或取消都会取消该任务。
-     * [MCPClientService] 会将单个服务器连接错误降级处理，因此此类错误不会单独使任务取消。未启用
-     * OpenAI 时返回 `null`。
-     *
-     * @return 初始组合就绪任务；没有需要连接的初始 OpenAI 实例时返回 `null`。
-     */
-    override fun initializationJob(): Job? = initialMcpConnectionJob
+    /** 显式建立首轮 OpenAI 会话、MCP 工具快照和模型列表。 */
+    override suspend fun performPublicationInitialization() {
+        withTimeout(deadlines.candidateInitialization) {
+            val settings = settingsChangeCoordinator.settingsFlow.value
+            val aiSettings = settings.ai
+                ?.takeIf { it.provider == AIProvider.OPENAI && isAiFeatureEnabled(it) }
+                ?: throw IllegalArgumentException("OpenAI agent configuration is incomplete.")
+            check(!closed) { "OpenAI agent is closed." }
 
-    /** 创建顺序执行模型发现的任务；首轮会话或模型快照无效时以取消状态结束。 */
-    private fun createInitialModelUpdateJob(initialResetJob: Job): Job = scope.launch(
-        CoroutineExceptionHandler { _, error ->
-            logger.error(
-                "OpenAI model discovery did not become ready; category={}",
-                SafeLogging.failureCategory(error).wireName,
-            )
-        },
-    ) {
-        initialResetJob.join()
-        if (initialResetJob.isCancelled) {
-            throw CancellationException("OpenAI initial session reset did not complete")
-        }
-        val snapshot = updateModel()
-            ?: throw IllegalStateException("OpenAI initial model discovery failed")
-        check(snapshot.availableModels.isNotEmpty()) { "OpenAI initial model list is empty" }
-        check(snapshot.currentModel in snapshot.availableModels) {
-            "OpenAI initial current model is not present in the discovered model list"
-        }
-    }
+            configuredApiKey = aiSettings.openAiApiKey
+            configuredBaseUrl = aiSettings.openAiBaseUrl
+            configuredProxy = settings.proxy
+            rawApiKey = aiSettings.openAiApiKey
+            rawBaseUrl = openAiBaseUrlForRequests(aiSettings.openAiBaseUrl)
+            rawTransport = CancellableOkHttpTransport(createOpenAIHttpClient(settings.proxy))
 
-    /**
-     * 组合首轮会话和模型发现，使候选仅在两个阶段均成功后才可发布。
-     *
-     * 总时限到期会取消两个同级任务，并将等待其退出的工作转到独立跟踪清理，保证候选不会在委派层已经
-     * 放开切换屏障后继续发布状态，也不会因不响应取消的 I/O 延长该时限。
-     */
-    private fun createInitialReadinessJob(initialResetJob: Job, initialModelJob: Job): Job = scope.launch(
-        CoroutineExceptionHandler { _, error ->
-            logger.error(
-                "OpenAI agent initialization did not become ready; category={}",
-                SafeLogging.failureCategory(error).wireName,
-            )
-        },
-    ) {
-        try {
-            withTimeout(deadlines.candidateInitialization) {
-                initialResetJob.join()
-                initialModelJob.join()
-                if (initialResetJob.isCancelled || initialModelJob.isCancelled) {
-                    throw CancellationException("OpenAI agent initialization failed")
-                }
-            }
-        } catch (e: TimeoutCancellationException) {
-            logger.warn("OpenAI candidate initialization timed out; cancelling unfinished initialization work.")
-            scheduleInitializationSiblingCleanup(initialResetJob, initialModelJob)
-            throw e
+            awaitPublicationJob(resetSession())
+            val snapshot = updateModelOrThrow()
+                ?: throw AgentInvalidResponseException()
+            if (snapshot.availableModels.isEmpty()) throw AgentEmptyModelListException()
+            if (snapshot.currentModel !in snapshot.availableModels) throw AgentInvalidResponseException()
+            logger.debug("OpenAI candidate completed publication initialization.")
         }
-    }
-
-    /**
-     * 取消并在独立作用域中等待超时初始化的同级任务。
-     *
-     * 等待不能留在候选就绪任务中：底层 I/O 可能忽略取消。这里先同步请求取消，再跟踪后台 `join`，使
-     * 委派层能按 deadline 释放屏障，同时仍保留对滞留任务的生命周期观察。
-     */
-    private fun scheduleInitializationSiblingCleanup(vararg jobs: Job) {
-        jobs.forEach(Job::cancel)
-        lateinit var cleanupJob: Job
-        synchronized(initializationCleanupLock) {
-            cleanupJob = closingScope.launch(start = CoroutineStart.LAZY) {
-                try {
-                    jobs.toList().joinAll()
-                } finally {
-                    synchronized(initializationCleanupLock) { initializationCleanupJobs.remove(cleanupJob) }
-                }
-            }
-            initializationCleanupJobs.add(cleanupJob)
-        }
-        cleanupJob.start()
     }
 
     /**
@@ -330,15 +239,25 @@ class OpenAIAgentService @Inject internal constructor(
      *
      * @return 刷新成功后的模型快照；HTTP 传输不可用、服务已关闭或刷新结果过期时返回 `null`。
      */
-    override suspend fun updateModel(): ModelSnapshot? = modelUpdateMutex.withLock {
-        try {
-            if (closed) {
-                return@withLock null
-            }
-            val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
-            val models = when (val currentTransport = rawTransport) {
+    override suspend fun updateModel(): ModelSnapshot? = try {
+        updateModelOrThrow()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        logger.debug("OpenAI model update failed; category={}", SafeLogging.failureCategory(e).wireName)
+        null
+    }
+
+    /** 与公开刷新共享实现，但保留初始化恢复分类所需的真实异常。 */
+    private suspend fun updateModelOrThrow(): ModelSnapshot? = modelUpdateMutex.withLock update@{
+        if (closed) {
+            return@update null
+        }
+        val selectionVersion = synchronized(modelStateLock) { modelSelectionVersion }
+        val models = try {
+            when (val currentTransport = rawTransport) {
                 null -> {
-                    val currentClient = client ?: return@withLock null
+                    val currentClient = client ?: return@update null
                     withContext(Dispatchers.IO) {
                         currentClient.models().list().data()
                     }
@@ -346,40 +265,44 @@ class OpenAIAgentService @Inject internal constructor(
 
                 else -> listRawOpenAIModels(currentTransport)
             }
-            val refreshedModels = models.map { it.id() }
-            val refreshResult = sessionMutex.withLock {
-                val (snapshot, fallbackModelChanged, invalidModel) = synchronized(modelStateLock) {
-                    if (closed || modelSelectionVersion != selectionVersion) {
-                        return@withLock null
-                    }
-                    availableModels = refreshedModels
-                    val invalidDesiredModel = desiredModel.takeUnless { it in availableModels }
-                    var modelChanged = false
-                    val fallbackModel = invalidDesiredModel?.let { preferredModel(availableModels) }
-                    fallbackModel?.let { preferredModel ->
-                        desiredModel = preferredModel
-                        modelSelectionVersion++
-                        if (currentModel !in availableModels) {
-                            currentModel = preferredModel
-                            modelChanged = true
-                        }
-                    }
-                    Triple(ModelSnapshot(currentModel, availableModels), modelChanged, invalidDesiredModel)
-                }
-                Triple(snapshot, if (fallbackModelChanged) resetSessionLocked() else null, invalidModel)
-            } ?: return@withLock null
-            awaitMcpConnectionJob(refreshResult.second)
-            if (refreshResult.second?.isCancelled == true) {
-                return@withLock null
-            }
-            refreshResult.third?.let(::clearPersistedSelectedModel)
-            refreshResult.first
         } catch (e: CancellationException) {
             throw e
+        } catch (e: AgentUpstreamHttpException) {
+            throw e
+        } catch (e: UpstreamResponseTooLargeException) {
+            throw e
+        } catch (e: java.io.IOException) {
+            throw e
         } catch (e: Exception) {
-            logger.error("Failed to update OpenAI models; category={}", SafeLogging.failureCategory(e).wireName)
-            null
+            throw AgentInvalidResponseException(e)
         }
+        val refreshedModels = models.map { it.id() }
+        if (refreshedModels.any(String::isBlank)) throw AgentInvalidResponseException()
+        if (refreshedModels.isEmpty()) throw AgentEmptyModelListException()
+        val refreshResult = sessionMutex.withLock {
+            val (snapshot, fallbackModelChanged, invalidModel) = synchronized(modelStateLock) {
+                if (closed || modelSelectionVersion != selectionVersion) {
+                    return@update null
+                }
+                availableModels = refreshedModels
+                val invalidDesiredModel = desiredModel.takeUnless { it in availableModels }
+                var modelChanged = false
+                val fallbackModel = invalidDesiredModel?.let { preferredModel(availableModels) }
+                fallbackModel?.let { preferredModel ->
+                    desiredModel = preferredModel
+                    modelSelectionVersion++
+                    if (currentModel !in availableModels) {
+                        currentModel = preferredModel
+                        modelChanged = true
+                    }
+                }
+                Triple(ModelSnapshot(currentModel, availableModels), modelChanged, invalidDesiredModel)
+            }
+            Triple(snapshot, if (fallbackModelChanged) resetSessionLocked() else null, invalidModel)
+        }
+        refreshResult.second?.let { awaitPublicationJob(it) }
+        refreshResult.third?.let(::clearPersistedSelectedModel)
+        refreshResult.first
     }
 
     /**
@@ -398,7 +321,7 @@ class OpenAIAgentService @Inject internal constructor(
         }
         return scope.launch(
             CoroutineExceptionHandler { _, error ->
-                logger.error("OpenAI session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
+                logger.debug("OpenAI session reset failed; category={}", SafeLogging.failureCategory(error).wireName)
             },
             start = CoroutineStart.UNDISPATCHED,
         ) {
@@ -443,7 +366,7 @@ class OpenAIAgentService @Inject internal constructor(
             return null
         }
         history.clear()
-        val aiSettings = settingsRepository.settingsFlow.value.ai
+        val aiSettings = settingsChangeCoordinator.settingsFlow.value.ai
         val mcpConnectionJob = aiSettings?.let { startMcpConnection(it.mcpServers) }
             ?: run {
                 cancelCurrentMcpConnection()
@@ -767,10 +690,6 @@ class OpenAIAgentService @Inject internal constructor(
         return localFunctionRouter
     }
 
-    private fun failedInitializationJob(): Job = Job().also {
-        it.cancel(CancellationException("OpenAI agent initialization failed"))
-    }
-
     /**
      * 执行完整的模型与工具调用流程。调用方必须已持有 [sessionMutex]。
      */
@@ -1035,14 +954,18 @@ class OpenAIAgentService @Inject internal constructor(
     private suspend fun listRawOpenAIModels(transport: CancellableOkHttpTransport): List<Model> {
         val response = transport.execute(rawOpenAIRequestBuilder("models").get().build())
         requireOpenAISuccess(response)
-        val mapper = jsonMapper()
-        JsonStructureLimits.validateJsonString(response.body)
-        val root = mapper.readTree(response.body)
-        val data = root.path("data")
-        if (!data.isArray) {
-            throw IllegalStateException("OpenAI models response did not contain a data array.")
+        return try {
+            val mapper = jsonMapper()
+            JsonStructureLimits.validateJsonString(response.body)
+            val root = mapper.readTree(response.body)
+            val data = root.path("data")
+            if (!data.isArray) throw AgentInvalidResponseException()
+            data.map { node -> mapper.treeToValue(node, Model::class.java) }
+        } catch (e: AgentInvalidResponseException) {
+            throw e
+        } catch (e: Exception) {
+            throw AgentInvalidResponseException(e)
         }
-        return data.map { node -> mapper.treeToValue(node, Model::class.java) }
     }
 
     /** 构建保留自定义基础路径、Bearer 认证和 SDK 附加参数的原生 OpenAI 请求。 */
@@ -1064,10 +987,10 @@ class OpenAIAgentService @Inject internal constructor(
             }
     }
 
-    /** 将非 2xx OpenAI 结果隔离在协议边界，防止其被误解为成功 DTO。 */
+    /** 将非 2xx OpenAI 结果转换为不保存正文或请求信息的公共上游异常。 */
     private fun requireOpenAISuccess(response: HttpResult) {
         if (response.statusCode !in 200..299) {
-            throw IllegalStateException("OpenAI API returned HTTP ${response.statusCode}: ${response.body.take(1024)}")
+            throw AgentUpstreamHttpException.fromResponse(response.statusCode, response.headers)
         }
     }
 
@@ -1088,7 +1011,7 @@ class OpenAIAgentService @Inject internal constructor(
      * 仅成功且仍为当前实例的客户端可清除已持久化的模型选择，避免旧刷新结果覆盖新设置。
      */
     private fun clearPersistedSelectedModel(invalidModel: String) {
-        settingsRepository.updateSettings { settings ->
+        settingsChangeCoordinator.updateSettings { settings ->
             val aiSettings = settings.ai
             if (
                 aiSettings?.provider == AIProvider.OPENAI &&
@@ -1119,9 +1042,6 @@ class OpenAIAgentService @Inject internal constructor(
             closed = true
             // 关闭先中断原生 HTTP Call，绝不等待 sessionMutex 中的网络回合返回。
             rawTransport?.close()
-            initialModelUpdateJob?.cancel()
-            initialModelUpdateJob = null
-            initialMcpConnectionJob?.cancel()
             serviceJob.cancel()
             closeCompletion = newCompletion
             closingScope.launch(start = CoroutineStart.UNDISPATCHED) {

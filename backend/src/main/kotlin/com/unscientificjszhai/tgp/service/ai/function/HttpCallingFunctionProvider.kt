@@ -3,7 +3,7 @@ package com.unscientificjszhai.tgp.service.ai.function
 import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.models.*
-import com.unscientificjszhai.tgp.repository.SettingsRepository
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.service.ai.agent.AgentToolExecutionContext
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.ktor.client.*
@@ -64,7 +64,7 @@ object SystemHttpToolDnsResolver : HttpToolDnsResolver {
  *
  */
 class HttpCallingFunctionProvider private constructor(
-    private val settingsRepository: SettingsRepository,
+    private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val dnsResolver: HttpToolDnsResolver,
     private val connectionObserver: HttpToolConnectionObserver,
     private val lifecycleObserver: HttpToolLifecycleObserver,
@@ -72,13 +72,13 @@ class HttpCallingFunctionProvider private constructor(
     /**
      * 创建受限 HTTP 函数提供者。
      *
-     * @param settingsRepository 提供当前 HTTP 工具设置快照；配置变更由其代理生命周期屏障协调。
+     * @param settingsChangeCoordinator 提供当前 HTTP 工具设置快照；配置变更由其代理生命周期屏障协调。
      * @param dnsResolver 实际 DNS 查询使用的解析器；其全部结果都会在连接前接受地址边界校验。
      */
     constructor(
-        settingsRepository: SettingsRepository,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
         dnsResolver: HttpToolDnsResolver = SystemHttpToolDnsResolver,
-    ) : this(settingsRepository, dnsResolver, HttpToolConnectionObserver {}, NoOpHttpToolLifecycleObserver)
+    ) : this(settingsChangeCoordinator, dnsResolver, HttpToolConnectionObserver {}, NoOpHttpToolLifecycleObserver)
 
     private val closed = AtomicBoolean(false)
     private val lifecycleLock = Any()
@@ -210,7 +210,7 @@ class HttpCallingFunctionProvider private constructor(
     }
 
     private fun currentSettingsOrNull(): HttpToolSettings? {
-        val settings = settingsRepository.settingsFlow.value.ai?.httpToolSettings ?: return null
+        val settings = settingsChangeCoordinator.settingsFlow.value.ai?.httpToolSettings ?: return null
         return try {
             settings.takeIf {
                 validateHttpToolSettings(it)
@@ -318,12 +318,25 @@ class HttpCallingFunctionProvider private constructor(
         }
     }
 
+    /**
+     * 一次关闭尝试原子摘取的 HTTP 客户端集合。
+     *
+     * @property clients 需要在生命周期锁外关闭的客户端。
+     * @property completion 所有关闭调用共享的完成信号。
+     * @property isInitialClose 当前调用是否负责执行首次关闭。
+     */
     private data class ClientCloseWork(
         val clients: List<HttpClient>,
         val completion: CountDownLatch,
         val isInitialClose: Boolean,
     )
 
+    /**
+     * 已通过结构校验的 HTTP 工具调用参数。
+     *
+     * @property targetId 允许目标的配置标识。
+     * @property body 可选请求正文。
+     */
     private data class CallArguments(
         val targetId: String,
         val body: String?,
@@ -401,12 +414,12 @@ class HttpCallingFunctionProvider private constructor(
         }
 
         internal fun withConnectionObserver(
-            settingsRepository: SettingsRepository,
+            settingsChangeCoordinator: SettingsChangeCoordinator,
             dnsResolver: HttpToolDnsResolver,
             connectionObserver: HttpToolConnectionObserver,
             lifecycleObserver: HttpToolLifecycleObserver = NoOpHttpToolLifecycleObserver,
         ): HttpCallingFunctionProvider =
-            HttpCallingFunctionProvider(settingsRepository, dnsResolver, connectionObserver, lifecycleObserver)
+            HttpCallingFunctionProvider(settingsChangeCoordinator, dnsResolver, connectionObserver, lifecycleObserver)
 
         fun error(code: String): JsonObject = buildJsonObject { put("error", code) }
     }

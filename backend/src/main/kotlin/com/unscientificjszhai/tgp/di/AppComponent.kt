@@ -1,11 +1,11 @@
 package com.unscientificjszhai.tgp.di
 
-import com.unscientificjszhai.tgp.repository.SettingsRepository
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.BotCommandReconciler
 import com.unscientificjszhai.tgp.service.MessagePoller
+import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.service.TelegramService
-import com.unscientificjszhai.tgp.service.ai.TaskSchedulerService
+import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import dagger.Component
 import javax.inject.Singleton
@@ -16,8 +16,8 @@ import javax.inject.Singleton
 @Singleton
 @Component(modules = [AppModule::class])
 interface AppComponent {
-    /** 应用设置的持久化仓库。 */
-    val settingsRepository: SettingsRepository
+    /** 协调应用设置持久化、条件写入与生命周期事件。 */
+    val settingsChangeCoordinator: SettingsChangeCoordinator
 
     /** 技能数据的持久化仓库。 */
     val skillRepository: SkillRepository
@@ -31,8 +31,8 @@ interface AppComponent {
     /** 轮询和处理 Telegram 消息的服务。 */
     val messagePoller: MessagePoller
 
-    /** 创建和执行定时任务的服务。 */
-    val taskSchedulerService: TaskSchedulerService
+    /** 扫描并执行已到期定时任务的应用级 worker。 */
+    val scheduledTaskWorker: ScheduledTaskWorker
 
     /**
      * 管理当前 AI 提供商代理的应用级委派服务。
