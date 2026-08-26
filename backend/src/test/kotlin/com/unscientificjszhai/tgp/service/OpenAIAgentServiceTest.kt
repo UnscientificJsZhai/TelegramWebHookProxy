@@ -22,13 +22,16 @@ import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
 import java.nio.file.Files
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 
 /**
@@ -40,11 +43,16 @@ class OpenAIAgentServiceTest {
     private lateinit var skillRepository: SkillRepository
     private lateinit var service: OpenAIAgentService
     private lateinit var tempDirectory: File
+    private lateinit var testJob: Job
+    private lateinit var testScope: CoroutineScope
+    private val services = mutableListOf<OpenAIAgentService>()
 
     @BeforeTest
     fun setup() {
         tempDirectory = Files.createTempDirectory("openai-agent-service-test").toFile()
-        val testScope = CoroutineScope(EmptyCoroutineContext)
+        testJob = SupervisorJob()
+        testScope = CoroutineScope(testJob)
+        services.clear()
         settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
             File(tempDirectory, "settings.json"),
             ModelSwitchBarrier(),
@@ -56,12 +64,19 @@ class OpenAIAgentServiceTest {
             skillRepository,
             MCPClientService(testScope),
             scheduledTaskService = mockk(),
-        )
+        ).also { services += it }
     }
 
     @AfterTest
     fun teardown() {
-        tempDirectory.deleteRecursively()
+        runBlocking {
+            val closeFailures = services.asReversed().mapNotNull { candidate ->
+                runCatching { candidate.close().join() }.exceptionOrNull()
+            }
+            testJob.cancelAndJoin()
+            tempDirectory.deleteRecursively()
+            closeFailures.firstOrNull()?.let { throw it }
+        }
     }
 
     /**
@@ -119,14 +134,13 @@ class OpenAIAgentServiceTest {
     }
 
     private fun newService(mcpClientService: MCPClientService? = null): OpenAIAgentService {
-        val testScope = CoroutineScope(EmptyCoroutineContext)
         return OpenAIAgentService(
             testScope,
             settingsChangeCoordinator,
             skillRepository,
             mcpClientService ?: MCPClientService(testScope),
             scheduledTaskService = mockk(),
-        )
+        ).also { services += it }
     }
 
     private fun setPrivateField(name: String, value: Any?) {

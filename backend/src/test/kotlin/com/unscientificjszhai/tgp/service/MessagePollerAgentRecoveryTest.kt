@@ -10,9 +10,9 @@ import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import java.io.File
 import java.nio.file.Files
@@ -132,7 +132,7 @@ class MessagePollerAgentRecoveryTest {
         } finally {
             poller?.closeAndJoin()
             delegating.close().join()
-            scope.cancel()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             directory.deleteRecursively()
         }
     }
@@ -203,7 +203,7 @@ class MessagePollerAgentRecoveryTest {
                         data.lastUpdateId == 0L &&
                         data.retryCheckpoint?.targetUpdateId == 101L
             }
-            delay(100)
+            agent.awaitAvailabilityCollectCycle(1)
             assertEquals(0, regularCalls.get())
             assertEquals(0, agent.turns.get())
 
@@ -219,7 +219,7 @@ class MessagePollerAgentRecoveryTest {
             assertEquals(1, agent.turns.get())
         } finally {
             poller.closeAndJoin()
-            scope.cancel()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             directory.deleteRecursively()
         }
     }
@@ -286,11 +286,12 @@ class MessagePollerAgentRecoveryTest {
                         updatesRepository.getData("123").retryCheckpoint?.targetUpdateId == 101L
             }
             assertNotNull(updatesRepository.getData("123").retryCheckpoint)
+            agent.awaitAvailabilityCollectCycle(1)
 
             agent.transition(AgentAvailabilityState.RETRY_SCHEDULED, sequence = 2)
-            delay(100)
+            agent.awaitAvailabilityCollectCycle(2)
             agent.transition(AgentAvailabilityState.INITIALIZING, sequence = 3)
-            delay(100)
+            agent.awaitAvailabilityCollectCycle(3)
             assertEquals(1, getUpdatesCalls.get())
             assertEquals(0, agent.turns.get())
 
@@ -305,7 +306,7 @@ class MessagePollerAgentRecoveryTest {
             assertNull(updatesRepository.getData("123").retryCheckpoint)
         } finally {
             poller.closeAndJoin()
-            scope.cancel()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             directory.deleteRecursively()
         }
     }
@@ -381,7 +382,7 @@ class MessagePollerAgentRecoveryTest {
             assertEquals(2, getUpdatesCalls.get())
         } finally {
             poller.closeAndJoin()
-            scope.cancel()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             directory.deleteRecursively()
         }
     }
@@ -473,7 +474,7 @@ class MessagePollerAgentRecoveryTest {
                 assertEquals(1, agent.turns.get())
             } finally {
                 poller.closeAndJoin()
-                scope.cancel()
+                scope.coroutineContext[Job]?.cancelAndJoin()
                 directory.deleteRecursively()
             }
         }
@@ -486,6 +487,7 @@ class MessagePollerAgentRecoveryTest {
 
     private fun completedJob(): Job = CompletableDeferred(Unit).also { it.complete(Unit) }
 
+    @OptIn(ExperimentalForInheritanceCoroutinesApi::class)
     private class RecoveringAgentService(settingsVersion: Long) : AgentService() {
         private val mutableAvailability = MutableStateFlow(
             AgentAvailabilitySnapshot(
@@ -496,13 +498,32 @@ class MessagePollerAgentRecoveryTest {
                 attempt = 1,
             ),
         )
-        override val availability: StateFlow<AgentAvailabilitySnapshot> = mutableAvailability.asStateFlow()
+        private val availabilityCollectCycles = MutableStateFlow(0)
+        override val availability: StateFlow<AgentAvailabilitySnapshot> = object : StateFlow<AgentAvailabilitySnapshot> {
+            override val value: AgentAvailabilitySnapshot
+                get() = mutableAvailability.value
+
+            override val replayCache: List<AgentAvailabilitySnapshot>
+                get() = mutableAvailability.replayCache
+
+            override suspend fun collect(collector: FlowCollector<AgentAvailabilitySnapshot>): Nothing {
+                // awaitAgentAvailabilityChange 每处理一个非终态都会重新调用 first；周期计数证明其已进入下一轮等待。
+                availabilityCollectCycles.value += 1
+                return mutableAvailability.collect(collector)
+            }
+        }
         override val currentModel: String = "test"
         override val availableModels: List<String> = listOf("test")
         val turns = AtomicInteger()
 
         @Volatile
         var ready: Boolean = false
+
+        suspend fun awaitAvailabilityCollectCycle(expectedCycle: Int) {
+            withTimeout(5.seconds) {
+                availabilityCollectCycles.first { it >= expectedCycle }
+            }
+        }
 
         fun transition(state: AgentAvailabilityState, sequence: Long) {
             mutableAvailability.value = mutableAvailability.value.copy(

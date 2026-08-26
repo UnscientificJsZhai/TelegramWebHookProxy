@@ -12,9 +12,12 @@ import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import io.ktor.http.HttpStatusCode
 import io.mockk.*
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
@@ -24,6 +27,7 @@ import java.time.ZoneId
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
@@ -33,6 +37,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 /** 定时任务 worker 的耐久预消费、授权和副作用边界测试。 */
 class ScheduledTaskWorkerTest {
@@ -40,6 +45,7 @@ class ScheduledTaskWorkerTest {
     private val clock = Clock.fixed(fixedInstant, ZoneId.of("UTC"))
     private val tempDirectory = createTempDirectory("scheduled-task-worker-test").toFile()
     private val scheduleFile = File(tempDirectory, "schedule.json")
+    private lateinit var parentJob: Job
     private lateinit var parentScope: CoroutineScope
     private lateinit var settingsChangeCoordinator: SettingsChangeCoordinator
     private lateinit var scheduledTaskService: ScheduledTaskService
@@ -49,7 +55,8 @@ class ScheduledTaskWorkerTest {
 
     @BeforeTest
     fun setup() {
-        parentScope = CoroutineScope(SupervisorJob())
+        parentJob = SupervisorJob()
+        parentScope = CoroutineScope(parentJob)
         settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
             File(tempDirectory, "settings.json"),
             ModelSwitchBarrier(),
@@ -64,9 +71,11 @@ class ScheduledTaskWorkerTest {
 
     @AfterTest
     fun teardown() {
-        worker.close()
-        parentScope.cancel()
-        tempDirectory.deleteRecursively()
+        runBlocking {
+            closeWorkerAndWait()
+            parentJob.cancelAndJoin()
+            tempDirectory.deleteRecursively()
+        }
     }
 
     @Test
@@ -121,7 +130,7 @@ class ScheduledTaskWorkerTest {
             LoopMode.ONCE,
             CHAT_ID,
         )
-        worker.close()
+        closeWorkerAndWait()
         worker = newWorker(scheduledTaskService)
         coEvery { agentService.sendMessage(any<String>()) } returns "finished"
         coEvery {
@@ -181,8 +190,8 @@ class ScheduledTaskWorkerTest {
     }
 
     @Test
-    fun `shutdown atomically closes creation and scan admission under contention`() {
-        worker.close()
+    fun `shutdown atomically closes creation and scan admission under contention`() = runBlocking {
+        closeWorkerAndWait()
         val contentionFile = File(tempDirectory, "contention-schedule.json")
         scheduledTaskService = spyk(ScheduledTaskService(contentionFile, zoneId = clock.zone))
         val existingId = scheduledTaskService.createTask(
@@ -246,10 +255,11 @@ class ScheduledTaskWorkerTest {
             assertFalse(creator.isAlive)
             assertTrue(createFailure.get() is IllegalStateException)
             releaseScanToAdmission.countDown()
-            assertFalse(
-                scanFinished.await(200, TimeUnit.MILLISECONDS),
-                "A scan must not pass lifecycle admission while shutdown is publishing the closed state.",
-            )
+            val lifecycleLock = workerLifecycleLock()
+            withTimeout(5.seconds) {
+                while (!lifecycleLock.hasQueuedThread(scanner)) yield()
+            }
+            assertEquals(1L, scanFinished.count)
         } finally {
             releaseScanToAdmission.countDown()
             releaseStop.countDown()
@@ -273,6 +283,15 @@ class ScheduledTaskWorkerTest {
         settingsChangeCoordinator = settingsChangeCoordinator,
         clock = clock,
     )
+
+    private suspend fun closeWorkerAndWait() {
+        worker.requestStop()
+        worker.awaitStopped()
+    }
+
+    private fun workerLifecycleLock(): ReentrantLock =
+        ScheduledTaskWorker::class.java.getDeclaredField("lifecycleLock").apply { isAccessible = true }
+            .get(worker) as ReentrantLock
 
     private fun allowReadyServiceScope(agent: AgentService) {
         coEvery { agent.withReadyService<Any?>(any()) } coAnswers {

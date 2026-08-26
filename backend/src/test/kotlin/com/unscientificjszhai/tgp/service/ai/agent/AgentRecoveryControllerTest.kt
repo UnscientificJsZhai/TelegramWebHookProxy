@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.AIProvider
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
@@ -215,6 +216,9 @@ class AgentRecoveryControllerTest {
     fun `two unfinished failed cleanups pause creation of a third candidate`() = runBlocking {
         val cleanupJobs = mutableMapOf<Int, CompletableDeferred<Unit>>()
         val createdSignal = Channel<Unit>(Channel.UNLIMITED)
+        val cleanupStarted = Channel<Int>(Channel.UNLIMITED)
+        val thirdAcquireStarted = CompletableDeferred<Unit>()
+        val cleanupPermits = ObservableSemaphore(Semaphore(2), thirdAcquireStarted)
         var created = 0
         val controller = controller(
             create = {
@@ -223,12 +227,21 @@ class AgentRecoveryControllerTest {
             initialize = { candidate ->
                 if (candidate.id <= 2) failed(AgentFailureKind.NETWORK) else AgentInitializationResult.Ready
             },
-            close = { candidate -> CompletableDeferred<Unit>().also { cleanupJobs[candidate.id] = it } },
+            close = { candidate ->
+                CompletableDeferred<Unit>().also {
+                    cleanupJobs[candidate.id] = it
+                    check(cleanupStarted.trySend(candidate.id).isSuccess)
+                }
+            },
+            cleanupPermits = cleanupPermits,
         )
 
         controller.replaceTarget("target", AIProvider.OPENAI, 1, resetFailures = true) {}
         repeat(2) { withTimeout(5.seconds) { createdSignal.receive() } }
-        delay(50)
+        assertEquals(setOf(1, 2), buildSet {
+            repeat(2) { add(withTimeout(5.seconds) { cleanupStarted.receive() }) }
+        })
+        withTimeout(5.seconds) { thirdAcquireStarted.await() }
         assertEquals(2, created)
 
         cleanupJobs.getValue(1).complete(Unit)
@@ -256,7 +269,6 @@ class AgentRecoveryControllerTest {
             controller.availability.first { it.state == AgentAvailabilityState.RETRY_SCHEDULED }
         }
         controller.close().join()
-        delay(50)
 
         assertEquals(1, created)
         assertEquals(0, published)
@@ -270,6 +282,7 @@ class AgentRecoveryControllerTest {
         publishWithTarget: ((String, Candidate) -> Boolean)? = null,
         close: (Candidate) -> Job? = { completedJob() },
         retryDelay: suspend (Duration) -> Unit = {},
+        cleanupPermits: Semaphore = Semaphore(2),
     ): AgentRecoveryController<String, Candidate> = AgentRecoveryController(
         parentScope = this,
         logger = LoggerFactory.getLogger("AgentRecoveryControllerTest"),
@@ -277,6 +290,7 @@ class AgentRecoveryControllerTest {
         initializeCandidate = initialize,
         publishCandidate = publishWithTarget ?: { _, candidate -> publish(candidate) },
         closeCandidate = close,
+        cleanupPermits = cleanupPermits,
         retryDelay = retryDelay,
         jitter = { it },
         monotonicMillis = { 1_000L },
@@ -284,6 +298,21 @@ class AgentRecoveryControllerTest {
 
     private fun failed(kind: AgentFailureKind): AgentInitializationResult.Failed =
         AgentInitializationResult.Failed(AgentFailure(kind, RecoveryDisposition.RETRY))
+
+    private class ObservableSemaphore(
+        private val delegate: Semaphore,
+        private val thirdAcquireStarted: CompletableDeferred<Unit>,
+    ) : Semaphore by delegate {
+        private val acquireCalls = AtomicInteger()
+
+        override suspend fun acquire() {
+            // 第三次获取发生在两个清理许可均未释放时；先发布进入点，再让真实信号量执行挂起。
+            if (acquireCalls.incrementAndGet() == 3) {
+                thirdAcquireStarted.complete(Unit)
+            }
+            delegate.acquire()
+        }
+    }
 
     private fun completedJob(): Job = CompletableDeferred(Unit).also { it.complete(Unit) }
 }

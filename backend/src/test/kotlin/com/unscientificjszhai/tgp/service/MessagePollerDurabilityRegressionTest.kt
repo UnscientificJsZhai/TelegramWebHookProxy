@@ -12,7 +12,7 @@ import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import io.ktor.http.HttpStatusCode
 import io.mockk.*
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.io.IOException
@@ -22,7 +22,6 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSupport() {
@@ -85,6 +84,7 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
     @Test
     fun `agent turn claim write failure never enters agent`() = runBlocking {
         val writeAttempted = CompletableDeferred<Unit>()
+        val retryStarted = CompletableDeferred<Unit>()
         val updates = UpdatesRepository(tempDirectory.resolve("failed-poller-agent-claim.json")) { state ->
             if (
                 state.bots["100"]?.agentTurnJournal?.any {
@@ -95,7 +95,13 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
                 throw IOException("injected agent journal write failure")
             }
         }
-        val fixture = fixture(retryDelay = {}, updatesOverride = updates)
+        val fixture = fixture(
+            retryDelay = {
+                retryStarted.complete(Unit)
+                awaitCancellation()
+            },
+            updatesOverride = updates,
+        )
         val chat = Chat(id = 123L, type = "private", firstName = "Test")
         fixture.saveSettings(
             AppSettings(
@@ -112,7 +118,7 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
         fixture.poller.start()
         try {
             withTimeout(2.seconds) { writeAttempted.await() }
-            delay(100.milliseconds)
+            withTimeout(2.seconds) { retryStarted.await() }
             coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
             assertEquals(0, fixture.updates.getData("100").lastUpdateId)
             assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())

@@ -9,6 +9,7 @@ import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import java.io.File
 import java.nio.file.Files
@@ -82,10 +83,11 @@ class DelegatingAgentLifecycleGuardTest {
     }
 
     @Test
-    fun `two unfinished retired closes pause creation of another candidate`() = runBlocking {
+    fun `retired cleanup completion lets an issued lifecycle target reach READY`() = runBlocking {
         val fixture = Fixture(this)
         var delegating: DelegatingAgentService? = null
         val retiredCloseGates = (1..3).associateWith { CompletableDeferred<Unit>() }
+        val closeStarted = Channel<Int>(Channel.UNLIMITED)
         try {
             fixture.installEnabledSettings()
             val created = AtomicInteger()
@@ -94,6 +96,7 @@ class DelegatingAgentLifecycleGuardTest {
                 mockedService(
                     id = id,
                     closeJob = retiredCloseGates[id] ?: completedJob(),
+                    onClose = { check(closeStarted.trySend(id).isSuccess) },
                 )
             }
             val service = fixture.delegating(factory)
@@ -102,8 +105,10 @@ class DelegatingAgentLifecycleGuardTest {
 
             fixture.updateGlobalContext("first rebuild")
             awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+            assertEquals(1, withTimeout(5.seconds) { closeStarted.receive() })
             fixture.updateGlobalContext("second rebuild")
             awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+            assertEquals(2, withTimeout(5.seconds) { closeStarted.receive() })
             assertEquals(3, created.get())
 
             fixture.updateGlobalContext("must wait for retirement capacity")
@@ -113,8 +118,6 @@ class DelegatingAgentLifecycleGuardTest {
                     it.settingsVersion == targetVersion && it.state == AgentAvailabilityState.INITIALIZING
                 }
             }
-            delay(100)
-            assertEquals(3, created.get())
 
             retiredCloseGates.getValue(1).complete(Unit)
             awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
@@ -131,11 +134,12 @@ class DelegatingAgentLifecycleGuardTest {
     }
 
     @Test
-    fun `retired and failed candidates share the same two cleanup capacity`() = runBlocking {
+    fun `failed cleanup completion lets an issued target reach READY alongside a registered retirement`() = runBlocking {
         val fixture = Fixture(this)
         var delegating: DelegatingAgentService? = null
         val retiredClose = CompletableDeferred<Unit>()
         val failedClose = CompletableDeferred<Unit>()
+        val closeStarted = Channel<Int>(Channel.UNLIMITED)
         try {
             fixture.installEnabledSettings()
             val created = AtomicInteger()
@@ -157,6 +161,7 @@ class DelegatingAgentLifecycleGuardTest {
                         3 -> failedClose
                         else -> completedJob()
                     },
+                    onClose = { check(closeStarted.trySend(id).isSuccess) },
                 )
             }
             val service = fixture.delegating(factory)
@@ -165,6 +170,7 @@ class DelegatingAgentLifecycleGuardTest {
 
             fixture.updateGlobalContext("publish replacement")
             awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+            assertEquals(1, withTimeout(5.seconds) { closeStarted.receive() })
             fixture.updateGlobalContext("create failed candidate")
             withTimeout(5.seconds) {
                 service.availability.first {
@@ -172,6 +178,7 @@ class DelegatingAgentLifecycleGuardTest {
                             it.state == AgentAvailabilityState.RETRY_SCHEDULED
                 }
             }
+            assertEquals(3, withTimeout(5.seconds) { closeStarted.receive() })
             assertEquals(3, created.get())
 
             fixture.updateGlobalContext("must wait for shared cleanup capacity")
@@ -181,10 +188,8 @@ class DelegatingAgentLifecycleGuardTest {
                     it.settingsVersion == targetVersion && it.state == AgentAvailabilityState.INITIALIZING
                 }
             }
-            delay(100)
-            assertEquals(3, created.get())
 
-            retiredClose.complete(Unit)
+            failedClose.complete(Unit)
             awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
             assertEquals(4, created.get())
         } finally {
@@ -253,6 +258,7 @@ class DelegatingAgentLifecycleGuardTest {
         id: Int,
         initialize: suspend () -> AgentInitializationResult = { AgentInitializationResult.Ready },
         closeJob: Job = completedJob(),
+        onClose: () -> Unit = {},
     ): OpenAIAgentService = mockk {
         coEvery { initializeForPublication() } coAnswers { initialize() }
         every { currentModel } returns "model-$id"
@@ -261,7 +267,10 @@ class DelegatingAgentLifecycleGuardTest {
         every { switchModel(any()) } returns completedJob()
         coEvery { updateModel() } returns ModelSnapshot("model-$id", listOf("model-$id"))
         every { resetSession() } returns completedJob()
-        every { close() } returns closeJob
+        every { close() } answers {
+            onClose()
+            closeJob
+        }
     }
 
     private suspend fun awaitReadyForCurrentSettings(

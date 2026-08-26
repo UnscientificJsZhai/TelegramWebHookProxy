@@ -9,10 +9,10 @@ import com.unscientificjszhai.tgp.models.Update
 import io.ktor.http.HttpStatusCode
 import io.mockk.*
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -22,7 +22,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSupport() {
@@ -46,8 +45,10 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
             fixture.poller.start()
             try {
                 withTimeout(2.seconds) { firstRequestStarted.await() }
+                val expiredSession = currentSession(fixture.poller)
                 fixture.saveSettings(AppSettings(telegramToken = "200:B$errorCode"))
                 allowLateFailure.complete(Unit)
+                withTimeout(2.seconds) { sessionJob(expiredSession).join() }
                 eventually {
                     assertEquals("200:B$errorCode", sessionToken(currentSession(fixture.poller)))
                     coVerify(atLeast = 1) {
@@ -55,7 +56,6 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
                     }
                 }
                 verify(exactly = 1) { fixture.agent.resetSession() }
-                delay(100.milliseconds)
                 assertEquals("200:B$errorCode", sessionToken(currentSession(fixture.poller)))
                 verify(exactly = 1) { fixture.agent.resetSession() }
                 assertFalse(fixture.barrier.isSwitching)
@@ -106,8 +106,9 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
                 assertTrue(fixture.barrier.isSwitching)
                 assertNull(currentSessionOrNull(fixture.poller))
                 coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("200:B$errorCode", -1, 0) }
-                val blockedRequest = async { fixture.barrier.runWhenReady { "admitted" } }
-                delay(100.milliseconds)
+                val blockedRequest = async(start = CoroutineStart.UNDISPATCHED) {
+                    fixture.barrier.runWhenReady { "admitted" }
+                }
                 assertFalse(blockedRequest.isCompleted)
 
                 allowRetryReset.complete()
@@ -202,8 +203,9 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
                     ai = AISettings(agentEnabled = true, agentChatId = "123"),
                 ),
             )
-            delay(100.milliseconds)
-            assertNull(currentSessionOrNull(fixture.poller))
+            eventually {
+                assertNull(currentSessionOrNull(fixture.poller))
+            }
             coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:new", any(), any()) }
 
             releaseAgent.complete(Unit)
@@ -225,10 +227,10 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
     fun `token switch while full update waits on barrier drops old batch without feedback`() = runBlocking {
         val fixture = fixture()
         val chat = Chat(id = 123L, type = "private", firstName = "Authorized")
+        val pollRequestStarted = CompletableDeferred<Unit>()
+        val allowPollResponse = CompletableDeferred<Unit>()
         val blockingAgentStarted = CompletableDeferred<Unit>()
         val allowBlockingAgent = CompletableDeferred<Unit>()
-        val barrierInstalled = CompletableDeferred<Unit>()
-        val availabilityChecks = AtomicInteger()
         var switchGeneration = Long.MIN_VALUE
         fixture.updates.saveLastUpdateId("100", 10)
         fixture.saveSettings(
@@ -241,25 +243,11 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
                 ),
             ),
         )
-        every { fixture.agent.isAiFeatureEnabled(any()) } answers {
-            if (availabilityChecks.incrementAndGet() == 11) {
-                switchGeneration = fixture.barrier.beginExternalSwitch()
-                barrierInstalled.complete(Unit)
-            }
-            true
+        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } coAnswers {
+            pollRequestStarted.complete(Unit)
+            allowPollResponse.await()
+            GetUpdatesResponse(ok = true)
         }
-        val batch = (11L..22L).map { updateId ->
-            Update(
-                updateId,
-                message = authorizedMessage(
-                    updateId,
-                    chat,
-                    text = if (updateId == 11L) "block" else "queued-$updateId",
-                ),
-            )
-        }
-        coEvery { fixture.telegram.getUpdatesForToken("100:A", 11, 30) } returns
-                GetUpdatesResponse(ok = true, result = batch)
         coEvery { fixture.telegram.getUpdatesForToken("200:B", -1, 0) } returns GetUpdatesResponse(ok = true)
         coEvery { fixture.telegram.sendChatActionForToken("100:A", "123", "typing") } returns mockk()
         coEvery { fixture.agent.sendMessage("block") } coAnswers {
@@ -270,9 +258,48 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
 
         fixture.poller.start()
         try {
+            withTimeout(2.seconds) { pollRequestStarted.await() }
+            val oldSession = currentSession(fixture.poller)
+            val admissionPolicy = admissionPolicy(fixture.poller)
+
+            val blockingAdmission = admissionPolicy.enqueueUpdate(
+                oldSession,
+                Update(11, message = authorizedMessage(11, chat, text = "block")),
+            )
+            assertTrue(blockingAdmission is UpdateAdmission.Enqueued)
             withTimeout(2.seconds) { blockingAgentStarted.await() }
-            withTimeout(2.seconds) { barrierInstalled.await() }
+
+            (12L..21L).forEach { updateId ->
+                val queuedAdmission = admissionPolicy.enqueueUpdate(
+                    oldSession,
+                    Update(updateId, message = authorizedMessage(updateId, chat, text = "queued-$updateId")),
+                )
+                assertTrue(queuedAdmission is UpdateAdmission.Enqueued)
+            }
+            val queueCapacityProbe = QueuedWork.Authorized(
+                update = Update(22, message = authorizedMessage(22, chat, text = "capacity-probe")),
+                entryTime = System.currentTimeMillis(),
+                completion = CompletableDeferred(),
+                expectedRetryCheckpointTarget = null,
+                ticket = AdmissionTicket(agentChatId = "123", generation = oldSession.generation),
+            )
+            assertEquals(
+                QueueOfferResult.FULL,
+                runtime(fixture.poller).offerUpdateForCurrent(oldSession, queueCapacityProbe),
+            )
+
+            switchGeneration = fixture.barrier.beginExternalSwitch()
+            val overflowAdmission = async(start = CoroutineStart.UNDISPATCHED) {
+                admissionPolicy.enqueueUpdate(
+                    oldSession,
+                    Update(22, message = authorizedMessage(22, chat, text = "overflow")),
+                )
+            }
             assertTrue(fixture.barrier.isSwitching)
+            assertFalse(overflowAdmission.isCompleted)
+            coVerify(exactly = 0) {
+                fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
+            }
 
             fixture.saveSettings(
                 AppSettings(
@@ -287,14 +314,22 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
             eventually {
                 assertEquals("200:B", sessionToken(currentSession(fixture.poller)))
             }
+            var staleWriteExecuted = false
+            val staleWriteResult = runtime(fixture.poller).writeForCurrent(oldSession) {
+                staleWriteExecuted = true
+                fixture.updates.confirmProcessedUpdate(oldSession.botId, 22, null)
+            }
+            assertNull(staleWriteResult)
+            assertFalse(staleWriteExecuted)
             fixture.barrier.complete(switchGeneration)
-            delay(100.milliseconds)
+            assertEquals(UpdateAdmission.Confirmed, withTimeout(2.seconds) { overflowAdmission.await() })
 
             assertEquals(10, fixture.updates.getData("100").lastUpdateId)
             coVerify(exactly = 0) {
                 fixture.telegram.sendMessageForToken("100:A", "123", match { it.contains("处理队列已满") }, any())
             }
         } finally {
+            allowPollResponse.complete(Unit)
             allowBlockingAgent.complete(Unit)
             if (switchGeneration != Long.MIN_VALUE) {
                 fixture.barrier.complete(switchGeneration)
@@ -326,28 +361,37 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
         }
 
         fixture.poller.start()
-        withTimeout(2.seconds) { requestStarted.await() }
-        val session = currentSession(fixture.poller)
-        fixture.poller.requestStop()
-        val stopped = async { fixture.poller.awaitStopped() }
-        delay(100.milliseconds)
-        assertFalse(stopped.isCompleted)
-        assertNull(currentSessionOrNull(fixture.poller))
-        assertTrue(sessionJob(session).isCancelled)
+        try {
+            withTimeout(2.seconds) { requestStarted.await() }
+            val session = currentSession(fixture.poller)
+            fixture.poller.requestStop()
+            val stopped = async(start = CoroutineStart.UNDISPATCHED) { fixture.poller.awaitStopped() }
+            assertFalse(stopped.isCompleted)
+            assertNull(currentSessionOrNull(fixture.poller))
+            assertTrue(sessionJob(session).isCancelled)
 
-        fixture.saveSettings(
-            AppSettings(
-                telegramToken = "200:new",
-                ai = AISettings(agentEnabled = true, agentChatId = "123"),
-            ),
-        )
-        releaseLateResponse.complete(Unit)
-        withTimeout(2.seconds) { stopped.await() }
-        withTimeout(2.seconds) { fixture.poller.closeAndJoin() }
-        withTimeout(2.seconds) { fixture.poller.awaitStopped() }
+            fixture.saveSettings(
+                AppSettings(
+                    telegramToken = "200:new",
+                    ai = AISettings(agentEnabled = true, agentChatId = "123"),
+                ),
+            )
+            releaseLateResponse.complete(Unit)
+            withTimeout(2.seconds) { stopped.await() }
+            withTimeout(2.seconds) { fixture.poller.closeAndJoin() }
+            withTimeout(2.seconds) { fixture.poller.awaitStopped() }
 
-        assertEquals(10, fixture.updates.getData("100").lastUpdateId)
-        coVerify(exactly = 0) { fixture.agent.sendMessage("too-late") }
-        coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("200:new", any(), any()) }
+            assertEquals(10, fixture.updates.getData("100").lastUpdateId)
+            coVerify(exactly = 0) { fixture.agent.sendMessage("too-late") }
+            coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("200:new", any(), any()) }
+        } finally {
+            releaseLateResponse.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }
     }
+
+    /** 取得 facade 实际组装的准入策略，以直接驱动 barrier 与会话失效契约。 */
+    private fun admissionPolicy(poller: MessagePoller): UpdateAdmissionPolicy =
+        MessagePoller::class.java.getDeclaredField("admissionPolicy").apply { isAccessible = true }
+            .get(poller) as UpdateAdmissionPolicy
 }

@@ -25,7 +25,6 @@ import okhttp3.OkHttpClient
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.*
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -39,11 +38,16 @@ class GeminiAgentServiceTest {
     private lateinit var skillRepository: com.unscientificjszhai.tgp.repository.SkillRepository
     private lateinit var service: GeminiAgentService
     private lateinit var tempDirectory: File
+    private lateinit var testJob: Job
+    private lateinit var testScope: CoroutineScope
+    private val services = mutableListOf<GeminiAgentService>()
 
     @BeforeTest
     fun setup() {
         tempDirectory = Files.createTempDirectory("gemini-agent-service-test").toFile()
-        val testScope = CoroutineScope(EmptyCoroutineContext)
+        testJob = SupervisorJob()
+        testScope = CoroutineScope(testJob)
+        services.clear()
         settingsChangeCoordinator = SettingsChangeCoordinator.forTesting(
             File(tempDirectory, "settings.json"),
             ModelSwitchBarrier(),
@@ -56,12 +60,19 @@ class GeminiAgentServiceTest {
             skillRepository,
             MCPClientService(testScope),
             scheduledTaskService = mockk(),
-        )
+        ).also { services += it }
     }
 
     @AfterTest
     fun teardown() {
-        tempDirectory.deleteRecursively()
+        runBlocking {
+            val closeFailures = services.asReversed().mapNotNull { candidate ->
+                runCatching { candidate.close().join() }.exceptionOrNull()
+            }
+            testJob.cancelAndJoin()
+            tempDirectory.deleteRecursively()
+            closeFailures.firstOrNull()?.let { throw it }
+        }
     }
 
     /**
@@ -229,14 +240,13 @@ class GeminiAgentServiceTest {
     }
 
     private fun newService(): GeminiAgentService {
-        val testScope = CoroutineScope(EmptyCoroutineContext)
         return GeminiAgentService(
             testScope,
             settingsChangeCoordinator,
             skillRepository,
             MCPClientService(testScope),
             scheduledTaskService = mockk(),
-        )
+        ).also { services += it }
     }
 
     /** 构造不触发初始会话的原生模型发现服务，并将其传输定向到测试服务器。 */
@@ -244,7 +254,6 @@ class GeminiAgentServiceTest {
         server: MockWebServer,
         deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     ): GeminiAgentService {
-        val testScope = CoroutineScope(EmptyCoroutineContext)
         return GeminiAgentService(
             testScope,
             settingsChangeCoordinator,
@@ -253,6 +262,7 @@ class GeminiAgentServiceTest {
             deadlines,
             scheduledTaskService = mockk(),
         ).also { rawService ->
+            services += rawService
             setPrivateField(rawService, "rawApiKey", "test-key")
             setPrivateField(rawService, "rawBaseUrl", server.url("/v1beta").toString().trimEnd('/'))
             setPrivateField(rawService, "rawTransport", CancellableOkHttpTransport(OkHttpClient()))
