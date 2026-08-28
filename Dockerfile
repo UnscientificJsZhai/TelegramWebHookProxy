@@ -19,7 +19,7 @@ COPY webui webui
 
 RUN ./gradlew build --no-daemon
 
-FROM bellsoft/liberica-openjdk-alpine:21.0.7
+FROM bellsoft/liberica-openjdk-alpine:26-37
 
 WORKDIR /app
 
