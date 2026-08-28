@@ -8,7 +8,7 @@ plugins {
     kotlin("jvm")
     kotlin("plugin.serialization") version "2.4.10"
     kotlin("kapt")
-    id("com.gradleup.shadow") version "8.3.11"
+    id("com.gradleup.shadow") version "9.6.1"
     id("com.github.jk1.dependency-license-report") version "2.9"
     application
 }
