@@ -223,23 +223,21 @@ class ScheduledTaskWorkerTest {
         worker = newWorker(scheduledTaskService)
 
         val stopFailure = AtomicReference<Throwable?>()
-        val stopper = thread(name = "scheduled-task-stopper") {
+        val stopper = thread(start = false, name = "scheduled-task-stopper") {
             runCatching { worker.requestStop() }.exceptionOrNull()?.let(stopFailure::set)
         }
-        assertTrue(creationGateClosed.await(5, TimeUnit.SECONDS))
 
         val scanFinished = CountDownLatch(1)
         val scanFailure = AtomicReference<Throwable?>()
-        val scanner = thread(name = "scheduled-task-scanner") {
+        val scanner = thread(start = false, name = "scheduled-task-scanner") {
             runCatching { runBlocking { worker.scanAndExecute() } }
                 .exceptionOrNull()
                 ?.let(scanFailure::set)
             scanFinished.countDown()
         }
-        assertTrue(scanReachedAdmission.await(5, TimeUnit.SECONDS))
 
         val createFailure = AtomicReference<Throwable?>()
-        val creator = thread(name = "scheduled-task-late-creator") {
+        val creator = thread(start = false, name = "scheduled-task-late-creator") {
             runCatching {
                 scheduledTaskService.createTask(
                     "late task",
@@ -249,9 +247,14 @@ class ScheduledTaskWorkerTest {
                 )
             }.exceptionOrNull()?.let(createFailure::set)
         }
-        creator.join(5_000)
 
         try {
+            stopper.start()
+            assertTrue(creationGateClosed.await(5, TimeUnit.SECONDS))
+            scanner.start()
+            assertTrue(scanReachedAdmission.await(5, TimeUnit.SECONDS))
+            creator.start()
+            creator.join(5_000)
             assertFalse(creator.isAlive)
             assertTrue(createFailure.get() is IllegalStateException)
             releaseScanToAdmission.countDown()
@@ -263,10 +266,12 @@ class ScheduledTaskWorkerTest {
         } finally {
             releaseScanToAdmission.countDown()
             releaseStop.countDown()
+            stopper.join(5_000)
+            scanner.join(5_000)
+            creator.join(5_000)
         }
 
-        stopper.join(5_000)
-        scanner.join(5_000)
+        assertFalse(creator.isAlive)
         assertFalse(stopper.isAlive)
         assertFalse(scanner.isAlive)
         stopFailure.get()?.let { throw it }

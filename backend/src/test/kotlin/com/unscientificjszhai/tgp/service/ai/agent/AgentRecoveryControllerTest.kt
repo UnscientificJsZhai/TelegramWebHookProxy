@@ -6,6 +6,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -176,10 +177,10 @@ class AgentRecoveryControllerTest {
     fun `superseded non cooperative candidate cannot publish and initialization stays serialized`() = runBlocking {
         val oldGate = CompletableDeferred<Unit>()
         val started = CompletableDeferred<Unit>()
+        val oldClosed = CompletableDeferred<Unit>()
         val active = AtomicInteger()
         val maximumActive = AtomicInteger()
-        val published = mutableListOf<String>()
-        val closed = mutableListOf<Int>()
+        val published = ConcurrentLinkedQueue<String>()
         var created = 0
         val controller = controller(
             create = { Candidate(++created) },
@@ -196,25 +197,36 @@ class AgentRecoveryControllerTest {
                     active.decrementAndGet()
                 }
             },
-            publishWithTarget = { target, _ -> published += target; true },
-            close = { candidate -> closed += candidate.id; completedJob() },
+            publishWithTarget = { target, _ -> published.add(target); true },
+            close = { candidate ->
+                if (candidate.id == 1) oldClosed.complete(Unit)
+                completedJob()
+            },
         )
 
-        controller.replaceTarget("old", AIProvider.GEMINI, 1, resetFailures = true) {}
-        started.await()
-        controller.replaceTarget("new", AIProvider.OPENAI, 2, resetFailures = true) {}
-        oldGate.complete(Unit)
-        withTimeout(5.seconds) { controller.availability.first { it.state == AgentAvailabilityState.READY } }
+        try {
+            controller.replaceTarget("old", AIProvider.GEMINI, 1, resetFailures = true) {}
+            withTimeout(5.seconds) { started.await() }
+            controller.replaceTarget("new", AIProvider.OPENAI, 2, resetFailures = true) {}
+            oldGate.complete(Unit)
+            withTimeout(5.seconds) {
+                controller.availability.first {
+                    it.state == AgentAvailabilityState.READY && it.settingsVersion == 2L
+                }
+                oldClosed.await()
+            }
 
-        assertEquals(listOf("new"), published)
-        assertTrue(1 in closed)
-        assertEquals(1, maximumActive.get())
-        controller.close().join()
+            assertEquals(listOf("new"), published.toList())
+            assertEquals(1, maximumActive.get())
+        } finally {
+            oldGate.complete(Unit)
+            controller.close().join()
+        }
     }
 
     @Test
     fun `two unfinished failed cleanups pause creation of a third candidate`() = runBlocking {
-        val cleanupJobs = mutableMapOf<Int, CompletableDeferred<Unit>>()
+        val cleanupJobs = (1..3).associateWith { CompletableDeferred<Unit>() }
         val createdSignal = Channel<Unit>(Channel.UNLIMITED)
         val cleanupStarted = Channel<Int>(Channel.UNLIMITED)
         val thirdAcquireStarted = CompletableDeferred<Unit>()
@@ -228,29 +240,33 @@ class AgentRecoveryControllerTest {
                 if (candidate.id <= 2) failed(AgentFailureKind.NETWORK) else AgentInitializationResult.Ready
             },
             close = { candidate ->
-                CompletableDeferred<Unit>().also {
-                    cleanupJobs[candidate.id] = it
+                cleanupJobs.getValue(candidate.id).also {
                     check(cleanupStarted.trySend(candidate.id).isSuccess)
                 }
             },
             cleanupPermits = cleanupPermits,
         )
 
-        controller.replaceTarget("target", AIProvider.OPENAI, 1, resetFailures = true) {}
-        repeat(2) { withTimeout(5.seconds) { createdSignal.receive() } }
-        assertEquals(setOf(1, 2), buildSet {
-            repeat(2) { add(withTimeout(5.seconds) { cleanupStarted.receive() }) }
-        })
-        withTimeout(5.seconds) { thirdAcquireStarted.await() }
-        assertEquals(2, created)
+        try {
+            controller.replaceTarget("target", AIProvider.OPENAI, 1, resetFailures = true) {}
+            repeat(2) { withTimeout(5.seconds) { createdSignal.receive() } }
+            assertEquals(setOf(1, 2), buildSet {
+                repeat(2) { add(withTimeout(5.seconds) { cleanupStarted.receive() }) }
+            })
+            withTimeout(5.seconds) { thirdAcquireStarted.await() }
+            assertEquals(2, created)
 
-        cleanupJobs.getValue(1).complete(Unit)
-        withTimeout(5.seconds) { createdSignal.receive() }
-        withTimeout(5.seconds) { controller.availability.first { it.state == AgentAvailabilityState.READY } }
-        assertEquals(3, created)
+            cleanupJobs.getValue(1).complete(Unit)
+            withTimeout(5.seconds) { createdSignal.receive() }
+            withTimeout(5.seconds) { controller.availability.first { it.state == AgentAvailabilityState.READY } }
+            assertEquals(3, created)
 
-        cleanupJobs.getValue(2).complete(Unit)
-        controller.close().join()
+            cleanupJobs.getValue(2).complete(Unit)
+        } finally {
+            cleanupJobs.values.forEach { it.complete(Unit) }
+            controller.close().join()
+        }
+        Unit
     }
 
     @Test

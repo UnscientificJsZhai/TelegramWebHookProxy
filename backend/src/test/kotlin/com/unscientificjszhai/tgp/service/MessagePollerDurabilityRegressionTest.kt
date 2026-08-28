@@ -16,6 +16,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -28,16 +29,15 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
     @Test
     fun `failed lower final commit blocks higher queued update`() = runBlocking {
         val file = tempDirectory.resolve("blocked-higher-agent-update.json")
-        var rejectLowerCompletion = true
+        val rejectLowerCompletion = AtomicBoolean(true)
         val updates = UpdatesRepository(file) { state ->
             val bot = state.bots["100"]
             if (
-                rejectLowerCompletion &&
                 bot?.lastUpdateId == 11L &&
                 bot.pendingTelegramReplies.any { it.updateId == 11L } &&
-                bot.agentTurnJournal.any { it.updateId == 11L && it.reply == "eleven" }
+                bot.agentTurnJournal.any { it.updateId == 11L && it.reply == "eleven" } &&
+                rejectLowerCompletion.compareAndSet(true, false)
             ) {
-                rejectLowerCompletion = false
                 throw IOException("injected lower completion failure")
             }
         }
@@ -71,7 +71,7 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
         fixture.poller.start()
         try {
             withTimeout(2.seconds) { retryStarted.await() }
-            assertFalse(rejectLowerCompletion)
+            assertFalse(rejectLowerCompletion.get())
             assertEquals(10, fixture.updates.getData("100").lastUpdateId)
             coVerify(exactly = 1) { fixture.agent.sendMessage("eleven") }
             coVerify(exactly = 0) { fixture.agent.sendMessage("twelve") }

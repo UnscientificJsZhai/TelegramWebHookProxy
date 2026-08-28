@@ -10,6 +10,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
@@ -35,32 +36,60 @@ class MessagePollerTest {
     }
 
     @Test
-    fun `rapid token restoration after start cancels old long poll and starts a new generation`() = runBlocking {
+    fun `rapid token restoration joins the old long poll before starting a new generation`() = runBlocking {
         val fixture = fixture()
         val oldPollStarted = CompletableDeferred<Unit>()
         val oldPollCancelled = CompletableDeferred<Unit>()
-        val neverCompletes = CompletableDeferred<Unit>()
+        val replacementPollStarted = CompletableDeferred<Unit>()
+        val pollCalls = AtomicInteger()
+        val activePolls = AtomicInteger()
+        val maxActivePolls = AtomicInteger()
+        val replacementObservedCompletedOldSession = AtomicBoolean()
+        lateinit var oldSessionJob: Job
         fixture.saveSettings(AppSettings(telegramToken = "100:A"))
         fixture.updates.saveLastUpdateId("100", 7)
         coEvery { fixture.telegram.getUpdatesForToken("100:A", 8, 30) } coAnswers {
-            oldPollStarted.complete(Unit)
+            val active = activePolls.incrementAndGet()
+            maxActivePolls.updateAndGet { previous -> maxOf(previous, active) }
             try {
-                neverCompletes.await()
-                GetUpdatesResponse(ok = true)
+                when (pollCalls.incrementAndGet()) {
+                    1 -> {
+                        oldPollStarted.complete(Unit)
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            oldPollCancelled.complete(Unit)
+                        }
+                    }
+
+                    2 -> {
+                        replacementObservedCompletedOldSession.set(oldSessionJob.isCompleted)
+                        replacementPollStarted.complete(Unit)
+                        awaitCancellation()
+                    }
+
+                    else -> error("轮询替换完成前出现了意外的额外请求。")
+                }
             } finally {
-                oldPollCancelled.complete(Unit)
+                activePolls.decrementAndGet()
             }
-        } andThen GetUpdatesResponse(ok = true)
+        }
 
         fixture.poller.start()
         try {
             withTimeout(2.seconds) { oldPollStarted.await() }
+            oldSessionJob = currentSession(fixture.poller).scope.coroutineContext.job
             fixture.saveSettings(AppSettings(telegramToken = ""))
             fixture.saveSettings(AppSettings(telegramToken = "100:A"))
-            eventually {
-                assert(oldPollCancelled.isCompleted)
-                coVerify(atLeast = 2) { fixture.telegram.getUpdatesForToken("100:A", 8, 30) }
-            }
+            withTimeout(2.seconds) { oldPollCancelled.await() }
+            withTimeout(2.seconds) { replacementPollStarted.await() }
+            assertTrue(
+                replacementObservedCompletedOldSession.get(),
+                "替代轮询启动前，旧会话根任务必须已经完成。",
+            )
+            assertEquals(1, maxActivePolls.get(), "旧轮询与替代轮询不得同时活跃。")
+            assertEquals(1, activePolls.get(), "替代轮询启动后应当只有一个活跃长轮询。")
+            coVerify(exactly = 2) { fixture.telegram.getUpdatesForToken("100:A", 8, 30) }
             assertEquals(3, fixture.settings.telegramTokenUpdateFlow.value.generation)
             verify(atLeast = 1) { fixture.agent.resetSession() }
         } finally {
@@ -114,16 +143,15 @@ class MessagePollerTest {
     @Test
     fun `final agent turn retries offset commit without reentering agent`() = runBlocking {
         val file = tempDirectory.resolve("retry-final-agent-turn.json")
-        var rejectFirstCompletion = true
+        val rejectFirstCompletion = AtomicBoolean(true)
         val updates = UpdatesRepository(file) { state ->
             val bot = state.bots["100"]
             if (
-                rejectFirstCompletion &&
                 bot?.lastUpdateId == 11L &&
                 bot.pendingTelegramReplies.any { it.updateId == 11L } &&
-                bot.agentTurnJournal.any { it.updateId == 11L && it.reply == "reply" }
+                bot.agentTurnJournal.any { it.updateId == 11L && it.reply == "reply" } &&
+                rejectFirstCompletion.compareAndSet(true, false)
             ) {
-                rejectFirstCompletion = false
                 throw IOException("injected completeAgentUpdate failure")
             }
         }
@@ -148,7 +176,7 @@ class MessagePollerTest {
         fixture.poller.start()
         try {
             eventually {
-                assertFalse(rejectFirstCompletion)
+                assertFalse(rejectFirstCompletion.get())
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                 fixture.updates.getPendingTelegramReplies("100").single().let { reply ->
                     assertEquals(11, reply.updateId)
@@ -228,11 +256,9 @@ class MessagePollerTest {
             withTimeout(2.seconds) { pollStarted.await() }
             val terminatedSession = currentSession(fixture.poller)
             releaseFatalUpdate.complete(Unit)
-            eventually {
-                assertNull(currentSessionOrNull(fixture.poller))
-                coVerify(exactly = 1) { fixture.agent.sendMessage("fatal") }
-            }
             withTimeout(2.seconds) { terminatedSession.scope.coroutineContext.job.join() }
+            assertNull(currentSessionOrNull(fixture.poller))
+            coVerify(exactly = 1) { fixture.agent.sendMessage("fatal") }
             fixture.poller.enqueueUpdateForTesting(
                 Update(
                     12,
@@ -552,7 +578,8 @@ class MessagePollerTest {
 
             resetJob.complete()
             assertEquals("admitted", withTimeout(2.seconds) { admitted.await() })
-            eventually { assertFalse(fixture.barrier.isSwitching) }
+            withTimeout(2.seconds) { fixture.barrier.awaitReady() }
+            assertFalse(fixture.barrier.isSwitching)
         } finally {
             resetJob.complete()
             fixture.poller.closeAndJoin()
