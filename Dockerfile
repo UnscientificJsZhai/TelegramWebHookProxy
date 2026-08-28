@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM bellsoft/liberica-openjdk-debian:21.0.7 AS builder
+FROM --platform=$BUILDPLATFORM bellsoft/liberica-openjdk-debian:26-37 AS builder
 
 WORKDIR /app
 
