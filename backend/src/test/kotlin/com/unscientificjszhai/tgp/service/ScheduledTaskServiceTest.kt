@@ -15,6 +15,7 @@ import java.time.ZoneId
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
@@ -225,24 +226,22 @@ class ScheduledTaskServiceTest {
     fun `precommit samples fresh time only after acquiring the task state lock`() {
         val blockingOperations = BlockingDirectorySyncFileOperations()
         service = ScheduledTaskService(scheduleFile, blockingOperations)
+        val stateLock = serviceStateLock()
         val expectedId = service.createTask("due", 1L, LoopMode.ONCE, "chat-a")
         val expected = service.listTasks().single { it.id == expectedId }
         blockingOperations.blockNextDirectorySync = true
 
         val writerFailure = AtomicReference<Throwable?>()
-        val writer = thread(name = "scheduled-task-lock-holder") {
+        val writer = thread(start = false, name = "scheduled-task-lock-holder") {
             runCatching {
                 service.createTask("writer", Long.MAX_VALUE, LoopMode.ONCE, "chat-a")
             }.exceptionOrNull()?.let(writerFailure::set)
         }
-        assertTrue(blockingOperations.directorySyncEntered.await(5, TimeUnit.SECONDS))
 
-        val precommitStarted = CountDownLatch(1)
         val timeSampled = CountDownLatch(1)
         val precommitFailure = AtomicReference<Throwable?>()
         val precommitted = AtomicReference<ScheduledTask?>()
-        val precommit = thread(name = "scheduled-task-precommit") {
-            precommitStarted.countDown()
+        val precommit = thread(start = false, name = "scheduled-task-precommit") {
             runCatching {
                 service.precommitExecution(expected) {
                     timeSampled.countDown()
@@ -252,25 +251,29 @@ class ScheduledTaskServiceTest {
                 .exceptionOrNull()
                 ?.let(precommitFailure::set)
         }
-        assertTrue(precommitStarted.await(5, TimeUnit.SECONDS))
 
         try {
-            assertFalse(
-                timeSampled.await(200, TimeUnit.MILLISECONDS),
-                "The fresh clock must not be sampled while another persistence transaction owns the state lock.",
+            writer.start()
+            assertTrue(blockingOperations.directorySyncEntered.await(5, TimeUnit.SECONDS))
+            precommit.start()
+            awaitQueuedThread(stateLock, precommit)
+            assertEquals(
+                1L,
+                timeSampled.count,
+                "另一个持久化事务持有状态锁时，不得提前读取新时钟。",
             )
         } finally {
             blockingOperations.releaseDirectorySync.countDown()
+            writer.join(5_000)
+            precommit.join(5_000)
         }
 
-        writer.join(5_000)
-        precommit.join(5_000)
         assertFalse(writer.isAlive)
         assertFalse(precommit.isAlive)
         writerFailure.get()?.let { throw it }
         precommitFailure.get()?.let { throw it }
         assertEquals(expected, precommitted.get())
-        assertTrue(timeSampled.await(0, TimeUnit.MILLISECONDS))
+        assertEquals(0L, timeSampled.count)
     }
 
     private fun newService(
@@ -288,6 +291,23 @@ class ScheduledTaskServiceTest {
                 DefaultAtomicJsonFileOperations.atomicReplace(source, target)
             }
         }
+
+    private fun serviceStateLock(): ReentrantLock =
+        ScheduledTaskService::class.java.getDeclaredField("stateLock").apply { isAccessible = true }
+            .get(service) as ReentrantLock
+
+    private fun awaitQueuedThread(lock: ReentrantLock, queuedThread: Thread) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!lock.hasQueuedThread(queuedThread)) {
+            if (!queuedThread.isAlive) {
+                fail("预提交线程在进入状态锁等待队列前已结束。")
+            }
+            if (System.nanoTime() >= deadline) {
+                fail("等待预提交线程进入状态锁队列超时。")
+            }
+            Thread.yield()
+        }
+    }
 
     private class BlockingDirectorySyncFileOperations :
         AtomicJsonFileOperations by DefaultAtomicJsonFileOperations {

@@ -107,6 +107,7 @@ class DelegatingAgentRecoveryIntegrationTest {
         val parentJob = SupervisorJob(coroutineContext[Job])
         val scope = CoroutineScope(coroutineContext + parentJob)
         var delegating: DelegatingAgentService? = null
+        val release = CompletableDeferred<Unit>()
         try {
             server.start()
             server.enqueue(
@@ -151,7 +152,6 @@ class DelegatingAgentRecoveryIntegrationTest {
             }
 
             val entered = CompletableDeferred<Unit>()
-            val release = CompletableDeferred<Unit>()
             val inFlight = async {
                 delegating.withReadyService { readyService ->
                     entered.complete(Unit)
@@ -161,7 +161,7 @@ class DelegatingAgentRecoveryIntegrationTest {
                     !reset.isCancelled
                 }
             }
-            entered.await()
+            withTimeout(5.seconds) { entered.await() }
 
             settingsChangeCoordinator.replaceSettingsForTest(
                 settingsChangeCoordinator.settingsFlow.value.copy(
@@ -175,11 +175,10 @@ class DelegatingAgentRecoveryIntegrationTest {
 
             release.complete(Unit)
             assertTrue(withTimeout(5.seconds) { inFlight.await() })
-            withTimeout(5.seconds) {
-                while (barrier.isSwitching) delay(10)
-            }
+            withTimeout(5.seconds) { barrier.awaitReady() }
             assertFalse(delegating.isAiFeatureEnabled(settingsChangeCoordinator.settingsFlow.value.ai!!))
         } finally {
+            release.complete(Unit)
             delegating?.close()?.join()
             parentJob.cancelAndJoin()
             server.close()

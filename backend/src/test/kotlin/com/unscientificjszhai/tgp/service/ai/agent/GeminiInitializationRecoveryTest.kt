@@ -26,6 +26,7 @@ class GeminiInitializationRecoveryTest {
         val directory = Files.createTempDirectory("gemini-initialization-recovery").toFile()
         val server = MockWebServer()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
+        var service: GeminiAgentService? = null
         try {
             server.start()
             server.enqueue(
@@ -48,7 +49,7 @@ class GeminiInitializationRecoveryTest {
                     ),
                 ),
             )
-            val service = GeminiAgentService(
+            val candidate = GeminiAgentService(
                 parentScope = scope,
                 settingsChangeCoordinator = settingsChangeCoordinator,
                 skillRepository = SkillRepository.forTesting(File(directory, "skills.json")),
@@ -56,18 +57,18 @@ class GeminiInitializationRecoveryTest {
                 deadlines = AgentExecutionDeadlines(),
                 scheduledTaskService = mockk<ScheduledTaskService>(),
                 baseUrlOverrideForTesting = server.url("/v1beta").toString().trimEnd('/'),
-            )
+            ).also { service = it }
 
-            val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
+            val failed = assertIs<AgentInitializationResult.Failed>(candidate.initializeForPublication())
 
             assertEquals(AgentFailureKind.UPSTREAM_HTTP, failed.failure.kind)
             assertEquals(RecoveryDisposition.RETRY, failed.failure.disposition)
             assertEquals(503, failed.failure.httpStatus)
             assertFalse(failed.toString().contains("gemini-response-body-secret"))
             assertFalse(failed.toString().contains(apiKey))
-            service.close().join()
         } finally {
-            scope.coroutineContext[Job]?.cancel()
+            service?.close()?.join()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             server.close()
             directory.deleteRecursively()
         }

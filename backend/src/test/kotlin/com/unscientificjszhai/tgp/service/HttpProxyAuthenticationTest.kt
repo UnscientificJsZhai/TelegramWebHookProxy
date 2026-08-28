@@ -44,12 +44,14 @@ class HttpProxyAuthenticationTest {
             assertEquals(200, response.code)
             assertEquals("proxied", response.body.string())
         }
-        assertNull(assertNotNull(proxyServer.takeRequest()).headers["Proxy-Authorization"])
+        assertNull(
+            assertNotNull(proxyServer.takeRequest(5, TimeUnit.SECONDS)).headers["Proxy-Authorization"],
+        )
         assertEquals(
             Credentials.basic("user", "password"),
-            assertNotNull(proxyServer.takeRequest()).headers["Proxy-Authorization"]
+            assertNotNull(proxyServer.takeRequest(5, TimeUnit.SECONDS)).headers["Proxy-Authorization"],
         )
-        assertNull(proxyServer.takeRequest(200, TimeUnit.MILLISECONDS))
+        assertEquals(2, proxyServer.requestCount)
     }
 
     /** 验证 HTTP 代理收到一次 407 后携带 Basic 凭据重试，重复挑战时停止重试。 */

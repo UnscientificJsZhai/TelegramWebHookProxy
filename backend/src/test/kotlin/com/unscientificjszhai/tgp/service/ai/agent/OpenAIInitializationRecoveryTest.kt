@@ -11,6 +11,7 @@ import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -28,6 +29,7 @@ class OpenAIInitializationRecoveryTest {
         val directory = Files.createTempDirectory("openai-initialization-recovery").toFile()
         val server = MockWebServer()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
+        var service: OpenAIAgentService? = null
         try {
             server.start()
             server.enqueue(
@@ -54,15 +56,15 @@ class OpenAIInitializationRecoveryTest {
                 ),
             )
             val skillRepository = SkillRepository.forTesting(File(directory, "skills.json"))
-            val service = OpenAIAgentService(
+            val candidate = OpenAIAgentService(
                 scope,
                 settingsChangeCoordinator,
                 skillRepository,
                 MCPClientService(scope),
                 scheduledTaskService = mockk(),
-            )
+            ).also { service = it }
 
-            val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
+            val failed = assertIs<AgentInitializationResult.Failed>(candidate.initializeForPublication())
 
             assertEquals(AgentFailureKind.RATE_LIMITED, failed.failure.kind)
             assertEquals(RecoveryDisposition.RETRY, failed.failure.disposition)
@@ -71,9 +73,9 @@ class OpenAIInitializationRecoveryTest {
             assertFalse(failed.toString().contains("response-body-secret"))
             assertFalse(failed.toString().contains(apiKey))
             assertFalse(failed.toString().contains(baseUrl))
-            service.close().join()
         } finally {
-            scope.coroutineContext[Job]?.cancel()
+            service?.close()?.join()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             server.close()
             directory.deleteRecursively()
         }
@@ -84,6 +86,7 @@ class OpenAIInitializationRecoveryTest {
         val directory = Files.createTempDirectory("openai-empty-model-recovery").toFile()
         val server = MockWebServer()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
+        var service: OpenAIAgentService? = null
         try {
             server.start()
             server.enqueue(
@@ -107,21 +110,21 @@ class OpenAIInitializationRecoveryTest {
                     ),
                 ),
             )
-            val service = OpenAIAgentService(
+            val candidate = OpenAIAgentService(
                 scope,
                 settingsChangeCoordinator,
                 SkillRepository.forTesting(File(directory, "skills.json")),
                 MCPClientService(scope),
                 scheduledTaskService = mockk(),
-            )
+            ).also { service = it }
 
-            val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
+            val failed = assertIs<AgentInitializationResult.Failed>(candidate.initializeForPublication())
 
             assertEquals(AgentFailureKind.EMPTY_MODEL_LIST, failed.failure.kind)
             assertEquals(RecoveryDisposition.RETRY_LOW_FREQUENCY, failed.failure.disposition)
-            service.close().join()
         } finally {
-            scope.coroutineContext[Job]?.cancel()
+            service?.close()?.join()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             server.close()
             directory.deleteRecursively()
         }
@@ -132,6 +135,7 @@ class OpenAIInitializationRecoveryTest {
         val directory = Files.createTempDirectory("openai-blank-model-recovery").toFile()
         val server = MockWebServer()
         val scope = CoroutineScope(coroutineContext + SupervisorJob(coroutineContext[Job]))
+        var service: OpenAIAgentService? = null
         try {
             server.start()
             server.enqueue(
@@ -155,21 +159,21 @@ class OpenAIInitializationRecoveryTest {
                     ),
                 ),
             )
-            val service = OpenAIAgentService(
+            val candidate = OpenAIAgentService(
                 scope,
                 settingsChangeCoordinator,
                 SkillRepository.forTesting(File(directory, "skills.json")),
                 MCPClientService(scope),
                 scheduledTaskService = mockk(),
-            )
+            ).also { service = it }
 
-            val failed = assertIs<AgentInitializationResult.Failed>(service.initializeForPublication())
+            val failed = assertIs<AgentInitializationResult.Failed>(candidate.initializeForPublication())
 
             assertEquals(AgentFailureKind.INVALID_RESPONSE, failed.failure.kind)
             assertEquals(RecoveryDisposition.RETRY_LOW_FREQUENCY, failed.failure.disposition)
-            service.close().join()
         } finally {
-            scope.coroutineContext[Job]?.cancel()
+            service?.close()?.join()
+            scope.coroutineContext[Job]?.cancelAndJoin()
             server.close()
             directory.deleteRecursively()
         }
