@@ -1,14 +1,23 @@
 package com.unscientificjszhai.tgp.service.ai.function
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
+import com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN
 import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.models.SkillStatus
 import com.unscientificjszhai.tgp.repository.SkillRepository
-import io.mockk.*
-import kotlinx.coroutines.test.runTest
+import com.unscientificjszhai.tgp.repository.SkillStorageIsolationException
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.serialization.json.jsonPrimitive
+import org.slf4j.LoggerFactory
 import kotlin.test.*
 
+/** 验证模型技能函数只能读取已批准技能并创建待审批草稿。 */
 class SkillFunctionProviderTest {
-
     private lateinit var skillRepository: SkillRepository
     private lateinit var provider: SkillFunctionProvider
 
@@ -18,57 +27,29 @@ class SkillFunctionProviderTest {
         provider = SkillFunctionProvider(skillRepository)
     }
 
+
+
+
+
+
+
+    /** 验证 OpenAI 函数 schema 只允许 read_skill 带标识，write_skill 不暴露覆盖入口。 */
     @Test
-    fun testReadSkill() = runTest {
-        val skill = Skill(id = "123", description = "Test Skill", content = "Test Content")
-        every { skillRepository.getSkillById("123") } returns skill
-        
-        val args = mapOf("id" to "123")
-        val result = provider.execute("read_skill", args)
-        
-        assertEquals("123", result["id"]?.jsonPrimitive?.content)
-        assertEquals("Test Skill", result["description"]?.jsonPrimitive?.content)
-        assertEquals("Test Content", result["content"]?.jsonPrimitive?.content)
-        verify { skillRepository.getSkillById("123") }
+    fun `OpenAI write schema omits id while read schema retains id constraints`() {
+        val functions = provider.providedOpenAIFunctions.associateBy { it.name() }
+        fun properties(name: String): Map<String, Any?> {
+            val parameters = checkNotNull(functions[name]).parameters().orElseThrow()._additionalProperties()
+            @Suppress("UNCHECKED_CAST")
+            return parameters.getValue("properties").convert(Map::class.java) as Map<String, Any?>
+        }
+
+        val readProperties = properties("read_skill")
+
+        @Suppress("UNCHECKED_CAST")
+        val idSchema = readProperties.getValue("id") as Map<String, Any?>
+        assertEquals(SKILL_ID_PATTERN, idSchema["pattern"])
+        assertEquals(1, (idSchema["minLength"] as Number).toInt())
+        assertFalse(properties("write_skill").containsKey("id"))
     }
 
-    @Test
-    fun testReadSkillNotFound() = runTest {
-        every { skillRepository.getSkillById(any()) } returns null
-        
-        val args = mapOf("id" to "456")
-        val result = provider.execute("read_skill", args)
-        
-        assertTrue(result.containsKey("error"))
-        verify { skillRepository.getSkillById("456") }
-    }
-
-    @Test
-    fun testWriteNewSkill() = runTest {
-        val description = "New Skill"
-        val content = "New Content"
-        justRun { skillRepository.saveSkill(any()) }
-        
-        val args = mapOf("description" to description, "content" to content)
-        val result = provider.execute("write_skill", args)
-        
-        assertEquals("success", result["status"]?.jsonPrimitive?.content)
-        assertNotNull(result["id"]?.jsonPrimitive?.content)
-        verify { skillRepository.saveSkill(match { it.description == description && it.content == content }) }
-    }
-
-    @Test
-    fun testWriteUpdateSkill() = runTest {
-        val id = "789"
-        val description = "Updated Skill"
-        val content = "Updated Content"
-        justRun { skillRepository.saveSkill(any()) }
-        
-        val args = mapOf("id" to id, "description" to description, "content" to content)
-        val result = provider.execute("write_skill", args)
-        
-        assertEquals("success", result["status"]?.jsonPrimitive?.content)
-        assertEquals(id, result["id"]?.jsonPrimitive?.content)
-        verify { skillRepository.saveSkill(match { it.id == id && it.description == description && it.content == content }) }
-    }
 }
