@@ -59,7 +59,7 @@ jobs:
           distribution: liberica
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v5
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Run backend tests and build project
         run: ./gradlew build
