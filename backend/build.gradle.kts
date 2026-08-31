@@ -15,8 +15,8 @@ plugins {
 
 version = "1.1.3"
 
-val ktorVersion = "3.4.3"
-val daggerVersion = "2.59.2"
+val ktorVersion = "3.5.2"
+val daggerVersion = "2.60.1"
 
 kotlin {
     jvmToolchain(21)
@@ -36,7 +36,7 @@ dependencies {
     implementation("io.ktor:ktor-server-body-limit-jvm:$ktorVersion")
     implementation("io.ktor:ktor-server-status-pages-jvm:$ktorVersion")
     implementation("io.ktor:ktor-server-config-yaml:$ktorVersion")
-    implementation("ch.qos.logback:logback-classic:1.5.32")
+    implementation("ch.qos.logback:logback-classic:1.6.3")
 
     implementation("io.ktor:ktor-client-core:$ktorVersion")
     implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
@@ -46,21 +46,21 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Gemini SDK
-    implementation("com.google.genai:google-genai:1.53.0") {
+    implementation("com.google.genai:google-genai:1.68.0") {
         exclude(group = "com.fasterxml.jackson.core", module = "jackson-core")
         exclude(group = "commons-codec", module = "commons-codec")
     }
-    implementation("com.fasterxml.jackson.core:jackson-core:2.22.1")
-    implementation("commons-codec:commons-codec:1.19.0")
+    implementation("com.fasterxml.jackson.core:jackson-core:2.22.2")
+    implementation("commons-codec:commons-codec:1.22.1")
 
     // OpenAI SDK
-    implementation("com.openai:openai-java:4.36.0")
+    implementation("com.openai:openai-java:4.52.0")
 
     // AI provider transport.  Requests must retain their native OkHttp Call so coroutine cancellation can abort it.
-    implementation("com.squareup.okhttp3:okhttp:5.3.2")
+    implementation("com.squareup.okhttp3:okhttp:5.5.0")
 
     // MCP SDK
-    implementation("io.modelcontextprotocol:kotlin-sdk:0.10.0")
+    implementation("io.modelcontextprotocol:kotlin-sdk:0.15.0")
 
     implementation("com.google.dagger:dagger:$daggerVersion")
     kapt("com.google.dagger:dagger-compiler:$daggerVersion")
@@ -70,9 +70,9 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-mock:$ktorVersion")
-    testImplementation("com.squareup.okhttp3:mockwebserver3:5.3.2")
-    testImplementation("io.mockk:mockk:1.13.13")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+    testImplementation("com.squareup.okhttp3:mockwebserver3:5.5.0")
+    testImplementation("io.mockk:mockk:1.14.11")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
 }
 
 application {
