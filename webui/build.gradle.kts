@@ -7,7 +7,7 @@ plugins {
 
 node {
     version.set("22.23.2")
-    npmVersion.set("10.9.8")
+    npmVersion.set("11.17.0")
     download.set(true)
 }
 
