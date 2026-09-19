@@ -197,6 +197,12 @@ internal class AgentTurnProcessor(
                     }
                 }
             }
+        } catch (cause: Throwable) {
+            if (cause !is CancellationException && !isRecoverableQueueConsumerFailure(cause)) {
+                // 先停止会话，再发布 Retry；scope 也覆盖 pollJob 尚未完成字段赋值的启动窗口。
+                session.scope.cancel(CancellationException("Queue consumer stopped after fatal error.", cause))
+            }
+            throw cause
         } finally {
             currentWork?.completion?.complete(UpdateCompletion.Retry)
             drainQueuedUpdatesAsRetry(session)

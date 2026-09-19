@@ -276,6 +276,49 @@ class MessagePollerTest {
 
 
     @Test
+    fun `fatal queue error cancels session before publishing retry completion`() = runBlocking {
+        val fixture = fixture()
+        val chat = Chat(id = 123L, type = "private", firstName = "Test")
+        val pollStarted = CompletableDeferred<Unit>()
+        val releaseFatalError = CompletableDeferred<Unit>()
+        fixture.updates.saveLastUpdateId("100", 10)
+        fixture.saveSettings(AppSettings(
+            telegramToken = "100:token",
+            ai = AISettings(agentEnabled = true, agentChatId = "123"),
+        ))
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } coAnswers {
+            pollStarted.complete(Unit)
+            awaitCancellation()
+        }
+        coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
+        coEvery { fixture.agent.sendMessage("fatal") } coAnswers {
+            releaseFatalError.await()
+            throw Error("injected fatal queue failure")
+        }
+        fixture.poller.start()
+        try {
+            withTimeout(2.seconds) { pollStarted.await() }
+            val session = currentSession(fixture.poller)
+            val sessionJob = session.scope.coroutineContext.job
+            val admission = assertIs<UpdateAdmission.Enqueued>(fixture.poller.enqueueUpdateForTesting(
+                Update(11, message = authorizedMessage(1, chat, text = "fatal")),
+            ))
+            val cancelledBeforeCompletion = CompletableDeferred<Boolean>()
+            admission.completion.invokeOnCompletion {
+                cancelledBeforeCompletion.complete(sessionJob.isCancelled)
+            }
+            releaseFatalError.complete(Unit)
+            assertEquals(UpdateCompletion.Retry, withTimeout(2.seconds) { admission.completion.await() })
+            assertTrue(withTimeout(2.seconds) { cancelledBeforeCompletion.await() })
+            withTimeout(2.seconds) { session.scope.coroutineContext.job.join() }
+            assertNull(currentSessionOrNull(fixture.poller))
+        } finally {
+            releaseFatalError.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }
+    }
+
+    @Test
     fun `full queue admission waits for barrier and returns Retry when feedback is rejected`() = runBlocking {
         val fixture = fixture()
         val chat = Chat(id = 123L, type = "private", firstName = "Authorized")
