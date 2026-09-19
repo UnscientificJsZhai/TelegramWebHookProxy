@@ -32,8 +32,8 @@ export const saveVersionedSettings = async <T>(
     };
 };
 
-export const patchVersionedSettings = async <T>(
-    patch: Partial<T>,
+export const patchVersionedSettings = async <T, P = Partial<T>>(
+    patch: P,
     etag: string | null
 ): Promise<VersionedSettings<T>> => {
     if (!etag) {

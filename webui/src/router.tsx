@@ -1,52 +1,24 @@
 /* eslint-disable react-refresh/only-export-components */
-import {createBrowserRouter} from 'react-router-dom';
+import {createBrowserRouter, Navigate} from 'react-router-dom';
 import {lazy, Suspense} from 'react';
+import {Box, CircularProgress} from '@mui/material';
 import Layout from './components/Layout';
 import ErrorPage from './pages/ErrorPage';
-import {Box, CircularProgress} from '@mui/material';
 
 const Home = lazy(() => import('./pages/Home'));
 const Settings = lazy(() => import('./pages/Settings'));
-const Skill = lazy(() => import('./pages/Skill'));
+const Agent = lazy(() => import('./pages/Agent'));
+const Webhook = lazy(() => import('./pages/Webhook'));
+const Loading = () => <Box role="status" aria-label="正在加载页面"
+                           sx={{display: 'grid', placeItems: 'center', minHeight: 240}}><CircularProgress/></Box>;
 
-const Loading = () => (
-    <Box sx={{display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%', minHeight: '200px'}}>
-        <CircularProgress/>
-    </Box>
-);
-
-const router = createBrowserRouter([
-    {
-        path: "/",
-        element: <Layout/>,
-        errorElement: <ErrorPage/>,
-        children: [
-            {
-                index: true,
-                element: (
-                    <Suspense fallback={<Loading/>}>
-                        <Home/>
-                    </Suspense>
-                ),
-            },
-            {
-                path: "settings",
-                element: (
-                    <Suspense fallback={<Loading/>}>
-                        <Settings/>
-                    </Suspense>
-                ),
-            },
-            {
-                path: "skill",
-                element: (
-                    <Suspense fallback={<Loading/>}>
-                        <Skill/>
-                    </Suspense>
-                ),
-            },
-        ],
-    },
-]);
-
-export default router;
+export default createBrowserRouter([{
+    path: '/', element: <Layout/>, errorElement: <ErrorPage/>,
+    children: [
+        {index: true, element: <Suspense fallback={<Loading/>}><Home/></Suspense>},
+        {path: 'settings', element: <Suspense fallback={<Loading/>}><Settings/></Suspense>},
+        {path: 'agent', element: <Suspense fallback={<Loading/>}><Agent/></Suspense>},
+        {path: 'webhook', element: <Suspense fallback={<Loading/>}><Webhook/></Suspense>},
+        {path: 'skill', element: <Navigate to="/agent#skills" replace/>},
+    ],
+}]);

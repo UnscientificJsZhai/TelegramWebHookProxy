@@ -1,818 +1,271 @@
-import React, {useEffect, useRef, useState} from 'react';
+import {useRef, useState} from 'react';
 import {
+    Accordion,
+    AccordionDetails,
+    AccordionSummary,
     Alert,
     Box,
     Button,
-    Checkbox,
-    CircularProgress,
+    Chip,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogTitle,
     Divider,
-    FormControl,
     FormControlLabel,
-    Grid,
-    IconButton,
-    InputLabel,
-    MenuItem,
+    List,
+    ListItemButton,
+    ListItemText,
     Paper,
-    Select,
-    type SelectChangeEvent,
-    Snackbar,
+    Radio,
+    RadioGroup,
+    Stack,
+    Switch,
     TextField,
     Typography
 } from '@mui/material';
-import DeleteIcon from '@mui/icons-material/Delete';
-import AddIcon from '@mui/icons-material/Add';
-import {useNavigate} from 'react-router-dom';
-import {fetchVersionedSettings, isSettingsConflict, saveVersionedSettings} from '../settingsClient';
-import {type MCPServerConfig, parseMcpHeaders, validateMcpServers} from './mcpSettingsValidation';
-import {isValidProxyAuthentication, type ProxySettings, type ProxyType, withProxyType} from './proxySettings';
+import KeyOutlined from '@mui/icons-material/KeyOutlined';
+import HubOutlined from '@mui/icons-material/HubOutlined';
+import RouteOutlined from '@mui/icons-material/RouteOutlined';
+import AccountTreeOutlined from '@mui/icons-material/AccountTreeOutlined';
+import SaveOutlined from '@mui/icons-material/SaveOutlined';
+import ExpandMore from '@mui/icons-material/ExpandMore';
+import ArrowDownward from '@mui/icons-material/ArrowDownward';
+import ListAltOutlined from '@mui/icons-material/ListAltOutlined';
+import TuneOutlined from '@mui/icons-material/TuneOutlined';
+import {useSettings} from '../settingsContext';
+import {useChats} from '../useChats';
+import {type AppSettings, utf8Length} from '../settings';
+import {isSettingsConflict, type VersionedSettings} from '../settingsClient';
+import {isValidProxyAuthentication, withProxyType} from './proxySettings';
+import PageHeader from '../components/PageHeader';
+import SectionCard from '../components/SectionCard';
+import SecretField from '../components/SecretField';
+import SettingsGate from '../components/SettingsGate';
+import UnsavedChangesGuard from '../components/UnsavedChangesGuard';
+import {FeedbackSnackbar, type Notice, SettingsConflictDialog} from '../components/Feedback';
 
-interface AISettings {
-    provider: 'GEMINI' | 'OPENAI';
-    geminiApiKey: string;
-    openAiApiKey: string;
-    openAiBaseUrl: string;
-    selectedModel: string;
-    agentEnabled: boolean;
-    agentChatId: string;
-    globalContext: string;
-    autoCleanContextIntervalMinutes: number;
-    silentContextCleanup: boolean;
-    mcpServers: MCPServerConfig[];
-    httpToolSettings: HttpToolSettings;
+export default function Settings() {
+    return <><PageHeader title="服务配置"
+                         description="管理 Telegram Bot 凭据、默认接收目标与网络代理，让每一条消息准确送达。"/><SettingsGate>{snapshot =>
+        <ServiceSettings initial={snapshot}/>}</SettingsGate></>;
 }
 
-interface HttpToolSettings {
-    enabled: boolean;
-    targets: unknown[];
-    requestTimeoutMillis: number;
-    maxConcurrentRequests: number;
-}
-
-interface AppSettings {
-    telegramToken: string;
-    chatId: string;
-    proxy: ProxySettings | null;
-    ai: AISettings | null;
-}
-
-const defaultAiSettings: AISettings = {
-    provider: 'GEMINI',
-    geminiApiKey: '',
-    openAiApiKey: '',
-    openAiBaseUrl: '',
-    selectedModel: '',
-    agentEnabled: false,
-    agentChatId: '',
-    globalContext: '',
-    autoCleanContextIntervalMinutes: 0,
-    silentContextCleanup: false,
-    mcpServers: [],
-    httpToolSettings: {
-        enabled: false,
-        targets: [],
-        requestTimeoutMillis: 10000,
-        maxConcurrentRequests: 2
-    }
-};
-
-const normalizeSettings = (settings: AppSettings): AppSettings => ({
-    ...settings,
-    proxy: settings.proxy ? {
-        ...settings.proxy,
-        username: settings.proxy.username ?? null,
-        password: settings.proxy.password ?? null
-    } : null,
-    ai: settings.ai ? {
-        ...defaultAiSettings,
-        ...settings.ai,
-        mcpServers: settings.ai.mcpServers || [],
-        httpToolSettings: {
-            ...defaultAiSettings.httpToolSettings,
-            ...settings.ai.httpToolSettings
-        }
-    } : null
-});
-
-const Settings: React.FC = () => {
-    const navigate = useNavigate();
-    const [settings, setSettings] = useState<AppSettings | null>(null);
-    const [settingsRevision, setSettingsRevision] = useState<string | null>(null);
+function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
+    const {update, reload, loading} = useSettings();
+    const {chats, error: chatsError, loading: chatsLoading, refresh} = useChats();
+    const [saved, setSaved] = useState(initial);
+    const [draft, setDraft] = useState(initial.settings);
+    const [notice, setNotice] = useState<Notice | null>(null);
     const [saving, setSaving] = useState(false);
-    const savingRef = useRef(false);
-    const [autoCleanIntervalInput, setAutoCleanIntervalInput] = useState('0');
-    const [autoCleanIntervalError, setAutoCleanIntervalError] = useState(false);
-    const [snackbar, setSnackbar] = useState<{
-        open: boolean,
-        message: string,
-        severity: 'success' | 'error' | 'info'
-    } | null>(null);
+    const [conflict, setConflict] = useState(false);
+    const [chooseChat, setChooseChat] = useState(false);
+    const saveLock = useRef(false);
+    const dirty = draft.telegramToken !== saved.settings.telegramToken || draft.chatId !== saved.settings.chatId || JSON.stringify(draft.proxy) !== JSON.stringify(saved.settings.proxy);
+    const tokenError = utf8Length(draft.telegramToken) > 256;
+    const chatError = utf8Length(draft.chatId) > 64;
+    const proxyValid = !draft.proxy || (!!draft.proxy.host.trim() && Number.isInteger(draft.proxy.port) && draft.proxy.port >= 1 && draft.proxy.port <= 65535);
+    const authValid = isValidProxyAuthentication(draft.proxy);
+    const setProxy = (patch: Partial<NonNullable<AppSettings['proxy']>>) => setDraft(previous => ({
+        ...previous,
+        proxy: previous.proxy ? {...previous.proxy, ...patch} : null
+    }));
 
-    useEffect(() => {
-        fetchVersionedSettings<AppSettings>()
-            .then(response => {
-                const normalizedSettings = normalizeSettings(response.settings);
-                const etag = response.etag;
-                setSettings(normalizedSettings);
-                setSettingsRevision(etag);
-                setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
-                setAutoCleanIntervalError(false);
-                if (!etag) {
-                    setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
-                }
-            })
-            .catch(error => {
-                console.error('Failed to fetch settings:', error);
-                setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
-            });
-    }, []);
-
-    const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (!settings) return;
-        const {name, value} = event.target;
-        const [section, field] = name.split('.');
-
-        if (section === 'proxy') {
-            setSettings(prev => {
-                if (!prev || !prev.proxy) return prev;
-                const proxyValue = field === 'port'
-                    ? Number(value)
-                    : ((field === 'username' || field === 'password') && value === '' ? null : value);
-                return {
-                    ...prev,
-                    proxy: {
-                        ...prev.proxy,
-                        [field]: proxyValue
-                    }
-                };
-            });
-        } else if (section === 'ai') {
-            setSettings(prev => {
-                if (!prev) return prev;
-                const ai = prev.ai || defaultAiSettings;
-                if (field === 'autoCleanContextIntervalMinutes') {
-                    setAutoCleanIntervalInput(value);
-                    const valid = /^[1-9]\d*$/.test(value);
-                    setAutoCleanIntervalError((ai.autoCleanContextIntervalMinutes || 0) > 0 && !valid);
-                    return valid ? {
-                        ...prev,
-                        ai: {
-                            ...ai,
-                            autoCleanContextIntervalMinutes: Number.parseInt(value, 10)
-                        }
-                    } : prev;
-                }
-                return {
-                    ...prev,
-                    ai: {
-                        ...ai,
-                        [field]: value
-                    }
-                };
-            });
-        } else {
-            setSettings(prev => ({
-                ...prev!,
-                [name]: value
-            }));
-        }
-    };
-
-    const handleAutoCleanToggle = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (!settings) return;
-        const enabled = event.target.checked;
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            const nextInterval = enabled
-                ? (ai.autoCleanContextIntervalMinutes > 0 ? ai.autoCleanContextIntervalMinutes : 60)
-                : 0;
-            setAutoCleanIntervalInput(String(nextInterval));
-            setAutoCleanIntervalError(false);
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    autoCleanContextIntervalMinutes: nextInterval,
-                    silentContextCleanup: enabled ? ai.silentContextCleanup : false
-                }
-            };
-        });
-    };
-
-    const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (!settings) return;
-        const {name, checked} = event.target;
-        const [section, field] = name.split('.');
-
-        if (section === 'ai') {
-            setSettings(prev => {
-                if (!prev) return prev;
-                const ai = prev.ai || defaultAiSettings;
-                return {
-                    ...prev,
-                    ai: {
-                        ...ai,
-                        [field]: checked
-                    }
-                };
-            });
-        }
-    };
-
-    const handleEnableProxyChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (!settings) return;
-        if (event.target.checked) {
-            setSettings(prev => ({
-                ...prev!,
-                proxy: {
-                    host: '127.0.0.1',
-                    port: 7890,
-                    type: 'HTTP',
-                    username: null,
-                    password: null
-                }
-            }));
-        } else {
-            setSettings(prev => ({
-                ...prev!,
-                proxy: null
-            }));
-        }
-    };
-
-    const handleProxyTypeChange = (event: SelectChangeEvent) => {
-        if (!settings) return;
-        const value = event.target.value as ProxyType;
-        setSettings(prev => {
-            if (!prev || !prev.proxy) return prev;
-            return {
-                ...prev,
-                proxy: withProxyType(prev.proxy, value)
-            };
-        });
-    };
-
-    const handleAiProviderChange = (event: SelectChangeEvent) => {
-        if (!settings) return;
-        const {value} = event.target;
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    provider: value as 'GEMINI' | 'OPENAI'
-                }
-            };
-        });
-    };
-
-    const handleCopyChatId = () => {
-        if (!settings) return;
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    agentChatId: prev.chatId
-                }
-            };
-        });
-    };
-
-    // MCP Server List Handlers
-    const handleAddMCPServer = () => {
-        if (!settings) return;
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            const currentServers = ai.mcpServers || [];
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    mcpServers: [...currentServers, {name: '', url: '', headers: {}}]
-                }
-            };
-        });
-    };
-
-    const handleRemoveMCPServer = (index: number) => {
-        if (!settings) return;
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            const updatedServers = [...(ai.mcpServers || [])];
-            updatedServers.splice(index, 1);
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    mcpServers: updatedServers
-                }
-            };
-        });
-    };
-
-    const handleMCPServerChange = (index: number, field: keyof MCPServerConfig, value: string) => {
-        if (!settings) return;
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            const updatedServers = [...(ai.mcpServers || [])];
-            updatedServers[index] = {...updatedServers[index], [field]: value};
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    mcpServers: updatedServers
-                }
-            };
-        });
-    };
-
-    const handleMCPHeaderChange = (index: number, headerString: string) => {
-        if (!settings) return;
-
-        setSettings(prev => {
-            if (!prev) return prev;
-            const ai = prev.ai || defaultAiSettings;
-            const updatedServers = [...(ai.mcpServers || [])];
-
-            const parsedHeaders = parseMcpHeaders(headerString) ?? updatedServers[index].headers;
-
-            updatedServers[index] = {
-                ...updatedServers[index],
-                headers: parsedHeaders,
-                _headerString: headerString
-            };
-
-            return {
-                ...prev,
-                ai: {
-                    ...ai,
-                    mcpServers: updatedServers
-                }
-            };
-        });
-    };
-
-    const handleSave = async () => {
-        if (!settings || savingRef.current) return;
-        if (!settingsRevision) {
-            setSnackbar({open: true, message: '获取设置失败', severity: 'error'});
-            return;
-        }
-        if ((settings.ai?.autoCleanContextIntervalMinutes || 0) > 0 && autoCleanIntervalError) {
-            setSnackbar({open: true, message: '清理间隔必须是正整数', severity: 'error'});
-            return;
-        }
-        if (!isValidProxyAuthentication(settings.proxy)) {
-            setSnackbar({
-                open: true,
-                message: 'HTTP 代理用户名和密码必须同时填写；SOCKS 代理不支持认证。',
-                severity: 'error'
-            });
-            return;
-        }
-        if (!validateMcpServers(settings.ai?.mcpServers || [])) {
-            setSnackbar({open: true, message: 'MCP 服务器配置不合法，请检查名称、URL 和请求头。', severity: 'error'});
-            return;
-        }
-
-        // 剥离仅用于 UI 的 _headerString 字段
-        const settingsToSave = {
-            ...settings,
-            ai: settings.ai ? {
-                ...settings.ai,
-                mcpServers: settings.ai.mcpServers.map((server) => {
-                    const serverToSave = {...server};
-                    delete serverToSave._headerString;
-                    return serverToSave;
-                })
-            } : null
-        };
-
-        savingRef.current = true;
+    const save = async () => {
+        if (!saved.etag || saveLock.current || tokenError || chatError || !proxyValid || !authValid) return;
+        saveLock.current = true;
         setSaving(true);
         try {
-            const response = await saveVersionedSettings<AppSettings>(settingsToSave, settingsRevision);
-            const normalizedSettings = normalizeSettings(response.settings);
-            const etag = response.etag;
-            setSettings(normalizedSettings);
-            setSettingsRevision(etag);
-            setAutoCleanIntervalInput(String(normalizedSettings.ai?.autoCleanContextIntervalMinutes || 0));
-            setAutoCleanIntervalError(false);
-            setSnackbar({
-                open: true,
-                message: etag ? '设置保存成功！' : '设置已保存，但获取设置修订值失败，请刷新页面',
-                severity: etag ? 'success' : 'error'
-            });
-        } catch (error: unknown) {
-            console.error('Failed to save settings:', error);
-            setSnackbar({
-                open: true,
-                message: isSettingsConflict(error)
-                    ? '配置已被其他操作修改，请刷新页面后重试'
-                    : '保存设置失败',
-                severity: 'error'
-            });
+            const next = await update({
+                telegramToken: draft.telegramToken,
+                chatId: draft.chatId,
+                proxy: draft.proxy
+            }, saved.etag);
+            setSaved(next);
+            setDraft(next.settings);
+            setNotice({message: '服务配置已保存', severity: 'success'});
+        } catch (error) {
+            if (isSettingsConflict(error)) setConflict(true);
+            else setNotice({message: '保存失败，请检查配置内容与服务连接。你的修改已保留。', severity: 'error'});
         } finally {
-            savingRef.current = false;
+            saveLock.current = false;
             setSaving(false);
         }
     };
-
-    const handleCloseSnackbar = () => {
-        setSnackbar(null);
+    const loadLatest = async () => {
+        try {
+            const next = await reload();
+            setSaved(next);
+            setDraft(next.settings);
+            setConflict(false);
+        } catch {
+            setNotice({message: '读取最新配置失败，本地修改已保留。', severity: 'error'});
+        }
     };
 
-    if (!settings) {
-        return <CircularProgress/>;
-    }
-
-    const ai = settings.ai || defaultAiSettings;
-    const autoCleanEnabled = (ai.autoCleanContextIntervalMinutes || 0) > 0;
-
-    return (
-        <Paper elevation={3} sx={{p: 4}}>
-            <Typography variant="h4" gutterBottom>
-                设置
-            </Typography>
-            <Grid container spacing={3}>
-                <Grid size={{xs: 12}}>
-                    <Typography variant="h5" gutterBottom>
-                        基础设置
-                    </Typography>
-                </Grid>
-                <Grid size={{xs: 12}}>
-                    <TextField
-                        fullWidth
-                        label="Telegram Bot令牌"
-                        name="telegramToken"
-                        value={settings.telegramToken}
-                        onChange={handleChange}
-                        variant="outlined"
-                    />
-                </Grid>
-
-                <Grid size={{xs: 12}}>
-                    <Divider sx={{my: 2}}/>
-                    <Typography variant="h5" gutterBottom>
-                        AI 代理设置
-                    </Typography>
-                </Grid>
-
-                <Grid size={{xs: 12}}>
-                    <Box sx={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-                        <FormControlLabel
-                            control={
-                                <Checkbox
-                                    checked={ai.agentEnabled}
-                                    name="ai.agentEnabled"
-                                    onChange={handleCheckboxChange}
-                                />
-                            }
-                            label="启用 AI Agent"
-                        />
-                        {ai.agentEnabled && (
-                            <Button
-                                variant="outlined"
-                                color="secondary"
-                                onClick={() => navigate('/skill')}
-                                size="small"
-                            >
-                                管理技能 (Skill)
-                            </Button>
-                        )}
-                    </Box>
-                </Grid>
-
-                {ai.agentEnabled && (
-                    <>
-                        <Grid size={{xs: 12}}>
-                            <FormControl fullWidth variant="outlined">
-                                <InputLabel>AI 提供商</InputLabel>
-                                <Select
-                                    value={ai.provider || 'GEMINI'}
-                                    onChange={handleAiProviderChange}
-                                    label="AI 提供商"
-                                >
-                                    <MenuItem value={'GEMINI'}>Gemini</MenuItem>
-                                    <MenuItem value={'OPENAI'}>OpenAI (兼容 API)</MenuItem>
-                                </Select>
-                            </FormControl>
-                        </Grid>
-
-                        {(!ai.provider || ai.provider === 'GEMINI') ? (
-                            <Grid size={{xs: 12}}>
-                                <TextField
-                                    fullWidth
-                                    label="Gemini API Key"
-                                    name="ai.geminiApiKey"
-                                    type="password"
-                                    value={ai.geminiApiKey}
-                                    onChange={handleChange}
-                                    inputProps={{maxLength: 512}}
-                                    variant="outlined"
-                                />
-                            </Grid>
-                        ) : (
-                            <>
-                                <Grid size={{xs: 12}}>
-                                    <TextField
-                                        fullWidth
-                                        label="OpenAI API Key"
-                                        name="ai.openAiApiKey"
-                                        type="password"
-                                        value={ai.openAiApiKey}
-                                        onChange={handleChange}
-                                        inputProps={{maxLength: 512}}
-                                        variant="outlined"
-                                    />
-                                </Grid>
-                                <Grid size={{xs: 12}}>
-                                    <TextField
-                                        fullWidth
-                                        label="OpenAI Base URL (可选)"
-                                        name="ai.openAiBaseUrl"
-                                        value={ai.openAiBaseUrl}
-                                        onChange={handleChange}
-                                        inputProps={{maxLength: 2048}}
-                                        variant="outlined"
-                                        placeholder="https://api.openai.com/v1"
-                                        helperText="留空则使用默认地址。可用于配置国内代理或中转接口。"
-                                    />
-                                </Grid>
-                            </>
-                        )}
-
-                        <Grid size={{xs: 12}}>
-                            <Box sx={{display: 'flex', gap: 2, alignItems: 'center'}}>
-                                <TextField
-                                    fullWidth
-                                    label="授权用户私聊 ID"
-                                    name="ai.agentChatId"
-                                    value={ai.agentChatId}
-                                    onChange={handleChange}
-                                    inputProps={{maxLength: 64}}
-                                    variant="outlined"
-                                    helperText="AI 仅处理私聊，且发送者 ID 与 Chat ID 都必须匹配此 ID。默认 Chat ID 仅在它是同一用户的私聊 ID 时可填入。"
-                                />
-                                <Button
-                                    variant="outlined"
-                                    onClick={handleCopyChatId}
-                                    sx={{whiteSpace: 'nowrap', height: 'fit-content', mt: -3}}
-                                >
-                                    填入默认 Chat ID（仅私聊）
-                                </Button>
-                            </Box>
-                        </Grid>
-
-                        <Grid size={{xs: 12}}>
-                            <TextField
-                                fullWidth
-                                label="全局上下文 (系统提示词)"
-                                name="ai.globalContext"
-                                value={ai.globalContext}
-                                onChange={handleChange}
-                                inputProps={{maxLength: 16384}}
-                                variant="outlined"
-                                multiline
-                                rows={4}
-                                helperText="最大 64 KiB（按 UTF-8 字节计）"
-                            />
-                        </Grid>
-
-                        <Grid size={{xs: 12}}>
-                            <Box
-                                sx={{
-                                    display: 'flex',
-                                    flexWrap: 'wrap',
-                                    gap: 3,
-                                    alignItems: 'flex-end'
-                                }}
-                            >
-                                <FormControlLabel
-                                    sx={{pb: '23px'}}
-                                    control={
-                                        <Checkbox
-                                            checked={autoCleanEnabled}
-                                            onChange={handleAutoCleanToggle}
-                                        />
-                                    }
-                                    label="自动清理上下文"
-                                />
-                                <TextField
-                                    label="清理间隔（分钟）"
-                                    name="ai.autoCleanContextIntervalMinutes"
-                                    type="number"
-                                    value={autoCleanIntervalInput}
-                                    onChange={handleChange}
-                                    variant="outlined"
-                                    disabled={!autoCleanEnabled}
-                                    error={autoCleanIntervalError}
-                                    slotProps={{htmlInput: {min: 1, step: 1}}}
-                                    helperText={autoCleanIntervalError ? '请输入正整数' : '关闭开关可停用自动清理'}
-                                    sx={{width: {xs: '100%', sm: 240}}}
-                                />
-                                <FormControlLabel
-                                    sx={{pb: '23px'}}
-                                    control={
-                                        <Checkbox
-                                            checked={ai.silentContextCleanup || false}
-                                            name="ai.silentContextCleanup"
-                                            onChange={handleCheckboxChange}
-                                            disabled={!autoCleanEnabled}
-                                        />
-                                    }
-                                    label="静默清理"
-                                />
-                            </Box>
-                        </Grid>
-
-                        <Grid size={{xs: 12}}>
-                            <Typography variant="h6" gutterBottom>
-                                MCP 服务器配置
-                            </Typography>
-                            {ai.mcpServers?.map((server, index) => (
-                                <Paper key={index} variant="outlined" sx={{p: 2, mb: 2}}>
-                                    <Grid container spacing={2} alignItems="center">
-                                        <Grid size={{xs: 12, md: 3}}>
-                                            <TextField
-                                                fullWidth
-                                                label="名称"
-                                                value={server.name}
-                                                onChange={(e) => handleMCPServerChange(index, 'name', e.target.value)}
-                                                variant="outlined"
-                                                size="small"
-                                            />
-                                        </Grid>
-                                        <Grid size={{xs: 12, md: 4}}>
-                                            <TextField
-                                                fullWidth
-                                                label="URL (SSE 端点)"
-                                                value={server.url}
-                                                onChange={(e) => handleMCPServerChange(index, 'url', e.target.value)}
-                                                variant="outlined"
-                                                size="small"
-                                            />
-                                        </Grid>
-                                        <Grid size={{xs: 12, md: 4}}>
-                                            <TextField
-                                                fullWidth
-                                                label="Headers (使用JSON格式配置请求头)"
-                                                value={server._headerString !== undefined ? server._headerString : JSON.stringify(server.headers || {})}
-                                                onChange={(e) => handleMCPHeaderChange(index, e.target.value)}
-                                                variant="outlined"
-                                                size="small"
-                                                error={!validateMcpServers([{
-                                                    ...server,
-                                                    name: 'header-validation',
-                                                    url: 'https://mcp.example.com'
-                                                }])}
-                                            />
-                                        </Grid>
-                                        <Grid size={{xs: 12, md: 1}} sx={{textAlign: 'center'}}>
-                                            <IconButton color="error" onClick={() => handleRemoveMCPServer(index)}>
-                                                <DeleteIcon/>
-                                            </IconButton>
-                                        </Grid>
-                                    </Grid>
-                                </Paper>
-                            ))}
-                            <Button
-                                variant="outlined"
-                                startIcon={<AddIcon/>}
-                                onClick={handleAddMCPServer}
-                            >
-                                添加 MCP 服务器
-                            </Button>
-                        </Grid>
-                    </>
-                )}
-
-
-                <Grid size={{xs: 12}}>
-                    <Divider sx={{my: 2}}/>
-                    <Typography variant="h5" gutterBottom>
-                        代理设置
-                    </Typography>
-                </Grid>
-                <Grid size={{xs: 12}}>
-                    <FormControlLabel
-                        control={
-                            <Checkbox
-                                checked={!!settings.proxy}
-                                onChange={handleEnableProxyChange}
-                            />
-                        }
-                        label="启用代理"
-                    />
-                </Grid>
-                {settings.proxy && (
-                    <>
-                        <Grid size={{xs: 12, sm: 6}}>
-                            <TextField
-                                fullWidth
-                                label="代理主机"
-                                name="proxy.host"
-                                value={settings.proxy.host}
-                                onChange={handleChange}
-                                variant="outlined"
-                            />
-                        </Grid>
-                        <Grid size={{xs: 12, sm: 6}}>
-                            <TextField
-                                fullWidth
-                                label="代理端口"
-                                name="proxy.port"
-                                type="number"
-                                value={settings.proxy.port}
-                                onChange={handleChange}
-                                variant="outlined"
-                            />
-                        </Grid>
-                        <Grid size={{xs: 12, sm: 6}}>
-                            <FormControl fullWidth variant="outlined">
-                                <InputLabel>代理类型</InputLabel>
-                                <Select
-                                    value={settings.proxy.type}
-                                    onChange={handleProxyTypeChange}
-                                    label="代理类型"
-                                >
-                                    <MenuItem value={'HTTP'}>HTTP</MenuItem>
-                                    <MenuItem value={'SOCKS'}>SOCKS</MenuItem>
-                                </Select>
-                            </FormControl>
-                        </Grid>
-                        {settings.proxy.type === 'SOCKS' && (
-                            <Grid size={{xs: 12}}>
-                                <Typography color="text.secondary" variant="body2">
-                                    SOCKS 代理不支持用户名和密码认证。
-                                </Typography>
-                            </Grid>
-                        )}
-                        <Grid size={{xs: 12, sm: 6}}>
-                            <TextField
-                                fullWidth
-                                label="用户名（可选）"
-                                name="proxy.username"
-                                value={settings.proxy.username || ''}
-                                onChange={handleChange}
-                                variant="outlined"
-                                disabled={settings.proxy.type === 'SOCKS'}
-                            />
-                        </Grid>
-                        <Grid size={{xs: 12, sm: 6}}>
-                            <TextField
-                                fullWidth
-                                label="密码（可选）"
-                                name="proxy.password"
-                                type="password"
-                                value={settings.proxy.password || ''}
-                                onChange={handleChange}
-                                variant="outlined"
-                                disabled={settings.proxy.type === 'SOCKS'}
-                            />
-                        </Grid>
-                    </>
-                )}
-                <Grid size={{xs: 12}}>
-                    <Box mt={2}>
-                        <Button
-                            variant="contained"
-                            color="primary"
-                            onClick={handleSave}
-                            disabled={saving || !settingsRevision}
-                        >
-                            保存设置
-                        </Button>
-                    </Box>
-                    <Box mt={4} textAlign="center">
-                        <Typography variant="body2" color="textSecondary">
-                            当前版本: {__APP_VERSION__}
-                        </Typography>
-                    </Box>
-                </Grid>
-            </Grid>
-            {snackbar && (
-                <Snackbar
-                    open={snackbar.open}
-                    autoHideDuration={6000}
-                    onClose={handleCloseSnackbar}
-                    anchorOrigin={{vertical: 'bottom', horizontal: 'center'}}
-                >
-                    <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{width: '100%'}}>
-                        {snackbar.message}
-                    </Alert>
-                </Snackbar>
-            )}
-        </Paper>
-    );
-};
-
-export default Settings;
+    return <>
+        {!saved.etag && <Alert severity="error" sx={{mb: 2}} action={<Button
+            onClick={() => setConflict(true)}>重新读取</Button>}>未取得配置版本，暂时无法保存。</Alert>}
+        <Box sx={{
+            display: 'grid',
+            gridTemplateColumns: {xs: '1fr', md: 'minmax(0, 1.65fr) minmax(0, 1fr)'},
+            gap: 3,
+            alignItems: 'start'
+        }}>
+            <Box component="form" onSubmit={event => {
+                event.preventDefault();
+                void save();
+            }}>
+                <Stack component="fieldset" disabled={saving} spacing={3} sx={{border: 0, p: 0, m: 0, minWidth: 0}}>
+                    <SectionCard title="Telegram Bot 基础凭据" icon={<KeyOutlined/>}>
+                        <Stack spacing={3}>
+                            <SecretField label="Telegram Bot 令牌" value={draft.telegramToken}
+                                         onChange={event => setDraft({...draft, telegramToken: event.target.value})}
+                                         error={tokenError}
+                                         helperText={tokenError ? '令牌不能超过 256 个 UTF-8 字节' : '从 @BotFather 获取。允许清空保存以停止出站消息。'}/>
+                            <TextField label="默认接收会话 ID" value={draft.chatId}
+                                       onChange={event => setDraft({...draft, chatId: event.target.value})}
+                                       error={chatError}
+                                       helperText={chatError ? 'Chat ID 不能超过 64 个 UTF-8 字节' : '请求未指定 chatId 或为空白时使用。留空时必须在每次请求中指定目标。'}/>
+                            <Button variant="outlined" startIcon={<ListAltOutlined/>}
+                                    onClick={() => setChooseChat(true)}
+                                    sx={{alignSelf: 'flex-start'}}>从已发现会话选择</Button>
+                        </Stack>
+                    </SectionCard>
+                    <SectionCard title="网络代理设置" icon={<HubOutlined/>}>
+                        <Stack spacing={2.5}>
+                            <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
+                                <Box><Typography variant="subtitle2">使用网络代理</Typography><Typography
+                                    variant="caption" color="text.secondary">向 Telegram API
+                                    发起通信时通过代理转发。</Typography></Box>
+                                <Switch checked={!!draft.proxy} onChange={event => setDraft({
+                                    ...draft,
+                                    proxy: event.target.checked ? {
+                                        host: '127.0.0.1',
+                                        port: 7890,
+                                        type: 'HTTP',
+                                        username: null,
+                                        password: null
+                                    } : null
+                                })} slotProps={{input: {'aria-label': '使用网络代理'}}}/>
+                            </Stack>
+                            {draft.proxy ? <>
+                                <Divider/>
+                                <RadioGroup row aria-label="代理类型" value={draft.proxy.type}
+                                            onChange={event => setDraft({
+                                                ...draft,
+                                                proxy: withProxyType(draft.proxy!, event.target.value as 'HTTP' | 'SOCKS')
+                                            })} sx={{gap: 1.5, flexWrap: {xs: 'wrap', sm: 'nowrap'}}}>
+                                    {(['HTTP', 'SOCKS'] as const).map(type => <Paper variant="outlined" key={type} sx={{
+                                        flex: '1 1 180px',
+                                        borderColor: draft.proxy?.type === type ? 'primary.main' : 'divider',
+                                        bgcolor: draft.proxy?.type === type ? 'action.selected' : 'transparent',
+                                        px: 1.5,
+                                        py: 1
+                                    }}><FormControlLabel value={type} control={<Radio size="small"/>}
+                                                         label={<Box><Typography
+                                                             variant="body2">{type} 代理</Typography><Typography
+                                                             variant="caption"
+                                                             color="text.secondary">{type === 'HTTP' ? '支持可选的用户名与密码' : '不支持认证，切换时清空凭据'}</Typography></Box>}
+                                                         sx={{m: 0}}/></Paper>)}
+                                </RadioGroup>
+                                <Stack direction={{xs: 'column', sm: 'row'}} spacing={2}>
+                                    <TextField label="代理主机" value={draft.proxy.host}
+                                               onChange={event => setProxy({host: event.target.value})}
+                                               error={!draft.proxy.host.trim()} placeholder="127.0.0.1"/>
+                                    <TextField label="端口" type="number" value={draft.proxy.port || ''}
+                                               onChange={event => setProxy({port: Number(event.target.value)})}
+                                               slotProps={{htmlInput: {min: 1, max: 65535, step: 1}}}
+                                               error={!Number.isInteger(draft.proxy.port) || draft.proxy.port < 1 || draft.proxy.port > 65535}
+                                               helperText="1–65535"/>
+                                </Stack>
+                                <Stack direction={{xs: 'column', sm: 'row'}} spacing={2}>
+                                    <TextField label="用户名（可选）" value={draft.proxy.username ?? ''}
+                                               onChange={event => setProxy({username: event.target.value || null})}
+                                               disabled={draft.proxy.type === 'SOCKS'} error={!authValid}/>
+                                    <SecretField label="密码（可选）" value={draft.proxy.password ?? ''}
+                                                 onChange={event => setProxy({password: event.target.value || null})}
+                                                 disabled={draft.proxy.type === 'SOCKS'} error={!authValid}/>
+                                </Stack>
+                                <Typography variant="caption"
+                                            color={authValid ? 'text.secondary' : 'error'}>{draft.proxy.type === 'SOCKS' ? 'SOCKS 代理不支持用户名和密码认证。' : 'HTTP 代理的用户名与密码须同时填写，或同时留空。'}</Typography>
+                            </> : <Alert severity="info" variant="outlined">当前将直接连接 Telegram API。</Alert>}
+                        </Stack>
+                    </SectionCard>
+                    <Stack direction={{xs: 'column', sm: 'row'}} alignItems={{sm: 'center'}}
+                           justifyContent="space-between" gap={2}>
+                        <Typography variant="caption"
+                                    color={dirty ? 'primary' : 'text.secondary'}>{dirty ? '有未保存的修改' : '所有修改已保存'}</Typography>
+                        <Stack direction="row" gap={1} justifyContent="flex-end"><Button color="secondary"
+                                                                                         disabled={!dirty || saving}
+                                                                                         onClick={() => setDraft(saved.settings)}>撤销修改</Button><Button
+                            type="submit" variant="contained" startIcon={<SaveOutlined/>}
+                            disabled={!dirty || saving || !saved.etag || tokenError || chatError || !proxyValid || !authValid}>{saving ? '正在保存…' : '保存配置'}</Button></Stack>
+                    </Stack>
+                    <Accordion disableGutters variant="outlined" sx={{'&:before': {display: 'none'}}}>
+                        <AccordionSummary expandIcon={<ExpandMore/>}><Stack direction="row" alignItems="center" gap={1}><TuneOutlined
+                            fontSize="small" color="primary"/><Typography
+                            variant="body2">高级：配置版本与并发控制</Typography></Stack></AccordionSummary>
+                        <AccordionDetails><Typography variant="body2" sx={{mb: 1}}>当前修订 ETag：<Box
+                            component="code">{saved.etag ?? '不可用'}</Box></Typography><Typography variant="body2"
+                                                                                                    color="text.secondary">保存时通过
+                            If-Match
+                            校验配置版本。如果其他管理操作已更新配置，服务器会拒绝过期写入并保留你的草稿。</Typography></AccordionDetails>
+                    </Accordion>
+                </Stack>
+            </Box>
+            <Stack spacing={3}>
+                <SectionCard title="默认目标与消息路由" icon={<RouteOutlined/>}>
+                    <Typography variant="body2" color="text.secondary" sx={{mb: 2}}>调用 POST /api/send-message
+                        时，按以下顺序解析接收目标。</Typography>
+                    <Stack spacing={2.5}>{[
+                        ['请求中指定目标', 'chatId 为非空白字符串时，优先投递至该会话。'],
+                        ['回退至默认目标', 'chatId 缺失、为 null 或空白时，使用已保存的默认接收会话。'],
+                        ['缺省时拒绝发送', '请求与配置都未指定目标时，返回参数错误。'],
+                    ].map(([title, description], index) => <Stack key={title} direction="row" gap={1.5}><Chip
+                        label={index + 1} color="primary" variant="outlined"
+                        sx={{width: 26, flexShrink: 0}}/><Box><Typography
+                        variant="subtitle2">{title}</Typography><Typography variant="body2"
+                                                                            color="text.secondary">{description}</Typography></Box></Stack>)}</Stack>
+                </SectionCard>
+                <SectionCard title="消息转发流程" icon={<AccountTreeOutlined/>}>
+                    <Stack spacing={1} alignItems="center">{[
+                        ['外部请求', 'POST /api/send-message'], ['校验与目标解析', '显式目标 / 默认 Chat ID'], ['网络连接', '直连或 HTTP / SOCKS 代理'], ['Telegram Bot API', 'api.telegram.org'],
+                    ].map(([title, description], index) => <Box key={title}
+                                                                sx={{width: '100%', textAlign: 'center'}}>{index > 0 &&
+                        <ArrowDownward sx={{fontSize: 16, color: 'text.disabled', mb: 1}}/>}<Paper variant="outlined"
+                                                                                                   sx={{
+                                                                                                       py: 1.5,
+                                                                                                       px: 2,
+                                                                                                       bgcolor: 'background.default',
+                                                                                                       borderRadius: 2
+                                                                                                   }}><Typography
+                        variant="subtitle2">{title}</Typography><Typography variant="caption"
+                                                                            color="text.secondary">{description}</Typography></Paper></Box>)}</Stack>
+                    <Typography variant="caption" color="text.secondary"
+                                sx={{display: 'block', mt: 2}}>此图展示转发逻辑，不代表实时连接状态。</Typography>
+                </SectionCard>
+            </Stack>
+        </Box>
+        <Dialog open={chooseChat} onClose={() => setChooseChat(false)} fullWidth maxWidth="sm"
+                aria-labelledby="choose-chat-title">
+            <DialogTitle id="choose-chat-title">选择默认接收目标</DialogTitle><DialogContent>
+            <Typography variant="body2" color="text.secondary"
+                        sx={{mb: 2}}>选择后填入当前草稿，保存配置后生效。</Typography>
+            {chatsError && <Alert severity="error"
+                                  action={<Button onClick={() => void refresh()}>重试</Button>}>{chatsError}</Alert>}
+            <List>{chats.map(chat => <ListItemButton key={chat.id} onClick={() => {
+                setDraft({...draft, chatId: chat.id});
+                setChooseChat(false);
+            }} sx={{borderRadius: 2}}><ListItemText primary={chat.title}
+                                                    secondary={`${chat.id} · ${chat.type}`}/></ListItemButton>)}</List>
+            {!chats.length && <Typography
+                color="text.secondary">{chatsLoading ? '正在读取会话…' : '暂无已发现的会话，可手动输入 Chat ID。'}</Typography>}
+        </DialogContent><DialogActions><Button onClick={() => setChooseChat(false)}>取消</Button></DialogActions>
+        </Dialog>
+        <SettingsConflictDialog open={conflict} busy={loading} onClose={() => setConflict(false)}
+                                onReload={() => void loadLatest()}/>
+        <FeedbackSnackbar notice={notice} onClose={() => setNotice(null)}/>
+        <UnsavedChangesGuard dirty={dirty}/>
+    </>;
+}

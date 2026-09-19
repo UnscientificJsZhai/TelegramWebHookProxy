@@ -1,0 +1,29 @@
+import {describe, expect, it} from 'vitest';
+import {buildAiPatch, DEFAULT_AI_SETTINGS, normalizeSettings} from './settings';
+
+describe('分区配置保存', () => {
+    it('首次创建 AI 配置时补齐默认值，不混入其他分区的草稿', () => {
+        const patch = buildAiPatch(null, {geminiApiKey: 'fictional-key'});
+        expect(patch.ai).toEqual({...DEFAULT_AI_SETTINGS, geminiApiKey: 'fictional-key'});
+        expect(patch).not.toHaveProperty('telegramToken');
+    });
+
+    it('更新现有 AI 配置时仅提交该分区，保留服务端 HTTP 工具和其他配置', () => {
+        const saved = {
+            ...DEFAULT_AI_SETTINGS,
+            httpToolSettings: {...DEFAULT_AI_SETTINGS.httpToolSettings, enabled: true, targets: [{id: 'internal-test'}]}
+        };
+        expect(buildAiPatch(saved, {selectedModel: 'example-model'})).toEqual({ai: {selectedModel: 'example-model'}});
+    });
+
+    it('读取配置时保留 HTTP 工具目标和模型，并规范化代理凭据', () => {
+        const ai = {
+            ...DEFAULT_AI_SETTINGS,
+            selectedModel: 'example-model',
+            httpToolSettings: {...DEFAULT_AI_SETTINGS.httpToolSettings, targets: [{id: 'target'}]}
+        };
+        const settings = normalizeSettings({telegramToken: '', chatId: '', proxy: null, ai});
+        expect(settings.ai).toEqual(ai);
+        expect(settings.proxy).toBeNull();
+    });
+});
