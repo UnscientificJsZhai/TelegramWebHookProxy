@@ -126,7 +126,6 @@ class OpenAIAgentServiceTest {
         assertEquals("gpt-4o", restoredService.currentModel)
     }
 
-
     private fun injectClient(client: OpenAIClient) = injectClient(service, client)
 
     private fun injectClient(target: OpenAIAgentService, client: OpenAIClient) {

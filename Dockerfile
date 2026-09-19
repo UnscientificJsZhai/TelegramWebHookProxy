@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM bellsoft/liberica-openjdk-debian:21.0.7 AS builder
+FROM --platform=$BUILDPLATFORM bellsoft/liberica-openjdk-debian:26-37 AS builder
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ COPY webui webui
 
 RUN ./gradlew build --no-daemon
 
-FROM bellsoft/liberica-openjdk-alpine:21.0.7
+FROM bellsoft/liberica-openjdk-alpine:26-37
 
 WORKDIR /app
 

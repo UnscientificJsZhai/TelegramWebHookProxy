@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.Chat
 import com.unscientificjszhai.tgp.models.GetUpdatesResponse
+import com.unscientificjszhai.tgp.models.InputRichMessage
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.Update
 import io.ktor.http.HttpStatusCode
@@ -191,7 +192,12 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
             "late"
         }
         coEvery {
-            fixture.telegram.sendMessageForToken("100:new", "123", "late", ReplyParameters(1))
+            fixture.telegram.sendRichMessageForToken(
+                "100:new",
+                "123",
+                InputRichMessage(markdown = "late"),
+                ReplyParameters(1)
+            )
         } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
 
         fixture.poller.start()
@@ -214,7 +220,12 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                 coVerify(exactly = 1) { fixture.agent.sendMessage("in-flight") }
                 coVerify {
-                    fixture.telegram.sendMessageForToken("100:new", "123", "late", ReplyParameters(1))
+                    fixture.telegram.sendRichMessageForToken(
+                        "100:new",
+                        "123",
+                        InputRichMessage(markdown = "late"),
+                        ReplyParameters(1)
+                    )
                 }
             }
         } finally {

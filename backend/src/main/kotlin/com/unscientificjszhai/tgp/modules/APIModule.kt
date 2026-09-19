@@ -2,6 +2,8 @@ package com.unscientificjszhai.tgp.modules
 
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
+import com.unscientificjszhai.tgp.models.InputRichMessage
+import com.unscientificjszhai.tgp.models.TelegramRichFormat
 import com.unscientificjszhai.tgp.service.HistoricalInvalidHttpToolConfigurationException
 import com.unscientificjszhai.tgp.service.HistoricalInvalidMcpConfigurationException
 import com.unscientificjszhai.tgp.service.HistoricalInvalidOpenAiBaseUrlConfigurationException
@@ -102,8 +104,24 @@ fun Application.apiModule(
                 }
             }
             route("/send-message") {
-                install(RequestBodyLimit) { bodyLimit { ResourceLimits.SEND_MESSAGE_REQUEST_BYTES } }
+                install(RequestBodyLimit) {
+                    bodyLimit { call ->
+                        val values = call.request.queryParameters.getAll("richformat")
+                        if (values?.size == 1 && TelegramRichFormat.fromWireName(values.single()) != null) {
+                            Long.MAX_VALUE
+                        } else {
+                            ResourceLimits.SEND_MESSAGE_REQUEST_BYTES
+                        }
+                    }
+                }
                 post {
+                    val formats = call.request.queryParameters.getAll("richformat")
+                    val formatValue = formats?.singleOrNull()?.takeUnless(String::isBlank)
+                    val richFormat = formatValue?.let(TelegramRichFormat::fromWireName)
+                    if ((formats != null && formats.size != 1) || (formatValue != null && richFormat == null)) {
+                        call.respondApiInputError("richformat 必须为空或 markdown、html、blocks，且只能指定一次")
+                        return@post
+                    }
                     val messageField = call.singleCustomFieldName("messagefield", "text") ?: return@post
                     val chatIdField = call.singleCustomFieldName("chatidfield", "chatId") ?: return@post
                     if (messageField.utf8Size() > 64 || chatIdField.utf8Size() > 64) {
@@ -112,11 +130,15 @@ fun Application.apiModule(
                     }
 
                     val contentType = call.request.contentType()
-                    val (requestChatId, requestText) = when {
+                    val (requestChatId, requestContent) = when {
                         contentType.match(ContentType.Application.Json) -> {
                             val json = call.readSendMessageJsonObject() ?: return@post
                             val (chatId, text) = try {
-                                json.optionalStringValue(chatIdField) to json.requiredStringValue(messageField)
+                                json.optionalStringValue(chatIdField) to if (richFormat == TelegramRichFormat.BLOCKS) {
+                                    json[messageField].requireRichBlocks()
+                                } else {
+                                    JsonPrimitive(json.requiredStringValue(messageField))
+                                }
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (_: IllegalArgumentException) {
@@ -127,10 +149,23 @@ fun Application.apiModule(
                         }
 
                         contentType.match(ContentType.Application.FormUrlEncoded) -> {
-                            val parameters = call.receiveParameters()
+                            // receiveText 避免表单读取器另设字段体积上限；普通消息仍受路由的 64 KiB 限制。
+                            val parameters = parseQueryString(call.receiveText())
                             val chatId = parameters[chatIdField]
                             val text = parameters[messageField] ?: ""
-                            chatId to text
+                            val content = try {
+                                if (richFormat == TelegramRichFormat.BLOCKS) {
+                                    JsonStructureLimits.parseToJsonElement(strictSettingsJson, text).requireRichBlocks()
+                                } else {
+                                    JsonPrimitive(text)
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                call.respondApiInputError("blocks 必须是非空 JSON 对象数组")
+                                return@post
+                            }
+                            chatId to content
                         }
 
                         else -> {
@@ -139,17 +174,16 @@ fun Application.apiModule(
                         }
                     }
 
-                    if (requestText.utf8Size() > ResourceLimits.SEND_MESSAGE_REQUEST_BYTES ||
-                        (requestChatId?.utf8Size() ?: 0) > 64
-                    ) {
+                    val requestText = (requestContent as? JsonPrimitive)?.content
+                    if ((requestChatId?.utf8Size() ?: 0) > 64) {
                         call.respondApiInputError("消息或聊天标识超过限制")
                         return@post
                     }
-                    if (requestText.isBlank()) {
+                    if (requestText != null && requestText.isBlank()) {
                         call.respondApiInputError("Message text is required")
                         return@post
                     }
-                    if (requestText.length > MAX_TELEGRAM_MESSAGE_TEXT_LENGTH) {
+                    if (richFormat == null && checkNotNull(requestText).length > MAX_TELEGRAM_MESSAGE_TEXT_LENGTH) {
                         call.respondApiInputError("Message text exceeds Telegram's 4096 character limit")
                         return@post
                     }
@@ -161,11 +195,20 @@ fun Application.apiModule(
                             call.respondApiInputError("Chat ID is required")
                             return@post
                         }
-                        val response = telegramService.sendMessageForToken(
-                            snapshot.settings.telegramToken,
-                            chatId,
-                            requestText,
-                        )
+                        val response = if (richFormat == null) {
+                            telegramService.sendMessageForToken(
+                                snapshot.settings.telegramToken,
+                                chatId,
+                                checkNotNull(requestText)
+                            )
+                        } else {
+                            val content = when (richFormat) {
+                                TelegramRichFormat.MARKDOWN -> InputRichMessage(markdown = checkNotNull(requestText))
+                                TelegramRichFormat.HTML -> InputRichMessage(html = checkNotNull(requestText))
+                                TelegramRichFormat.BLOCKS -> InputRichMessage(blocks = requestContent as JsonArray)
+                            }
+                            telegramService.sendRichMessageForToken(snapshot.settings.telegramToken, chatId, content)
+                        }
                         call.respond(response.status, response.body)
                     } catch (e: CancellationException) {
                         throw e
@@ -295,6 +338,11 @@ private fun JsonObject.optionalStringValue(field: String): String? = when (val v
 private fun JsonElement.asStringValue(field: String): String =
     (this as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
         ?: throw IllegalArgumentException("$field must be a JSON string.")
+
+/** 仅验证 blocks 的基本形态，不复制 Telegram 的块类型及字段校验。 */
+private fun JsonElement?.requireRichBlocks(): JsonArray =
+    (this as? JsonArray)?.takeIf { it.isNotEmpty() && it.all { block -> block is JsonObject } }
+        ?: throw IllegalArgumentException("blocks 必须是非空 JSON 对象数组")
 
 private suspend fun ApplicationCall.respondApiInputError(message: String) {
     respond(HttpStatusCode.BadRequest, mapOf("error" to message))

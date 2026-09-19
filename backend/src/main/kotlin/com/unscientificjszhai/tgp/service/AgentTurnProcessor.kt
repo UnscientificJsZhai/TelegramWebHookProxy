@@ -12,6 +12,7 @@ import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -196,6 +197,12 @@ internal class AgentTurnProcessor(
                     }
                 }
             }
+        } catch (cause: Throwable) {
+            if (cause !is CancellationException && !isRecoverableQueueConsumerFailure(cause)) {
+                // 先停止会话，再发布 Retry；scope 也覆盖 pollJob 尚未完成字段赋值的启动窗口。
+                session.scope.cancel(CancellationException("Queue consumer stopped after fatal error.", cause))
+            }
+            throw cause
         } finally {
             currentWork?.completion?.complete(UpdateCompletion.Retry)
             drainQueuedUpdatesAsRetry(session)
@@ -575,7 +582,9 @@ internal class AgentTurnProcessor(
                     val finalized = try {
                         val reply = request.sendWith(readyAgent).takeIf { it.isNotBlank() }
                         withContext(NonCancellable) {
-                            updatesRepository.finalizeAgentTurn(session.botId, updateId, reply)
+                            updatesRepository.finalizeAgentTurn(
+                                session.botId, updateId, reply, reply?.let(TelegramRichTextChunks::plan),
+                            )
                         }
                     } catch (e: CancellationException) {
                         throw e
@@ -676,7 +685,13 @@ internal class AgentTurnProcessor(
         expectedRetryCheckpointTarget: Long?,
     ): UpdateCompletion {
         val reply = entry.reply?.let {
-            PendingTelegramReply(entry.updateId, entry.chatId, it, entry.replyParameters)
+            PendingTelegramReply(
+                entry.updateId,
+                entry.chatId,
+                it,
+                entry.replyParameters,
+                deliveryPlan = entry.deliveryPlan
+            )
         }
         return try {
             val committed = withContext(NonCancellable) {

@@ -1,290 +1,274 @@
-import React, {useCallback, useEffect, useState} from 'react';
+import {useCallback, useEffect, useRef, useState} from 'react';
+import {useLocation} from 'react-router-dom';
 import {
     Alert,
     Box,
     Button,
-    Card,
-    CardActions,
-    CardContent,
     Chip,
-    Container,
+    CircularProgress,
     Dialog,
     DialogActions,
     DialogContent,
     DialogTitle,
-    Grid,
     IconButton,
     Pagination,
     Paper,
-    Snackbar,
+    Stack,
     TextField,
+    Tooltip,
     Typography
 } from '@mui/material';
-import DeleteIcon from '@mui/icons-material/Delete';
-import EditIcon from '@mui/icons-material/Edit';
-import AddIcon from '@mui/icons-material/Add';
-import ArrowBackIcon from '@mui/icons-material/ArrowBack';
-import {useNavigate} from 'react-router-dom';
-import type {Skill, SkillDraft} from '../api';
-import {approveSkill, deleteSkill, getSkills, revokeSkill, saveSkill} from '../api';
+import MenuBookOutlined from '@mui/icons-material/MenuBookOutlined';
+import AddOutlined from '@mui/icons-material/AddOutlined';
+import RefreshOutlined from '@mui/icons-material/RefreshOutlined';
+import {approveSkill, deleteSkill, getSkills, revokeSkill, saveSkill, type Skill} from '../api';
+import {utf8Length} from '../settings';
+import SectionCard from '../components/SectionCard';
+import {ConfirmDialog, FeedbackSnackbar, type Notice} from '../components/Feedback';
 
-const SkillPage: React.FC = () => {
-    const navigate = useNavigate();
-    const [skills, setSkills] = useState<Skill[]>([]);
-    const [open, setOpen] = useState(false);
-    const [currentSkill, setCurrentSkill] = useState<Partial<Skill>>({});
-    const [snackbar, setSnackbar] = useState<{
-        open: boolean,
-        message: string,
-        severity: 'success' | 'error'
-    } | null>(null);
-
-    // Pagination state
-    const [page, setPage] = useState(1);
-    const [total, setTotal] = useState(0);
-    const pageSize = 10;
-
-    const showSnackbar = (message: string, severity: 'success' | 'error') => {
-        setSnackbar({open: true, message, severity});
-    };
-
-    const fetchSkills = useCallback(async () => {
-        try {
-            const data = await getSkills(page, pageSize);
-            setSkills(Array.isArray(data?.items) ? data.items : []);
-            setTotal(data?.total || 0);
-        } catch (error) {
-            console.error('Failed to fetch skills:', error);
-            showSnackbar('加载技能失败', 'error');
-        }
-    }, [page]);
-
-    useEffect(() => {
-        const timeoutId = window.setTimeout(() => {
-            void fetchSkills();
-        }, 0);
-
-        return () => window.clearTimeout(timeoutId);
-    }, [fetchSkills]);
-
-    const handleOpen = (skill?: Skill) => {
-        if (skill) {
-            setCurrentSkill(skill);
-        } else {
-            setCurrentSkill({});
-        }
-        setOpen(true);
-    };
-
-    const handleClose = () => {
-        setOpen(false);
-    };
-
-    const handleSave = async () => {
-        if (!currentSkill.description || !currentSkill.content) {
-            showSnackbar('请填写描述和内容', 'error');
-            return;
-        }
-
-        try {
-            const saved = await saveSkill({
-                id: currentSkill.id,
-                description: currentSkill.description,
-                content: currentSkill.content,
-                revision: currentSkill.revision,
-            } as SkillDraft);
-            showSnackbar(saved.status === 'PENDING' ? '技能已保存为待审批草稿' : '技能保存成功', 'success');
-            handleClose();
-            fetchSkills();
-        } catch (error) {
-            console.error('Failed to save skill:', error);
-            void fetchSkills();
-            showSnackbar('保存技能失败', 'error');
-        }
-    };
-
-    const handleApprove = async (skill: Skill) => {
-        if (!window.confirm('确认批准此技能并允许它进入 Agent 提示词吗？')) return;
-        try {
-            await approveSkill(skill.id, skill.revision);
-            showSnackbar('技能已批准并启用', 'success');
-            fetchSkills();
-        } catch (error) {
-            console.error('Failed to approve skill:', error);
-            void fetchSkills();
-            showSnackbar('批准失败，请刷新后重试', 'error');
-        }
-    };
-
-    const handleRevoke = async (skill: Skill) => {
-        if (!window.confirm('确认撤销此技能吗？它会立即退出 Agent 提示词。')) return;
-        try {
-            await revokeSkill(skill.id, skill.revision);
-            showSnackbar('技能已撤销批准', 'success');
-            fetchSkills();
-        } catch (error) {
-            console.error('Failed to revoke skill:', error);
-            void fetchSkills();
-            showSnackbar('撤销失败，请刷新后重试', 'error');
-        }
-    };
-
-    const handleDelete = async (id: string) => {
-        if (!window.confirm('确定要删除这个技能吗？')) return;
-        try {
-            await deleteSkill(id);
-            showSnackbar('技能删除成功', 'success');
-            // If deleting the last item on the current page, and it's not the first page, go back a page
-            if (skills.length === 1 && page > 1) {
-                setPage(page - 1);
-            } else {
-                fetchSkills();
-            }
-        } catch (error) {
-            console.error('Failed to delete skill:', error);
-            showSnackbar('删除技能失败', 'error');
-        }
-    };
-
-    const handlePageChange = (_event: React.ChangeEvent<unknown>, value: number) => {
-        setPage(value);
-    };
-
-    const totalPages = Math.ceil(total / pageSize);
-
-    return (
-        <Container maxWidth="lg" sx={{mt: 4, mb: 4}}>
-            <Box display="flex" alignItems="center" mb={3}>
-                <IconButton onClick={() => navigate('/settings')} sx={{mr: 2}}>
-                    <ArrowBackIcon/>
-                </IconButton>
-                <Typography variant="h4" component="h1" gutterBottom sx={{mb: 0}}>
-                    技能管理
-                </Typography>
-                <Box flexGrow={1}/>
-                <Button variant="contained" startIcon={<AddIcon/>} onClick={() => handleOpen()}>
-                    新增技能
-                </Button>
-            </Box>
-
-            <Grid container spacing={3}>
-                {skills.map((skill) => (
-                    <Grid size={{xs: 12, sm: 6, md: 4}} key={skill.id}>
-                        <Card elevation={3} sx={{height: '100%', display: 'flex', flexDirection: 'column'}}>
-                            <CardContent sx={{flexGrow: 1}}>
-                                <Typography variant="h6" gutterBottom noWrap>
-                                    {skill.description}
-                                </Typography>
-                                <Chip
-                                    size="small"
-                                    color={skill.status === 'APPROVED' ? 'success' : 'warning'}
-                                    label={skill.status === 'APPROVED' ? '已批准' : '待审批'}
-                                    sx={{mb: 1}}
-                                />
-                                <Typography variant="body2" color="textSecondary" sx={{
-                                    display: '-webkit-box',
-                                    WebkitLineClamp: 3,
-                                    WebkitBoxOrient: 'vertical',
-                                    overflow: 'hidden',
-                                    height: '4.5em'
-                                }}>
-                                    {skill.content}
-                                </Typography>
-                                <Typography variant="caption" color="textDisabled">
-                                    ID: {skill.id} · 版本 {skill.revision}
-                                </Typography>
-                            </CardContent>
-                            <CardActions sx={{justifyContent: 'flex-end'}}>
-                                <IconButton size="small" onClick={() => handleOpen(skill)} color="primary">
-                                    <EditIcon/>
-                                </IconButton>
-                                {skill.status === 'PENDING' ? (
-                                    <Button size="small" color="success"
-                                            onClick={() => handleApprove(skill)}>批准并启用</Button>
-                                ) : (
-                                    <Button size="small" color="warning"
-                                            onClick={() => handleRevoke(skill)}>撤销批准</Button>
-                                )}
-                                <IconButton size="small" onClick={() => handleDelete(skill.id)} color="error">
-                                    <DeleteIcon/>
-                                </IconButton>
-                            </CardActions>
-                        </Card>
-                    </Grid>
-                ))}
-                {skills.length === 0 && (
-                    <Grid size={{xs: 12}}>
-                        <Paper sx={{p: 3, textAlign: 'center'}}>
-                            <Typography color="textSecondary">暂无技能，点击“新增技能”开始创建。</Typography>
-                        </Paper>
-                    </Grid>
-                )}
-            </Grid>
-
-            {totalPages > 1 && (
-                <Box display="flex" justifyContent="center" mt={4}>
-                    <Pagination
-                        count={totalPages}
-                        page={page}
-                        onChange={handlePageChange}
-                        color="primary"
-                    />
-                </Box>
-            )}
-
-            <Dialog open={open} onClose={handleClose} fullWidth maxWidth="md">
-                <DialogTitle>{currentSkill.id ? '编辑技能' : '新增技能'}</DialogTitle>
-                <DialogContent>
-                    {currentSkill.id && (
-                        <Alert severity="warning" sx={{mb: 2}}>
-                            编辑现有技能会将其变为待审批草稿，需再次批准后才会进入 Agent 提示词。
-                        </Alert>
-                    )}
-                    <TextField
-                        autoFocus
-                        margin="dense"
-                        label="描述"
-                        fullWidth
-                        variant="outlined"
-                        value={currentSkill.description || ''}
-                        onChange={(e) => setCurrentSkill({...currentSkill, description: e.target.value})}
-                        inputProps={{maxLength: 256}}
-                        helperText="最多 1 KiB（按 UTF-8 字节计）"
-                        sx={{mb: 2}}
-                    />
-                    <TextField
-                        margin="dense"
-                        label="内容"
-                        fullWidth
-                        variant="outlined"
-                        multiline
-                        rows={10}
-                        value={currentSkill.content || ''}
-                        onChange={(e) => setCurrentSkill({...currentSkill, content: e.target.value})}
-                        inputProps={{maxLength: 16384}}
-                        helperText="最多 64 KiB（按 UTF-8 字节计）"
-                    />
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={handleClose}>取消</Button>
-                    <Button onClick={handleSave} variant="contained">保存为待审批草稿</Button>
-                </DialogActions>
-            </Dialog>
-
-            {snackbar && (
-                <Snackbar
-                    open={snackbar.open}
-                    autoHideDuration={6000}
-                    onClose={() => setSnackbar(null)}
-                    anchorOrigin={{vertical: 'bottom', horizontal: 'center'}}
-                >
-                    <Alert severity={snackbar.severity} sx={{width: '100%'}}>
-                        {snackbar.message}
-                    </Alert>
-                </Snackbar>
-            )}
-        </Container>
-    );
+// 后端每页最多 50 项，技能总量最多 64 项；读取完整目录后进行本地状态筛选。
+const fetchCatalog = async (): Promise<Skill[]> => {
+    const first = await getSkills(1, 50);
+    if (first.total <= 50) return first.items;
+    const second = await getSkills(2, 50);
+    return [...first.items, ...second.items];
 };
 
-export default SkillPage;
+export default function SkillCatalog({onEditingChange}: { onEditingChange: (editing: boolean) => void }) {
+    const {hash} = useLocation();
+    const [skills, setSkills] = useState<Skill[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(false);
+    const [filter, setFilter] = useState<'ALL' | Skill['status']>('ALL');
+    const [page, setPage] = useState(1);
+    const [editor, setEditor] = useState<Partial<Skill> | null>(null);
+    const [conflict, setConflict] = useState(false);
+    const [action, setAction] = useState<{ kind: 'approve' | 'revoke' | 'delete'; skill: Skill } | null>(null);
+    const [discardAction, setDiscardAction] = useState<'close' | 'reload' | null>(null);
+    const [busy, setBusy] = useState(false);
+    const [notice, setNotice] = useState<Notice | null>(null);
+    const lock = useRef(false);
+    const editing = editor !== null;
+    useEffect(() => {
+        onEditingChange(editing);
+    }, [editing, onEditingChange]);
+    const load = useCallback(() => fetchCatalog()
+        .then(next => {
+            setSkills(next);
+            return next;
+        }).catch(() => {
+            setError(true);
+            return null;
+        }).finally(() => {
+            setLoading(false);
+        }), []);
+    const refresh = useCallback(() => {
+        setLoading(true);
+        setError(false);
+        return load();
+    }, [load]);
+    useEffect(() => {
+        void load();
+    }, [load]);
+    useEffect(() => {
+        if (!loading && hash === '#skills') document.getElementById('skills')?.scrollIntoView({block: 'start'});
+    }, [hash, loading]);
+    const filtered = skills.filter(skill => filter === 'ALL' || skill.status === filter);
+    const pages = Math.max(1, Math.ceil(filtered.length / 5));
+    const currentPage = Math.min(page, pages);
+    const descriptionBytes = utf8Length(editor?.description ?? '');
+    const contentBytes = utf8Length(editor?.content ?? '');
+    const validDraft = !!editor?.description?.trim() && !!editor?.content?.trim() && descriptionBytes <= 1024 && contentBytes <= 65536;
+    const showError = (error: unknown) => {
+        const status = (error as { response?: { status?: number } })?.response?.status;
+        if (status === 409 && editor) setConflict(true);
+        setNotice({
+            message: status === 409 ? '技能版本或状态已更新，请读取最新版本。当前草稿已保留。' : '操作失败，请检查内容或稍后重试。',
+            severity: 'error'
+        });
+    };
+    const save = async () => {
+        if (!editor || !validDraft || lock.current || conflict) return;
+        lock.current = true;
+        setBusy(true);
+        try {
+            await saveSkill({
+                id: editor.id,
+                description: editor.description!,
+                content: editor.content!,
+                revision: editor.revision
+            });
+            setEditor(null);
+            setNotice({message: '技能已保存为待审批草稿', severity: 'success'});
+            await refresh();
+        } catch (error) {
+            showError(error);
+        } finally {
+            lock.current = false;
+            setBusy(false);
+        }
+    };
+    const transition = async () => {
+        if (!action || lock.current) return;
+        lock.current = true;
+        setBusy(true);
+        try {
+            if (action.kind === 'approve') await approveSkill(action.skill.id, action.skill.revision);
+            else if (action.kind === 'revoke') await revokeSkill(action.skill.id, action.skill.revision);
+            else await deleteSkill(action.skill.id);
+            setNotice({
+                message: action.kind === 'approve' ? '技能已批准，可供 Agent 读取' : action.kind === 'revoke' ? '已撤销批准，技能不再提供给 Agent' : '技能已删除',
+                severity: 'success'
+            });
+            setAction(null);
+            await refresh();
+        } catch (error) {
+            showError(error);
+            setAction(null);
+            await refresh();
+        } finally {
+            lock.current = false;
+            setBusy(false);
+        }
+    };
+    const discard = async () => {
+        if (discardAction === 'reload') {
+            const latest = await refresh();
+            if (latest) {
+                const skill = latest.find(item => item.id === editor?.id);
+                if (skill) {
+                    setEditor(skill);
+                    setConflict(false);
+                } else {
+                    setEditor(null);
+                    setNotice({message: '此技能已被删除', severity: 'info'});
+                }
+            }
+        } else setEditor(null);
+        setDiscardAction(null);
+    };
+
+    return <>
+        <SectionCard id="skills" title="技能管理" icon={<MenuBookOutlined/>}
+                     action={<Stack direction="row"><Tooltip title="刷新技能"><IconButton size="small"
+                                                                                          aria-label="刷新技能"
+                                                                                          disabled={loading || busy}
+                                                                                          onClick={() => void refresh()}><RefreshOutlined
+                         fontSize="small"/></IconButton></Tooltip><Button size="small" startIcon={<AddOutlined/>}
+                                                                          disabled={loading || busy || skills.length >= 64}
+                                                                          onClick={() => {
+                                                                              setEditor({description: '', content: ''});
+                                                                              setConflict(false);
+                                                                          }}>新增技能</Button></Stack>}>
+            <Typography variant="body2" color="text.secondary" sx={{mb: 2}}>供 Agent
+                读取的提示词指令集。新建或编辑后进入待审批状态，经人工批准后生效。</Typography>
+            <Stack direction="row" sx={{
+                gap: 1,
+                mb: 2,
+                flexWrap: 'wrap'
+            }}>{([['ALL', '全部'], ['PENDING', '待审批'], ['APPROVED', '已批准']] as const).map(([value, label]) =>
+                <Chip key={value}
+                      label={`${label} ${value === 'ALL' ? skills.length : skills.filter(skill => skill.status === value).length}`}
+                      color={filter === value ? 'primary' : 'default'}
+                      variant={filter === value ? 'filled' : 'outlined'} aria-pressed={filter === value}
+                      onClick={() => {
+                          setFilter(value);
+                          setPage(1);
+                      }}/>)}</Stack>
+            {error && <Alert severity="error" sx={{mb: 2}}
+                             action={<Button onClick={() => void refresh()}>重试</Button>}>无法加载技能目录。</Alert>}
+            {loading ?
+                <Box sx={{py: 4, textAlign: 'center'}}><CircularProgress size={24} aria-label="正在加载技能"/></Box> :
+                <Stack spacing={2}>
+                    {filtered.slice((currentPage - 1) * 5, currentPage * 5).map(skill => <Paper key={skill.id}
+                                                                                                variant="outlined" sx={{
+                        p: 2,
+                        borderRadius: 2
+                    }}>
+                        <Stack direction="row"
+                               sx={{
+                                   alignItems: 'flex-start',
+                                   justifyContent: 'space-between',
+                                   gap: 1,
+                                   mb: 1
+                               }}><Typography variant="subtitle2"
+                                              sx={{overflowWrap: 'anywhere'}}>{skill.description}</Typography><Chip
+                            label={skill.status === 'APPROVED' ? '已批准' : '待审批'}
+                            color={skill.status === 'APPROVED' ? 'success' : 'warning'} variant="outlined"
+                            sx={{flexShrink: 0}}/></Stack>
+                        <Typography variant="caption" color="text.secondary"
+                                    sx={{overflowWrap: 'anywhere'}}>ID: {skill.id} ·
+                            修订号 {skill.revision}</Typography>
+                        <Typography variant="body2" color="text.secondary" sx={{
+                            my: 1.5,
+                            p: 1.5,
+                            bgcolor: 'background.default',
+                            borderRadius: 1,
+                            whiteSpace: 'pre-wrap',
+                            overflowWrap: 'anywhere',
+                            display: '-webkit-box',
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: 'vertical',
+                            overflow: 'hidden'
+                        }}>{skill.content}</Typography>
+                        <Stack direction="row" sx={{justifyContent: 'flex-end', flexWrap: 'wrap', gap: 0.5}}>
+                            <Button size="small" disabled={busy} onClick={() => setAction({
+                                kind: skill.status === 'PENDING' ? 'approve' : 'revoke',
+                                skill
+                            })}>{skill.status === 'PENDING' ? '批准供 Agent 读取' : '撤销批准'}</Button>
+                            <Button size="small" color="secondary" disabled={busy} onClick={() => {
+                                setEditor({...skill});
+                                setConflict(false);
+                            }}>编辑</Button>
+                            <Button size="small" color="error" disabled={busy}
+                                    onClick={() => setAction({kind: 'delete', skill})}>删除</Button>
+                        </Stack>
+                    </Paper>)}
+                    {!filtered.length &&
+                        <Box sx={{py: 3, textAlign: 'center', color: 'text.secondary'}}><MenuBookOutlined
+                            sx={{fontSize: 32, mb: 1}}/><Typography
+                            variant="body2">{skills.length ? '没有此状态的技能' : '创建你的第一个技能'}</Typography><Typography
+                            variant="caption">将常用的处理流程保存为提示词指令。</Typography></Box>}
+                </Stack>}
+            {pages > 1 &&
+                <Pagination count={pages} page={currentPage} onChange={(_, value) => setPage(value)} color="primary"
+                            size="small" sx={{mt: 2}}/>}
+            <Typography variant="caption" color="text.secondary" sx={{display: 'block', mt: 2}}>最多 64
+                项。编辑已批准技能后，需要重新审批。</Typography>
+        </SectionCard>
+        <Dialog open={!!editor} onClose={busy ? undefined : () => setDiscardAction('close')} fullWidth maxWidth="md"
+                aria-labelledby="skill-editor-title">
+            <DialogTitle id="skill-editor-title">{editor?.id ? '编辑提示词技能' : '新增提示词技能'}</DialogTitle>
+            <DialogContent><Stack spacing={2.5} sx={{pt: 1}}>
+                {conflict && <Alert severity="warning" action={<Button disabled={busy}
+                                                                       onClick={() => setDiscardAction('reload')}>读取最新版本</Button>}>此技能已被其他操作修改。草稿已保留，重新载入后才能继续保存。</Alert>}
+                <TextField autoFocus label="技能描述" value={editor?.description ?? ''} disabled={busy}
+                           onChange={event => setEditor(previous => ({...previous, description: event.target.value}))}
+                           error={descriptionBytes > 1024}
+                           helperText={`${descriptionBytes.toLocaleString()} / 1,024 字节`}/>
+                <TextField label="提示词指令内容" value={editor?.content ?? ''} disabled={busy}
+                           onChange={event => setEditor(previous => ({...previous, content: event.target.value}))}
+                           multiline minRows={8} maxRows={16} error={contentBytes > 65536}
+                           helperText={`${contentBytes.toLocaleString()} / 65,536 字节，按 UTF-8 计数`}/>
+                <Alert severity="info">保存后将进入待审批状态，需人工批准后才会供 Agent 读取。</Alert>
+            </Stack></DialogContent>
+            <DialogActions><Button disabled={busy} onClick={() => setDiscardAction('close')}>取消</Button><Button
+                variant="contained" onClick={() => void save()}
+                disabled={!validDraft || busy || conflict}>{busy ? '正在保存…' : '保存为待审批草稿'}</Button></DialogActions>
+        </Dialog>
+        <ConfirmDialog open={!!action}
+                       title={action?.kind === 'approve' ? '批准此技能？' : action?.kind === 'revoke' ? '撤销技能批准？' : '删除此技能？'}
+                       danger={action?.kind === 'delete'} busy={busy}
+                       confirmLabel={action?.kind === 'approve' ? '批准并启用' : action?.kind === 'revoke' ? '撤销批准' : '删除技能'}
+                       onClose={() => setAction(null)} onConfirm={() => void transition()}>
+            <Typography
+                sx={{mb: 1}}>{action?.skill.description}</Typography>{action?.kind === 'approve' ? '批准后，此技能的完整内容将提供给 Agent 读取。请先通过编辑查看并审核提示词。' : action?.kind === 'revoke' ? '撤销后，此技能将立即退出 Agent 提示词。' : '删除后将无法恢复此技能。'}
+        </ConfirmDialog>
+        <ConfirmDialog open={!!discardAction}
+                       title={discardAction === 'reload' ? '用服务端版本覆盖草稿？' : '放弃技能草稿？'}
+                       confirmLabel={discardAction === 'reload' ? '读取并覆盖' : '放弃草稿'} busy={loading}
+                       onClose={() => setDiscardAction(null)}
+                       onConfirm={() => void discard()}>当前编辑器中未保存的内容将丢失。</ConfirmDialog>
+        <FeedbackSnackbar notice={notice} onClose={() => setNotice(null)}/>
+    </>;
+}

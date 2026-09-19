@@ -6,8 +6,8 @@ plugins {
 }
 
 node {
-    version.set("22.12.0")
-    npmVersion.set("10.2.4")
+    version.set("22.23.2")
+    npmVersion.set("11.17.0")
     download.set(true)
 }
 
@@ -28,12 +28,14 @@ val generateLicenses by tasks.registering(NpxTask::class) {
 
     command.set("license-checker")
 
-    args.set(listOf(
-        "--production",
-        "--customPath", layout.projectDirectory.file("license-checker.json").asFile.absolutePath,
-        "--csv",
-        "--out", licenseDir.get().file("frontend-licenses.txt").asFile.absolutePath
-    ))
+    args.set(
+        listOf(
+            "--production",
+            "--customPath", layout.projectDirectory.file("license-checker.json").asFile.absolutePath,
+            "--csv",
+            "--out", licenseDir.get().file("frontend-licenses.txt").asFile.absolutePath
+        )
+    )
 
     inputs.file("package.json")
     inputs.file("package-lock.json")

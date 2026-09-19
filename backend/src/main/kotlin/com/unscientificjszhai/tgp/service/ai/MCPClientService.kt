@@ -61,7 +61,7 @@ class MCPClientService internal constructor(
         deadlines,
         {
             Client(
-                Implementation(name = "telegram-webhook-proxy", version = "1.1.3"),
+                Implementation(name = "telegram-webhook-proxy", version = "1.2.0"),
             )
         },
     )

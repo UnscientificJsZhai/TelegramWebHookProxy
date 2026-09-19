@@ -267,6 +267,22 @@ class TelegramService private constructor(
         }
     }
 
+    /** 使用调用开始前捕获的 token 和既有客户端租约发送富消息。 */
+    internal suspend fun sendRichMessageForToken(
+        token: String,
+        chatId: String,
+        richMessage: InputRichMessage,
+        replyParameters: ReplyParameters? = null,
+    ): TelegramApiResponse {
+        requireTelegramToken(token)
+        return withClientLease { client ->
+            client.post("https://api.telegram.org/bot$token/sendRichMessage") {
+                contentType(ContentType.Application.Json)
+                setBody(SendTelegramRichMessageRequest(chatId, richMessage, replyParameters))
+            }.toTelegramApiResponse()
+        }
+    }
+
     /** 供轮询会话使用，以会话捕获的 token 发送聊天动作。 */
     internal suspend fun sendChatActionForToken(
         token: String,

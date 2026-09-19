@@ -499,19 +499,20 @@ class MessagePollerAgentRecoveryTest {
             ),
         )
         private val availabilityCollectCycles = MutableStateFlow(0)
-        override val availability: StateFlow<AgentAvailabilitySnapshot> = object : StateFlow<AgentAvailabilitySnapshot> {
-            override val value: AgentAvailabilitySnapshot
-                get() = mutableAvailability.value
+        override val availability: StateFlow<AgentAvailabilitySnapshot> =
+            object : StateFlow<AgentAvailabilitySnapshot> {
+                override val value: AgentAvailabilitySnapshot
+                    get() = mutableAvailability.value
 
-            override val replayCache: List<AgentAvailabilitySnapshot>
-                get() = mutableAvailability.replayCache
+                override val replayCache: List<AgentAvailabilitySnapshot>
+                    get() = mutableAvailability.replayCache
 
-            override suspend fun collect(collector: FlowCollector<AgentAvailabilitySnapshot>): Nothing {
-                // awaitAgentAvailabilityChange 每处理一个非终态都会重新调用 first；周期计数证明其已进入下一轮等待。
-                availabilityCollectCycles.value += 1
-                return mutableAvailability.collect(collector)
+                override suspend fun collect(collector: FlowCollector<AgentAvailabilitySnapshot>): Nothing {
+                    // awaitAgentAvailabilityChange 每处理一个非终态都会重新调用 first；周期计数证明其已进入下一轮等待。
+                    availabilityCollectCycles.value += 1
+                    return mutableAvailability.collect(collector)
+                }
             }
-        }
         override val currentModel: String = "test"
         override val availableModels: List<String> = listOf("test")
         val turns = AtomicInteger()

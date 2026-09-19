@@ -138,6 +138,7 @@ class GeminiAgentServiceTest {
         listOf(sdkPrompt, wirePrompt).forEach { prompt ->
             assertTrue(prompt.contains("APPROVED_SKILL_CANARY"))
             assertFalse(prompt.contains("PENDING_SKILL_CANARY"))
+            assertTrue(prompt.contains("SYSTEM_CONTEXT_CANARY"))
         }
     }
 

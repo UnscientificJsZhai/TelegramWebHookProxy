@@ -28,11 +28,6 @@ class SkillFunctionProviderTest {
     }
 
 
-
-
-
-
-
     /** 验证 OpenAI 函数 schema 只允许 read_skill 带标识，write_skill 不暴露覆盖入口。 */
     @Test
     fun `OpenAI write schema omits id while read schema retains id constraints`() {

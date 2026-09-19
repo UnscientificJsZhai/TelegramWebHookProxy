@@ -1,18 +1,19 @@
 package com.unscientificjszhai.tgp.service.ai
 
+import com.unscientificjszhai.tgp.models.InputRichMessage
 import com.unscientificjszhai.tgp.models.ScheduledTask
 import com.unscientificjszhai.tgp.service.ActiveTelegramBotUnavailableException
 import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
-import com.unscientificjszhai.tgp.service.TelegramApiResponse
 import com.unscientificjszhai.tgp.service.TelegramBotLease
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentConfigurationNotReadyException
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
-import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.service.isTelegramAccepted
+import com.unscientificjszhai.tgp.service.isPermanentTelegramRejection
 import com.unscientificjszhai.tgp.utils.SafeLogging
+import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
 import com.unscientificjszhai.tgp.utils.TelegramTextChunks
-import io.ktor.http.isSuccess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -24,10 +25,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.util.concurrent.locks.ReentrantLock
@@ -339,15 +336,31 @@ class ScheduledTaskWorker private constructor(
     private suspend fun deliverTaskResult(task: ScheduledTask, token: String, result: String) {
         try {
             val fullText = "⏰ 定时任务执行结果：\n\n$result"
-            for (chunk in TelegramTextChunks.split(fullText)) {
+            for ((text, sourceStart, sourceEnd, format) in TelegramRichTextChunks.plan(fullText)) {
                 if (!isTaskResultTokenCurrent(token)) {
                     logger.info("Stopping task result delivery for {} because its bot token changed", task.id)
                     return
                 }
-                val response = telegramService.sendMessageForToken(token, task.agentChatId, chunk)
-                if (!response.isTelegramOk()) {
+                val response = if (format != null) {
+                    telegramService.sendRichMessageForToken(token, task.agentChatId, InputRichMessage(markdown = text))
+                } else {
+                    telegramService.sendMessageForToken(token, task.agentChatId, text)
+                }
+                if (response.isTelegramAccepted()) continue
+                if (format == null || !response.isPermanentTelegramRejection()) {
                     logger.warn("Telegram did not accept task result chunk for {}", task.id)
                     return
+                }
+                logger.warn("Telegram 明确拒绝定时任务 {} 的富片段，尝试以普通消息投递该部分原文。", task.id)
+                for (plain in TelegramTextChunks.split(fullText.substring(sourceStart, sourceEnd))) {
+                    if (!isTaskResultTokenCurrent(token)) {
+                        logger.info("Stopping task result delivery for {} because its bot token changed", task.id)
+                        return
+                    }
+                    if (!telegramService.sendMessageForToken(token, task.agentChatId, plain).isTelegramAccepted()) {
+                        logger.warn("Telegram 未接受定时任务 {} 的普通降级片段，停止本次结果投递。", task.id)
+                        return
+                    }
                 }
             }
         } catch (e: CancellationException) {
@@ -366,13 +379,6 @@ class ScheduledTaskWorker private constructor(
     } catch (_: ActiveTelegramBotUnavailableException) {
         false
     }
-
-    private fun TelegramApiResponse.isTelegramOk(): Boolean =
-        status.isSuccess() && try {
-            JsonStructureLimits.parseToJsonElement(Json, body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
-        } catch (_: Exception) {
-            false
-        }
 
     /** 关闭扫描准入并取消 worker 拥有的全部协程。 */
     internal fun requestStop() {
