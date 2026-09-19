@@ -23,8 +23,6 @@ import SendOutlined from '@mui/icons-material/SendOutlined';
 import SettingsOutlined from '@mui/icons-material/SettingsOutlined';
 import SmartToyOutlined from '@mui/icons-material/SmartToyOutlined';
 import CodeOutlined from '@mui/icons-material/CodeOutlined';
-import KeyOutlined from '@mui/icons-material/KeyOutlined';
-import {useSettings} from '../settingsContext';
 
 const navigation = [
     {path: '/', label: '发送消息', icon: <SendOutlined/>},
@@ -36,7 +34,6 @@ const navigation = [
 export default function Layout() {
     const {pathname} = useLocation();
     const [drawerOpen, setDrawerOpen] = useState(false);
-    const {snapshot, error} = useSettings();
     const current = navigation.find(item => item.path === pathname) ?? navigation[0];
     useEffect(() => {
         document.title = `${current.label} · Telegram Webhook 代理`;
@@ -68,9 +65,6 @@ export default function Layout() {
                         {navigation.map(item => <Tab key={item.path} value={item.path} label={item.label}
                                                      component={Link} to={item.path}/>)}
                     </Tabs>
-                    <Chip icon={<KeyOutlined/>}
-                          label={error ? '服务不可用' : !snapshot ? '读取配置中' : snapshot.settings.telegramToken.trim() ? 'Token 已配置' : 'Token 未配置'}
-                          variant="outlined" sx={{display: {xs: 'none', sm: 'flex'}, bgcolor: 'action.hover'}}/>
                 </Toolbar>
             </Container>
         </AppBar>
