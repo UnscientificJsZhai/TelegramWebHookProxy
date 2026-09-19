@@ -121,7 +121,7 @@ class HttpIngressProtectionTest {
         assertMarkerForPartialRequest("MKCOL /", "MKCOL")
         assertMarkerForPartialRequest("BREW /", "BREW")
 
-        for ((description, control) in listOf("CR" to "\r", "LF" to "\n", "space" to " ", "DEL" to "\u007f")) {
+        for ((description, control) in listOf("CR" to "\r", "LF" to "\n", "space" to " ")) {
             val observed = mutableListOf<String>()
             val channel = EmbeddedChannel(TrackingHttpServerCodec(testLimits()), markerObservingHandler(observed))
             try {
@@ -141,11 +141,31 @@ class HttpIngressProtectionTest {
         try {
             repeatedControlChannel.writeInbound(Unpooled.copiedBuffer("\r", Charsets.US_ASCII))
             repeatedControlChannel.writeInbound(Unpooled.copiedBuffer("\n", Charsets.US_ASCII))
-            repeatedControlChannel.writeInbound(Unpooled.copiedBuffer(" \u007f", Charsets.US_ASCII))
+            repeatedControlChannel.writeInbound(Unpooled.copiedBuffer(" ", Charsets.US_ASCII))
             assertEquals(listOf("marker"), repeatedControlEvents)
         } finally {
             repeatedControlChannel.drainInboundMessages()
             repeatedControlChannel.finishAndReleaseAll()
+        }
+    }
+
+    /** Netty 会立即拒绝前导 DEL；拒绝前仍必须先启动且只启动一次请求期限。 */
+    @Test
+    fun `tracking codec marks rejected DEL before invalid request`() {
+        val observed = mutableListOf<String>()
+        val channel = EmbeddedChannel(TrackingHttpServerCodec(testLimits()), markerObservingHandler(observed))
+        try {
+            channel.writeInbound(Unpooled.copiedBuffer("\u007f", Charsets.US_ASCII))
+            assertEquals(listOf("marker", "request"), observed)
+            val rejected = channel.readInbound<HttpRequest>()
+            try {
+                assertTrue(rejected.decoderResult().isFailure)
+            } finally {
+                ReferenceCountUtil.release(rejected)
+            }
+        } finally {
+            channel.drainInboundMessages()
+            channel.finishAndReleaseAll()
         }
     }
 

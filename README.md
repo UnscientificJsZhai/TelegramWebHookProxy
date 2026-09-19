@@ -27,7 +27,7 @@ TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统�
 
 | 模块 | 技术                                                                  |
 |----|---------------------------------------------------------------------|
-| 后端 | Kotlin 2.4.10、Ktor 3、Dagger、kotlinx.serialization                   |
+| 后端 | Kotlin 2.4.20、Ktor 3、Dagger、kotlinx.serialization                   |
 | AI | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
 | 前端 | React 19、Vite、Material UI、React Router、Axios                        |
 | 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                          |

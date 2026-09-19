@@ -125,7 +125,7 @@ val isPackagingTaskRequested = gradle.startParameter.taskNames.any {
     val name = it.lowercase()
     name.contains("build") || name.contains("assemble") ||
             name.contains("jar") || name.contains("shadowjar") ||
-            name.contains("dist")
+            name.contains("dist") || name.substringAfterLast(':') in setOf("check", "verifypackagedserialization")
 }
 
 val processFrontendResources by tasks.registering(Copy::class) {
@@ -157,16 +157,26 @@ tasks.withType<ShadowJar> {
     archiveVersion.set(version.toString())
     archiveClassifier.set("all")
 
-    // Shadow 9 合并 Kotlin 模块元数据前，需要收到每个同名输入。
+    // Shadow 9 的 Kotlin 模块元数据转换器需要收到每个同名输入。
     filesMatching("META-INF/*.kotlin_module") {
         duplicatesStrategy = DuplicatesStrategy.INCLUDE
     }
     failOnDuplicateEntries.set(true)
 
-    // google-genai 的 Java 9 Kotlin 反射类路径未随内部类名重定位。
-    // 避免 Shadow 9 自动开启 Multi-Release 后激活该类，破坏泛型响应的序列化。
-    addMultiReleaseAttribute.set(false)
-
     dependsOn(processFrontendResources)
     from(processFrontendResources.map { it.destinationDir })
+}
+
+val verifyPackagedSerialization by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Checks generic response serialization using the actual Shadow Jar"
+    val packagedJar = tasks.named<ShadowJar>("shadowJar")
+    dependsOn(tasks.named("testClasses"), packagedJar)
+    classpath(sourceSets["test"].output.classesDirs, packagedJar.flatMap { it.archiveFile })
+    mainClass.set("com.unscientificjszhai.tgp.PackagedSerializationProbeKt")
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) })
+}
+
+tasks.named("check") {
+    dependsOn(verifyPackagedSerialization)
 }
