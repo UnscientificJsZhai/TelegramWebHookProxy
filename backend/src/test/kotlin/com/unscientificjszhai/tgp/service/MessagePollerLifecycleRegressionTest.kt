@@ -192,7 +192,12 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
             "late"
         }
         coEvery {
-            fixture.telegram.sendRichMessageForToken("100:new", "123", InputRichMessage(markdown = "late"), ReplyParameters(1))
+            fixture.telegram.sendRichMessageForToken(
+                "100:new",
+                "123",
+                InputRichMessage(markdown = "late"),
+                ReplyParameters(1)
+            )
         } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
 
         fixture.poller.start()
@@ -215,7 +220,12 @@ internal class MessagePollerLifecycleRegressionTest : MessagePollerFacadeTestSup
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                 coVerify(exactly = 1) { fixture.agent.sendMessage("in-flight") }
                 coVerify {
-                    fixture.telegram.sendRichMessageForToken("100:new", "123", InputRichMessage(markdown = "late"), ReplyParameters(1))
+                    fixture.telegram.sendRichMessageForToken(
+                        "100:new",
+                        "123",
+                        InputRichMessage(markdown = "late"),
+                        ReplyParameters(1)
+                    )
                 }
             }
         } finally {

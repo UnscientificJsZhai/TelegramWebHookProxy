@@ -107,10 +107,18 @@ internal class TelegramReplyOutboxWorker(
             runtime.ensureCurrent(session)
             if (reply.isRichDelivery()) {
                 telegramService.sendRichMessageForToken(
-                    session.token, reply.chatId, InputRichMessage(markdown = reply.deliveryText()), reply.deliveryReplyParameters(),
+                    session.token,
+                    reply.chatId,
+                    InputRichMessage(markdown = reply.deliveryText()),
+                    reply.deliveryReplyParameters(),
                 )
             } else {
-                telegramService.sendMessageForToken(session.token, reply.chatId, reply.deliveryText(), reply.deliveryReplyParameters())
+                telegramService.sendMessageForToken(
+                    session.token,
+                    reply.chatId,
+                    reply.deliveryText(),
+                    reply.deliveryReplyParameters()
+                )
             }
         } catch (e: CancellationException) {
             throw e
@@ -165,6 +173,7 @@ internal class TelegramReplyOutboxWorker(
                         permanentRejectionCount = 0,
                         plainFallbackStart = 0,
                     )
+
                     response?.isPermanentTelegramRejection() == true -> reply.afterPermanentTelegramRejection()
                     else -> reply.afterRetryableTelegramFailure()
                 }

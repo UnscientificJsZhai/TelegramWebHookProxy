@@ -32,7 +32,9 @@ class TelegramRichTextChunksTest {
         val source = "```kotlin\n$body```\n"
         val parts = plan(source)
         assertTrue(parts.size > 1)
-        assertTrue(parts.all { it.format != null && it.text.startsWith("```kotlin\n") && it.text.trimEnd().endsWith("```") })
+        assertTrue(parts.all {
+            it.format != null && it.text.startsWith("```kotlin\n") && it.text.trimEnd().endsWith("```")
+        })
         val restored = parts.joinToString("") { it.text.removePrefix("```kotlin\n").removeSuffix("```\n") }
         assertEquals(body, restored)
     }
@@ -59,7 +61,8 @@ class TelegramRichTextChunksTest {
 
     @Test
     fun `footnotes and reference links are available in each referring fragment`() {
-        val source = "第一段[^note] [文档][doc]\n\n" + "x".repeat(32700) + "\n\n第二段[^note] [文档][doc]\n\n[^note]: 注释内容\n\n[doc]: https://example.test\n"
+        val source =
+            "第一段[^note] [文档][doc]\n\n" + "x".repeat(32700) + "\n\n第二段[^note] [文档][doc]\n\n[^note]: 注释内容\n\n[doc]: https://example.test\n"
         val parts = plan(source)
         assertTrue(parts.size > 1)
         for (part in parts.filter { it.format != null && (it.text.contains("第一段") || it.text.contains("第二段")) }) {
@@ -84,7 +87,9 @@ class TelegramRichTextChunksTest {
 
     @Test
     fun `many list items and media split on complete structures`() {
-        for (source in listOf((1..300).joinToString("\n") { "- 第 $it 项\n  - 子项目" }, (1..51).joinToString("\n\n") { "![](https://example.test/$it.jpg)" })) {
+        for (source in listOf(
+            (1..300).joinToString("\n") { "- 第 $it 项\n  - 子项目" },
+            (1..51).joinToString("\n\n") { "![](https://example.test/$it.jpg)" })) {
             val parts = plan(source)
             assertTrue(parts.size > 1)
             assertTrue(parts.all { it.format != null })
@@ -98,7 +103,8 @@ class TelegramRichTextChunksTest {
         assertNotNull(plan(code).single().format)
 
         val longBody = "x".repeat(33000)
-        val references = "[foo]\n\n```text\n$longBody\n```\n\n[foo]: https://first.example\n\n[foo]: https://last.example\n"
+        val references =
+            "[foo]\n\n```text\n$longBody\n```\n\n[foo]: https://first.example\n\n[foo]: https://last.example\n"
         val parts = plan(references)
         assertTrue(parts.size > 1)
         val firstPartText = parts.first().text
@@ -150,7 +156,12 @@ class TelegramRichTextChunksTest {
     @Test
     fun `Telegram inline extensions and all formula forms stay atomic`() {
         val body = "x".repeat(40000)
-        for (block in listOf("||$body||", "==$body==", "<tg-math-block>\n\n$body\n\n</tg-math-block>", "```math\n$body\n```")) {
+        for (block in listOf(
+            "||$body||",
+            "==$body==",
+            "<tg-math-block>\n\n$body\n\n</tg-math-block>",
+            "```math\n$body\n```"
+        )) {
             val parts = plan("前言\n\n$block\n\n后记")
             assertNotNull(parts.first().format)
             assertNotNull(parts.last().format)
@@ -160,7 +171,8 @@ class TelegramRichTextChunksTest {
         val parts = plan("前言\n\n$nested\n\n后记")
         assertNotNull(parts.first().format)
         assertNotNull(parts.last().format)
-        assertTrue(parts.filter { it.format != null }.none { it.text.contains("<details>") || it.text.contains("</details>") })
+        assertTrue(parts.filter { it.format != null }
+            .none { it.text.contains("<details>") || it.text.contains("</details>") })
     }
 
     @Test

@@ -6,7 +6,11 @@ import kotlinx.serialization.json.*
 
 /** 富消息成功响应包含完整 blocks，节点预算必须容纳 HTTP 客户端已限制为 1 MiB 的响应。 */
 private fun TelegramApiResponse.resultObject(): JsonObject? = try {
-    JsonStructureLimits.parseToJsonElement(Json, body, JsonStructureLimits.Budget(maxNodes = 1024 * 1024)) as? JsonObject
+    JsonStructureLimits.parseToJsonElement(
+        Json,
+        body,
+        JsonStructureLimits.Budget(maxNodes = 1024 * 1024)
+    ) as? JsonObject
 } catch (_: Exception) {
     null
 }

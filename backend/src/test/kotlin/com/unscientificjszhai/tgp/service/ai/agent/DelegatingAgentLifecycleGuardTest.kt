@@ -134,71 +134,72 @@ class DelegatingAgentLifecycleGuardTest {
     }
 
     @Test
-    fun `failed cleanup completion lets an issued target reach READY alongside a registered retirement`() = runBlocking {
-        val fixture = Fixture(this)
-        var delegating: DelegatingAgentService? = null
-        val retiredClose = CompletableDeferred<Unit>()
-        val failedClose = CompletableDeferred<Unit>()
-        val closeStarted = Channel<Int>(Channel.UNLIMITED)
-        try {
-            fixture.installEnabledSettings()
-            val created = AtomicInteger()
-            val factory = fixture.factory { id ->
-                created.incrementAndGet()
-                mockedService(
-                    id = id,
-                    initialize = {
-                        if (id == 3) {
-                            AgentInitializationResult.Failed(
-                                AgentFailure(AgentFailureKind.NETWORK, RecoveryDisposition.RETRY),
-                            )
-                        } else {
-                            AgentInitializationResult.Ready
-                        }
-                    },
-                    closeJob = when (id) {
-                        1 -> retiredClose
-                        3 -> failedClose
-                        else -> completedJob()
-                    },
-                    onClose = { check(closeStarted.trySend(id).isSuccess) },
-                )
-            }
-            val service = fixture.delegating(factory)
-            delegating = service
-            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
-
-            fixture.updateGlobalContext("publish replacement")
-            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
-            assertEquals(1, withTimeout(5.seconds) { closeStarted.receive() })
-            fixture.updateGlobalContext("create failed candidate")
-            withTimeout(5.seconds) {
-                service.availability.first {
-                    it.settingsVersion == fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation &&
-                            it.state == AgentAvailabilityState.RETRY_SCHEDULED
+    fun `failed cleanup completion lets an issued target reach READY alongside a registered retirement`() =
+        runBlocking {
+            val fixture = Fixture(this)
+            var delegating: DelegatingAgentService? = null
+            val retiredClose = CompletableDeferred<Unit>()
+            val failedClose = CompletableDeferred<Unit>()
+            val closeStarted = Channel<Int>(Channel.UNLIMITED)
+            try {
+                fixture.installEnabledSettings()
+                val created = AtomicInteger()
+                val factory = fixture.factory { id ->
+                    created.incrementAndGet()
+                    mockedService(
+                        id = id,
+                        initialize = {
+                            if (id == 3) {
+                                AgentInitializationResult.Failed(
+                                    AgentFailure(AgentFailureKind.NETWORK, RecoveryDisposition.RETRY),
+                                )
+                            } else {
+                                AgentInitializationResult.Ready
+                            }
+                        },
+                        closeJob = when (id) {
+                            1 -> retiredClose
+                            3 -> failedClose
+                            else -> completedJob()
+                        },
+                        onClose = { check(closeStarted.trySend(id).isSuccess) },
+                    )
                 }
-            }
-            assertEquals(3, withTimeout(5.seconds) { closeStarted.receive() })
-            assertEquals(3, created.get())
+                val service = fixture.delegating(factory)
+                delegating = service
+                awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
 
-            fixture.updateGlobalContext("must wait for shared cleanup capacity")
-            val targetVersion = fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation
-            withTimeout(5.seconds) {
-                service.availability.first {
-                    it.settingsVersion == targetVersion && it.state == AgentAvailabilityState.INITIALIZING
+                fixture.updateGlobalContext("publish replacement")
+                awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+                assertEquals(1, withTimeout(5.seconds) { closeStarted.receive() })
+                fixture.updateGlobalContext("create failed candidate")
+                withTimeout(5.seconds) {
+                    service.availability.first {
+                        it.settingsVersion == fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation &&
+                                it.state == AgentAvailabilityState.RETRY_SCHEDULED
+                    }
                 }
-            }
+                assertEquals(3, withTimeout(5.seconds) { closeStarted.receive() })
+                assertEquals(3, created.get())
 
-            failedClose.complete(Unit)
-            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
-            assertEquals(4, created.get())
-        } finally {
-            retiredClose.complete(Unit)
-            failedClose.complete(Unit)
-            delegating?.close()?.join()
-            fixture.close()
+                fixture.updateGlobalContext("must wait for shared cleanup capacity")
+                val targetVersion = fixture.settingsChangeCoordinator.currentSettingsSnapshot().generation
+                withTimeout(5.seconds) {
+                    service.availability.first {
+                        it.settingsVersion == targetVersion && it.state == AgentAvailabilityState.INITIALIZING
+                    }
+                }
+
+                failedClose.complete(Unit)
+                awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+                assertEquals(4, created.get())
+            } finally {
+                retiredClose.complete(Unit)
+                failedClose.complete(Unit)
+                delegating?.close()?.join()
+                fixture.close()
+            }
         }
-    }
 
     private class Fixture(parentScope: CoroutineScope) {
         private val directory = Files.createTempDirectory("delegating-agent-lifecycle-guard").toFile()

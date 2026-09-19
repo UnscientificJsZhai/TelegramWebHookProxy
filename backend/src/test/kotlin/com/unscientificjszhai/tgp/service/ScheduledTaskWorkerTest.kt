@@ -103,7 +103,12 @@ class ScheduledTaskWorkerTest {
         assertTrue(scheduledTaskService.listTasks().isEmpty())
         coVerify(exactly = 1) { agentService.sendMessage(any<String>()) }
         coVerify(exactly = 1) {
-            telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, match { it.markdown?.contains("finished") == true }, null)
+            telegramService.sendRichMessageForToken(
+                BOT_TOKEN,
+                CHAT_ID,
+                match { it.markdown?.contains("finished") == true },
+                null
+            )
         }
     }
 
@@ -182,18 +187,38 @@ class ScheduledTaskWorkerTest {
         coEvery { agentService.sendMessage(any<String>()) } returns reply
         coEvery { telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, any(), null) } coAnswers {
             val markdown = thirdArg<InputRichMessage>().markdown
-            if (markdown == rejectedPart.text) TelegramApiResponse(HttpStatusCode.BadRequest, "rejected") else successfulTelegramResponse()
+            if (markdown == rejectedPart.text) TelegramApiResponse(
+                HttpStatusCode.BadRequest,
+                "rejected"
+            ) else successfulTelegramResponse()
         }
-        coEvery { telegramService.sendMessageForToken(BOT_TOKEN, CHAT_ID, any(), null) } returns successfulTelegramResponse()
+        coEvery {
+            telegramService.sendMessageForToken(
+                BOT_TOKEN,
+                CHAT_ID,
+                any(),
+                null
+            )
+        } returns successfulTelegramResponse()
 
         worker.scanAndExecute()
         worker.scanAndExecute()
 
         coVerifyOrder {
             telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, match { it.markdown == parts[0].text }, null)
-            telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, match { it.markdown == rejectedPart.text }, null)
+            telegramService.sendRichMessageForToken(
+                BOT_TOKEN,
+                CHAT_ID,
+                match { it.markdown == rejectedPart.text },
+                null
+            )
             telegramService.sendMessageForToken(BOT_TOKEN, CHAT_ID, any(), null)
-            telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, match { it.markdown == parts.last().text }, null)
+            telegramService.sendRichMessageForToken(
+                BOT_TOKEN,
+                CHAT_ID,
+                match { it.markdown == parts.last().text },
+                null
+            )
         }
         coVerify(exactly = 1) { agentService.sendMessage(any<String>()) }
         assertTrue(scheduledTaskService.listTasks().isEmpty())
@@ -202,7 +227,12 @@ class ScheduledTaskWorkerTest {
     @Test
     fun `scheduled temporary error stops remaining delivery without replay`() = runBlocking {
         settingsChangeCoordinator.replaceSettingsForTest(enabledSettings())
-        scheduledTaskService.createTask("stop-error", fixedInstant.minusSeconds(1).toEpochMilli(), LoopMode.ONCE, CHAT_ID)
+        scheduledTaskService.createTask(
+            "stop-error",
+            fixedInstant.minusSeconds(1).toEpochMilli(),
+            LoopMode.ONCE,
+            CHAT_ID
+        )
         clearMocks(agentService, telegramService)
         allowReadyServiceScope(agentService)
         coEvery { agentService.sendMessage(any<String>()) } returns "x".repeat(70000)
@@ -221,7 +251,12 @@ class ScheduledTaskWorkerTest {
     @Test
     fun `scheduled token rotation stops remaining delivery without replay`() = runBlocking {
         settingsChangeCoordinator.replaceSettingsForTest(enabledSettings())
-        scheduledTaskService.createTask("stop-rotation", fixedInstant.minusSeconds(1).toEpochMilli(), LoopMode.ONCE, CHAT_ID)
+        scheduledTaskService.createTask(
+            "stop-rotation",
+            fixedInstant.minusSeconds(1).toEpochMilli(),
+            LoopMode.ONCE,
+            CHAT_ID
+        )
         clearMocks(agentService, telegramService)
         allowReadyServiceScope(agentService)
         coEvery { agentService.sendMessage(any<String>()) } returns "x".repeat(70000)

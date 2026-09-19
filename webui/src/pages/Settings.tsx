@@ -192,17 +192,21 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
                             </> : <Alert severity="info" variant="outlined">当前将直接连接 Telegram API。</Alert>}
                         </Stack>
                     </SectionCard>
-                    <Stack direction={{xs: 'column', sm: 'row'}} sx={{alignItems: {sm: 'center'}, justifyContent: 'space-between', gap: 2}}>
+                    <Stack direction={{xs: 'column', sm: 'row'}}
+                           sx={{alignItems: {sm: 'center'}, justifyContent: 'space-between', gap: 2}}>
                         <Typography variant="caption"
                                     color={dirty ? 'primary' : 'text.secondary'}>{dirty ? '有未保存的修改' : '所有修改已保存'}</Typography>
                         <Stack direction="row" sx={{gap: 1, justifyContent: 'flex-end'}}><Button color="secondary"
-                                                                                         disabled={!dirty || saving}
-                                                                                         onClick={() => setDraft(saved.settings)}>撤销修改</Button><Button
+                                                                                                 disabled={!dirty || saving}
+                                                                                                 onClick={() => setDraft(saved.settings)}>撤销修改</Button><Button
                             type="submit" variant="contained" startIcon={<SaveOutlined/>}
                             disabled={!dirty || saving || !saved.etag || tokenError || chatError || !proxyValid || !authValid}>{saving ? '正在保存…' : '保存配置'}</Button></Stack>
                     </Stack>
                     <Accordion disableGutters variant="outlined" sx={{'&:before': {display: 'none'}}}>
-                        <AccordionSummary expandIcon={<ExpandMore/>}><Stack direction="row" sx={{alignItems: 'center', gap: 1}}><TuneOutlined
+                        <AccordionSummary expandIcon={<ExpandMore/>}><Stack direction="row" sx={{
+                            alignItems: 'center',
+                            gap: 1
+                        }}><TuneOutlined
                             fontSize="small" color="primary"/><Typography
                             variant="body2">高级：配置版本与并发控制</Typography></Stack></AccordionSummary>
                         <AccordionDetails><Typography variant="body2" sx={{mb: 1}}>当前修订 ETag：<Box

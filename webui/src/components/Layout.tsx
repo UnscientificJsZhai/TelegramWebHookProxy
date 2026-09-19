@@ -49,7 +49,13 @@ export default function Layout() {
                     <IconButton aria-label="打开导航菜单" sx={{display: {md: 'none'}, ml: -1}}
                                 onClick={() => setDrawerOpen(true)}><MenuIcon/></IconButton>
                     <Stack component={Link} to="/" direction="row"
-                           sx={{alignItems: 'center', gap: 1.25, color: 'text.primary', textDecoration: 'none', flexShrink: 0}}>
+                           sx={{
+                               alignItems: 'center',
+                               gap: 1.25,
+                               color: 'text.primary',
+                               textDecoration: 'none',
+                               flexShrink: 0
+                           }}>
                         <Box component="img" src="/icon.svg" alt="" sx={{
                             width: 34,
                             height: 34,

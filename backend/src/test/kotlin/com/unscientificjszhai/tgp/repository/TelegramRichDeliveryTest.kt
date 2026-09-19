@@ -17,7 +17,9 @@ class TelegramRichDeliveryTest {
     )
 
     @AfterTest
-    fun cleanup() { directory.deleteRecursively() }
+    fun cleanup() {
+        directory.deleteRecursively()
+    }
 
     @Test
     fun `final journal and partial plain fallback resume their saved plan`() {
@@ -26,7 +28,11 @@ class TelegramRichDeliveryTest {
         val final = assertNotNull(repository.finalizeAgentTurn("100", 11, source, plan))
         repository = UpdatesRepository(file)
         assertEquals(final, repository.getData("100").agentTurnJournal.single())
-        repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", source, deliveryPlan = final.deliveryPlan))
+        repository.completeAgentUpdate(
+            "100",
+            11,
+            PendingTelegramReply(11, "chat", source, deliveryPlan = final.deliveryPlan)
+        )
         val rich = assertNotNull(repository.preparePendingTelegramReplyDelivery("100", 11))
         val plain = rich.copy(deliveryStage = TelegramReplyDeliveryStage.PLAIN_FALLBACK, deliveryAttempts = 0)
         assertTrue(repository.replacePendingTelegramReply("100", rich, plain))
@@ -75,14 +81,20 @@ class TelegramRichDeliveryTest {
         val invalidPlans = listOf(plan.drop(1), plan.map { it.copy(sourceEnd = it.sourceEnd - 1) })
         invalidPlans.forEach { invalid ->
             assertFailsWith<IllegalArgumentException> {
-                repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", source, deliveryPlan = invalid))
+                repository.completeAgentUpdate(
+                    "100",
+                    11,
+                    PendingTelegramReply(11, "chat", source, deliveryPlan = invalid)
+                )
             }
         }
         assertFailsWith<IllegalArgumentException> {
-            validateTelegramDeliveryPlan("😀", listOf(
-                TelegramReplyPart("a", 0, 1, TelegramRichFormat.MARKDOWN),
-                TelegramReplyPart("b", 1, 2, TelegramRichFormat.MARKDOWN),
-            ))
+            validateTelegramDeliveryPlan(
+                "😀", listOf(
+                    TelegramReplyPart("a", 0, 1, TelegramRichFormat.MARKDOWN),
+                    TelegramReplyPart("b", 1, 2, TelegramRichFormat.MARKDOWN),
+                )
+            )
         }
         assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
     }

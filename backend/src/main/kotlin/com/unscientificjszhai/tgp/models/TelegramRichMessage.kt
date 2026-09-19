@@ -9,9 +9,12 @@ import kotlinx.serialization.json.JsonArray
 /** 调用方可选择的 Telegram 富消息正文格式。 */
 @Serializable
 enum class TelegramRichFormat(val wireName: String) {
-    @SerialName("markdown") MARKDOWN("markdown"),
-    @SerialName("html") HTML("html"),
-    @SerialName("blocks") BLOCKS("blocks");
+    @SerialName("markdown")
+    MARKDOWN("markdown"),
+    @SerialName("html")
+    HTML("html"),
+    @SerialName("blocks")
+    BLOCKS("blocks");
 
     companion object {
         fun fromWireName(value: String): TelegramRichFormat? = entries.firstOrNull { it.wireName == value }

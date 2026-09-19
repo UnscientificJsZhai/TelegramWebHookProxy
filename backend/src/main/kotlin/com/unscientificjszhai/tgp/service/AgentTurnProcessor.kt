@@ -685,7 +685,13 @@ internal class AgentTurnProcessor(
         expectedRetryCheckpointTarget: Long?,
     ): UpdateCompletion {
         val reply = entry.reply?.let {
-            PendingTelegramReply(entry.updateId, entry.chatId, it, entry.replyParameters, deliveryPlan = entry.deliveryPlan)
+            PendingTelegramReply(
+                entry.updateId,
+                entry.chatId,
+                it,
+                entry.replyParameters,
+                deliveryPlan = entry.deliveryPlan
+            )
         }
         return try {
             val committed = withContext(NonCancellable) {

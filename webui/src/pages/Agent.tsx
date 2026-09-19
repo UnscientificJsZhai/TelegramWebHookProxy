@@ -170,7 +170,8 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                             Telegram 私聊中发送 /model 选择。</Alert>
                     </Stack>
                     <SaveButton label="保存服务凭据" changed={credentialsDirty} disabled={disabled}
-                                saving={saving === 'credentials'} onSave={() => void saveGroup(credentials, 'credentials')}
+                                saving={saving === 'credentials'}
+                                onSave={() => void saveGroup(credentials, 'credentials')}
                                 invalid={keyBytes > 512 || utf8Length(draft.openAiBaseUrl) > 2048}/>
                 </SectionCard>
                 <SectionCard title="模型名称" icon={<PsychologyOutlined/>}
@@ -186,7 +187,9 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                              action={<Chip label={baseline.agentEnabled ? '已启用' : '未启用'}
                                            color={baseline.agentEnabled ? 'primary' : 'default'} variant="outlined"/>}>
                     <Stack spacing={2.5}>
-                        <Stack direction="row" sx={{justifyContent: 'space-between', alignItems: 'center', gap: 2}}><Box><Typography variant="subtitle2">启用 AI Agent</Typography><Typography
+                        <Stack direction="row"
+                               sx={{justifyContent: 'space-between', alignItems: 'center', gap: 2}}><Box><Typography
+                            variant="subtitle2">启用 AI Agent</Typography><Typography
                             variant="caption"
                             color="text.secondary">接收授权私聊消息并调用模型回复。</Typography></Box><Switch
                             checked={draft.agentEnabled} onChange={event => set('agentEnabled', event.target.checked)}

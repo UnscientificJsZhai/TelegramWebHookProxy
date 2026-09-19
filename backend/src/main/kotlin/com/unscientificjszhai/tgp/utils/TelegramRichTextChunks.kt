@@ -31,7 +31,14 @@ internal object TelegramRichLimits {
  */
 internal object TelegramRichTextChunks {
     private val parser = Parser.builder()
-        .extensions(listOf(TablesExtension.create(), FootnotesExtension.create(), TaskListItemsExtension.create(), StrikethroughExtension.create()))
+        .extensions(
+            listOf(
+                TablesExtension.create(),
+                FootnotesExtension.create(),
+                TaskListItemsExtension.create(),
+                StrikethroughExtension.create()
+            )
+        )
         .includeSourceSpans(IncludeSourceSpans.BLOCKS_AND_INLINES)
         .build()
 
@@ -69,7 +76,10 @@ internal object TelegramRichTextChunks {
                     else -> null
                 }
                 if (label != null && node.sourceSpans.isNotEmpty()) {
-                    definitions.putIfAbsent(normalizeLabel(label), source.substring(startOf(node), endOf(node)).trimEnd())
+                    definitions.putIfAbsent(
+                        normalizeLabel(label),
+                        source.substring(startOf(node), endOf(node)).trimEnd()
+                    )
                 }
             }
             val children = children(document)
@@ -99,7 +109,12 @@ internal object TelegramRichTextChunks {
                 return
             }
             when (node) {
-                is FencedCodeBlock -> if (node.info?.trim() == "math") emitPlain(start, end) else splitCode(node, start, end)
+                is FencedCodeBlock -> if (node.info?.trim() == "math") emitPlain(start, end) else splitCode(
+                    node,
+                    start,
+                    end
+                )
+
                 is TableBlock -> splitTable(node, start, end)
                 is ListBlock, is BlockQuote -> splitContainer(node, start, end)
                 is Paragraph -> splitParagraph(node, start, end)
@@ -256,14 +271,17 @@ internal object TelegramRichTextChunks {
             val containers = mutableListOf<Node>()
             walk(document) { node, _ ->
                 if ((node is Code || node is FencedCodeBlock || node is IndentedCodeBlock) && node.sourceSpans.isNotEmpty()) {
-                    codeRanges += node.sourceSpans.first().inputIndex until node.sourceSpans.last().let { it.inputIndex + it.length }
+                    codeRanges += node.sourceSpans.first().inputIndex until node.sourceSpans.last()
+                        .let { it.inputIndex + it.length }
                 }
                 if (node is Paragraph || node is Heading || node is TableCell || node is HtmlBlock) containers += node
             }
             return buildSet {
                 for (node in containers) {
                     val spans = node.sourceSpans
-                    val literal = spans.joinToString("\n") { fragment.substring(it.inputIndex, it.inputIndex + it.length) }
+                    val literal =
+                        spans.joinToString("\n") { fragment.substring(it.inputIndex, it.inputIndex + it.length) }
+
                     fun originalOffset(offset: Int): Int {
                         var remaining = offset
                         for (span in spans) {
@@ -285,7 +303,8 @@ internal object TelegramRichTextChunks {
         private fun startOf(node: Node): Int = lineStart(node.sourceSpans.minOfOrNull { it.inputIndex } ?: 0)
         private fun endOf(node: Node): Int = lineEnd(node.sourceSpans.maxOfOrNull { it.inputIndex + it.length } ?: 0)
         private fun lineStart(offset: Int): Int = if (offset <= 0) 0 else source.lastIndexOf('\n', offset - 1) + 1
-        private fun lineEnd(offset: Int): Int = source.indexOf('\n', offset).let { if (it < 0) source.length else it + 1 }
+        private fun lineEnd(offset: Int): Int =
+            source.indexOf('\n', offset).let { if (it < 0) source.length else it + 1 }
     }
 
     /** 以源码长度和 AST 计数保守规划，Telegram 对扩展语法保留最终判定权。 */
@@ -300,7 +319,8 @@ internal object TelegramRichTextChunks {
             if (node is TableRow) blocks++
             if (node is Image) media++
             if (depth > TelegramRichLimits.NESTING + 1) valid = false
-            if (node is TableRow && children(node).count { it is TableCell } > TelegramRichLimits.TABLE_COLUMNS) valid = false
+            if (node is TableRow && children(node).count { it is TableCell } > TelegramRichLimits.TABLE_COLUMNS) valid =
+                false
             // 围栏及行内代码里的标签只是文字，不能计为富消息容器或媒体。
             when (node) {
                 is HtmlBlock -> html.append(node.literal).append('\n')
@@ -351,7 +371,8 @@ internal object TelegramRichTextChunks {
         val inlineCodeRanges = mutableListOf<IntRange>()
         walk(document) { node, _ ->
             if (node is Code && node.sourceSpans.isNotEmpty()) {
-                inlineCodeRanges += node.sourceSpans.first().inputIndex until node.sourceSpans.last().let { it.inputIndex + it.length }
+                inlineCodeRanges += node.sourceSpans.first().inputIndex until node.sourceSpans.last()
+                    .let { it.inputIndex + it.length }
             }
         }
         var offset = 0
@@ -365,7 +386,10 @@ internal object TelegramRichTextChunks {
             val fence = Regex("^(`{3,}|~{3,})").find(trimmed)?.value
             val markdownBody = tag == null || tag in setOf("details", "tg-collage", "tg-slideshow")
             if (fenced != null) {
-                if (fence != null && fence.first() == fenced.first() && fence.length >= fenced.length && trimmed.drop(fence.length).isBlank()) fenced = null
+                if (fence != null && fence.first() == fenced.first() && fence.length >= fenced.length && trimmed.drop(
+                        fence.length
+                    ).isBlank()
+                ) fenced = null
             } else if (fence != null && (protectedStart == null || markdownBody)) {
                 fenced = fence
             } else {
@@ -412,8 +436,28 @@ internal object TelegramRichTextChunks {
 
     private val LABEL = Regex("\\[([^]\\u0000]+)]")
     private val HTML_TAG = Regex("<(/?)([a-zA-Z][\\w-]*)\\b[^>]*>")
-    private val CONTAINER_OPEN = Regex("^<(details|tg-collage|tg-slideshow|table|tg-math-block|tg-math|figure|blockquote|aside|pre)(?=[\\s/>])", RegexOption.IGNORE_CASE)
+    private val CONTAINER_OPEN = Regex(
+        "^<(details|tg-collage|tg-slideshow|table|tg-math-block|tg-math|figure|blockquote|aside|pre)(?=[\\s/>])",
+        RegexOption.IGNORE_CASE
+    )
     private val CONTAINER_PREFIX = Regex("^(?:>[ \\t]*|[-+*][ \\t]+|[0-9]+[.)][ \\t]+)*")
     private val VOID_TAGS = setOf("img", "br", "hr", "source", "input")
-    private val HTML_BLOCK_TAGS = setOf("p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "blockquote", "details", "pre", "hr", "img", "video", "audio")
+    private val HTML_BLOCK_TAGS = setOf(
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "tr",
+        "blockquote",
+        "details",
+        "pre",
+        "hr",
+        "img",
+        "video",
+        "audio"
+    )
 }

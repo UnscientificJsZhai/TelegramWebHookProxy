@@ -162,7 +162,8 @@ export default function SkillCatalog({onEditingChange}: { onEditingChange: (edit
                                                                           }}>新增技能</Button></Stack>}>
             <Typography variant="body2" color="text.secondary" sx={{mb: 2}}>供 Agent
                 读取的提示词指令集。新建或编辑后进入待审批状态，经人工批准后生效。</Typography>
-            <Stack direction="row" sx={{gap: 1,
+            <Stack direction="row" sx={{
+                gap: 1,
                 mb: 2,
                 flexWrap: 'wrap'
             }}>{([['ALL', '全部'], ['PENDING', '待审批'], ['APPROVED', '已批准']] as const).map(([value, label]) =>
@@ -185,8 +186,13 @@ export default function SkillCatalog({onEditingChange}: { onEditingChange: (edit
                         borderRadius: 2
                     }}>
                         <Stack direction="row"
-                               sx={{alignItems: 'flex-start', justifyContent: 'space-between', gap: 1, mb: 1}}><Typography variant="subtitle2"
-                                                        sx={{overflowWrap: 'anywhere'}}>{skill.description}</Typography><Chip
+                               sx={{
+                                   alignItems: 'flex-start',
+                                   justifyContent: 'space-between',
+                                   gap: 1,
+                                   mb: 1
+                               }}><Typography variant="subtitle2"
+                                              sx={{overflowWrap: 'anywhere'}}>{skill.description}</Typography><Chip
                             label={skill.status === 'APPROVED' ? '已批准' : '待审批'}
                             color={skill.status === 'APPROVED' ? 'success' : 'warning'} variant="outlined"
                             sx={{flexShrink: 0}}/></Stack>

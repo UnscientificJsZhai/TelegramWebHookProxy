@@ -196,7 +196,11 @@ fun Application.apiModule(
                             return@post
                         }
                         val response = if (richFormat == null) {
-                            telegramService.sendMessageForToken(snapshot.settings.telegramToken, chatId, checkNotNull(requestText))
+                            telegramService.sendMessageForToken(
+                                snapshot.settings.telegramToken,
+                                chatId,
+                                checkNotNull(requestText)
+                            )
                         } else {
                             val content = when (richFormat) {
                                 TelegramRichFormat.MARKDOWN -> InputRichMessage(markdown = checkNotNull(requestText))

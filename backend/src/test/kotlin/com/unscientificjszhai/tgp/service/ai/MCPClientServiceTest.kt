@@ -15,11 +15,6 @@ import kotlin.test.*
 class MCPClientServiceTest {
 
 
-
-
-
-
-
     /** 验证深层 structuredContent 在 MCP result serializer 之前被拒绝。 */
     @Test
     fun `deep tool result is rejected before serialization`() {

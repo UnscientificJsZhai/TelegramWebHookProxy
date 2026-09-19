@@ -39,7 +39,14 @@ import {FeedbackSnackbar, type Notice} from '../components/Feedback';
 import {MAX_TELEGRAM_MESSAGE_TEXT_LENGTH} from '../messageText';
 import {buildWebhookRequest, validateWebhookDraft, WEBHOOK_EXAMPLES, type WebhookDraft} from './webhookRequest';
 
-const INITIAL_DRAFT: WebhookDraft = {format: 'json', richFormat: '', chatId: '', text: '', messageField: '', chatIdField: ''};
+const INITIAL_DRAFT: WebhookDraft = {
+    format: 'json',
+    richFormat: '',
+    chatId: '',
+    text: '',
+    messageField: '',
+    chatIdField: ''
+};
 const parameterRows = [
     ['text', '必填 · string / array', 'Body', '普通消息最多 4,096 个 UTF-16 单元；Markdown、HTML 为字符串，blocks 为非空对象数组（表单中用 JSON 字符串）。一次请求只发送一条消息。'],
     ['richformat', '选填 · enum', 'Query', '省略或空白为普通消息；富消息可选 markdown、html、blocks。富消息不设应用层请求体字节上限，保留 JSON 结构保护；完整格式与内容限制由 Telegram 判定，不自动拆分或降级。'],
@@ -108,7 +115,7 @@ export default function Webhook() {
                     description="通过 HTTP POST 发送普通或富消息，支持 JSON、URL 编码表单与顶层字段映射。"/>
         <Paper variant="outlined" sx={{p: {xs: 2, sm: 3}, mb: 3}}>
             <Stack direction="row" sx={{alignItems: 'center', gap: 1.5, flexWrap: 'wrap', mb: 2.5}}><Chip label="POST"
-                                                                                                      color="success"/><Typography
+                                                                                                          color="success"/><Typography
                 component="code" variant="subtitle1" sx={{fontFamily: 'monospace'}}>/api/send-message</Typography><Chip
                 label="application/json" variant="outlined"/><Chip label="application/x-www-form-urlencoded"
                                                                    variant="outlined"/></Stack>
@@ -144,7 +151,10 @@ export default function Webhook() {
                             格式</ToggleButton><ToggleButton value="form">URL
                             编码表单</ToggleButton></ToggleButtonGroup>
                         <TextField select label="消息格式" value={draft.richFormat}
-                                   onChange={event => setDraft({...draft, richFormat: event.target.value as WebhookDraft['richFormat']})}>
+                                   onChange={event => setDraft({
+                                       ...draft,
+                                       richFormat: event.target.value as WebhookDraft['richFormat']
+                                   })}>
                             <MenuItem value="">普通消息</MenuItem>
                             <MenuItem value="markdown">Rich Markdown</MenuItem>
                             <MenuItem value="html">Rich HTML</MenuItem>
@@ -174,7 +184,8 @@ export default function Webhook() {
                                                                                          })}/><TextField
                             label="chatidfield" placeholder="chatId" value={draft.chatIdField}
                             onChange={event => setDraft({...draft, chatIdField: event.target.value})}/></Stack></Box>
-                        <TextField label={draft.richFormat === 'blocks' ? 'Blocks JSON 数组' : '消息正文'} multiline minRows={5} maxRows={12} value={draft.text}
+                        <TextField label={draft.richFormat === 'blocks' ? 'Blocks JSON 数组' : '消息正文'} multiline
+                                   minRows={5} maxRows={12} value={draft.text}
                                    onChange={event => setDraft({...draft, text: event.target.value})}
                                    slotProps={{htmlInput: {maxLength: draft.richFormat ? undefined : MAX_TELEGRAM_MESSAGE_TEXT_LENGTH}}}
                                    helperText={draft.richFormat ? '富消息由 Telegram 验证内容与结构限制；不会自动拆分或降级。' : `${draft.text.length.toLocaleString()} / 4,096 UTF-16 代码单元`}/>
@@ -187,8 +198,8 @@ export default function Webhook() {
                         {!hasTarget && <Typography variant="caption" color="warning.main">请输入接收目标，或在服务配置中设置默认
                             Chat ID。</Typography>}
                         <Stack direction="row" sx={{gap: 1}}><Button variant="contained" startIcon={<SendOutlined/>}
-                                                               disabled={sending || !!validation || !tokenReady || !hasTarget}
-                                                               onClick={() => void send()}>{sending ? '正在发送…' : '发送测试消息'}</Button><Button
+                                                                     disabled={sending || !!validation || !tokenReady || !hasTarget}
+                                                                     onClick={() => void send()}>{sending ? '正在发送…' : '发送测试消息'}</Button><Button
                             color="secondary" onClick={() => {
                             setDraft(INITIAL_DRAFT);
                             setResult(null);
@@ -223,7 +234,13 @@ export default function Webhook() {
                         </Paper>
                         <Paper variant="outlined" sx={{borderRadius: 2, overflow: 'hidden'}}>
                             <Stack direction="row"
-                                   sx={{justifyContent: 'space-between', alignItems: 'center', gap: 1, p: 1.5, bgcolor: 'background.default'}}><Typography
+                                   sx={{
+                                       justifyContent: 'space-between',
+                                       alignItems: 'center',
+                                       gap: 1,
+                                       p: 1.5,
+                                       bgcolor: 'background.default'
+                                   }}><Typography
                                 variant="subtitle2">执行响应</Typography><Chip variant="outlined"
                                                                                color={result ? result.ok ? 'success' : 'error' : 'default'}
                                                                                label={sending ? '正在请求…' : result ? `${result.status} · ${result.duration} ms` : '尚未发送'}/></Stack>
@@ -274,7 +291,10 @@ export default function Webhook() {
                     icon: <CodeOutlined/>,
                     description: '组合标题、表格与引用。',
                     code: 'POST /api/send-message?richformat=markdown',
-                    draft: {richFormat: 'markdown' as const, text: '# 检查结果\n\n| 指标 | 结果 |\n| --- | --- |\n| 状态 | 正常 |\n\n> 本次检查已完成。'}
+                    draft: {
+                        richFormat: 'markdown' as const,
+                        text: '# 检查结果\n\n| 指标 | 结果 |\n| --- | --- |\n| 状态 | 正常 |\n\n> 本次检查已完成。'
+                    }
                 },
                 {
                     title: 'Rich HTML',

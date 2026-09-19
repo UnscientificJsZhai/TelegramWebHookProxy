@@ -282,10 +282,12 @@ class MessagePollerTest {
         val pollStarted = CompletableDeferred<Unit>()
         val releaseFatalError = CompletableDeferred<Unit>()
         fixture.updates.saveLastUpdateId("100", 10)
-        fixture.saveSettings(AppSettings(
-            telegramToken = "100:token",
-            ai = AISettings(agentEnabled = true, agentChatId = "123"),
-        ))
+        fixture.saveSettings(
+            AppSettings(
+                telegramToken = "100:token",
+                ai = AISettings(agentEnabled = true, agentChatId = "123"),
+            )
+        )
         coEvery { fixture.telegram.getUpdatesForToken("100:token", 11, 30) } coAnswers {
             pollStarted.complete(Unit)
             awaitCancellation()
@@ -300,9 +302,11 @@ class MessagePollerTest {
             withTimeout(2.seconds) { pollStarted.await() }
             val session = currentSession(fixture.poller)
             val sessionJob = session.scope.coroutineContext.job
-            val admission = assertIs<UpdateAdmission.Enqueued>(fixture.poller.enqueueUpdateForTesting(
-                Update(11, message = authorizedMessage(1, chat, text = "fatal")),
-            ))
+            val admission = assertIs<UpdateAdmission.Enqueued>(
+                fixture.poller.enqueueUpdateForTesting(
+                    Update(11, message = authorizedMessage(1, chat, text = "fatal")),
+                )
+            )
             val cancelledBeforeCompletion = CompletableDeferred<Boolean>()
             admission.completion.invokeOnCompletion {
                 cancelledBeforeCompletion.complete(sessionJob.isCancelled)

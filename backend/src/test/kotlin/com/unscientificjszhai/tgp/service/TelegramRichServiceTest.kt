@@ -28,7 +28,11 @@ class TelegramRichServiceTest {
         }) {
             install(ContentNegotiation) { json() }
         }
-        val service = TelegramService(CoroutineScope(job), settings, UpdatesRepository(directory.resolve("updates.json"))) { client }
+        val service = TelegramService(
+            CoroutineScope(job),
+            settings,
+            UpdatesRepository(directory.resolve("updates.json"))
+        ) { client }
         try {
             val contents = listOf(
                 InputRichMessage(markdown = "# 标题"),
@@ -36,7 +40,10 @@ class TelegramRichServiceTest {
                 InputRichMessage(blocks = Json.parseToJsonElement("""[{"type":"paragraph","text":"标题","future_field":{"file_id":"test"}}]""").jsonArray),
             )
             for (content in contents) {
-                assertEquals(TelegramApiResponse(HttpStatusCode.BadRequest, "upstream-body"), service.sendRichMessageForToken("100:test", "123", content, ReplyParameters(1)))
+                assertEquals(
+                    TelegramApiResponse(HttpStatusCode.BadRequest, "upstream-body"),
+                    service.sendRichMessageForToken("100:test", "123", content, ReplyParameters(1))
+                )
             }
             requests.zip(listOf("markdown", "html", "blocks")).forEach { (body, key) ->
                 assertEquals(setOf("chat_id", "rich_message", "reply_parameters"), body.keys)
@@ -59,10 +66,25 @@ class TelegramRichServiceTest {
         }.toString()
         assertTrue(TelegramApiResponse(HttpStatusCode.OK, body).isTelegramAccepted())
         for (code in listOf(408, 429, 500, 503)) {
-            assertFalse(TelegramApiResponse(HttpStatusCode.fromValue(code), """{"ok":false,"error_code":400}""").isPermanentTelegramRejection())
-            assertFalse(TelegramApiResponse(HttpStatusCode.OK, """{"ok":false,"error_code":$code}""").isPermanentTelegramRejection())
+            assertFalse(
+                TelegramApiResponse(
+                    HttpStatusCode.fromValue(code),
+                    """{"ok":false,"error_code":400}"""
+                ).isPermanentTelegramRejection()
+            )
+            assertFalse(
+                TelegramApiResponse(
+                    HttpStatusCode.OK,
+                    """{"ok":false,"error_code":$code}"""
+                ).isPermanentTelegramRejection()
+            )
         }
-        assertTrue(TelegramApiResponse(HttpStatusCode.OK, """{"ok":false,"error_code":400}""").isPermanentTelegramRejection())
+        assertTrue(
+            TelegramApiResponse(
+                HttpStatusCode.OK,
+                """{"ok":false,"error_code":400}"""
+            ).isPermanentTelegramRejection()
+        )
         assertFalse(TelegramApiResponse(HttpStatusCode.OK, "invalid").isTelegramAccepted())
     }
 }
