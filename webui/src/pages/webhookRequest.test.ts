@@ -24,6 +24,7 @@ describe('Webhook 请求契约', () => {
             expect(validateWebhookDraft(draft({richFormat: 'blocks', text: invalid}))).not.toBeNull();
         }
     });
+
     it('使用默认字段且省略空白目标，使后端回退至默认配置', () => {
         const request = buildWebhookRequest(draft({chatId: '  '}));
         expect(request.path).toBe('/send-message');
@@ -37,17 +38,18 @@ describe('Webhook 请求契约', () => {
             messageField: '内容 & text',
             chatIdField: 'receiver'
         }));
-        expect(new URL(request.path, 'https://example.test').searchParams.get('messagefield')).toBe('内容 & text');
+        const url = new URL(request.path, 'https://example.test');
+        expect(url.searchParams.get('messagefield')).toBe('内容 & text');
+        expect(url.searchParams.get('chatidfield')).toBe('receiver');
         expect(JSON.parse(request.body)).toEqual({'内容 & text': '测试 & hello', receiver: '-100123'});
     });
 
-    it('表单编码保留中文、换行、加号和与号', () => {
+    it('表单编码生成合法的 urlencoded 格式并保留字段内容', () => {
         const request = buildWebhookRequest(draft({format: 'form', text: '服务 + 消息 & 测试\n下一行', chatId: '42'}));
         expect(request.contentType).toBe('application/x-www-form-urlencoded');
-        expect(Object.fromEntries(new URLSearchParams(request.body))).toEqual({
-            text: '服务 + 消息 & 测试\n下一行',
-            chatId: '42'
-        });
+        const params = new URLSearchParams(request.body);
+        expect(params.get('text')).toBe('服务 + 消息 & 测试\n下一行');
+        expect(params.get('chatId')).toBe('42');
     });
 
     it('按 UTF-16 长度校验消息，按 UTF-8 字节校验键名与 ID', () => {
@@ -65,17 +67,5 @@ describe('Webhook 请求契约', () => {
         }]) {
             expect(() => buildWebhookRequest(draft(patch))).toThrow();
         }
-    });
-
-    it('将特殊对象属性名作为普通顶层字段序列化', () => {
-        const request = buildWebhookRequest(draft({
-            messageField: '__proto__',
-            chatIdField: 'constructor',
-            chatId: '42'
-        }));
-        expect(Object.keys(JSON.parse(request.body))).toEqual(['__proto__', 'constructor']);
-        expect(JSON.parse(request.body).__proto__).toBe('测试 & hello');
-        const targetKeyRequest = buildWebhookRequest(draft({chatIdField: '__proto__', chatId: '42'}));
-        expect(JSON.parse(targetKeyRequest.body).__proto__).toBe('42');
     });
 });

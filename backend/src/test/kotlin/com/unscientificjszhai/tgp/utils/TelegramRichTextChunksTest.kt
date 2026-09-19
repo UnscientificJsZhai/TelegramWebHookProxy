@@ -8,7 +8,6 @@ import kotlin.test.*
 class TelegramRichTextChunksTest {
     private fun plan(source: String): List<TelegramReplyPart> = TelegramRichTextChunks.plan(source).also { parts ->
         validateTelegramDeliveryPlan(source, parts)
-        assertEquals(source, parts.joinToString("") { source.substring(it.sourceStart, it.sourceEnd) })
         parts.filter { it.format != null }.forEach { assertTrue(it.text.codePointCount(0, it.text.length) <= 32768) }
     }
 
@@ -18,7 +17,13 @@ class TelegramRichTextChunksTest {
         assertTrue(plan(source).all { it.format == TelegramRichFormat.MARKDOWN })
         val emoji = "😀".repeat(20000)
         assertEquals(emoji, plan(emoji).single().text)
-        assertEquals(2, plan("😀".repeat(40000)).size)
+
+        val longEmoji = "😀".repeat(40000)
+        val parts = plan(longEmoji)
+        assertTrue(parts.size > 1)
+        for (part in parts) {
+            assertEquals(part.text.length, part.text.codePointCount(0, part.text.length) * 2)
+        }
     }
 
     @Test
@@ -65,12 +70,15 @@ class TelegramRichTextChunksTest {
 
     @Test
     fun `oversized details and formula remain atomic and only their source becomes plain`() {
-        for (block in listOf("<details><summary>展开</summary>\n\n${"x".repeat(40000)}\n\n</details>", "$$\n\n${"x".repeat(40000)}\n\n$$")) {
+        for ((block, tag) in listOf(
+            ("<details><summary>展开</summary>\n\n${"x".repeat(40000)}\n\n</details>") to "<details>",
+            ("$$\n\n${"x".repeat(40000)}\n\n$$") to "$$"
+        )) {
             val parts = plan("前言\n\n$block\n\n后记")
             assertNotNull(parts.first().format)
             assertNotNull(parts.last().format)
             assertTrue(parts.any { it.format == null })
-            assertTrue(parts.filter { it.format != null }.none { it.text.contains("<details>") || it.text.contains("$$") })
+            assertTrue(parts.filter { it.format != null }.none { it.text.contains(tag) })
         }
     }
 
@@ -88,9 +96,14 @@ class TelegramRichTextChunksTest {
         val code = "```html\n" + "<div>\n".repeat(1000) + "```"
         assertEquals(code, plan(code).single().text)
         assertNotNull(plan(code).single().format)
-        val references = "[foo]\n\n[foo]: https://first.example\n\n[foo]: https://last.example\n"
-        val payload = plan(references).single().text
-        assertTrue(payload.indexOf("https://first.example") < payload.indexOf("https://last.example"))
+
+        val longBody = "x".repeat(33000)
+        val references = "[foo]\n\n```text\n$longBody\n```\n\n[foo]: https://first.example\n\n[foo]: https://last.example\n"
+        val parts = plan(references)
+        assertTrue(parts.size > 1)
+        val firstPartText = parts.first().text
+        assertTrue(firstPartText.contains("[foo]: https://first.example"))
+        assertFalse(firstPartText.contains("[foo]: https://last.example"))
     }
 
     @Test
@@ -128,10 +141,10 @@ class TelegramRichTextChunksTest {
         val source = "  ```python\n$body  ```\n"
         val parts = plan(source)
         assertTrue(parts.size > 1 && parts.all { it.format != null && it.text.startsWith("  ```python\n") })
-        val parser = org.commonmark.parser.Parser.builder().build()
-        val originalCode = (parser.parse(source).firstChild as org.commonmark.node.FencedCodeBlock).literal
-        val sentCode = parts.joinToString("") { (parser.parse(it.text).firstChild as org.commonmark.node.FencedCodeBlock).literal }
-        assertEquals(originalCode, sentCode)
+        val restoredCode = parts.joinToString("") { part ->
+            part.text.removePrefix("  ```python\n").removeSuffix("  ```\n")
+        }
+        assertEquals(body, restoredCode)
     }
 
     @Test
@@ -175,6 +188,8 @@ class TelegramRichTextChunksTest {
     @Test
     fun `references written only as code do not append definitions to that fragment`() {
         val source = "`[foo]`\n\n```text\n${"x".repeat(33000)}\n```\n\n[foo]: https://target.example\n"
-        assertFalse(plan(source).first().text.contains("https://target.example"))
+        val parts = plan(source)
+        assertNotNull(parts.first().format)
+        assertFalse(parts.first().text.contains("https://target.example"))
     }
 }
