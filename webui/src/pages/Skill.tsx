@@ -52,23 +52,24 @@ export default function SkillCatalog({onEditingChange}: { onEditingChange: (edit
     useEffect(() => {
         onEditingChange(editing);
     }, [editing, onEditingChange]);
-    const refresh = useCallback(async () => {
-        setLoading(true);
-        setError(false);
-        try {
-            const next = await fetchCatalog();
+    const load = useCallback(() => fetchCatalog()
+        .then(next => {
             setSkills(next);
             return next;
-        } catch {
+        }).catch(() => {
             setError(true);
             return null;
-        } finally {
+        }).finally(() => {
             setLoading(false);
-        }
-    }, []);
+        }), []);
+    const refresh = useCallback(() => {
+        setLoading(true);
+        setError(false);
+        return load();
+    }, [load]);
     useEffect(() => {
-        void refresh();
-    }, [refresh]);
+        void load();
+    }, [load]);
     useEffect(() => {
         if (!loading && hash === '#skills') document.getElementById('skills')?.scrollIntoView({block: 'start'});
     }, [hash, loading]);

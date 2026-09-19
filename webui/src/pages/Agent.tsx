@@ -36,6 +36,24 @@ export default function Agent() {
         <AgentSettings initial={snapshot}/>}</SettingsGate></>;
 }
 
+function SaveButton({label, changed, onSave, disabled, saving, invalid = false}: {
+    label: string;
+    changed: boolean;
+    onSave: () => void;
+    disabled: boolean;
+    saving: boolean;
+    invalid?: boolean;
+}) {
+    return <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1} sx={{mt: 2.5}}>
+        <Typography variant="caption" color={changed ? 'primary' : 'text.secondary'}>
+            {changed ? '有未保存修改' : '已与配置同步'}
+        </Typography>
+        <Button variant="contained" size="small" disabled={disabled || !changed || invalid} onClick={onSave}>
+            {saving ? '正在保存…' : label}
+        </Button>
+    </Stack>;
+}
+
 function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
     const {update, reload, loading} = useSettings();
     const [saved, setSaved] = useState(initial);
@@ -120,12 +138,6 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
         }
     };
     const disabled = !!saving || !saved.etag;
-    const saveButton = (group: string, label: string, changed: boolean, onSave: () => void, invalid = false) => <Stack
-        direction="row" justifyContent="space-between" alignItems="center" gap={1} sx={{mt: 2.5}}><Typography
-        variant="caption"
-        color={changed ? 'primary' : 'text.secondary'}>{changed ? '有未保存修改' : '已与配置同步'}</Typography><Button
-        variant="contained" size="small" disabled={disabled || !changed || invalid}
-        onClick={onSave}>{saving === group ? '正在保存…' : label}</Button></Stack>;
 
     return <>
         {!saved.etag && <Alert severity="error" sx={{mb: 2}} action={<Button
@@ -157,15 +169,18 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                         <Alert severity="info">更换提供商或当前 API 密钥并保存后，服务端会清空已选模型。请先保存凭据，再从下方列表选择模型，或在
                             Telegram 私聊中发送 /model 选择。</Alert>
                     </Stack>
-                    {saveButton('credentials', '保存服务凭据', credentialsDirty, () => void saveGroup(credentials, 'credentials'), keyBytes > 512 || utf8Length(draft.openAiBaseUrl) > 2048)}
+                    <SaveButton label="保存服务凭据" changed={credentialsDirty} disabled={disabled}
+                                saving={saving === 'credentials'} onSave={() => void saveGroup(credentials, 'credentials')}
+                                invalid={keyBytes > 512 || utf8Length(draft.openAiBaseUrl) > 2048}/>
                 </SectionCard>
                 <SectionCard title="模型名称" icon={<PsychologyOutlined/>}
                              action={<Typography variant="caption" color="text.secondary">独立保存</Typography>}>
                     <ModelSelector {...models} value={selectedModel} credentialsDirty={credentialsDirty}
                                    busy={disabled} onChange={setModelDraft}
                                    onRefresh={models.refresh}/>
-                    {saveButton('model', '保存模型名称', modelDirty, () => void saveGroup({selectedModel}, 'model'),
-                        credentialsDirty || models.loading || !!models.error || !models.availableModels.includes(selectedModel) || utf8Length(selectedModel) > 256)}
+                    <SaveButton label="保存模型名称" changed={modelDirty} disabled={disabled}
+                                saving={saving === 'model'} onSave={() => void saveGroup({selectedModel}, 'model')}
+                                invalid={credentialsDirty || models.loading || !!models.error || !models.availableModels.includes(selectedModel) || utf8Length(selectedModel) > 256}/>
                 </SectionCard>
                 <SectionCard title="会话策略" icon={<TuneOutlined/>}
                              action={<Chip label={baseline.agentEnabled ? '已启用' : '未启用'}
@@ -201,13 +216,15 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                         <Typography variant="caption" color="text.secondary">距上次成功 AI
                             回复达到设定时长后，在下次处理消息时清理上下文。</Typography>
                     </Stack>
-                    {saveButton('policy', '保存会话设置', policyDirty, () => void saveGroup({
+                    <SaveButton label="保存会话设置" changed={policyDirty} disabled={disabled}
+                                saving={saving === 'policy'} onSave={() => void saveGroup({
                         agentEnabled: draft.agentEnabled,
                         agentChatId: draft.agentChatId,
                         globalContext: draft.globalContext,
                         autoCleanContextIntervalMinutes: Number(interval),
                         silentContextCleanup: interval === '0' ? false : draft.silentContextCleanup
-                    }, 'policy'), !intervalValid || contextBytes > 65536 || utf8Length(draft.agentChatId) > 64 || (draft.agentEnabled && !draft.agentChatId.trim()))}
+                    }, 'policy')}
+                                invalid={!intervalValid || contextBytes > 65536 || utf8Length(draft.agentChatId) > 64 || (draft.agentEnabled && !draft.agentChatId.trim())}/>
                 </SectionCard>
             </Stack>
             <Stack spacing={3}>
