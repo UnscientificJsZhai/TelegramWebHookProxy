@@ -19,7 +19,7 @@ import {
     Tooltip,
     Typography
 } from '@mui/material';
-import ChatBubbleOutline from '@mui/icons-material/ChatBubbleOutline';
+import ChatBubbleOutlined from '@mui/icons-material/ChatBubbleOutlined';
 import SendOutlined from '@mui/icons-material/SendOutlined';
 import EditNoteOutlined from '@mui/icons-material/EditNoteOutlined';
 import SearchOutlined from '@mui/icons-material/SearchOutlined';
@@ -150,7 +150,7 @@ export default function Home() {
             gap: 3,
             alignItems: 'start'
         }}>
-            <SectionCard title="选择目标会话" icon={<ChatBubbleOutline/>}
+            <SectionCard title="选择目标会话" icon={<ChatBubbleOutlined/>}
                          action={<Tooltip title="刷新会话与默认配置"><IconButton aria-label="刷新会话与默认配置"
                                                                                  disabled={loading} onClick={() => {
                              void refresh();
@@ -213,7 +213,7 @@ export default function Home() {
                                 </Paper>;
                             })}
                             {!visibleChats.length &&
-                                <Box sx={{textAlign: 'center', py: 4, color: 'text.secondary'}}><ChatBubbleOutline
+                                <Box sx={{textAlign: 'center', py: 4, color: 'text.secondary'}}><ChatBubbleOutlined
                                     sx={{fontSize: 32, mb: 1}}/><Typography
                                     variant="body2">{search ? '未找到匹配的会话' : '暂无已发现的会话'}</Typography><Typography
                                     variant="caption">与机器人交互后刷新，或手工输入 Chat ID。</Typography></Box>}
