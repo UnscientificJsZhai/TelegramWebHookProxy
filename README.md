@@ -58,7 +58,7 @@ docker run -d \
 
 ### 使用 Jar 包
 
-项目需要 JDK 21。Gradle 会在构建前自动下载前端所需的 Node.js 版本。
+可以使用 JDK 21 或 JDK 26 启动构建。编译和默认测试仍使用 JDK 21，Gradle 会按需下载对应工具链及前端所需的 Node.js/npm。Docker 构建和运行镜像使用 JDK 26。
 
 ```bash
 ./gradlew build
