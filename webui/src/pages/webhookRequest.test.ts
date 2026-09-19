@@ -2,10 +2,28 @@ import {describe, expect, it} from 'vitest';
 import {buildWebhookRequest, validateWebhookDraft, type WebhookDraft} from './webhookRequest';
 
 const draft = (patch: Partial<WebhookDraft> = {}): WebhookDraft => ({
-    format: 'json', chatId: '', text: '测试 & hello', messageField: '', chatIdField: '', ...patch,
+    format: 'json', richFormat: '', chatId: '', text: '测试 & hello', messageField: '', chatIdField: '', ...patch,
 });
 
 describe('Webhook 请求契约', () => {
+    it('富消息选择放在查询参数，文本不套用普通消息长度限制', () => {
+        for (const richFormat of ['markdown', 'html'] as const) {
+            const request = buildWebhookRequest(draft({richFormat, text: '字'.repeat(40000)}));
+            expect(request.path).toBe(`/send-message?richformat=${richFormat}`);
+            expect(JSON.parse(request.body).text).toHaveLength(40000);
+        }
+    });
+
+    it('blocks 按 JSON 数组或表单字符串发送，保留自定义正文键', () => {
+        const text = '[{"type":"paragraph","text":"测试"}]';
+        const json = buildWebhookRequest(draft({richFormat: 'blocks', text, messageField: 'content'}));
+        expect(JSON.parse(json.body).content).toEqual(JSON.parse(text));
+        const form = buildWebhookRequest(draft({richFormat: 'blocks', format: 'form', text, messageField: 'content'}));
+        expect(new URLSearchParams(form.body).get('content')).toBe(text);
+        for (const invalid of ['[]', '{}', '[null]', '[1]', '[[]]', 'invalid']) {
+            expect(validateWebhookDraft(draft({richFormat: 'blocks', text: invalid}))).not.toBeNull();
+        }
+    });
     it('使用默认字段且省略空白目标，使后端回退至默认配置', () => {
         const request = buildWebhookRequest(draft({chatId: '  '}));
         expect(request.path).toBe('/send-message');

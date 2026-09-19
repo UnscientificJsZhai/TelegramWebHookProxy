@@ -18,6 +18,7 @@ import com.unscientificjszhai.tgp.service.ai.agent.AgentTurnFailedException
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_TOOL_CALL_ROUNDS
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.ai.agent.OpenAIAgentService
+import com.unscientificjszhai.tgp.service.ai.agent.TELEGRAM_RICH_REPLY_PROMPT
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
 import io.mockk.every
 import io.mockk.mockk
@@ -124,6 +125,16 @@ class OpenAIAgentServiceTest {
         val restoredService = newService()
 
         assertEquals("gpt-4o", restoredService.currentModel)
+    }
+
+    @Test
+    fun `system history retains global context and appends rich reply guidance`() = runBlocking {
+        settingsChangeCoordinator.replaceSettingsForTest(AppSettings(ai = AISettings(provider = AIProvider.OPENAI, globalContext = "SYSTEM_CONTEXT_CANARY")))
+        service.resetSession()?.join()
+        val history = OpenAIAgentService::class.java.getDeclaredField("history").apply { isAccessible = true }.get(service) as List<*>
+        val prompt = history.first().toString()
+        assertTrue(prompt.contains("SYSTEM_CONTEXT_CANARY"))
+        assertTrue(prompt.contains(TELEGRAM_RICH_REPLY_PROMPT))
     }
 
 

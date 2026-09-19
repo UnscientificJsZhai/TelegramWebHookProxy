@@ -3,6 +3,7 @@ import {utf8Length} from '../settings';
 
 export interface WebhookDraft {
     format: 'json' | 'form';
+    richFormat: '' | 'markdown' | 'html' | 'blocks';
     chatId: string;
     text: string;
     messageField: string;
@@ -11,7 +12,17 @@ export interface WebhookDraft {
 
 export const validateWebhookDraft = (draft: WebhookDraft): string | null => {
     if (!draft.text.trim()) return '消息正文不能全为空白。';
-    if (!isTelegramMessageTextWithinLimit(draft.text)) return '消息不能超过 4,096 个 UTF-16 代码单元。';
+    if (!draft.richFormat && !isTelegramMessageTextWithinLimit(draft.text)) return '消息不能超过 4,096 个 UTF-16 代码单元。';
+    if (draft.richFormat === 'blocks') {
+        try {
+            const blocks: unknown = JSON.parse(draft.text);
+            if (!Array.isArray(blocks) || blocks.length === 0 || blocks.some(block => !block || typeof block !== 'object' || Array.isArray(block))) {
+                return 'blocks 必须是非空 JSON 对象数组。';
+            }
+        } catch {
+            return 'blocks 必须是合法 JSON 数组。';
+        }
+    }
     if (utf8Length(draft.chatId) > 64) return 'Chat ID 不能超过 64 个 UTF-8 字节。';
     const messageField = draft.messageField || 'text';
     const chatIdField = draft.chatIdField || 'chatId';
@@ -25,6 +36,7 @@ export const buildWebhookRequest = (draft: WebhookDraft) => {
     const error = validateWebhookDraft(draft);
     if (error) throw new Error(error);
     const query = new URLSearchParams();
+    if (draft.richFormat) query.set('richformat', draft.richFormat);
     if (draft.messageField) query.set('messagefield', draft.messageField);
     if (draft.chatIdField) query.set('chatidfield', draft.chatIdField);
     const body: Record<string, string> = Object.fromEntries([
@@ -34,7 +46,10 @@ export const buildWebhookRequest = (draft: WebhookDraft) => {
     const suffix = query.toString();
     return {
         path: `/send-message${suffix ? `?${suffix}` : ''}`,
-        body: draft.format === 'json' ? JSON.stringify(body) : new URLSearchParams(body).toString(),
+        body: draft.format === 'json' ? JSON.stringify({
+            ...body,
+            [draft.messageField || 'text']: draft.richFormat === 'blocks' ? JSON.parse(draft.text) : draft.text,
+        }) : new URLSearchParams(body).toString(),
         contentType: draft.format === 'json' ? 'application/json' : 'application/x-www-form-urlencoded',
     };
 };

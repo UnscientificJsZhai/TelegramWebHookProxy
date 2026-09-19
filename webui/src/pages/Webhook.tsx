@@ -8,6 +8,7 @@ import {
     Chip,
     Divider,
     Paper,
+    MenuItem,
     Stack,
     Tab,
     Table,
@@ -38,9 +39,10 @@ import {FeedbackSnackbar, type Notice} from '../components/Feedback';
 import {MAX_TELEGRAM_MESSAGE_TEXT_LENGTH} from '../messageText';
 import {buildWebhookRequest, validateWebhookDraft, WEBHOOK_EXAMPLES, type WebhookDraft} from './webhookRequest';
 
-const INITIAL_DRAFT: WebhookDraft = {format: 'json', chatId: '', text: '', messageField: '', chatIdField: ''};
+const INITIAL_DRAFT: WebhookDraft = {format: 'json', richFormat: '', chatId: '', text: '', messageField: '', chatIdField: ''};
 const parameterRows = [
-    ['text', '必填 · string', 'Body', '普通文本，不能全为空白，最多 4,096 个 UTF-16 代码单元（部分 emoji 占 2 个）。超限返回 400，不会自动截断。不解析 Markdown / HTML。'],
+    ['text', '必填 · string / array', 'Body', '普通消息最多 4,096 个 UTF-16 单元；Markdown、HTML 为字符串，blocks 为非空对象数组（表单中用 JSON 字符串）。一次请求只发送一条消息。'],
+    ['richformat', '选填 · enum', 'Query', '省略或空白为普通消息；富消息可选 markdown、html、blocks。富消息不设应用层请求体字节上限，保留 JSON 结构保护；完整格式与内容限制由 Telegram 判定，不自动拆分或降级。'],
     ['chatId', '选填 · string', 'Body', '目标会话 ID，必须使用字符串。缺失、为 null 或全空白时回退至全局默认目标。最多 64 个 UTF-8 字节。'],
     ['messagefield', '选填 · string', 'Query', '正文的顶层键名，默认为 text。仅支持顶层映射，不支持 JSONPath 或嵌套提取。最多 64 个 UTF-8 字节。'],
     ['chatidfield', '选填 · string', 'Query', '目标会话的顶层键名，默认为 chatId。最多 64 个 UTF-8 字节。'],
@@ -103,7 +105,7 @@ export default function Webhook() {
 
     return <>
         <PageHeader title="Webhook 接口文档与调试"
-                    description="通过 HTTP POST 将普通文本消息投递至 Telegram，支持 JSON、URL 编码表单与顶层字段映射。"/>
+                    description="通过 HTTP POST 发送普通或富消息，支持 JSON、URL 编码表单与顶层字段映射。"/>
         <Paper variant="outlined" sx={{p: {xs: 2, sm: 3}, mb: 3}}>
             <Stack direction="row" alignItems="center" gap={1.5} flexWrap="wrap" sx={{mb: 2.5}}><Chip label="POST"
                                                                                                       color="success"/><Typography
@@ -123,8 +125,8 @@ export default function Webhook() {
                     color: 'text.secondary',
                     lineHeight: 1.7
                 }}>{description}</TableCell></TableRow>)}</TableBody></Table></TableContainer>
-            <Typography variant="caption" color="text.secondary" sx={{display: 'block', mt: 2}}>请求体上限 64
-                KiB。建议为正文与目标使用不同的字段名。基准地址为当前部署站点。</Typography>
+            <Typography variant="caption" color="text.secondary" sx={{display: 'block', mt: 2}}>普通消息请求体上限 64
+                KiB；富消息不设应用层字节上限。建议为正文与目标使用不同的字段名。基准地址为当前部署站点。</Typography>
         </Paper>
         <Box ref={testerRef} sx={{scrollMarginTop: 96}}>
             <SectionCard title="接口测试器" icon={<BuildOutlined/>}>
@@ -141,6 +143,13 @@ export default function Webhook() {
                                            }} size="small" aria-label="请求编码"><ToggleButton value="json">JSON
                             格式</ToggleButton><ToggleButton value="form">URL
                             编码表单</ToggleButton></ToggleButtonGroup>
+                        <TextField select label="消息格式" value={draft.richFormat}
+                                   onChange={event => setDraft({...draft, richFormat: event.target.value as WebhookDraft['richFormat']})}>
+                            <MenuItem value="">普通消息</MenuItem>
+                            <MenuItem value="markdown">Rich Markdown</MenuItem>
+                            <MenuItem value="html">Rich HTML</MenuItem>
+                            <MenuItem value="blocks">Blocks</MenuItem>
+                        </TextField>
                         <Autocomplete freeSolo options={chats.map(chat => chat.id)} value={draft.chatId || null}
                                       inputValue={draft.chatId}
                                       onInputChange={(_, value) => setDraft(previous => ({...previous, chatId: value}))}
@@ -165,10 +174,10 @@ export default function Webhook() {
                                                                                          })}/><TextField
                             label="chatidfield" placeholder="chatId" value={draft.chatIdField}
                             onChange={event => setDraft({...draft, chatIdField: event.target.value})}/></Stack></Box>
-                        <TextField label="消息正文" multiline minRows={5} maxRows={12} value={draft.text}
+                        <TextField label={draft.richFormat === 'blocks' ? 'Blocks JSON 数组' : '消息正文'} multiline minRows={5} maxRows={12} value={draft.text}
                                    onChange={event => setDraft({...draft, text: event.target.value})}
-                                   slotProps={{htmlInput: {maxLength: MAX_TELEGRAM_MESSAGE_TEXT_LENGTH}}}
-                                   helperText={`${draft.text.length.toLocaleString()} / 4,096 UTF-16 代码单元`}/>
+                                   slotProps={{htmlInput: {maxLength: draft.richFormat ? undefined : MAX_TELEGRAM_MESSAGE_TEXT_LENGTH}}}
+                                   helperText={draft.richFormat ? '富消息由 Telegram 验证内容与结构限制；不会自动拆分或降级。' : `${draft.text.length.toLocaleString()} / 4,096 UTF-16 代码单元`}/>
                         {validation && draft.text.length > 0 && <Alert severity="warning">{validation}</Alert>}
                         {settingsError && <Alert severity="error" action={<Button
                             onClick={() => void reload().catch(() => undefined)}>重试</Button>}>{settingsError}</Alert>}
@@ -259,6 +268,27 @@ export default function Webhook() {
                     description: '将固定顶层字段映射为消息正文。',
                     code: 'POST /api/send-message?messagefield=title\n\n{"title":"主机内存使用率突破 90%"}',
                     draft: {messageField: 'title', text: '主机内存使用率突破 90%'}
+                },
+                {
+                    title: 'Rich Markdown',
+                    icon: <CodeOutlined/>,
+                    description: '组合标题、表格与引用。',
+                    code: 'POST /api/send-message?richformat=markdown',
+                    draft: {richFormat: 'markdown' as const, text: '# 检查结果\n\n| 指标 | 结果 |\n| --- | --- |\n| 状态 | 正常 |\n\n> 本次检查已完成。'}
+                },
+                {
+                    title: 'Rich HTML',
+                    icon: <CodeOutlined/>,
+                    description: '使用 Telegram 支持的 HTML 标签。',
+                    code: 'POST /api/send-message?richformat=html',
+                    draft: {richFormat: 'html' as const, text: '<h1>检查结果</h1><p><b>服务正常</b></p>'}
+                },
+                {
+                    title: 'Blocks',
+                    icon: <CodeOutlined/>,
+                    description: '以结构化数组组织消息内容。',
+                    code: 'POST /api/send-message?richformat=blocks',
+                    draft: {richFormat: 'blocks' as const, text: '[{"type":"paragraph","text":"检查已完成。"}]'}
                 },
             ].map(example => <Paper key={example.title} variant="outlined" sx={{
                 p: 2,

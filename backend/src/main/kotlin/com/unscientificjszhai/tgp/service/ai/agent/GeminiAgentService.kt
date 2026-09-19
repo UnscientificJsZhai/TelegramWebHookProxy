@@ -1049,11 +1049,7 @@ class GeminiAgentService @Inject internal constructor(
     ): GenerateContentConfig {
         val configBuilder = GenerateContentConfig.builder()
         val skillPrompt = getSkillPrompt(skillRepository.getApprovedSkillSummaries())
-        val systemInstruction = if (aiSettings.globalContext.isNotBlank()) {
-            Content.fromParts(Part.fromText(skillPrompt + aiSettings.globalContext))
-        } else {
-            Content.fromParts(Part.fromText(skillPrompt))
-        }
+        val systemInstruction = Content.fromParts(Part.fromText(withTelegramRichReplyGuidance(skillPrompt + aiSettings.globalContext)))
         configBuilder.systemInstruction(systemInstruction)
         val functionDeclarations = functionRouteSnapshot.providedFunctions()
         if (functionDeclarations.isNotEmpty()) {
@@ -1228,7 +1224,7 @@ class GeminiAgentService @Inject internal constructor(
         routeSnapshot: LocalFunctionRouteSnapshot,
     ): JsonObject = buildJsonObject {
         val skillPrompt = getSkillPrompt(skillRepository.getApprovedSkillSummaries())
-        val instruction = skillPrompt + aiSettings.globalContext
+        val instruction = withTelegramRichReplyGuidance(skillPrompt + aiSettings.globalContext)
         if (instruction.isNotBlank()) {
             put("systemInstruction", buildJsonObject {
                 put("parts", buildJsonArray { add(buildJsonObject { put("text", instruction) }) })

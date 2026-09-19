@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.repository
 
 import com.unscientificjszhai.tgp.models.ChatInfo
 import com.unscientificjszhai.tgp.models.ReplyParameters
+import com.unscientificjszhai.tgp.models.TelegramReplyPart
 import com.unscientificjszhai.tgp.utils.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.serialization.Serializable
@@ -121,6 +122,8 @@ data class AgentTurnJournalEntry(
     val replyParameters: ReplyParameters? = null,
     val status: AgentTurnJournalStatus,
     val reply: String? = null,
+    /** 成功 AI 回合的固定投递计划；旧数据和系统失败回复均为 null。 */
+    val deliveryPlan: List<TelegramReplyPart>? = null,
 )
 
 /** Agent 回合持久化账本的状态。 */
@@ -154,8 +157,8 @@ internal sealed interface AgentTurnClaim {
  * 每个机器人内同一 [updateId] 最多保留一项。回复以至少一次语义投递：网络结果不确定或 Telegram
  * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。每次网络投递前都会先持久化
  * [deliveryAttempts]，因此进程在请求中断后可能少于该次数实际发送，但绝不会突破回退消息的投递上限。
- * 原文首片段携带引用参数时，永久 `4xx` 会先清除引用并从同一片段重新投递原文；任何回退消息被接受或
- * 耗尽投递次数都会终止整条回复，不能继续发送后续原文片段。
+ * 原文首片段携带引用参数时，永久 `4xx` 会先清除引用并从同一片段重新投递原文；富片段普通降级完成后
+ * 继续下一片段。固定失败提示被接受或耗尽投递次数才会终止整条回复。
  *
  * @property updateId 生成该回复的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，且在同一机器人 outbox 中唯一。
  * @property chatId 回复目标聊天标识；不能为空。
@@ -166,7 +169,7 @@ internal sealed interface AgentTurnClaim {
  * @property deliveryStage 当前片段投递阶段；旧文件缺少该字段时默认为 [TelegramReplyDeliveryStage.ORIGINAL]。
  * @property deliveryAttempts 当前片段的 [deliveryStage] 已持久化投递次数；必须为非负数，切换片段或阶段时归零。
  * @property permanentRejectionCount 原文阶段连续出现的永久 `4xx` 拒绝次数；仅
- * [TelegramReplyDeliveryStage.ORIGINAL] 使用且取值只能为 `0` 或 `1`。首片段仍带引用参数的永久拒绝会
+ * 普通原文投递及 [TelegramReplyDeliveryStage.PLAIN_FALLBACK] 使用且取值只能为 `0` 或 `1`。首片段仍带引用参数的永久拒绝会
  * 先清除引用并将该计数归零；任一可重试失败也会将其清零，旧文件缺少该字段时默认为 `0`。
  */
 @Serializable
@@ -179,19 +182,29 @@ data class PendingTelegramReply(
     val deliveryStage: TelegramReplyDeliveryStage = TelegramReplyDeliveryStage.ORIGINAL,
     val deliveryAttempts: Int = 0,
     val permanentRejectionCount: Int = 0,
+    /** 缺少计划的历史记录继续使用 nextChunkStart，不重新解释旧游标。 */
+    val deliveryPlan: List<TelegramReplyPart>? = null,
+    /** 固定计划中当前待投递片段的索引。 */
+    val nextPartIndex: Int = 0,
+    /** 当前富片段降级后，下一普通分片在该片原文中的 UTF-16 起点。 */
+    val plainFallbackStart: Int = 0,
 )
 
 /**
  * 等待投递的 Telegram 回复所处的阶段。
  *
- * 原文当前片段收到两次连续的永久 `4xx` 拒绝后会切换到 [FALLBACK]；但首片段仍带引用参数时会先清除引用
- * 重试相同原文。可重试失败会清除原文的连续拒绝计数。回退消息始终作为不引用原消息的独立消息发送，成功
+ * 首片段仍带引用参数时会先清除引用重试。富片段被明确拒绝后切换到 [PLAIN_FALLBACK]，其原文发送成功后
+ * 继续下一片段。普通投递收到两次连续的永久 `4xx` 后切换到 [FALLBACK]。可重试失败会清除连续拒绝计数。
+ * 固定失败提示始终作为不引用原消息的独立消息发送，成功
  * 或耗尽后都会终止整条原文回复。
  */
 @Serializable
 enum class TelegramReplyDeliveryStage {
     /** 投递 Agent 生成的原始回复；连续永久拒绝计数最多为 `1`。 */
     ORIGINAL,
+
+    /** 当前富片段明确被拒后，以普通消息继续投递该片段原文。 */
+    PLAIN_FALLBACK,
 
     /** 投递说明原始回复未能发送的固定回退消息；接受或耗尽后终止整条回复。 */
     FALLBACK,
@@ -761,9 +774,11 @@ class UpdatesRepository private constructor(
         botId: String,
         updateId: Long,
         reply: String?,
+        deliveryPlan: List<TelegramReplyPart>? = null,
     ): AgentTurnJournalEntry? {
         requirePersistableTelegramUpdateId(updateId, "updateId")
         validateAgentTurnReply(reply)
+        validateTelegramDeliveryPlan(reply, deliveryPlan)
         if (!botId.isValidBotId()) {
             return null
         }
@@ -778,7 +793,7 @@ class UpdatesRepository private constructor(
         if (existing.status != AgentTurnJournalStatus.IN_PROGRESS) {
             return null
         }
-        val finalized = existing.copy(status = AgentTurnJournalStatus.FINAL, reply = reply)
+        val finalized = existing.copy(status = AgentTurnJournalStatus.FINAL, reply = reply, deliveryPlan = deliveryPlan)
         val journal = current.agentTurnJournal.toMutableList().also { it[entryIndex] = finalized }
         saveState(state.copy(bots = state.bots + (botId to current.copy(agentTurnJournal = journal))))
         return finalized
@@ -974,6 +989,7 @@ class UpdatesRepository private constructor(
         validatePendingTelegramReply(replacement, expected.updateId)
         require(replacement.chatId == expected.chatId) { "replacement chatId must match expected reply." }
         require(replacement.text == expected.text) { "replacement must preserve the source reply text." }
+        require(replacement.deliveryPlan == expected.deliveryPlan) { "replacement must preserve the delivery plan." }
         if (!botId.isValidBotId()) {
             return false
         }
@@ -993,7 +1009,7 @@ class UpdatesRepository private constructor(
      * 条件确认当前已发送片段，并原子推进到下一片段或删除末片段记录。
      *
      * 只有当前 outbox 记录仍与 [expected] 完全一致时才推进，避免旧 token 的迟到成功响应确认新会话已改变
-     * 的投递状态。原文片段接受后推进下一片段并恢复原文阶段；回退消息接受后则删除整条回复，绝不推进
+     * 的投递状态。原文片段接受后推进下一片段并恢复原文阶段；固定失败提示接受后则删除整条回复，绝不推进
      * 原文 cursor。
      *
      * @param botId token 冒号前的非空机器人标识。
@@ -1071,6 +1087,32 @@ class UpdatesRepository private constructor(
         replyIndex: Int,
         reply: PendingTelegramReply,
     ): UpdatesData {
+        if (reply.deliveryPlan != null) {
+            val nextPlainStart = if (reply.deliveryStage == TelegramReplyDeliveryStage.PLAIN_FALLBACK) {
+                TelegramTextChunks.nextStartAfter(reply.currentPartSource(), reply.plainFallbackStart)
+            } else null
+            val advanced = if (nextPlainStart != null && nextPlainStart < reply.currentPartSource().length) {
+                reply.copy(
+                    plainFallbackStart = nextPlainStart,
+                    deliveryAttempts = 0,
+                    permanentRejectionCount = 0,
+                )
+            } else {
+                val nextPart = reply.nextPartIndex + 1
+                if (nextPart == reply.deliveryPlan.size) {
+                    return current.copy(pendingTelegramReplies = current.pendingTelegramReplies.filterNot { it.updateId == reply.updateId })
+                }
+                reply.copy(
+                    nextPartIndex = nextPart,
+                    plainFallbackStart = 0,
+                    deliveryStage = TelegramReplyDeliveryStage.ORIGINAL,
+                    deliveryAttempts = 0,
+                    permanentRejectionCount = 0,
+                )
+            }
+            val replies = current.pendingTelegramReplies.toMutableList().also { it[replyIndex] = advanced }
+            return current.copy(pendingTelegramReplies = replies)
+        }
         val nextChunkStart = TelegramTextChunks.nextStartAfter(reply.text, reply.nextChunkStart)
         if (nextChunkStart == reply.text.length) {
             return current.copy(pendingTelegramReplies = current.pendingTelegramReplies.filterNot { it.updateId == reply.updateId })
@@ -1441,6 +1483,7 @@ class UpdatesRepository private constructor(
         requirePersistableTelegramUpdateId(entry.updateId, "agent turn updateId")
         require(entry.chatId.isNotBlank()) { "agent turn chatId must not be blank." }
         validateAgentTurnReply(entry.reply)
+        validateTelegramDeliveryPlan(entry.reply, entry.deliveryPlan)
         when (entry.status) {
             AgentTurnJournalStatus.IN_PROGRESS -> {
                 require(entry.reply == null) { "in-progress agent turn must not contain a reply." }
@@ -1577,13 +1620,26 @@ private fun validatePendingTelegramReply(reply: PendingTelegramReply, expectedUp
     requirePersistableTelegramUpdateId(reply.updateId, "reply updateId")
     require(reply.chatId.isNotBlank()) { "reply chatId must not be blank." }
     require(reply.text.isNotBlank()) { "reply text must not be blank." }
-    require(TelegramTextChunks.isChunkStart(reply.text, reply.nextChunkStart)) {
-        "reply nextChunkStart must identify a pending Telegram text chunk."
+    validateTelegramDeliveryPlan(reply.text, reply.deliveryPlan)
+    if (reply.deliveryPlan == null) {
+        require(TelegramTextChunks.isChunkStart(reply.text, reply.nextChunkStart)) {
+            "reply nextChunkStart must identify a pending Telegram text chunk."
+        }
+        require(reply.nextPartIndex == 0 && reply.plainFallbackStart == 0)
+        require(reply.deliveryStage != TelegramReplyDeliveryStage.PLAIN_FALLBACK)
+    } else {
+        require(reply.nextChunkStart == 0 && reply.nextPartIndex in reply.deliveryPlan.indices)
+        if (reply.deliveryStage == TelegramReplyDeliveryStage.PLAIN_FALLBACK) {
+            require(reply.currentPart()?.format != null && reply.replyParameters == null)
+            require(TelegramTextChunks.isChunkStart(reply.currentPartSource(), reply.plainFallbackStart))
+        } else {
+            require(reply.plainFallbackStart == 0)
+        }
     }
     require(reply.deliveryAttempts >= 0) { "reply deliveryAttempts must not be negative." }
     require(reply.permanentRejectionCount >= 0) { "reply permanentRejectionCount must not be negative." }
     when (reply.deliveryStage) {
-        TelegramReplyDeliveryStage.ORIGINAL -> {
+        TelegramReplyDeliveryStage.ORIGINAL, TelegramReplyDeliveryStage.PLAIN_FALLBACK -> {
             require(reply.permanentRejectionCount <= 1) {
                 "original reply permanentRejectionCount must not exceed one."
             }
@@ -1606,6 +1662,7 @@ private fun validateAgentTurnJournal(entries: List<AgentTurnJournalEntry>) {
         requirePersistableTelegramUpdateId(entry.updateId, "agent turn updateId")
         require(entry.chatId.isNotBlank()) { "agent turn chatId must not be blank." }
         validateAgentTurnReply(entry.reply)
+        validateTelegramDeliveryPlan(entry.reply, entry.deliveryPlan)
         if (entry.status == AgentTurnJournalStatus.IN_PROGRESS) {
             require(entry.reply == null) { "in-progress agent turn must not contain a reply." }
         }

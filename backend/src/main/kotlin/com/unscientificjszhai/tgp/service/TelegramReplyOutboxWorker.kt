@@ -1,24 +1,20 @@
 package com.unscientificjszhai.tgp.service
 
+import com.unscientificjszhai.tgp.models.InputRichMessage
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.repository.MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
 import com.unscientificjszhai.tgp.repository.PendingTelegramReply
 import com.unscientificjszhai.tgp.repository.RetryCheckpointCommitResult
 import com.unscientificjszhai.tgp.repository.TelegramReplyDeliveryStage
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
-import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.repository.isRichDelivery
+import com.unscientificjszhai.tgp.repository.isFirstOriginalPart
+import com.unscientificjszhai.tgp.repository.originalDeliveryText
 import com.unscientificjszhai.tgp.utils.SafeLogging
-import com.unscientificjszhai.tgp.utils.TelegramTextChunks
-import io.ktor.http.isSuccess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.Logger
 import kotlin.time.Duration.Companion.seconds
 
@@ -109,12 +105,13 @@ internal class TelegramReplyOutboxWorker(
 
         val response = try {
             runtime.ensureCurrent(session)
-            telegramService.sendMessageForToken(
-                session.token,
-                reply.chatId,
-                reply.deliveryText(),
-                reply.deliveryReplyParameters(),
-            )
+            if (reply.isRichDelivery()) {
+                telegramService.sendRichMessageForToken(
+                    session.token, reply.chatId, InputRichMessage(markdown = reply.deliveryText()), reply.deliveryReplyParameters(),
+                )
+            } else {
+                telegramService.sendMessageForToken(session.token, reply.chatId, reply.deliveryText(), reply.deliveryReplyParameters())
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -155,12 +152,19 @@ internal class TelegramReplyOutboxWorker(
                 }
                 return OutboxDelivery.RETRY
             }
-            if (reply.deliveryStage == TelegramReplyDeliveryStage.ORIGINAL) {
+            if (reply.deliveryStage != TelegramReplyDeliveryStage.FALLBACK) {
                 val replacement = when {
                     response?.isPermanentTelegramRejection() == true &&
                             reply.shouldRetryFirstChunkWithoutReplyParameters() ->
                         reply.withoutFirstChunkReplyParameters()
 
+                    response?.isPermanentTelegramRejection() == true && reply.isRichDelivery() -> reply.copy(
+                        replyParameters = null,
+                        deliveryStage = TelegramReplyDeliveryStage.PLAIN_FALLBACK,
+                        deliveryAttempts = 0,
+                        permanentRejectionCount = 0,
+                        plainFallbackStart = 0,
+                    )
                     response?.isPermanentTelegramRejection() == true -> reply.afterPermanentTelegramRejection()
                     else -> reply.afterRetryableTelegramFailure()
                 }
@@ -204,6 +208,12 @@ internal class TelegramReplyOutboxWorker(
                         "Telegram permanently rejected the quoted first chunk for outbox reply {} of bot {}; retrying original without reply parameters.",
                         reply.updateId,
                         session.botId,
+                    )
+                } else if (reply.isRichDelivery() && replacement.deliveryStage == TelegramReplyDeliveryStage.PLAIN_FALLBACK) {
+                    logger.warn(
+                        "Telegram 明确拒绝回复 {} 的富片段 {}；下一次投递仅降级该片段原文。",
+                        reply.updateId,
+                        reply.nextPartIndex,
                     )
                 } else if (replacement.permanentRejectionCount == 0) {
                     logger.warn(
@@ -300,30 +310,8 @@ internal class TelegramReplyOutboxWorker(
         runtime.signalOutboxForBot(botId)
     }
 
-    private fun TelegramApiResponse.isTelegramAccepted(): Boolean =
-        status.isSuccess() && try {
-            JsonStructureLimits.parseToJsonElement(Json, body).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull == true
-        } catch (_: Exception) {
-            false
-        }
-
-    private fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean {
-        if (status.value == 429) return false
-        if (status.value in 400..499) return true
-        return try {
-            JsonStructureLimits.parseToJsonElement(Json, body)
-                .jsonObject["error_code"]
-                ?.jsonPrimitive
-                ?.intOrNull
-                ?.let { it in 400..499 && it != 429 }
-                ?: false
-        } catch (_: Exception) {
-            false
-        }
-    }
-
     private fun PendingTelegramReply.afterPermanentTelegramRejection(): PendingTelegramReply {
-        check(deliveryStage == TelegramReplyDeliveryStage.ORIGINAL) {
+        check(deliveryStage != TelegramReplyDeliveryStage.FALLBACK) {
             "only original replies can record permanent rejections."
         }
         val rejectionCount = permanentRejectionCount + 1
@@ -333,6 +321,7 @@ internal class TelegramReplyOutboxWorker(
             copy(
                 replyParameters = null,
                 deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
+                plainFallbackStart = 0,
                 deliveryAttempts = 0,
                 permanentRejectionCount = 0,
             )
@@ -340,9 +329,7 @@ internal class TelegramReplyOutboxWorker(
     }
 
     private fun PendingTelegramReply.shouldRetryFirstChunkWithoutReplyParameters(): Boolean =
-        deliveryStage == TelegramReplyDeliveryStage.ORIGINAL &&
-                nextChunkStart == 0 &&
-                replyParameters != null
+        isFirstOriginalPart() && replyParameters != null
 
     private fun PendingTelegramReply.withoutFirstChunkReplyParameters(): PendingTelegramReply {
         check(shouldRetryFirstChunkWithoutReplyParameters()) {
@@ -356,20 +343,20 @@ internal class TelegramReplyOutboxWorker(
     }
 
     private fun PendingTelegramReply.afterRetryableTelegramFailure(): PendingTelegramReply {
-        check(deliveryStage == TelegramReplyDeliveryStage.ORIGINAL) {
+        check(deliveryStage != TelegramReplyDeliveryStage.FALLBACK) {
             "only original replies can reset permanent rejections."
         }
         return if (permanentRejectionCount == 0) this else copy(permanentRejectionCount = 0)
     }
 
     private fun PendingTelegramReply.deliveryText(): String = when (deliveryStage) {
-        TelegramReplyDeliveryStage.ORIGINAL -> TelegramTextChunks.chunkAt(text, nextChunkStart)
+        TelegramReplyDeliveryStage.ORIGINAL, TelegramReplyDeliveryStage.PLAIN_FALLBACK -> originalDeliveryText()
         TelegramReplyDeliveryStage.FALLBACK -> TELEGRAM_REPLY_FALLBACK_MESSAGE
     }
 
     private fun PendingTelegramReply.deliveryReplyParameters(): ReplyParameters? =
         replyParameters.takeIf {
-            deliveryStage == TelegramReplyDeliveryStage.ORIGINAL && nextChunkStart == 0
+            isFirstOriginalPart()
         }
 
     private enum class OutboxDelivery {

@@ -376,7 +376,7 @@ class OpenAIAgentService @Inject internal constructor(
         val skills = skillRepository.getApprovedSkillSummaries()
         val skillPrompt = getSkillPrompt(skills)
 
-        val systemPrompt = (aiSettings.globalContext) + "\n\n" + skillPrompt
+        val systemPrompt = withTelegramRichReplyGuidance(aiSettings.globalContext + "\n\n" + skillPrompt)
         if (systemPrompt.isNotBlank()) {
             history.add(
                 ChatCompletionMessageParam.ofSystem(

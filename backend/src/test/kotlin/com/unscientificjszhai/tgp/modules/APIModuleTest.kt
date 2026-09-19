@@ -32,6 +32,88 @@ private val completeSettingsJson = Json {
  * 设置 HTTP API 的测试设计。
  */
 class APIModuleTest {
+    @Test
+    fun `rich formats preserve mapped content and upstream responses without fallback`() = withTestApi { settings, telegram, _ ->
+        settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "default") }
+        val bodies = mutableListOf<com.unscientificjszhai.tgp.models.InputRichMessage>()
+        coEvery { telegram.sendRichMessageForToken(any(), any(), capture(bodies), any()) } returns
+                TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false,"description":"format rejected"}""")
+        val cases = listOf(
+            "markdown" to "\"# 标题\"",
+            "html" to "\"<h1>标题</h1>\"",
+            "blocks" to """[{"type":"paragraph","text":"标题","future_field":true}]""",
+        )
+        for ((format, body) in cases) {
+            client.post("/api/send-message?richformat=$format&messagefield=body&chatidfield=target") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"body":$body,"target":"42"}""")
+            }.apply {
+                assertEquals(HttpStatusCode.BadRequest, status)
+                assertTrue(bodyAsText().contains("format rejected"))
+            }
+        }
+        assertEquals("# 标题", bodies[0].markdown)
+        assertEquals("<h1>标题</h1>", bodies[1].html)
+        assertTrue(bodies[2].blocks.toString().contains("future_field"))
+        client.post("/api/send-message?richformat=blocks&messagefield=body") {
+            contentType(ContentType.Application.FormUrlEncoded)
+            setBody(listOf("body" to """[{"type":"paragraph","text":"hello + 世界"}]""").formUrlEncode())
+        }
+        assertTrue(bodies.last().blocks.toString().contains("hello + 世界"))
+        coVerify(exactly = 1) { telegram.sendRichMessageForToken("100:test", "default", any(), null) }
+        coVerify(exactly = 0) { telegram.sendMessageForToken(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `rich requests bypass plain length and byte limits for json and forms`() = withTestApi { settings, telegram, _ ->
+        settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "42") }
+        coEvery { telegram.sendRichMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+        val text = "字".repeat(24000)
+        val json = Json.encodeToString(mapOf("text" to text))
+        for ((type, body) in listOf(ContentType.Application.Json to json, ContentType.Application.FormUrlEncoded to listOf("text" to text).formUrlEncode())) {
+            assertEquals(HttpStatusCode.OK, client.post("/api/send-message?richformat=markdown") {
+                contentType(type)
+                setBody(body)
+            }.status)
+        }
+        coVerify(exactly = 2) { telegram.sendRichMessageForToken("100:test", "42", match { it.markdown == text }, null) }
+    }
+
+    @Test
+    fun `rich format rejects unknown duplicate and invalid block shapes before delivery`() = withTestApi { _, telegram, _ ->
+        for (query in listOf("richformat=Markdown", "richformat=null", "richformat=markdown&richformat=html")) {
+            assertEquals(HttpStatusCode.BadRequest, client.post("/api/send-message?$query") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"text":"hello"}""")
+            }.status)
+        }
+        for (value in listOf("[]", "[null]", "[1]", "[[]]", "{}", "null", "\"[]\"")) {
+            assertEquals(HttpStatusCode.BadRequest, client.post("/api/send-message?richformat=blocks") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"text":$value}""")
+            }.status)
+        }
+        assertEquals(HttpStatusCode.BadRequest, client.post("/api/send-message?richformat=blocks") {
+            contentType(ContentType.Application.FormUrlEncoded)
+            setBody("text=not-json")
+        }.status)
+        coVerify(exactly = 0) { telegram.sendRichMessageForToken(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `empty and blank rich format preserve ordinary requests`() = withTestApi { settings, telegram, _ ->
+        settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "42") }
+        coEvery { telegram.sendMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+        for (query in listOf("", "?richformat=", "?richformat=%20")) {
+            assertEquals(HttpStatusCode.OK, client.post("/api/send-message$query") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"text":"**raw**"}""")
+            }.status)
+        }
+        coVerify(exactly = 3) { telegram.sendMessageForToken("100:test", "42", "**raw**", null) }
+        coVerify(exactly = 0) { telegram.sendRichMessageForToken(any(), any(), any(), any()) }
+    }
+
 
     /**
      * 验证发送消息接口拒绝非字符串 JSON 文本及损坏 JSON，且不会调用 Telegram。

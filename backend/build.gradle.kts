@@ -66,6 +66,13 @@ dependencies {
     kapt("com.google.dagger:dagger-compiler:$daggerVersion")
     kapt("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.10")
 
+    // 通过原文位置识别 Markdown 结构，所有扩展使用同一固定版本。
+    implementation("org.commonmark:commonmark:0.30.0")
+    implementation("org.commonmark:commonmark-ext-gfm-tables:0.30.0")
+    implementation("org.commonmark:commonmark-ext-footnotes:0.30.0")
+    implementation("org.commonmark:commonmark-ext-task-list-items:0.30.0")
+    implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.30.0")
+
     // Testing
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")

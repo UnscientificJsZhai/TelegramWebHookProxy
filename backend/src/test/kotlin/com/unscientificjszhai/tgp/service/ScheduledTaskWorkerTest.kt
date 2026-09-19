@@ -3,12 +3,15 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.LoopMode
+import com.unscientificjszhai.tgp.models.InputRichMessage
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
+import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
+import com.unscientificjszhai.tgp.utils.TelegramTextChunks
 import io.ktor.http.HttpStatusCode
 import io.mockk.*
 import kotlinx.coroutines.CoroutineScope
@@ -91,7 +94,7 @@ class ScheduledTaskWorkerTest {
             "finished"
         }
         coEvery {
-            telegramService.sendMessageForToken(BOT_TOKEN, CHAT_ID, any(), null)
+            telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, any(), null)
         } returns successfulTelegramResponse()
 
         worker.scanAndExecute()
@@ -100,7 +103,7 @@ class ScheduledTaskWorkerTest {
         assertTrue(scheduledTaskService.listTasks().isEmpty())
         coVerify(exactly = 1) { agentService.sendMessage(any<String>()) }
         coVerify(exactly = 1) {
-            telegramService.sendMessageForToken(BOT_TOKEN, CHAT_ID, match { it.contains("finished") }, null)
+            telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, match { it.markdown?.contains("finished") == true }, null)
         }
     }
 
@@ -134,7 +137,7 @@ class ScheduledTaskWorkerTest {
         worker = newWorker(scheduledTaskService)
         coEvery { agentService.sendMessage(any<String>()) } returns "finished"
         coEvery {
-            telegramService.sendMessageForToken(BOT_TOKEN, CHAT_ID, any(), null)
+            telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, any(), null)
         } returns successfulTelegramResponse()
 
         fileOperations.failDirectorySync = true
@@ -165,6 +168,59 @@ class ScheduledTaskWorkerTest {
 
         assertEquals(1, scheduledTaskService.listTasks().size)
         coVerify(exactly = 0) { agentService.sendMessage(any<String>()) }
+    }
+
+    @Test
+    fun `scheduled rich rejection falls back for only current part without replaying task`() = runBlocking {
+        scheduledTaskService.createTask("rich", fixedInstant.minusSeconds(1).toEpochMilli(), LoopMode.ONCE, CHAT_ID)
+        val reply = "第一段\n\n" + "x".repeat(40000) + "\n\n**后记**"
+        val source = "⏰ 定时任务执行结果：\n\n$reply"
+        val parts = TelegramRichTextChunks.plan(source)
+        assertTrue(parts.size > 1)
+        val rejectedPart = parts[1]
+        val sent = mutableListOf<String>()
+        coEvery { agentService.sendMessage(any<String>()) } returns reply
+        coEvery { telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, any(), null) } coAnswers {
+            val markdown = thirdArg<InputRichMessage>().markdown!!
+            sent += "rich:$markdown"
+            if (markdown == rejectedPart.text) TelegramApiResponse(HttpStatusCode.BadRequest, "rejected") else successfulTelegramResponse()
+        }
+        coEvery { telegramService.sendMessageForToken(BOT_TOKEN, CHAT_ID, any(), null) } coAnswers {
+            sent += "plain:${thirdArg<String>()}"
+            successfulTelegramResponse()
+        }
+        worker.scanAndExecute()
+        worker.scanAndExecute()
+        val expected = parts.flatMap { part ->
+            listOf("rich:${part.text}") + if (part == rejectedPart) {
+                TelegramTextChunks.split(source.substring(part.sourceStart, part.sourceEnd)).map { "plain:$it" }
+            } else emptyList()
+        }
+        assertEquals(expected, sent)
+        coVerify(exactly = 1) { agentService.sendMessage(any<String>()) }
+        assertTrue(scheduledTaskService.listTasks().isEmpty())
+    }
+
+    @Test
+    fun `scheduled temporary error and token rotation stop remaining delivery without replay`() = runBlocking {
+        for (rotateToken in listOf(false, true)) {
+            settingsChangeCoordinator.replaceSettingsForTest(enabledSettings())
+            scheduledTaskService.createTask("stop", fixedInstant.minusSeconds(1).toEpochMilli(), LoopMode.ONCE, CHAT_ID)
+            clearMocks(agentService, telegramService)
+            allowReadyServiceScope(agentService)
+            coEvery { agentService.sendMessage(any<String>()) } returns "x".repeat(70000)
+            coEvery { telegramService.sendRichMessageForToken(BOT_TOKEN, CHAT_ID, any(), null) } coAnswers {
+                if (rotateToken) {
+                    settingsChangeCoordinator.replaceSettingsForTest(enabledSettings().copy(telegramToken = "100:rotated"))
+                    successfulTelegramResponse()
+                } else TelegramApiResponse(HttpStatusCode.TooManyRequests, """{"ok":false,"error_code":429}""")
+            }
+            worker.scanAndExecute()
+            worker.scanAndExecute()
+            coVerify(exactly = 1) { agentService.sendMessage(any<String>()) }
+            coVerify(exactly = 1) { telegramService.sendRichMessageForToken(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        }
     }
 
     @Test
