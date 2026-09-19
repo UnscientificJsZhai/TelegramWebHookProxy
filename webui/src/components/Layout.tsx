@@ -48,8 +48,8 @@ export default function Layout() {
                 <Toolbar disableGutters sx={{gap: 2, minHeight: 72}}>
                     <IconButton aria-label="打开导航菜单" sx={{display: {md: 'none'}, ml: -1}}
                                 onClick={() => setDrawerOpen(true)}><MenuIcon/></IconButton>
-                    <Stack component={Link} to="/" direction="row" alignItems="center" gap={1.25}
-                           sx={{color: 'text.primary', textDecoration: 'none', flexShrink: 0}}>
+                    <Stack component={Link} to="/" direction="row"
+                           sx={{alignItems: 'center', gap: 1.25, color: 'text.primary', textDecoration: 'none', flexShrink: 0}}>
                         <Box component="img" src="/icon.svg" alt="" sx={{
                             width: 34,
                             height: 34,

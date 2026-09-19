@@ -107,9 +107,9 @@ export default function Webhook() {
         <PageHeader title="Webhook 接口文档与调试"
                     description="通过 HTTP POST 发送普通或富消息，支持 JSON、URL 编码表单与顶层字段映射。"/>
         <Paper variant="outlined" sx={{p: {xs: 2, sm: 3}, mb: 3}}>
-            <Stack direction="row" alignItems="center" gap={1.5} flexWrap="wrap" sx={{mb: 2.5}}><Chip label="POST"
+            <Stack direction="row" sx={{alignItems: 'center', gap: 1.5, flexWrap: 'wrap', mb: 2.5}}><Chip label="POST"
                                                                                                       color="success"/><Typography
-                component="code" variant="subtitle1" fontFamily="monospace">/api/send-message</Typography><Chip
+                component="code" variant="subtitle1" sx={{fontFamily: 'monospace'}}>/api/send-message</Typography><Chip
                 label="application/json" variant="outlined"/><Chip label="application/x-www-form-urlencoded"
                                                                    variant="outlined"/></Stack>
             <TableContainer><Table size="small" aria-label="Webhook 请求参数" sx={{minWidth: 620}}><TableHead><TableRow
@@ -186,7 +186,7 @@ export default function Webhook() {
                             Bot 令牌。</Alert>}
                         {!hasTarget && <Typography variant="caption" color="warning.main">请输入接收目标，或在服务配置中设置默认
                             Chat ID。</Typography>}
-                        <Stack direction="row" gap={1}><Button variant="contained" startIcon={<SendOutlined/>}
+                        <Stack direction="row" sx={{gap: 1}}><Button variant="contained" startIcon={<SendOutlined/>}
                                                                disabled={sending || !!validation || !tokenReady || !hasTarget}
                                                                onClick={() => void send()}>{sending ? '正在发送…' : '发送测试消息'}</Button><Button
                             color="secondary" onClick={() => {
@@ -222,8 +222,8 @@ export default function Webhook() {
                                                                          onClick={() => void copyExample()}>复制示例</Button></Box>
                         </Paper>
                         <Paper variant="outlined" sx={{borderRadius: 2, overflow: 'hidden'}}>
-                            <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}
-                                   sx={{p: 1.5, bgcolor: 'background.default'}}><Typography
+                            <Stack direction="row"
+                                   sx={{justifyContent: 'space-between', alignItems: 'center', gap: 1, p: 1.5, bgcolor: 'background.default'}}><Typography
                                 variant="subtitle2">执行响应</Typography><Chip variant="outlined"
                                                                                color={result ? result.ok ? 'success' : 'error' : 'default'}
                                                                                label={sending ? '正在请求…' : result ? `${result.status} · ${result.duration} ms` : '尚未发送'}/></Stack>
@@ -297,7 +297,7 @@ export default function Webhook() {
                 flexDirection: 'column',
                 gap: 1.5,
                 minWidth: 0
-            }}><Stack direction="row" alignItems="center" gap={1}><Box
+            }}><Stack direction="row" sx={{alignItems: 'center', gap: 1}}><Box
                 sx={{color: 'primary.main', display: 'flex'}}>{example.icon}</Box><Typography
                 variant="subtitle2">{example.title}</Typography></Stack><Typography variant="body2"
                                                                                     color="text.secondary">{example.description}</Typography><Box

@@ -134,7 +134,7 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
                     </SectionCard>
                     <SectionCard title="网络代理设置" icon={<HubOutlined/>}>
                         <Stack spacing={2.5}>
-                            <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
+                            <Stack direction="row" sx={{alignItems: 'center', justifyContent: 'space-between', gap: 2}}>
                                 <Box><Typography variant="subtitle2">使用网络代理</Typography><Typography
                                     variant="caption" color="text.secondary">向 Telegram API
                                     发起通信时通过代理转发。</Typography></Box>
@@ -192,18 +192,17 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
                             </> : <Alert severity="info" variant="outlined">当前将直接连接 Telegram API。</Alert>}
                         </Stack>
                     </SectionCard>
-                    <Stack direction={{xs: 'column', sm: 'row'}} alignItems={{sm: 'center'}}
-                           justifyContent="space-between" gap={2}>
+                    <Stack direction={{xs: 'column', sm: 'row'}} sx={{alignItems: {sm: 'center'}, justifyContent: 'space-between', gap: 2}}>
                         <Typography variant="caption"
                                     color={dirty ? 'primary' : 'text.secondary'}>{dirty ? '有未保存的修改' : '所有修改已保存'}</Typography>
-                        <Stack direction="row" gap={1} justifyContent="flex-end"><Button color="secondary"
+                        <Stack direction="row" sx={{gap: 1, justifyContent: 'flex-end'}}><Button color="secondary"
                                                                                          disabled={!dirty || saving}
                                                                                          onClick={() => setDraft(saved.settings)}>撤销修改</Button><Button
                             type="submit" variant="contained" startIcon={<SaveOutlined/>}
                             disabled={!dirty || saving || !saved.etag || tokenError || chatError || !proxyValid || !authValid}>{saving ? '正在保存…' : '保存配置'}</Button></Stack>
                     </Stack>
                     <Accordion disableGutters variant="outlined" sx={{'&:before': {display: 'none'}}}>
-                        <AccordionSummary expandIcon={<ExpandMore/>}><Stack direction="row" alignItems="center" gap={1}><TuneOutlined
+                        <AccordionSummary expandIcon={<ExpandMore/>}><Stack direction="row" sx={{alignItems: 'center', gap: 1}}><TuneOutlined
                             fontSize="small" color="primary"/><Typography
                             variant="body2">高级：配置版本与并发控制</Typography></Stack></AccordionSummary>
                         <AccordionDetails><Typography variant="body2" sx={{mb: 1}}>当前修订 ETag：<Box
@@ -222,14 +221,14 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
                         ['请求中指定目标', 'chatId 为非空白字符串时，优先投递至该会话。'],
                         ['回退至默认目标', 'chatId 缺失、为 null 或空白时，使用已保存的默认接收会话。'],
                         ['缺省时拒绝发送', '请求与配置都未指定目标时，返回参数错误。'],
-                    ].map(([title, description], index) => <Stack key={title} direction="row" gap={1.5}><Chip
+                    ].map(([title, description], index) => <Stack key={title} direction="row" sx={{gap: 1.5}}><Chip
                         label={index + 1} color="primary" variant="outlined"
                         sx={{width: 26, flexShrink: 0}}/><Box><Typography
                         variant="subtitle2">{title}</Typography><Typography variant="body2"
                                                                             color="text.secondary">{description}</Typography></Box></Stack>)}</Stack>
                 </SectionCard>
                 <SectionCard title="消息转发流程" icon={<AccountTreeOutlined/>}>
-                    <Stack spacing={1} alignItems="center">{[
+                    <Stack spacing={1} sx={{alignItems: 'center'}}>{[
                         ['外部请求', 'POST /api/send-message'], ['校验与目标解析', '显式目标 / 默认 Chat ID'], ['网络连接', '直连或 HTTP / SOCKS 代理'], ['Telegram Bot API', 'api.telegram.org'],
                     ].map(([title, description], index) => <Box key={title}
                                                                 sx={{width: '100%', textAlign: 'center'}}>{index > 0 &&

@@ -61,7 +61,7 @@ export default function McpServers({servers, busy, onSave, onEditingChange}: {
                 Agent 提供工具。保存配置不会进行连通性测试。</Typography>
             <Stack spacing={1.5}>{servers.map((server, index) => <Paper variant="outlined" key={server.name}
                                                                         sx={{p: 2, borderRadius: 2}}>
-                <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1}><Typography
+                <Stack direction="row" sx={{alignItems: 'center', justifyContent: 'space-between', gap: 1}}><Typography
                     variant="subtitle2" sx={{overflowWrap: 'anywhere'}}>{server.name}</Typography><Stack
                     direction="row"><Button size="small" disabled={busy} onClick={() => openEditor(index)}>编辑</Button><Button
                     size="small" color="secondary" disabled={busy}

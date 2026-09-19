@@ -44,7 +44,7 @@ function SaveButton({label, changed, onSave, disabled, saving, invalid = false}:
     saving: boolean;
     invalid?: boolean;
 }) {
-    return <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1} sx={{mt: 2.5}}>
+    return <Stack direction="row" sx={{justifyContent: 'space-between', alignItems: 'center', gap: 1, mt: 2.5}}>
         <Typography variant="caption" color={changed ? 'primary' : 'text.secondary'}>
             {changed ? '有未保存修改' : '已与配置同步'}
         </Typography>
@@ -186,8 +186,7 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                              action={<Chip label={baseline.agentEnabled ? '已启用' : '未启用'}
                                            color={baseline.agentEnabled ? 'primary' : 'default'} variant="outlined"/>}>
                     <Stack spacing={2.5}>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center"
-                               gap={2}><Box><Typography variant="subtitle2">启用 AI Agent</Typography><Typography
+                        <Stack direction="row" sx={{justifyContent: 'space-between', alignItems: 'center', gap: 2}}><Box><Typography variant="subtitle2">启用 AI Agent</Typography><Typography
                             variant="caption"
                             color="text.secondary">接收授权私聊消息并调用模型回复。</Typography></Box><Switch
                             checked={draft.agentEnabled} onChange={event => set('agentEnabled', event.target.checked)}

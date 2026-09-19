@@ -115,9 +115,8 @@ export default function Home() {
             <Alert severity="warning" sx={{mb: 2}} action={<Button component={Link} to="/settings">前往配置</Button>}>请先配置
                 Telegram Bot 令牌，再发送消息。</Alert>}
         <Paper variant="outlined" sx={{p: 2.5, mb: 3}}>
-            <Stack direction={{xs: 'column', md: 'row'}} alignItems={{md: 'center'}} justifyContent="space-between"
-                   gap={2}>
-                <Stack direction="row" alignItems="center" gap={2} sx={{minWidth: 0}}>
+            <Stack direction={{xs: 'column', md: 'row'}} sx={{alignItems: {md: 'center'}, justifyContent: 'space-between', gap: 2}}>
+                <Stack direction="row" sx={{alignItems: 'center', gap: 2, minWidth: 0}}>
                     <Box sx={{
                         bgcolor: 'action.selected',
                         color: 'primary.main',
@@ -126,7 +125,7 @@ export default function Home() {
                         display: 'flex'
                     }}><SendOutlined/></Box>
                     <Box sx={{minWidth: 0}}>
-                        <Stack direction="row" alignItems="center" gap={1} sx={{mb: 0.5}}><Typography variant="caption"
+                        <Stack direction="row" sx={{alignItems: 'center', gap: 1, mb: 0.5}}><Typography variant="caption"
                                                                                                       color="text.secondary">本次投递目标</Typography><Chip
                             label={target ? '仅本次投递' : '使用默认目标'} color="primary" variant="outlined"
                             sx={{height: 20}}/></Stack>
@@ -136,7 +135,7 @@ export default function Home() {
                                         sx={{ml: 1.5}}>{targetId}</Typography>}</Typography>
                     </Box>
                 </Stack>
-                <Stack direction={{xs: 'column', sm: 'row'}} alignItems={{sm: 'center'}} gap={1}>
+                <Stack direction={{xs: 'column', sm: 'row'}} sx={{alignItems: {sm: 'center'}, gap: 1}}>
                     <Button size="small" startIcon={<UndoOutlined/>} disabled={!target}
                             onClick={() => setTarget(null)}>使用默认目标</Button>
                     <Typography variant="caption" color="text.secondary"
@@ -188,7 +187,7 @@ export default function Home() {
                                     borderColor: selected ? 'primary.main' : 'divider',
                                     bgcolor: selected ? 'action.selected' : 'background.paper'
                                 }}>
-                                    <Stack component="label" direction="row" alignItems="flex-start" sx={{p: 1.25, pb: 0.5, cursor: 'pointer'}}>
+                                    <Stack component="label" direction="row" sx={{alignItems: 'flex-start', p: 1.25, pb: 0.5, cursor: 'pointer'}}>
                                         <Radio checked={selected}
                                                onChange={() => setTarget({id: chat.id, source: 'chat'})} value={chat.id}
                                                slotProps={{input: {'aria-label': `选择 ${chat.title}`}}} size="small"
@@ -198,13 +197,13 @@ export default function Home() {
                                                         sx={{overflowWrap: 'anywhere'}}>{chat.title}</Typography>
                                             <Typography variant="caption" color="text.secondary"
                                                         sx={{overflowWrap: 'anywhere'}}>ID: {chat.id}</Typography>
-                                            <Stack direction="row" gap={1} sx={{mt: 1, flexWrap: 'wrap'}}><Chip
+                                            <Stack direction="row" sx={{gap: 1, mt: 1, flexWrap: 'wrap'}}><Chip
                                                 label={chat.type} sx={{height: 20}}/>{defaultId === chat.id &&
                                                 <Chip icon={<FlagOutlined/>} label="默认目标" variant="outlined"
                                                       color="primary" sx={{height: 20}}/>}</Stack>
                                         </Box>
                                     </Stack>
-                                    <Stack direction="row" justifyContent="flex-end" sx={{px: 1, pb: 1}}>
+                                    <Stack direction="row" sx={{justifyContent: 'flex-end', px: 1, pb: 1}}>
                                         <Button size="small" disabled={defaultId === chat.id || !snapshot?.etag}
                                                 onClick={() => setAction({kind: 'default', chat})}>设为默认</Button>
                                         <Button size="small" color="secondary"
@@ -232,7 +231,7 @@ export default function Home() {
                                onChange={event => setText(event.target.value)} disabled={sending} multiline minRows={9}
                                maxRows={18} slotProps={{htmlInput: {maxLength: MAX_TELEGRAM_MESSAGE_TEXT_LENGTH}}}
                                helperText={TELEGRAM_MESSAGE_TEXT_LIMIT_DESCRIPTION}/>
-                    <Stack direction="row" justifyContent="space-between" gap={2}><Typography variant="caption"
+                    <Stack direction="row" sx={{justifyContent: 'space-between', gap: 2}}><Typography variant="caption"
                                                                                               color="text.secondary">普通文本
                         · 不解析 Markdown / HTML</Typography><Typography variant="caption"
                                                                          color="text.secondary">{text.length.toLocaleString()} /
@@ -240,8 +239,7 @@ export default function Home() {
                     <Alert severity="info" variant="outlined">消息不能全为空白。请检查接收目标，发送后消息将真实投递至
                         Telegram。</Alert>
                     <Divider/>
-                    <Stack direction={{xs: 'column', sm: 'row'}} alignItems={{sm: 'center'}}
-                           justifyContent="space-between" gap={2}>
+                    <Stack direction={{xs: 'column', sm: 'row'}} sx={{alignItems: {sm: 'center'}, justifyContent: 'space-between', gap: 2}}>
                         <Typography variant="caption" color="text.secondary"
                                     sx={{overflowWrap: 'anywhere'}}>本次目标：{targetTitle || targetId || '未选择'}</Typography>
                         <Button variant="contained"
@@ -252,8 +250,7 @@ export default function Home() {
                 </Stack>
             </SectionCard>
         </Box>
-        <Paper variant="outlined" sx={{p: 2.5, mt: 3}}><Stack direction={{xs: 'column', sm: 'row'}}
-                                                              alignItems={{sm: 'center'}} gap={2}>
+        <Paper variant="outlined" sx={{p: 2.5, mt: 3}}><Stack direction={{xs: 'column', sm: 'row'}} sx={{alignItems: {sm: 'center'}, gap: 2}}>
             <ApiOutlined color="primary"/><Box sx={{flex: 1}}><Typography variant="subtitle2">通过 Webhook
             自动发送</Typography><Typography variant="body2" color="text.secondary">第三方系统通过 POST
             /api/send-message 投递消息，查看字段映射与调用示例。</Typography></Box><Button component={Link} to="/webhook"
