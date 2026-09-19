@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {buildAiPatch, DEFAULT_AI_SETTINGS, normalizeSettings} from './settings';
+import {type AppSettings, buildAiPatch, DEFAULT_AI_SETTINGS, normalizeSettings} from './settings';
 
 describe('分区配置保存', () => {
     it('首次创建 AI 配置时补齐默认值', () => {
@@ -28,8 +28,8 @@ describe('分区配置保存', () => {
         const settings = normalizeSettings({
             telegramToken: '',
             chatId: '',
-            proxy: rawProxy as any,
-            ai: partialAi as any,
+            proxy: rawProxy as AppSettings['proxy'],
+            ai: partialAi as AppSettings['ai'],
         });
         expect(settings.ai).toEqual({
             ...DEFAULT_AI_SETTINGS,

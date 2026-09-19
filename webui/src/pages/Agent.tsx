@@ -16,6 +16,8 @@ import KeyOutlined from '@mui/icons-material/KeyOutlined';
 import PsychologyOutlined from '@mui/icons-material/PsychologyOutlined';
 import TuneOutlined from '@mui/icons-material/TuneOutlined';
 import {useSettings} from '../settingsContext';
+import {useModels} from '../useModels';
+import {resolveModelSelection} from '../modelSelection';
 import {type AISettings, type AppSettings, buildAiPatch, DEFAULT_AI_SETTINGS, utf8Length} from '../settings';
 import {isSettingsConflict, type VersionedSettings} from '../settingsClient';
 import PageHeader from '../components/PageHeader';
@@ -24,6 +26,7 @@ import SecretField from '../components/SecretField';
 import SettingsGate from '../components/SettingsGate';
 import UnsavedChangesGuard from '../components/UnsavedChangesGuard';
 import McpServers from '../components/McpServers';
+import ModelSelector from '../components/ModelSelector';
 import {FeedbackSnackbar, type Notice, SettingsConflictDialog} from '../components/Feedback';
 import SkillCatalog from './Skill';
 
@@ -41,6 +44,9 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
     const [saving, setSaving] = useState<string | null>(null);
     const [notice, setNotice] = useState<Notice | null>(null);
     const [conflict, setConflict] = useState(false);
+    const [modelReloadEpoch, setModelReloadEpoch] = useState(0);
+    const [modelDraft, setModelDraft] = useState<string | null>(null);
+    const models = useModels(saved.settings, modelReloadEpoch);
     const [mcpEditorEpoch, setMcpEditorEpoch] = useState(0);
     const [mcpEditing, setMcpEditing] = useState(false);
     const [skillEditing, setSkillEditing] = useState(false);
@@ -55,7 +61,10 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
     const credentialsDirty = (Object.keys(credentials) as (keyof typeof credentials)[]).some(key => draft[key] !== baseline[key]);
     const policyKeys = ['agentEnabled', 'agentChatId', 'globalContext', 'silentContextCleanup'] as const;
     const policyDirty = policyKeys.some(key => draft[key] !== baseline[key]) || interval !== String(baseline.autoCleanContextIntervalMinutes);
-    const modelDirty = draft.selectedModel !== baseline.selectedModel;
+    const {
+        value: selectedModel,
+        dirty: modelDirty
+    } = resolveModelSelection(modelDraft, baseline.selectedModel, models.currentModel);
     const dirty = credentialsDirty || policyDirty || modelDirty;
     const intervalValid = /^(0|[1-9]\d*)$/.test(interval) && Number(interval) <= 2147483647;
     const contextBytes = utf8Length(draft.globalContext);
@@ -78,9 +87,11 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                 ...Object.fromEntries(Object.keys(patch).map(key => [key, nextAi[key as keyof AISettings]])),
                 ...(group === 'credentials' ? {selectedModel: nextAi.selectedModel} : {}),
             }));
+            if (group === 'credentials') setModelReloadEpoch(previous => previous + 1);
+            if (group === 'credentials' || group === 'model') setModelDraft(null);
             if (group === 'policy') setInterval(String(nextAi.autoCleanContextIntervalMinutes));
             setNotice({
-                message: group === 'credentials' ? '服务凭据已保存，请确认模型名称。' : '配置已保存',
+                message: group === 'credentials' ? '服务凭据已保存，请选择模型。' : '配置已保存',
                 severity: 'success'
             });
             return true;
@@ -100,6 +111,8 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
             setDraft(next.settings.ai ?? DEFAULT_AI_SETTINGS);
             setInterval(String(next.settings.ai?.autoCleanContextIntervalMinutes ?? 0));
             setMcpEditorEpoch(previous => previous + 1);
+            setModelReloadEpoch(previous => previous + 1);
+            setModelDraft(null);
             setMcpEditing(false);
             setConflict(false);
         } catch {
@@ -141,22 +154,18 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                                                                placeholder="https://api.openai.com/v1"
                                                                helperText="选填，留空使用默认地址。"
                                                                error={utf8Length(draft.openAiBaseUrl) > 2048}/></>}
-                        <Alert severity="info">更换提供商或当前 API 密钥并保存后，服务端会清空已选模型。请先保存凭据，再填写模型名称，或在
+                        <Alert severity="info">更换提供商或当前 API 密钥并保存后，服务端会清空已选模型。请先保存凭据，再从下方列表选择模型，或在
                             Telegram 私聊中发送 /model 选择。</Alert>
                     </Stack>
                     {saveButton('credentials', '保存服务凭据', credentialsDirty, () => void saveGroup(credentials, 'credentials'), keyBytes > 512 || utf8Length(draft.openAiBaseUrl) > 2048)}
                 </SectionCard>
                 <SectionCard title="模型名称" icon={<PsychologyOutlined/>}
                              action={<Typography variant="caption" color="text.secondary">独立保存</Typography>}>
-                    <TextField label="模型标识" value={draft.selectedModel}
-                               onChange={event => set('selectedModel', event.target.value)}
-                               placeholder="输入服务提供商支持的模型名称" error={utf8Length(draft.selectedModel) > 256}
-                               helperText="可手动填写，或在 Telegram 私聊中使用 /model 切换。"/>
-                    {credentialsDirty && <Typography variant="caption" color="warning.main" sx={{
-                        display: 'block',
-                        mt: 1
-                    }}>请先保存上方服务凭据，再保存模型名称。</Typography>}
-                    {saveButton('model', '保存模型名称', modelDirty, () => void saveGroup({selectedModel: draft.selectedModel}, 'model'), credentialsDirty || utf8Length(draft.selectedModel) > 256)}
+                    <ModelSelector {...models} value={selectedModel} credentialsDirty={credentialsDirty}
+                                   busy={disabled} onChange={setModelDraft}
+                                   onRefresh={models.refresh}/>
+                    {saveButton('model', '保存模型名称', modelDirty, () => void saveGroup({selectedModel}, 'model'),
+                        credentialsDirty || models.loading || !!models.error || !models.availableModels.includes(selectedModel) || utf8Length(selectedModel) > 256)}
                 </SectionCard>
                 <SectionCard title="会话策略" icon={<TuneOutlined/>}
                              action={<Chip label={baseline.agentEnabled ? '已启用' : '未启用'}

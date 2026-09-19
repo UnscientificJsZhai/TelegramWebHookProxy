@@ -950,23 +950,8 @@ class OpenAIAgentService @Inject internal constructor(
         return mapper.readValue(response.body, ChatCompletion::class.java)
     }
 
-    /** 列出 OpenAI 兼容服务的模型，并通过 SDK 的 [Model] DTO 校验每个条目。 */
-    private suspend fun listRawOpenAIModels(transport: CancellableOkHttpTransport): List<Model> {
-        val response = transport.execute(rawOpenAIRequestBuilder("models").get().build())
-        requireOpenAISuccess(response)
-        return try {
-            val mapper = jsonMapper()
-            JsonStructureLimits.validateJsonString(response.body)
-            val root = mapper.readTree(response.body)
-            val data = root.path("data")
-            if (!data.isArray) throw AgentInvalidResponseException()
-            data.map { node -> mapper.treeToValue(node, Model::class.java) }
-        } catch (e: AgentInvalidResponseException) {
-            throw e
-        } catch (e: Exception) {
-            throw AgentInvalidResponseException(e)
-        }
-    }
+    private suspend fun listRawOpenAIModels(transport: CancellableOkHttpTransport): List<Model> =
+        fetchOpenAIModels(transport, rawOpenAIRequestBuilder("models").get().build())
 
     /** 构建保留自定义基础路径、Bearer 认证和 SDK 附加参数的原生 OpenAI 请求。 */
     private fun rawOpenAIRequestBuilder(

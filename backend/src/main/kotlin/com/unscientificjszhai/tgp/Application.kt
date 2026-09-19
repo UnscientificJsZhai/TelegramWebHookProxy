@@ -180,6 +180,7 @@ fun Application.module() {
     installProtocolUpgradeRejection()
 
     apiModule(appComponent.settingsChangeCoordinator, telegramService)
+    aiModelAPIModule(appComponent.settingsChangeCoordinator, agentService = agentService)
     skillAPIModule(appComponent.skillRepository)
     messagePollerModule(messagePoller)
     taskSchedulerModule(scheduledTaskWorker)

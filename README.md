@@ -79,12 +79,28 @@ java -jar backend/build/libs/TelegramWebHookProxy-1.2.0-all.jar
 3. 如果访问 Telegram API 需要代理，配置 HTTP 或 SOCKS 代理。
 4. 向 Bot 发送一条消息，让服务通过 Telegram updates 发现会话。
 5. 在首页选择默认会话，之后 `/api/send-message` 可以省略 `chatId`。
-6. 如需 AI Agent，在 Settings 页面开启 AI，选择 Provider 并填写 API Key、Agent Chat ID 和系统提示词。
+6. 如需 AI Agent，在 AI Agent 页面选择 Provider 并保存 API Key，然后从“模型名称”下拉列表选择模型并独立保存，最后配置 Agent Chat ID、系统提示词并启用 AI。
 
 > [!NOTE]
 > 会话列表由后台轮询 Telegram updates 自动维护。首次启动时会跳过历史消息，从最新 update 开始处理。
 
 ## API 使用
+
+### 查询可选 AI 模型
+
+`GET /api/ai/models`
+
+按已保存的 AI 提供商、API Key、Base URL 和代理查询当前模型列表。无需启用 Agent，查询不会修改已选模型或重置会话。
+
+```json
+{"provider":"OPENAI","currentModel":"model-a","availableModels":["model-a","model-b"]}
+```
+
+Gemini 会汇总分页结果，并只保留支持 `generateContent` 的模型。空列表正常返回 `200`；配置不完整返回 `400`，上游请求失败返回 `502`，超时返回 `504`，错误响应为 `{"error":"说明"}`。
+
+`currentModel` 用于回显当前选项：优先返回已保存的 `ai.selectedModel`；未保存选择时返回同一份配置下已就绪 Agent 的实际模型。两者都不存在时返回空字符串，页面显示“请选择模型”。查询不会自动保存默认模型，已保存但不在列表中的模型仍会返回并标记为不可用。
+
+模型选择继续使用 `PATCH /api/settings`，携带从 `GET /api/settings` 获取的 `ETag` 作为 `If-Match`，请求体为 `{"ai":{"selectedModel":"model-a"}}`。
 
 ### 发送消息
 
