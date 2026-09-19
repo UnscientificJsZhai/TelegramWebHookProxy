@@ -157,6 +157,16 @@ tasks.withType<ShadowJar> {
     archiveVersion.set(version.toString())
     archiveClassifier.set("all")
 
+    // Shadow 9 合并 Kotlin 模块元数据前，需要收到每个同名输入。
+    filesMatching("META-INF/*.kotlin_module") {
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+    failOnDuplicateEntries.set(true)
+
+    // google-genai 的 Java 9 Kotlin 反射类路径未随内部类名重定位。
+    // 避免 Shadow 9 自动开启 Multi-Release 后激活该类，破坏泛型响应的序列化。
+    addMultiReleaseAttribute.set(false)
+
     dependsOn(processFrontendResources)
     from(processFrontendResources.map { it.destinationDir })
 }
