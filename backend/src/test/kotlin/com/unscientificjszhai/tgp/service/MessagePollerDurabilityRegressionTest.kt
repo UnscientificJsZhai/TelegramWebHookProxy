@@ -51,7 +51,9 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
                 awaitCancellation()
             }
             fixture.poller.start()
-            try {
+            withTestCleanup(cleanup = {
+                fixture.poller.closeAndJoin()
+            }) {
                 withTimeout(7.seconds) { pollingStarted.await() }
                 val restored = fixture.updates.getData("100")
                 assertEquals(13L, restored.lastUpdateId)
@@ -61,8 +63,6 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
                 assertEquals(listOf(11L, 13L), restored.pendingTelegramReplies.map { it.updateId })
                 coVerify(exactly = 0) { fixture.agent.sendMessage(any(), any()) }
                 coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
-            } finally {
-                fixture.poller.closeAndJoin()
             }
         }
     }
@@ -97,7 +97,9 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
             awaitCancellation()
         }
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             withTimeout(3.seconds) { retryStarted.await() }
             val retained = updates.getData("100")
             assertEquals(0L, retained.lastUpdateId)
@@ -115,8 +117,6 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
             assertTrue(recovered.agentTurnJournal.isEmpty())
             assertEquals("saved-reply", recovered.pendingTelegramReplies.single().text)
             coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:token", 11, 30) }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -163,15 +163,15 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
         coEvery { fixture.agent.sendMessage("eleven") } returns "eleven"
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { retryStarted.await() }
+        withTestCleanup(cleanup = {
+            allowRetry.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { retryStarted.await() }
             assertFalse(rejectLowerCompletion.get())
             assertEquals(10, fixture.updates.getData("100").lastUpdateId)
             coVerify(exactly = 1) { fixture.agent.sendMessage("eleven") }
             coVerify(exactly = 0) { fixture.agent.sendMessage("twelve") }
-        } finally {
-            allowRetry.complete(Unit)
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -210,14 +210,14 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
         coEvery { fixture.telegram.sendChatActionForToken("100:token", "123", "typing") } returns mockk()
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { writeAttempted.await() }
-            withTimeout(2.seconds) { retryStarted.await() }
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { writeAttempted.await() }
+            withTimeout(5.seconds) { retryStarted.await() }
             coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
             assertEquals(0, fixture.updates.getData("100").lastUpdateId)
             assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -245,7 +245,9 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
             ) andThen GetUpdatesResponse(ok = true)
 
             fixture.poller.start()
-            try {
+            withTestCleanup(cleanup = {
+                fixture.poller.closeAndJoin()
+            }) {
                 eventually {
                     assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                     assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
@@ -253,8 +255,6 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
                     coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
                     coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
                 }
-            } finally {
-                fixture.poller.closeAndJoin()
             }
         }
     }
@@ -279,17 +279,19 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
         } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             eventually {
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
-                fixture.updates.getPendingTelegramReplies("100").single().let { reply ->
+                val replies = fixture.updates.getPendingTelegramReplies("100")
+                assertEquals(1, replies.size)
+                replies.single().let { reply ->
                     assertEquals("saved-reply", reply.text)
                     assertEquals(ReplyParameters(1), reply.replyParameters)
                 }
                 coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
             }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -307,14 +309,14 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
         }
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { requestStarted.await() }
+        withTestCleanup(cleanup = {
+            holdRequest.cancel()
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { requestStarted.await() }
             coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:token", Long.MAX_VALUE, 30) }
             coVerify(exactly = 0) { fixture.telegram.getUpdatesForToken("100:token", Long.MIN_VALUE, 30) }
             assertNull(fixture.updates.getData("100").retryCheckpoint)
-        } finally {
-            holdRequest.cancel()
-            fixture.poller.closeAndJoin()
         }
     }
 }

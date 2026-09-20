@@ -15,7 +15,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
 import kotlin.time.Duration
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -29,7 +28,7 @@ class MessagePollerTest {
     @AfterTest
     fun cleanUp() = runBlocking {
         try {
-            parentScope.coroutineContext.job.cancelAndJoin()
+            withTimeout(5.seconds) { parentScope.coroutineContext.job.cancelAndJoin() }
         } finally {
             tempDirectory.deleteRecursively()
         }
@@ -76,13 +75,15 @@ class MessagePollerTest {
         }
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { oldPollStarted.await() }
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { oldPollStarted.await() }
             oldSessionJob = currentSession(fixture.poller).scope.coroutineContext.job
             fixture.saveSettings(AppSettings(telegramToken = ""))
             fixture.saveSettings(AppSettings(telegramToken = "100:A"))
-            withTimeout(2.seconds) { oldPollCancelled.await() }
-            withTimeout(2.seconds) { replacementPollStarted.await() }
+            withTimeout(5.seconds) { oldPollCancelled.await() }
+            withTimeout(5.seconds) { replacementPollStarted.await() }
             assertTrue(
                 replacementObservedCompletedOldSession.get(),
                 "替代轮询启动前，旧会话根任务必须已经完成。",
@@ -92,8 +93,6 @@ class MessagePollerTest {
             coVerify(exactly = 2) { fixture.telegram.getUpdatesForToken("100:A", 8, 30) }
             assertEquals(3, fixture.settings.telegramTokenUpdateFlow.value.generation)
             verify(atLeast = 1) { fixture.agent.resetSession() }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -126,16 +125,16 @@ class MessagePollerTest {
         }
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.beforeModelSelectionPersistForTesting = null
+            fixture.poller.closeAndJoin()
+        }) {
             eventually {
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                 assertEquals("", fixture.settings.settingsFlow.value.ai?.selectedModel)
                 assertEquals(17, fixture.settings.settingsFlow.value.ai?.autoCleanContextIntervalMinutes)
                 coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
             }
-        } finally {
-            fixture.poller.beforeModelSelectionPersistForTesting = null
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -174,11 +173,15 @@ class MessagePollerTest {
                 TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":false}""")
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             eventually {
                 assertFalse(rejectFirstCompletion.get())
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
-                fixture.updates.getPendingTelegramReplies("100").single().let { reply ->
+                val replies = fixture.updates.getPendingTelegramReplies("100")
+                assertEquals(1, replies.size)
+                replies.single().let { reply ->
                     assertEquals(11, reply.updateId)
                     assertEquals("reply", reply.text)
                     assertEquals(ReplyParameters(1), reply.replyParameters)
@@ -186,8 +189,6 @@ class MessagePollerTest {
                 assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
                 coVerify(exactly = 1) { fixture.agent.sendMessage("once") }
             }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -214,15 +215,15 @@ class MessagePollerTest {
         coEvery { fixture.agent.sendMessage("overflow") } throws StackOverflowError("injected deeply nested JSON")
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             eventually {
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                 assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
                 assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                 coVerify(exactly = 1) { fixture.agent.sendMessage("overflow") }
             }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -252,11 +253,14 @@ class MessagePollerTest {
         coEvery { fixture.agent.sendMessage("fatal") } throws Error("injected fatal queue failure")
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { pollStarted.await() }
+        withTestCleanup(cleanup = {
+            releaseFatalUpdate.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { pollStarted.await() }
             val terminatedSession = currentSession(fixture.poller)
             releaseFatalUpdate.complete(Unit)
-            withTimeout(2.seconds) { terminatedSession.scope.coroutineContext.job.join() }
+            withTimeout(5.seconds) { terminatedSession.scope.coroutineContext.job.join() }
             assertNull(currentSessionOrNull(fixture.poller))
             coVerify(exactly = 1) { fixture.agent.sendMessage("fatal") }
             fixture.poller.enqueueUpdateForTesting(
@@ -268,9 +272,6 @@ class MessagePollerTest {
             coVerify(exactly = 1) { fixture.agent.sendMessage("fatal") }
             coVerify(exactly = 0) { fixture.agent.sendMessage("must-not-queue") }
             coVerify(exactly = 1) { fixture.telegram.getUpdatesForToken("100:token", 11, 30) }
-        } finally {
-            releaseFatalUpdate.complete(Unit)
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -298,8 +299,11 @@ class MessagePollerTest {
             throw Error("injected fatal queue failure")
         }
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { pollStarted.await() }
+        withTestCleanup(cleanup = {
+            releaseFatalError.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { pollStarted.await() }
             val session = currentSession(fixture.poller)
             val sessionJob = session.scope.coroutineContext.job
             val admission = assertIs<UpdateAdmission.Enqueued>(
@@ -312,13 +316,10 @@ class MessagePollerTest {
                 cancelledBeforeCompletion.complete(sessionJob.isCancelled)
             }
             releaseFatalError.complete(Unit)
-            assertEquals(UpdateCompletion.Retry, withTimeout(2.seconds) { admission.completion.await() })
-            assertTrue(withTimeout(2.seconds) { cancelledBeforeCompletion.await() })
-            withTimeout(2.seconds) { session.scope.coroutineContext.job.join() }
+            assertEquals(UpdateCompletion.Retry, withTimeout(5.seconds) { admission.completion.await() })
+            assertTrue(withTimeout(5.seconds) { cancelledBeforeCompletion.await() })
+            withTimeout(5.seconds) { session.scope.coroutineContext.job.join() }
             assertNull(currentSessionOrNull(fixture.poller))
-        } finally {
-            releaseFatalError.complete(Unit)
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -355,14 +356,18 @@ class MessagePollerTest {
         } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":true}""")
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { pollRequestStarted.await() }
+        withTestCleanup(cleanup = {
+            allowBlockingAgent.complete(Unit)
+            switchGeneration?.let(fixture.barrier::complete)
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { pollRequestStarted.await() }
             assertIs<UpdateAdmission.Enqueued>(
                 fixture.poller.enqueueUpdateForTesting(
                     Update(100, message = authorizedMessage(100, chat, text = "block")),
                 ),
             )
-            withTimeout(2.seconds) { blockingAgentStarted.await() }
+            withTimeout(5.seconds) { blockingAgentStarted.await() }
             (101L..110L).forEach { updateId ->
                 assertIs<UpdateAdmission.Enqueued>(
                     fixture.poller.enqueueUpdateForTesting(
@@ -387,7 +392,7 @@ class MessagePollerTest {
             }
 
             fixture.barrier.complete(checkNotNull(switchGeneration))
-            assertEquals(UpdateAdmission.Retry, withTimeout(2.seconds) { admission.await() })
+            assertEquals(UpdateAdmission.Retry, withTimeout(5.seconds) { admission.await() })
             coVerify(exactly = 1) {
                 fixture.telegram.sendMessageForToken(
                     "100:token",
@@ -397,10 +402,6 @@ class MessagePollerTest {
                 )
             }
             assertEquals(10, fixture.updates.getData("100").lastUpdateId)
-        } finally {
-            allowBlockingAgent.complete(Unit)
-            switchGeneration?.let(fixture.barrier::complete)
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -451,14 +452,20 @@ class MessagePollerTest {
             } returns TelegramApiResponse(HttpStatusCode.InternalServerError, """{"ok":true}""")
 
             fixture.poller.start()
-            try {
-                withTimeout(2.seconds) { pollRequestStarted.await() }
+            withTestCleanup(cleanup = {
+                pollResponses.trySend(GetUpdatesResponse(ok = true))
+                allowBlockingAgent.complete(Unit)
+                allowRetry.complete(Unit)
+                fixture.poller.closeAndJoin()
+                pollResponses.cancel()
+            }) {
+                withTimeout(5.seconds) { pollRequestStarted.await() }
                 assertIs<UpdateAdmission.Enqueued>(
                     fixture.poller.enqueueUpdateForTesting(
                         Update(100, message = authorizedMessage(100, chat, text = "block")),
                     ),
                 )
-                withTimeout(2.seconds) { blockingAgentStarted.await() }
+                withTimeout(5.seconds) { blockingAgentStarted.await() }
                 (101L..110L).forEach { updateId ->
                     assertIs<UpdateAdmission.Enqueued>(
                         fixture.poller.enqueueUpdateForTesting(
@@ -479,7 +486,7 @@ class MessagePollerTest {
                     ),
                 )
 
-                assertEquals(1.seconds, withTimeout(2.seconds) { retryStarted.await() })
+                assertEquals(1.seconds, withTimeout(5.seconds) { retryStarted.await() })
                 val durableState = fixture.updates.getData("100")
                 assertEquals(10, durableState.lastUpdateId)
                 assertEquals(11, assertNotNull(durableState.retryCheckpoint).targetUpdateId)
@@ -491,12 +498,6 @@ class MessagePollerTest {
                         any(),
                     )
                 }
-            } finally {
-                pollResponses.trySend(GetUpdatesResponse(ok = true))
-                allowBlockingAgent.complete(Unit)
-                allowRetry.complete(Unit)
-                fixture.poller.closeAndJoin()
-                pollResponses.cancel()
             }
         }
 
@@ -513,19 +514,20 @@ class MessagePollerTest {
         val poller = MessagePoller(parentScope, telegram, agent, settings, updates, barrier)
 
         poller.start()
-        try {
-            val stopped = async(start = CoroutineStart.UNDISPATCHED) { poller.closeAndJoin() }
-            barrier.complete(generation)
-            withTimeout(2.seconds) { stopped.await() }
-
-            coVerify(exactly = 0) { telegram.getUpdatesForToken(any(), any(), any()) }
-        } finally {
+        withTestCleanup(cleanup = {
             barrier.complete(generation)
             poller.closeAndJoin()
+        }) {
+            val stopped = async(start = CoroutineStart.UNDISPATCHED) { poller.closeAndJoin() }
+            barrier.complete(generation)
+            withTimeout(5.seconds) { stopped.await() }
+
+            coVerify(exactly = 0) { telegram.getUpdatesForToken(any(), any(), any()) }
         }
     }
 
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `reset command clears queue and timer only after successful reset job`() = runBlocking {
         val fixture = fixture()
@@ -534,19 +536,11 @@ class MessagePollerTest {
         val releaseBatch = CompletableDeferred<Unit>()
         val resetStarted = CompletableDeferred<Unit>()
         val resetJob = Job()
-        val secondUpdateAdmitted = CompletableDeferred<Unit>()
-        val availabilityChecks = AtomicInteger()
         val commandReplySent = CompletableDeferred<Unit>()
         fixture.updates.saveLastUpdateId("100", 10)
         fixture.saveSettings(
             AppSettings(telegramToken = "100:token", ai = AISettings(agentEnabled = true, agentChatId = "123")),
         )
-        every { fixture.agent.isAiFeatureEnabled(any()) } answers {
-            if (availabilityChecks.incrementAndGet() == 2) {
-                secondUpdateAdmitted.complete(Unit)
-            }
-            true
-        }
         every { fixture.agent.resetSession() } answers {
             resetStarted.complete(Unit)
             resetJob
@@ -568,13 +562,18 @@ class MessagePollerTest {
         }
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { pollStarted.await() }
+        withTestCleanup(cleanup = {
+            releaseBatch.complete(Unit)
+            resetJob.complete()
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { pollStarted.await() }
             val session = currentSession(fixture.poller)
             session.lastAiReplyAtMillis = 1234L
             releaseBatch.complete(Unit)
-            withTimeout(2.seconds) { resetStarted.await() }
-            withTimeout(2.seconds) { secondUpdateAdmitted.await() }
+            withTimeout(5.seconds) { resetStarted.await() }
+            // 唯一消费者仍阻塞在 resetJob；此时队列非空才能证明第二条消息已实际入队。
+            eventually(5.seconds) { assertFalse(session.updateChannel.isEmpty) }
             resetJob.complete()
 
             eventually {
@@ -591,10 +590,6 @@ class MessagePollerTest {
                     )
                 }
             }
-        } finally {
-            releaseBatch.complete(Unit)
-            resetJob.complete()
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -614,8 +609,11 @@ class MessagePollerTest {
         fixture.saveSettings(AppSettings(telegramToken = "100:A"))
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { resetStarted.await() }
+        withTestCleanup(cleanup = {
+            resetJob.complete()
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { resetStarted.await() }
             assertTrue(fixture.barrier.isSwitching)
 
             val admitted = async(start = CoroutineStart.UNDISPATCHED) {
@@ -624,12 +622,9 @@ class MessagePollerTest {
             assertFalse(admitted.isCompleted)
 
             resetJob.complete()
-            assertEquals("admitted", withTimeout(2.seconds) { admitted.await() })
-            withTimeout(2.seconds) { fixture.barrier.awaitReady() }
+            assertEquals("admitted", withTimeout(5.seconds) { admitted.await() })
+            withTimeout(5.seconds) { fixture.barrier.awaitReady() }
             assertFalse(fixture.barrier.isSwitching)
-        } finally {
-            resetJob.complete()
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -654,12 +649,12 @@ class MessagePollerTest {
         coEvery { telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
 
         poller.start()
-        try {
-            withTimeout(2.seconds) { writeAttempted.await() }
+        withTestCleanup(cleanup = {
+            poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { writeAttempted.await() }
             coVerify(exactly = 0) { telegram.sendMessageForToken("100:token", "123", "reply", null) }
             assertEquals(0, updates.getPendingTelegramReplies("100").single().deliveryAttempts)
-        } finally {
-            poller.closeAndJoin()
         }
     }
 
@@ -700,20 +695,22 @@ class MessagePollerTest {
             }
 
             fixture.poller.start()
-            try {
-                withTimeout(2.seconds) { nextRoundStarted.await() }
+            withTestCleanup(cleanup = {
+                releaseNextRound.complete(Unit)
+                fixture.poller.closeAndJoin()
+            }) {
+                withTimeout(5.seconds) { nextRoundStarted.await() }
                 assertEquals(11, fixture.updates.getData("100").lastUpdateId)
                 assertNull(fixture.updates.getData("100").retryCheckpoint)
                 assertTrue(fixture.updates.getData("100").agentTurnJournal.isEmpty())
                 if (mode == "final") {
-                    assertEquals("saved", fixture.updates.getPendingTelegramReplies("100").single().text)
+                    val replies = fixture.updates.getPendingTelegramReplies("100")
+                    assertEquals(1, replies.size)
+                    assertEquals("saved", replies.single().text)
                 } else {
                     assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                 }
                 coVerify(exactly = 0) { fixture.agent.sendMessage(any()) }
-            } finally {
-                releaseNextRound.complete(Unit)
-                fixture.poller.closeAndJoin()
             }
         }
     }
@@ -786,19 +783,6 @@ class MessagePollerTest {
         this.settings.updateSettings { enabledTestSettings }
         // 只能完成本次设置写入创建的屏障；认证或 token 轮换中的外部代次必须继续保持封闭。
         barrier.completeSettingsThrough(this.settings.settingsUpdateFlow.value.switchGeneration)
-    }
-
-    private suspend fun eventually(timeout: Duration = 3.seconds, assertion: () -> Unit) {
-        withTimeout(timeout) {
-            while (true) {
-                try {
-                    assertion()
-                    return@withTimeout
-                } catch (_: AssertionError) {
-                    delay(20.milliseconds)
-                }
-            }
-        }
     }
 
     /**

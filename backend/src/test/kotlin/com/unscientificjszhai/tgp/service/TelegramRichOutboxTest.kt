@@ -61,7 +61,10 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
                 accepted
             }
             fixture.poller.start()
-            try {
+            withTestCleanup(cleanup = {
+                release.complete(Unit)
+                fixture.poller.closeAndJoin()
+            }) {
                 val pending = withTimeout(5.seconds) { sent.await() }
                 assertEquals(reply, pending.text)
                 assertEquals(reply, pending.deliveryPlan?.single()?.text)
@@ -71,9 +74,6 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
                 eventually { assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty()) }
                 coVerify(exactly = 1) { fixture.telegram.sendRichMessageForToken(any(), any(), any(), any()) }
                 coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
-            } finally {
-                release.complete(Unit)
-                fixture.poller.closeAndJoin()
             }
         }
     }
@@ -112,7 +112,9 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
         }
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             withTimeout(8.seconds) { secondPlainStarted.await() }
             val saved = UpdatesRepository(file).getPendingTelegramReplies("100").single()
             assertEquals(plan, saved.deliveryPlan)
@@ -134,8 +136,6 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
                 fixture.telegram.sendMessageForToken("100:token", "123", "a".repeat(4096), null)
                 fixture.telegram.sendMessageForToken("100:token", "123", "a".repeat(904), null)
             }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
 
         val restarted = fixture(updatesOverride = UpdatesRepository(file))
@@ -151,7 +151,9 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
             )
         } returns accepted
         restarted.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            restarted.poller.closeAndJoin()
+        }) {
             eventually { assertTrue(restarted.updates.getPendingTelegramReplies("100").isEmpty()) }
             coVerifyOrder {
                 restarted.telegram.sendMessageForToken("100:token", "123", "a".repeat(904), null)
@@ -165,8 +167,6 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
             coVerify(exactly = 1) { restarted.telegram.sendMessageForToken(any(), any(), any(), any()) }
             coVerify(exactly = 1) { restarted.telegram.sendRichMessageForToken(any(), any(), any(), any()) }
             coVerify(exactly = 0) { restarted.agent.sendMessage(any<String>()) }
-        } finally {
-            restarted.poller.closeAndJoin()
         }
     }
 
@@ -203,12 +203,12 @@ internal class TelegramRichOutboxTest : MessagePollerFacadeTestSupport() {
             }
         }
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             eventually(10.seconds) { assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty()) }
             assertEquals(5, attempts.get())
             coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 }
