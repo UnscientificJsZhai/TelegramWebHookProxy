@@ -175,7 +175,7 @@ class HttpCallingFunctionProvider private constructor(
                 return error(ERROR_TARGET_NOT_ALLOWED)
             }
         }
-        val client = createClient(settings, target)
+        val client = createClient(settings, target, fixedUrl)
         val isRegistered = synchronized(lifecycleLock) {
             if (closed.get()) {
                 false
@@ -231,14 +231,14 @@ class HttpCallingFunctionProvider private constructor(
         }
     }
 
-    private fun createClient(settings: HttpToolSettings, target: HttpCallTarget): HttpClient =
+    private fun createClient(settings: HttpToolSettings, target: HttpCallTarget, fixedUrl: HttpUrl): HttpClient =
         HttpClient(OkHttp) {
             expectSuccess = false
             followRedirects = false
             engine {
                 clientCacheSize = 0
                 config {
-                    dns(ValidatingDns(target, dnsResolver))
+                    dns(ValidatingDns(target, fixedUrl.host, dnsResolver))
                     proxy(Proxy.NO_PROXY)
                     followRedirects(false)
                     followSslRedirects(false)
@@ -364,13 +364,15 @@ class HttpCallingFunctionProvider private constructor(
     private class ResponseTooLargeException : Exception()
 
     private class ValidatingDns(
-        private val target: HttpCallTarget,
+        target: HttpCallTarget,
+        private val canonicalHost: String,
         private val resolver: HttpToolDnsResolver,
     ) : Dns {
         private val allowedAddresses = target.allowedCidrs.map(::parseExactHttpToolCidr)
 
         override fun lookup(hostname: String): List<InetAddress> {
-            if (hostname != target.host) throw UnknownHostException("HTTP tool target mismatch")
+            // 与请求 URL 共用 OkHttp 的大小写及 IDN 规范化结果，仍要求精确匹配唯一目标。
+            if (hostname != canonicalHost) throw UnknownHostException("HTTP tool target mismatch")
             val addresses = resolver.lookup(hostname)
             if (addresses.isEmpty() || addresses.any { !it.isAllowedForTarget(allowedAddresses) }) {
                 throw UnknownHostException("HTTP tool DNS result rejected")

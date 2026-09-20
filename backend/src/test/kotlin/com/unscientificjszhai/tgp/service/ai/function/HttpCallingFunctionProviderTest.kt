@@ -123,6 +123,67 @@ class HttpCallingFunctionProviderTest {
     }
 
 
+    /** 真实 OkHttp 路由应将规范化主机交给 DNS，允许配置中的大小写与 IDN 写法。 */
+    @Test
+    fun `hostname validation uses the same canonical host as the request`() = runBlocking {
+        listOf(
+            "EXAMPLE.TEST" to "example.test",
+            "BÜCHER.Example" to "xn--bcher-kva.example",
+            "example.test" to "example.test",
+        ).forEach { (configuredHost, canonicalHost) ->
+            val repository = SettingsChangeCoordinator.forTesting(
+                File(temporaryDirectory, "canonical-${System.nanoTime()}.json"), ModelSwitchBarrier(),
+            )
+            val settings = httpsHostnameSettings().let {
+                it.copy(targets = listOf(it.targets.single().copy(host = configuredHost)))
+            }
+            repository.replaceSettingsForTest(AppSettings(ai = AISettings(httpToolSettings = settings)))
+            val resolvedHosts = mutableListOf<String>()
+            val connections = AtomicInteger()
+            providerWith(repository, HttpToolDnsResolver { hostname ->
+                resolvedHosts += hostname
+                listOf(InetAddress.getByName("127.0.0.1"))
+            }, HttpToolConnectionObserver {
+                connections.incrementAndGet()
+                throw IOException("stop before socket connect")
+            }).use { provider ->
+                assertEquals(
+                    HttpCallingFunctionProvider.error(HttpCallingFunctionProvider.ERROR_REQUEST_FAILED),
+                    provider.execute("call_http_api", mapOf("targetId" to "fixed")), configuredHost,
+                )
+            }
+            assertEquals(listOf(canonicalHost), resolvedHosts, configuredHost)
+            assertEquals(1, connections.get(), configuredHost)
+        }
+    }
+
+    @Test
+    fun `canonical hostname still rejects any unauthorized DNS address`() = runBlocking {
+        val repository = SettingsChangeCoordinator.forTesting(
+            File(temporaryDirectory, "canonical-denied.json"), ModelSwitchBarrier(),
+        )
+        val settings = httpsHostnameSettings().let {
+            it.copy(targets = listOf(it.targets.single().copy(host = "EXAMPLE.TEST", allowedCidrs = emptyList())))
+        }
+        repository.replaceSettingsForTest(AppSettings(ai = AISettings(httpToolSettings = settings)))
+        val resolvedHosts = mutableListOf<String>()
+        val connections = AtomicInteger()
+        providerWith(repository, HttpToolDnsResolver { hostname ->
+            resolvedHosts += hostname
+            listOf(InetAddress.getByName("8.8.8.8"), InetAddress.getByName("127.0.0.1"))
+        }, HttpToolConnectionObserver {
+            connections.incrementAndGet()
+            throw IOException("unexpected connection")
+        }).use { provider ->
+            assertEquals(
+                HttpCallingFunctionProvider.error(HttpCallingFunctionProvider.ERROR_REQUEST_FAILED),
+                provider.execute("call_http_api", mapOf("targetId" to "fixed")),
+            )
+        }
+        assertEquals(listOf("example.test"), resolvedHosts)
+        assertEquals(0, connections.get())
+    }
+
     /**
      * 验证 `/23` 前缀匹配恰好覆盖 `2001::/23`，不会把紧邻的正常全球单播地址纳入拒绝范围。
      */
