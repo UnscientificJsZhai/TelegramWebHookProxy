@@ -163,7 +163,7 @@ curl -X POST 'http://localhost:10178/api/send-message?richformat=blocks&messagef
 服务只检查正文类型、非空要求及 JSON 结构，保留 blocks 对象内容，完整语法和内容限制交由 Telegram 验证。
 富消息请求只设置 `rich_message` 中选定的一个字段，详见 [InputRichMessage](https://core.telegram.org/bots/api#inputrichmessage)。
 
-一次 API 请求仅投递一条消息，不自动拆分或降级，Telegram 状态码和响应正文继续透传。普通消息保留 4,096 个 UTF-16 单元和 64 KiB 请求体限制；富消息不设应用层 HTTP 请求体字节上限，仍保留 JSON 深度及节点数保护。
+一次 API 请求仅投递一条消息，不自动拆分或降级，Telegram 状态码和响应正文继续透传。普通消息保留 4,096 个 UTF-16 单元和 64 KiB 请求体限制；三种富消息格式的 HTTP 请求体上限均为 1 MiB（1,048,576 字节），按实际传输的字节计量，包含 JSON 或表单编码开销。超过上限返回 `413`，未声明 `Content-Length` 的流式请求同样受限；仍保留 JSON 深度及节点数保护。
 正文可引用媒体 URL，blocks 可使用 Telegram 文件引用；接口不提供独立 `media` 参数或文件上传。富消息语法和平台限制见 [Telegram 官方文档](https://core.telegram.org/bots/api#rich-message-formatting-options)。
 
 Web UI 的 Webhook 页面可选择四种格式并载入示例，首页快捷发送继续使用普通消息。

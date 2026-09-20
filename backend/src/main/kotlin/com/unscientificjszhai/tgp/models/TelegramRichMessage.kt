@@ -3,7 +3,6 @@ package com.unscientificjszhai.tgp.models
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.EncodeDefault
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.JsonArray
 
 /** 调用方可选择的 Telegram 富消息正文格式。 */
@@ -11,8 +10,10 @@ import kotlinx.serialization.json.JsonArray
 enum class TelegramRichFormat(val wireName: String) {
     @SerialName("markdown")
     MARKDOWN("markdown"),
+
     @SerialName("html")
     HTML("html"),
+
     @SerialName("blocks")
     BLOCKS("blocks");
 
@@ -23,7 +24,6 @@ enum class TelegramRichFormat(val wireName: String) {
 
 /** 富消息的三种正文互斥；blocks 的具体字段由 Telegram 验证。 */
 @Serializable
-@OptIn(ExperimentalSerializationApi::class)
 data class InputRichMessage(
     @EncodeDefault(EncodeDefault.Mode.NEVER) val markdown: String? = null,
     @EncodeDefault(EncodeDefault.Mode.NEVER) val html: String? = null,

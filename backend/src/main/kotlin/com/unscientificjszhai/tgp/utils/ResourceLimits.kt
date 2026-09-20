@@ -12,6 +12,9 @@ internal object ResourceLimits {
     const val CHAT_SETTINGS_REQUEST_BYTES = 8 * 1024L
     const val SKILL_REQUEST_BYTES = 128 * 1024L
     const val SEND_MESSAGE_REQUEST_BYTES = 64 * 1024L
+
+    // 为富消息标记、blocks 结构及表单百分号编码预留空间，同时限制整包读取的内存占用。
+    const val SEND_RICH_MESSAGE_REQUEST_BYTES = 1024 * 1024L
 }
 
 /** JSON 文件或待提交内容超过所属仓储的字节上限。 */

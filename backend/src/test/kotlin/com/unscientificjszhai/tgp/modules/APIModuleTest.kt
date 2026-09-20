@@ -11,10 +11,12 @@ import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.http.content.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.testing.*
+import io.ktor.utils.io.*
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
@@ -66,7 +68,7 @@ class APIModuleTest {
         }
 
     @Test
-    fun `rich requests bypass plain length and byte limits for json and forms`() =
+    fun `rich requests preserve multibyte content above plain limits for json and forms`() =
         withTestApi { settings, telegram, _ ->
             settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "42") }
             coEvery { telegram.sendRichMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(
@@ -92,6 +94,71 @@ class APIModuleTest {
                     null
                 )
             }
+        }
+
+    /** 验证三种富格式的请求体字节上限，边界可投递，超限在解析前拒绝，且不依赖 Content-Length。 */
+    @Test
+    fun `rich requests enforce byte boundary with and without content length`() =
+        withTestApi { settings, telegram, _ ->
+            settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "42") }
+            coEvery { telegram.sendRichMessageForToken(any(), any(), any(), any()) } returns
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+            val limit = 1024 * 1024
+            for (format in listOf("markdown", "html", "blocks")) {
+                val text = if (format == "blocks") """[{"type":"paragraph","text":"字"}]""" else "字"
+                val content = if (format == "blocks") Json.parseToJsonElement(text) else JsonPrimitive(text)
+                val jsonBody = buildJsonObject { put("text", content) }.toString()
+                val formBody = listOf("text" to text).formUrlEncode() + "&padding="
+                for ((type, prefix) in listOf(
+                    ContentType.Application.Json to jsonBody,
+                    ContentType.Application.FormUrlEncoded to formBody,
+                )) {
+                    val bodyAtLimit = prefix + " ".repeat(limit - prefix.encodeToByteArray().size)
+                    for (includeContentLength in listOf(true, false)) {
+                        for (extraBytes in listOf(0, 1)) {
+                            // JSON 末尾多出的 x 同时验证超限响应优先于语法错误。
+                            val bytes = (bodyAtLimit + "x".repeat(extraBytes)).encodeToByteArray()
+                            val context = "$format, $type, Content-Length=$includeContentLength, extra=$extraBytes"
+                            assertEquals(limit + extraBytes, bytes.size, context)
+                            client.post("/api/send-message?richformat=$format") {
+                                contentType(type)
+                                setBody(object : OutgoingContent.ReadChannelContent() {
+                                    override val contentLength: Long? =
+                                        bytes.size.toLong().takeIf { includeContentLength }
+
+                                    override fun readFrom(): ByteReadChannel = ByteReadChannel(bytes)
+                                })
+                            }.apply {
+                                if (extraBytes == 0) {
+                                    assertEquals(HttpStatusCode.OK, status, context)
+                                } else {
+                                    assertEquals(HttpStatusCode.PayloadTooLarge, status, context)
+                                    assertEquals(
+                                        "请求体超过限制。",
+                                        Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.jsonPrimitive?.content,
+                                        context,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            coVerify(exactly = 4) {
+                telegram.sendRichMessageForToken("100:test", "42", InputRichMessage(markdown = "字"), null)
+            }
+            coVerify(exactly = 4) {
+                telegram.sendRichMessageForToken("100:test", "42", InputRichMessage(html = "字"), null)
+            }
+            coVerify(exactly = 4) {
+                telegram.sendRichMessageForToken(
+                    "100:test", "42",
+                    InputRichMessage(blocks = Json.parseToJsonElement("""[{"type":"paragraph","text":"字"}]""").jsonArray),
+                    null,
+                )
+            }
+            coVerify(exactly = 12) { telegram.sendRichMessageForToken(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { telegram.sendMessageForToken(any(), any(), any(), any()) }
         }
 
     @Test
@@ -305,18 +372,21 @@ class APIModuleTest {
     /** 验证超出路由请求体限制时，`413` 错误优先于 JSON 解析。 */
     @Test
     fun `send message body limit returns a fixed payload too large response`() = withTestApi { _, telegramService, _ ->
-        client.post("/api/send-message") {
-            contentType(ContentType.Application.Json)
-            setBody("""{"text":"${"x".repeat(65 * 1024)}"}""")
-        }.apply {
-            assertEquals(HttpStatusCode.PayloadTooLarge, status)
-            assertEquals(
-                "请求体超过限制。",
-                Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.toString()?.trim('"')
-            )
+        for (query in listOf("", "?richformat=", "?richformat=%20")) {
+            client.post("/api/send-message$query") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"text":"${"x".repeat(65 * 1024)}"}""")
+            }.apply {
+                assertEquals(HttpStatusCode.PayloadTooLarge, status)
+                assertEquals(
+                    "请求体超过限制。",
+                    Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.toString()?.trim('"')
+                )
+            }
         }
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
         coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendRichMessageForToken(any(), any(), any(), any()) }
     }
 
     /** 验证所有设置写入入口均拒绝超限字段或请求体，且不改变持久化状态。 */
