@@ -302,6 +302,10 @@ internal class TrackingHttpServerResponseEncoder(
     }
 
     override fun isContentAlwaysEmpty(msg: HttpResponse): Boolean {
+        // 信息响应仍属于队首请求；只有最终响应才能消费方法，否则流水线中的 HEAD 会错配正文。
+        if (msg.status().codeClass() == HttpStatusClass.INFORMATIONAL) {
+            return super.isContentAlwaysEmpty(msg)
+        }
         requestMethod = requestMethods.poll()
         return HttpMethod.HEAD == requestMethod || super.isContentAlwaysEmpty(msg)
     }

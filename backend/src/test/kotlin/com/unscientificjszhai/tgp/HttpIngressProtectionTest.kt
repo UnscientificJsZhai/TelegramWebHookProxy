@@ -400,6 +400,48 @@ class HttpIngressProtectionTest {
         )
     }
 
+    /** 复现 Ktor 的 Expect handler 自动回复 100 后，同连接 POST、HEAD、GET 的编码顺序。 */
+    @Test
+    fun `informational responses preserve pipelined request method association`() {
+        val channel = EmbeddedChannel(
+            TrackingHttpServerCodec(testLimits()),
+            HttpRequestDeadlineHandler(testLimits()),
+            HttpServerExpectContinueHandler(),
+        )
+        try {
+            channel.writeInbound(Unpooled.copiedBuffer(
+                "POST /first HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n",
+                Charsets.US_ASCII,
+            ))
+            assertEquals("HTTP/1.1 100 Continue\r\n\r\n", channel.drainOutboundText())
+            channel.writeInbound(Unpooled.copiedBuffer(
+                "dataHEAD /second HTTP/1.1\r\nHost: localhost\r\n\r\n" +
+                    "GET /third HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                Charsets.US_ASCII,
+            ))
+            channel.drainInboundMessages()
+            channel.writeOutbound(DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.EARLY_HINTS))
+            assertEquals("HTTP/1.1 103 Early Hints\r\n\r\n", channel.drainOutboundText())
+
+            for (body in listOf("post-body", "head-body", "get-body")) {
+                val response = DefaultFullHttpResponse(
+                    HttpVersion.HTTP_1_1, HttpResponseStatus.OK, Unpooled.copiedBuffer(body, Charsets.US_ASCII),
+                )
+                HttpUtil.setContentLength(response, body.length.toLong())
+                channel.writeOutbound(response)
+            }
+            assertEquals(
+                "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\npost-body" +
+                    "HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n" +
+                    "HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\nget-body",
+                channel.drainOutboundText(),
+            )
+        } finally {
+            channel.drainInboundMessages()
+            channel.finishAndReleaseAll()
+        }
+    }
+
     private fun testLimits(
         maxConnections: Int = 8,
         rawReadIdleTimeout: kotlin.time.Duration = 1.seconds,
