@@ -45,8 +45,12 @@ fun Application.apiModule(
     routing {
         route("/api") {
             get("/settings") {
-                val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
+                val (snapshot, recoveryFields) = settingsChangeCoordinator.currentSettingsWithRecovery()
                 call.response.headers.append(HttpHeaders.ETag, snapshot.revision.toStrongETag())
+                call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+                if (recoveryFields.isNotEmpty()) {
+                    call.response.headers.append("X-Settings-Recovery", recoveryFields.joinToString(","))
+                }
                 call.respondCompleteSettings(snapshot.settings)
             }
             route("/settings") {

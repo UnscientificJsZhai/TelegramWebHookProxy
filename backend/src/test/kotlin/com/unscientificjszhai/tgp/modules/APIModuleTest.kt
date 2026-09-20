@@ -934,6 +934,14 @@ class APIModuleTest {
 
         val repairCases = listOf(
             RepairCase(
+                patch = """{"ai":{"httpToolSettings":{"enabled":false,"targets":[],"requestTimeoutMillis":10000,"maxConcurrentRequests":2}}}""",
+                verifiesReplacement = { repository ->
+                    assertEquals(HttpToolSettings(), repository.settingsFlow.value.ai!!.httpToolSettings)
+                    assertEquals("key", repository.settingsFlow.value.ai!!.openAiApiKey)
+                    assertEquals("old-chat", repository.settingsFlow.value.chatId)
+                },
+            ),
+            RepairCase(
                 patch =
                     """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"safe","scheme":"https","host":"api.example.com","port":443,"path":"/status","method":"GET","allowedCidrs":[]}]}}}""",
                 verifiesReplacement = { repository ->
@@ -960,6 +968,10 @@ class APIModuleTest {
                 testApplication {
                     application { configureTestApi(repository, telegramService) }
 
+                    client.get("/api/settings").apply {
+                        assertEquals("httpToolSettings", headers["X-Settings-Recovery"])
+                        assertEquals("no-store", headers[HttpHeaders.CacheControl])
+                    }
                     client.patch("/api/settings") {
                         header(HttpHeaders.IfMatch, currentSettingsETag())
                         contentType(ContentType.Application.Json)
@@ -1011,6 +1023,7 @@ class APIModuleTest {
                     }.apply {
                         assertEquals(HttpStatusCode.OK, status)
                     }
+                    assertNull(client.get("/api/settings").headers["X-Settings-Recovery"])
                 }
 
                 assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
@@ -1019,6 +1032,67 @@ class APIModuleTest {
             } finally {
                 temporaryDirectory.deleteRecursively()
             }
+        }
+    }
+
+    /** 多种历史非法配置一次显式修复，保留其余设置并遵守原有版本条件。 */
+    @Test
+    fun `settings recovery reports all protected fields and repairs them atomically`() {
+        val temporaryDirectory = createTempDirectory("api-combined-settings-recovery").toFile()
+        try {
+            val configFile = temporaryDirectory.resolve("settings.json")
+            val historicalContent = """{
+                "telegramToken":"100:token","chatId":"old-chat",
+                "proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"},
+                "ai":{"provider":"OPENAI","openAiApiKey":"keep-key","globalContext":"keep context",
+                    "openAiBaseUrl":"https://gateway.example.com/v1/%6dodels",
+                    "mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}],
+                    "httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}
+            }"""
+            configFile.writeText(historicalContent)
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+            val original = repository.settingsFlow.value
+            val telegramService = mockk<TelegramService>(relaxed = true)
+            val repair = """{
+                "proxy":{"host":"127.0.0.1","port":1080,"type":"SOCKS","username":null,"password":null},
+                "ai":{"openAiBaseUrl":"https://gateway.example.com/v1","mcpServers":[],
+                    "httpToolSettings":{"enabled":false,"targets":[],"requestTimeoutMillis":10000,"maxConcurrentRequests":2}}
+            }"""
+
+            testApplication {
+                application { configureTestApi(repository, telegramService) }
+                val initial = client.get("/api/settings")
+                assertEquals("proxy,mcpServers,openAiBaseUrl,httpToolSettings", initial.headers["X-Settings-Recovery"])
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, "\"${"0".repeat(64)}\"")
+                    contentType(ContentType.Application.Json)
+                    setBody(repair)
+                }.apply { assertEquals(HttpStatusCode.PreconditionFailed, status) }
+                assertEquals(historicalContent, configFile.readText())
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, initial.headers[HttpHeaders.ETag])
+                    contentType(ContentType.Application.Json)
+                    setBody(repair)
+                }.apply { assertEquals(HttpStatusCode.OK, status) }
+                assertEquals(
+                    original.copy(
+                        proxy = ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS),
+                        ai = original.ai!!.copy(openAiBaseUrl = "https://gateway.example.com/v1"),
+                    ),
+                    repository.settingsFlow.value,
+                )
+                assertNull(client.get("/api/settings").headers["X-Settings-Recovery"])
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"chatId":"new-chat"}""")
+                }.apply { assertEquals(HttpStatusCode.OK, status) }
+            }
+            val reloaded = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+            assertTrue(reloaded.currentSettingsWithRecovery().second.isEmpty())
+            assertEquals(repository.settingsFlow.value, reloaded.settingsFlow.value)
+        } finally {
+            temporaryDirectory.deleteRecursively()
         }
     }
 
