@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.net.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -165,6 +166,15 @@ class HttpCallingFunctionProvider private constructor(
             }
         }
 
+        val fixedUrl = target.toFixedUrl().toHttpUrlOrNull() ?: return error(ERROR_TARGET_NOT_ALLOWED)
+        // OkHttp 对字面 IP 不调用自定义 DNS；必须使用实际 URL 的主机在创建客户端前执行同一地址策略。
+        // 无法按严格格式解析的数字主机也拒绝，避免 JVM 对缩写或前导零地址的兼容解析绕过校验。
+        if (fixedUrl.host.contains(':') || fixedUrl.host.all { it.isDigit() || it == '.' }) {
+            val address = parseHttpToolLiteralAddress(fixedUrl.host) ?: return error(ERROR_TARGET_NOT_ALLOWED)
+            if (!address.isAllowedForTarget(target.allowedCidrs.map(::parseExactHttpToolCidr))) {
+                return error(ERROR_TARGET_NOT_ALLOWED)
+            }
+        }
         val client = createClient(settings, target)
         val isRegistered = synchronized(lifecycleLock) {
             if (closed.get()) {
@@ -182,7 +192,7 @@ class HttpCallingFunctionProvider private constructor(
         return try {
             lifecycleObserver.afterRegistrationBeforeRequest()
             if (closed.get()) return error(ERROR_REQUEST_FAILED)
-            val response = client.request(target.toFixedUrl()) {
+            val response = client.request(fixedUrl.toString()) {
                 method = when (target.method) {
                     HttpToolMethod.GET -> HttpMethod.Get
                     HttpToolMethod.POST -> HttpMethod.Post
