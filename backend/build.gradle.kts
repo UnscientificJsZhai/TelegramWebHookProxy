@@ -15,7 +15,7 @@ plugins {
 
 version = "1.2.0"
 
-val ktorVersion = "3.5.2"
+val ktorVersion = "3.6.0"
 val daggerVersion = "2.60.1"
 
 kotlin {
@@ -46,7 +46,7 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Gemini SDK
-    implementation("com.google.genai:google-genai:1.70.0") {
+    implementation("com.google.genai:google-genai:1.72.0") {
         exclude(group = "com.fasterxml.jackson.core", module = "jackson-core")
         exclude(group = "commons-codec", module = "commons-codec")
     }
@@ -54,7 +54,7 @@ dependencies {
     implementation("commons-codec:commons-codec:1.22.1")
 
     // OpenAI SDK
-    implementation("com.openai:openai-java:4.63.1")
+    implementation("com.openai:openai-java:4.64.0")
 
     // AI provider transport.  Requests must retain their native OkHttp Call so coroutine cancellation can abort it.
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
