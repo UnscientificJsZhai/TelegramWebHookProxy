@@ -30,12 +30,12 @@ private val MAX_COMMAND_RETRY_DELAY = 1.minutes
  * @param telegramService 唯一执行 Telegram 命令写入的服务。
  */
 @Singleton
-class BotCommandReconciler private constructor(
+class BotCommandReconciler internal constructor(
     parentScope: CoroutineScope,
     private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val telegramService: TelegramService,
     private val retryDelay: suspend (Duration) -> Unit,
-    @Suppress("UNUSED_PARAMETER") testConstructorMarker: Unit,
+    workerDispatcher: CoroutineDispatcher,
 ) : AutoCloseable {
     /**
      * 创建使用生产退避策略的应用级命令协调器。
@@ -49,7 +49,7 @@ class BotCommandReconciler private constructor(
         parentScope: CoroutineScope,
         settingsChangeCoordinator: SettingsChangeCoordinator,
         telegramService: TelegramService,
-    ) : this(parentScope, settingsChangeCoordinator, telegramService, { duration -> delay(duration) }, Unit)
+    ) : this(parentScope, settingsChangeCoordinator, telegramService, { duration -> delay(duration) }, Dispatchers.IO)
 
     /**
      * 一个设置版本期望写入 Telegram 的命令目标。
@@ -75,7 +75,7 @@ class BotCommandReconciler private constructor(
 
     private val logger = LoggerFactory.getLogger(BotCommandReconciler::class.java)
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
-    private val scope = CoroutineScope(parentScope.coroutineContext + Dispatchers.IO + scopeJob)
+    private val scope = CoroutineScope(parentScope.coroutineContext + workerDispatcher + scopeJob)
     private val lifecycleLock = Any()
     private val wakeups = Channel<Unit>(Channel.CONFLATED)
 
@@ -189,15 +189,14 @@ class BotCommandReconciler private constructor(
             drainWakeups()
             try {
                 val command = checkNotNull(target.command)
+                // 请求可能已经改变远端，即使响应随后失败也不能继续信任此前的收敛状态。
+                synchronized(lifecycleLock) { convergedCommand = null }
                 telegramService.updateBotCommands(command.token, command.provider)
-                val current = synchronized(lifecycleLock) {
-                    !closed && latestTarget?.version == target.version
-                }
-                if (current) {
-                    synchronized(lifecycleLock) {
-                        if (!closed && latestTarget?.version == target.version) {
-                            convergedCommand = command
-                        }
+                synchronized(lifecycleLock) {
+                    // 记录实际成功写入的目标；即使设置已变化，也必须让下一轮发现远端仍需追赶。
+                    // 空 token 保留失效状态，重新配置 token 时仍需再次确认远端。
+                    if (!closed && latestTarget?.command != null) {
+                        convergedCommand = command
                     }
                 }
                 retryAttempt = 0

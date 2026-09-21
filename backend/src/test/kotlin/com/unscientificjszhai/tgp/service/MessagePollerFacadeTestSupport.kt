@@ -22,12 +22,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.assertNotNull
 import kotlin.time.Duration
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -39,7 +39,7 @@ internal abstract class MessagePollerFacadeTestSupport {
     fun cleanUpFacadeTestSupport() {
         runBlocking {
             try {
-                parentScope.coroutineContext.job.cancelAndJoin()
+                withTimeout(5.seconds) { parentScope.coroutineContext.job.cancelAndJoin() }
             } finally {
                 tempDirectory.deleteRecursively()
             }
@@ -115,19 +115,6 @@ internal abstract class MessagePollerFacadeTestSupport {
     protected fun Fixture.saveRawSettings(settings: AppSettings) {
         this.settings.updateSettings { settings }
         barrier.completeSettingsThrough(this.settings.settingsUpdateFlow.value.switchGeneration)
-    }
-
-    protected suspend fun eventually(timeout: Duration = 3.seconds, assertion: () -> Unit) {
-        kotlinx.coroutines.withTimeout(timeout) {
-            while (true) {
-                try {
-                    assertion()
-                    return@withTimeout
-                } catch (_: AssertionError) {
-                    delay(20.milliseconds)
-                }
-            }
-        }
     }
 
     protected fun currentSession(poller: MessagePoller): PollingSession =

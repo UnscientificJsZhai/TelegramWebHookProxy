@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.TelegramReplyPart
 import com.unscientificjszhai.tgp.models.TelegramRichFormat
+import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
 import java.io.IOException
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
@@ -73,6 +74,45 @@ class TelegramRichDeliveryTest {
         assertFailsWith<IOException> { repository.advancePendingTelegramReplyDelivery("100", pending) }
         assertEquals(pending, repository.getPendingTelegramReplies("100").single())
         assertEquals(pending, UpdatesRepository(file).getPendingTelegramReplies("100").single())
+    }
+
+    @Test
+    fun `long shared footnotes survive journal and outbox persistence`() {
+        val reply = "Paragraph with reference[^n].\n\n".repeat(200) + "[^n]: " + "x".repeat(30000) + "\n"
+        val deliveryPlan = TelegramRichTextChunks.plan(reply)
+        val repository = UpdatesRepository(file)
+        repository.claimAgentTurn("100", 11, "chat", null)
+        val finalized = assertNotNull(repository.finalizeAgentTurn("100", 11, reply, deliveryPlan))
+        assertEquals(reply, finalized.reply)
+        assertEquals(finalized, UpdatesRepository(file).getData("100").agentTurnJournal.single())
+
+        repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", reply, deliveryPlan = deliveryPlan))
+        val restored = UpdatesRepository(file).getPendingTelegramReplies("100").single()
+        assertEquals(reply, restored.text)
+        assertEquals(deliveryPlan, restored.deliveryPlan)
+    }
+
+    @Test
+    fun `unused duplicate definitions remain compact through journal and outbox persistence`() {
+        val reply = "[f]: a\n\n```text\n" + "x".repeat(33000) + "\n```\n\n" + "[f]: b\n\n".repeat(10000)
+        val deliveryPlan = TelegramRichTextChunks.plan(reply)
+        val repository = UpdatesRepository(file)
+        repository.claimAgentTurn("100", 11, "chat", null)
+        val finalized = assertNotNull(repository.finalizeAgentTurn("100", 11, reply, deliveryPlan))
+        assertEquals(finalized, UpdatesRepository(file).getData("100").agentTurnJournal.single())
+
+        assertEquals(
+            RetryCheckpointCommitResult.Committed,
+            repository.completeAgentUpdateAtRetryCheckpoint(
+                "100", 11, PendingTelegramReply(11, "chat", reply, deliveryPlan = deliveryPlan), null,
+            ),
+        )
+        val restored = UpdatesRepository(file).getData("100")
+        assertEquals(11, restored.lastUpdateId)
+        assertEquals(finalized, restored.agentTurnJournal.single())
+        assertEquals(reply, restored.pendingTelegramReplies.single().text)
+        assertEquals(deliveryPlan, restored.pendingTelegramReplies.single().deliveryPlan)
+        assertTrue(deliveryPlan.all { it.format == TelegramRichFormat.MARKDOWN })
     }
 
     @Test

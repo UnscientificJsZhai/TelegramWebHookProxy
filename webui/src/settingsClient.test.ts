@@ -33,6 +33,18 @@ describe('带修订值的设置 API', () => {
         });
     });
 
+    it('读取需要显式修复的字段，忽略未知字段并去重', async () => {
+        get.mockResolvedValueOnce({
+            data: {chatId: 'first'},
+            headers: {etag: '"revision-1"', 'x-settings-recovery': 'httpToolSettings, proxy,unknown,proxy'},
+        });
+        await expect(fetchVersionedSettings()).resolves.toEqual({
+            settings: {chatId: 'first'},
+            etag: '"revision-1"',
+            recoveryFields: ['proxy', 'httpToolSettings'],
+        });
+    });
+
     it('保存时发送 If-Match 并采用响应设置和新 ETag', async () => {
         put.mockResolvedValueOnce({
             data: {chatId: 'server-value'},

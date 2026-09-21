@@ -66,22 +66,13 @@ internal object TelegramRichTextChunks {
         private val definitions = linkedMapOf<String, String>()
         private val result = mutableListOf<TelegramReplyPart>()
         private val protectedRanges = protectedRanges(source, document)
+        private var lastRichRaw: String? = null
+        private var planBytes = 0L
+        private val planByteBudget = source.toByteArray(Charsets.UTF_8).size.toLong() * 4
 
         fun build(): List<TelegramReplyPart> {
             if (fits(source)) return listOf(TelegramReplyPart(source, 0, source.length, TelegramRichFormat.MARKDOWN))
-            walk(document) { node, _ ->
-                val label = when (node) {
-                    is LinkReferenceDefinition -> node.label
-                    is FootnoteDefinition -> "^${node.label}"
-                    else -> null
-                }
-                if (label != null && node.sourceSpans.isNotEmpty()) {
-                    definitions.putIfAbsent(
-                        normalizeLabel(label),
-                        source.substring(startOf(node), endOf(node)).trimEnd()
-                    )
-                }
-            }
+            definitions.putAll(referenceDefinitions(source, document))
             val children = children(document)
             if (children.isEmpty()) return plainParts(source, 0, source.length)
             val boundaries = sortedSetOf(0, source.length)
@@ -234,35 +225,86 @@ internal object TelegramRichTextChunks {
             if (!fits(text)) return false
             val previous = result.lastOrNull()
             if (merge && previous?.format == TelegramRichFormat.MARKDOWN && previous.sourceEnd == start) {
-                val combined = previous.text + "\n\n" + text
-                if (fits(combined)) {
-                    result[result.lastIndex] = previous.copy(text = combined, sourceEnd = end)
+                // 合并尚未补充定义的正文，避免共享脚注或链接定义被重复计入预算和发送内容。
+                val combinedRaw = checkNotNull(lastRichRaw) + "\n\n" + raw
+                val combined = withReferences(combinedRaw)
+                if (fits(combined) && !hasConflictingDefinitions(combinedRaw)) {
+                    val merged = previous.copy(text = combined, sourceEnd = end)
+                    accountPart(merged, previous)
+                    result[result.lastIndex] = merged
+                    lastRichRaw = combinedRaw
                     return true
                 }
             }
-            result += TelegramReplyPart(text, start, end, TelegramRichFormat.MARKDOWN)
+            val part = TelegramReplyPart(text, start, end, TelegramRichFormat.MARKDOWN)
+            accountPart(part)
+            result += part
+            lastRichRaw = raw
             return true
         }
 
         private fun emitPlain(start: Int, end: Int) {
-            result += plainParts(source, start, end)
+            val parts = plainParts(source, start, end)
+            parts.forEach { accountPart(it) }
+            result += parts
+            lastRichRaw = null
         }
 
+        /** 将片段元数据和 JSON 转义计入预算，避免大量短片段挤满账本；超额时由 plan 无损降级。 */
+        private fun accountPart(part: TelegramReplyPart, replaced: TelegramReplyPart? = null) {
+            planBytes += serializedSize(part) - (replaced?.let(::serializedSize) ?: 0)
+            check(planBytes <= planByteBudget) { "富消息投递计划超过原文体积预算。" }
+        }
+
+        private fun serializedSize(part: TelegramReplyPart): Int =
+            ConfigJson.encodeToString(part).toByteArray(Charsets.UTF_8).size
+
         private fun withReferences(text: String): String {
-            if (definitions.isEmpty()) return text
-            val needed = linkedSetOf<String>()
+            val needed = requiredDefinitions(text)
+            if (needed.isEmpty()) return text
+            // 代码或 HTML 示例中的同文字符串不是定义，不能阻止补齐真正的引用目标。
+            val local = referenceDefinitions(text)
+            val additions = needed.filter { (label, definition) -> local[label] != definition }.values
+            return if (additions.isEmpty()) text else text + "\n\n" + additions.joinToString("\n\n")
+        }
+
+        private fun requiredDefinitions(text: String): Map<String, String> {
+            if (definitions.isEmpty()) return emptyMap()
+            val needed = linkedMapOf<String, String>()
             val queue = ArrayDeque<String>()
             queue.add(text)
             while (queue.isNotEmpty()) {
                 val fragment = queue.removeFirst()
                 referenceLabels(fragment).forEach { label ->
                     val definition = definitions[label]
-                    if (definition != null && needed.add(label)) queue.add(definition)
+                    if (definition != null && needed.putIfAbsent(label, definition) == null) queue.add(definition)
                 }
             }
-            val additions = needed.mapNotNull { definitions[it] }.filterNot { text.contains(it) }
-            return if (additions.isEmpty()) text else text + "\n\n" + additions.joinToString("\n\n")
+            return needed
         }
+
+        /** 后补的全局定义不能排在不同的局部定义之后；此时保留两个片段，避免改变引用目标。 */
+        private fun hasConflictingDefinitions(fragment: String): Boolean {
+            val needed = requiredDefinitions(fragment)
+            if (needed.isEmpty()) return false
+            val local = referenceDefinitions(fragment)
+            return needed.any { (label, definition) -> local[label]?.let { it != definition } == true }
+        }
+
+        /** 只读取 AST 中的实际定义，并保留同名定义首次出现的优先级。 */
+        private fun referenceDefinitions(text: String, document: Node = parser.parse(text)): Map<String, String> =
+            buildMap {
+                walk(document) { node, _ ->
+                    val label = when (node) {
+                        is LinkReferenceDefinition -> node.label
+                        is FootnoteDefinition -> "^${node.label}"
+                        else -> null
+                    }?.let(::normalizeLabel)
+                    if (label != null && !containsKey(label) && node.sourceSpans.isNotEmpty()) {
+                        put(label, text.substring(startOf(node, text), endOf(node, text)).trimEnd())
+                    }
+                }
+            }
 
         /** 保留 label 中的原始标记及跨行文字，避免 Text 节点反转义或去掉强调/代码标记。 */
         private fun referenceLabels(fragment: String): Set<String> {
@@ -300,11 +342,17 @@ internal object TelegramRichTextChunks {
             }
         }
 
-        private fun startOf(node: Node): Int = lineStart(node.sourceSpans.minOfOrNull { it.inputIndex } ?: 0)
-        private fun endOf(node: Node): Int = lineEnd(node.sourceSpans.maxOfOrNull { it.inputIndex + it.length } ?: 0)
-        private fun lineStart(offset: Int): Int = if (offset <= 0) 0 else source.lastIndexOf('\n', offset - 1) + 1
-        private fun lineEnd(offset: Int): Int =
-            source.indexOf('\n', offset).let { if (it < 0) source.length else it + 1 }
+        private fun startOf(node: Node, text: String = source): Int =
+            lineStart(node.sourceSpans.minOfOrNull { it.inputIndex } ?: 0, text)
+
+        private fun endOf(node: Node, text: String = source): Int =
+            lineEnd(node.sourceSpans.maxOfOrNull { it.inputIndex + it.length } ?: 0, text)
+
+        private fun lineStart(offset: Int, text: String = source): Int =
+            if (offset <= 0) 0 else text.lastIndexOf('\n', offset - 1) + 1
+
+        private fun lineEnd(offset: Int, text: String = source): Int =
+            text.indexOf('\n', offset).let { if (it < 0) text.length else it + 1 }
     }
 
     /** 以源码长度和 AST 计数保守规划，Telegram 对扩展语法保留最终判定权。 */

@@ -45,8 +45,12 @@ fun Application.apiModule(
     routing {
         route("/api") {
             get("/settings") {
-                val snapshot = settingsChangeCoordinator.currentSettingsSnapshot()
+                val (snapshot, recoveryFields) = settingsChangeCoordinator.currentSettingsWithRecovery()
                 call.response.headers.append(HttpHeaders.ETag, snapshot.revision.toStrongETag())
+                call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+                if (recoveryFields.isNotEmpty()) {
+                    call.response.headers.append("X-Settings-Recovery", recoveryFields.joinToString(","))
+                }
                 call.respondCompleteSettings(snapshot.settings)
             }
             route("/settings") {
@@ -108,7 +112,7 @@ fun Application.apiModule(
                     bodyLimit { call ->
                         val values = call.request.queryParameters.getAll("richformat")
                         if (values?.size == 1 && TelegramRichFormat.fromWireName(values.single()) != null) {
-                            Long.MAX_VALUE
+                            ResourceLimits.SEND_RICH_MESSAGE_REQUEST_BYTES
                         } else {
                             ResourceLimits.SEND_MESSAGE_REQUEST_BYTES
                         }
@@ -149,7 +153,7 @@ fun Application.apiModule(
                         }
 
                         contentType.match(ContentType.Application.FormUrlEncoded) -> {
-                            // receiveText 避免表单读取器另设字段体积上限；普通消息仍受路由的 64 KiB 限制。
+                            // receiveText 避免表单读取器另设字段体积上限；读取过程受路由请求体字节上限保护。
                             val parameters = parseQueryString(call.receiveText())
                             val chatId = parameters[chatIdField]
                             val text = parameters[messageField] ?: ""

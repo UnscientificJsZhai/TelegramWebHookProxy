@@ -11,10 +11,12 @@ import com.unscientificjszhai.tgp.utils.MAX_TELEGRAM_MESSAGE_TEXT_LENGTH
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.http.content.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.testing.*
+import io.ktor.utils.io.*
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
@@ -66,7 +68,7 @@ class APIModuleTest {
         }
 
     @Test
-    fun `rich requests bypass plain length and byte limits for json and forms`() =
+    fun `rich requests preserve multibyte content above plain limits for json and forms`() =
         withTestApi { settings, telegram, _ ->
             settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "42") }
             coEvery { telegram.sendRichMessageForToken(any(), any(), any(), any()) } returns TelegramApiResponse(
@@ -92,6 +94,71 @@ class APIModuleTest {
                     null
                 )
             }
+        }
+
+    /** 验证三种富格式的请求体字节上限，边界可投递，超限在解析前拒绝，且不依赖 Content-Length。 */
+    @Test
+    fun `rich requests enforce byte boundary with and without content length`() =
+        withTestApi { settings, telegram, _ ->
+            settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "42") }
+            coEvery { telegram.sendRichMessageForToken(any(), any(), any(), any()) } returns
+                    TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+            val limit = 1024 * 1024
+            for (format in listOf("markdown", "html", "blocks")) {
+                val text = if (format == "blocks") """[{"type":"paragraph","text":"字"}]""" else "字"
+                val content = if (format == "blocks") Json.parseToJsonElement(text) else JsonPrimitive(text)
+                val jsonBody = buildJsonObject { put("text", content) }.toString()
+                val formBody = listOf("text" to text).formUrlEncode() + "&padding="
+                for ((type, prefix) in listOf(
+                    ContentType.Application.Json to jsonBody,
+                    ContentType.Application.FormUrlEncoded to formBody,
+                )) {
+                    val bodyAtLimit = prefix + " ".repeat(limit - prefix.encodeToByteArray().size)
+                    for (includeContentLength in listOf(true, false)) {
+                        for (extraBytes in listOf(0, 1)) {
+                            // JSON 末尾多出的 x 同时验证超限响应优先于语法错误。
+                            val bytes = (bodyAtLimit + "x".repeat(extraBytes)).encodeToByteArray()
+                            val context = "$format, $type, Content-Length=$includeContentLength, extra=$extraBytes"
+                            assertEquals(limit + extraBytes, bytes.size, context)
+                            client.post("/api/send-message?richformat=$format") {
+                                contentType(type)
+                                setBody(object : OutgoingContent.ReadChannelContent() {
+                                    override val contentLength: Long? =
+                                        bytes.size.toLong().takeIf { includeContentLength }
+
+                                    override fun readFrom(): ByteReadChannel = ByteReadChannel(bytes)
+                                })
+                            }.apply {
+                                if (extraBytes == 0) {
+                                    assertEquals(HttpStatusCode.OK, status, context)
+                                } else {
+                                    assertEquals(HttpStatusCode.PayloadTooLarge, status, context)
+                                    assertEquals(
+                                        "请求体超过限制。",
+                                        Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.jsonPrimitive?.content,
+                                        context,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            coVerify(exactly = 4) {
+                telegram.sendRichMessageForToken("100:test", "42", InputRichMessage(markdown = "字"), null)
+            }
+            coVerify(exactly = 4) {
+                telegram.sendRichMessageForToken("100:test", "42", InputRichMessage(html = "字"), null)
+            }
+            coVerify(exactly = 4) {
+                telegram.sendRichMessageForToken(
+                    "100:test", "42",
+                    InputRichMessage(blocks = Json.parseToJsonElement("""[{"type":"paragraph","text":"字"}]""").jsonArray),
+                    null,
+                )
+            }
+            coVerify(exactly = 12) { telegram.sendRichMessageForToken(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { telegram.sendMessageForToken(any(), any(), any(), any()) }
         }
 
     @Test
@@ -305,18 +372,21 @@ class APIModuleTest {
     /** 验证超出路由请求体限制时，`413` 错误优先于 JSON 解析。 */
     @Test
     fun `send message body limit returns a fixed payload too large response`() = withTestApi { _, telegramService, _ ->
-        client.post("/api/send-message") {
-            contentType(ContentType.Application.Json)
-            setBody("""{"text":"${"x".repeat(65 * 1024)}"}""")
-        }.apply {
-            assertEquals(HttpStatusCode.PayloadTooLarge, status)
-            assertEquals(
-                "请求体超过限制。",
-                Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.toString()?.trim('"')
-            )
+        for (query in listOf("", "?richformat=", "?richformat=%20")) {
+            client.post("/api/send-message$query") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"text":"${"x".repeat(65 * 1024)}"}""")
+            }.apply {
+                assertEquals(HttpStatusCode.PayloadTooLarge, status)
+                assertEquals(
+                    "请求体超过限制。",
+                    Json.parseToJsonElement(bodyAsText()).jsonObject["error"]?.toString()?.trim('"')
+                )
+            }
         }
         coVerify(exactly = 0) { telegramService.sendMessage(any(), any(), any()) }
         coVerify(exactly = 0) { telegramService.sendMessageForToken(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { telegramService.sendRichMessageForToken(any(), any(), any(), any()) }
     }
 
     /** 验证所有设置写入入口均拒绝超限字段或请求体，且不改变持久化状态。 */
@@ -864,6 +934,14 @@ class APIModuleTest {
 
         val repairCases = listOf(
             RepairCase(
+                patch = """{"ai":{"httpToolSettings":{"enabled":false,"targets":[],"requestTimeoutMillis":10000,"maxConcurrentRequests":2}}}""",
+                verifiesReplacement = { repository ->
+                    assertEquals(HttpToolSettings(), repository.settingsFlow.value.ai!!.httpToolSettings)
+                    assertEquals("key", repository.settingsFlow.value.ai!!.openAiApiKey)
+                    assertEquals("old-chat", repository.settingsFlow.value.chatId)
+                },
+            ),
+            RepairCase(
                 patch =
                     """{"ai":{"httpToolSettings":{"enabled":true,"targets":[{"id":"safe","scheme":"https","host":"api.example.com","port":443,"path":"/status","method":"GET","allowedCidrs":[]}]}}}""",
                 verifiesReplacement = { repository ->
@@ -890,6 +968,10 @@ class APIModuleTest {
                 testApplication {
                     application { configureTestApi(repository, telegramService) }
 
+                    client.get("/api/settings").apply {
+                        assertEquals("httpToolSettings", headers["X-Settings-Recovery"])
+                        assertEquals("no-store", headers[HttpHeaders.CacheControl])
+                    }
                     client.patch("/api/settings") {
                         header(HttpHeaders.IfMatch, currentSettingsETag())
                         contentType(ContentType.Application.Json)
@@ -941,6 +1023,7 @@ class APIModuleTest {
                     }.apply {
                         assertEquals(HttpStatusCode.OK, status)
                     }
+                    assertNull(client.get("/api/settings").headers["X-Settings-Recovery"])
                 }
 
                 assertFalse(repository.hasHistoricalInvalidHttpToolSettings)
@@ -949,6 +1032,67 @@ class APIModuleTest {
             } finally {
                 temporaryDirectory.deleteRecursively()
             }
+        }
+    }
+
+    /** 多种历史非法配置一次显式修复，保留其余设置并遵守原有版本条件。 */
+    @Test
+    fun `settings recovery reports all protected fields and repairs them atomically`() {
+        val temporaryDirectory = createTempDirectory("api-combined-settings-recovery").toFile()
+        try {
+            val configFile = temporaryDirectory.resolve("settings.json")
+            val historicalContent = """{
+                "telegramToken":"100:token","chatId":"old-chat",
+                "proxy":{"host":"proxy.example.com","port":70000,"type":"HTTP"},
+                "ai":{"provider":"OPENAI","openAiApiKey":"keep-key","globalContext":"keep context",
+                    "openAiBaseUrl":"https://gateway.example.com/v1/%6dodels",
+                    "mcpServers":[{"name":"unsafe","url":"ftp://mcp.example.com","headers":{}}],
+                    "httpToolSettings":{"enabled":true,"targets":[{"id":"unsafe","scheme":"http","host":"localhost","port":8080,"path":"/admin","method":"GET"}]}}
+            }"""
+            configFile.writeText(historicalContent)
+            val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+            val original = repository.settingsFlow.value
+            val telegramService = mockk<TelegramService>(relaxed = true)
+            val repair = """{
+                "proxy":{"host":"127.0.0.1","port":1080,"type":"SOCKS","username":null,"password":null},
+                "ai":{"openAiBaseUrl":"https://gateway.example.com/v1","mcpServers":[],
+                    "httpToolSettings":{"enabled":false,"targets":[],"requestTimeoutMillis":10000,"maxConcurrentRequests":2}}
+            }"""
+
+            testApplication {
+                application { configureTestApi(repository, telegramService) }
+                val initial = client.get("/api/settings")
+                assertEquals("proxy,mcpServers,openAiBaseUrl,httpToolSettings", initial.headers["X-Settings-Recovery"])
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, "\"${"0".repeat(64)}\"")
+                    contentType(ContentType.Application.Json)
+                    setBody(repair)
+                }.apply { assertEquals(HttpStatusCode.PreconditionFailed, status) }
+                assertEquals(historicalContent, configFile.readText())
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, initial.headers[HttpHeaders.ETag])
+                    contentType(ContentType.Application.Json)
+                    setBody(repair)
+                }.apply { assertEquals(HttpStatusCode.OK, status) }
+                assertEquals(
+                    original.copy(
+                        proxy = ProxySettings("127.0.0.1", 1080, ProxyType.SOCKS),
+                        ai = original.ai!!.copy(openAiBaseUrl = "https://gateway.example.com/v1"),
+                    ),
+                    repository.settingsFlow.value,
+                )
+                assertNull(client.get("/api/settings").headers["X-Settings-Recovery"])
+                client.patch("/api/settings") {
+                    header(HttpHeaders.IfMatch, currentSettingsETag())
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"chatId":"new-chat"}""")
+                }.apply { assertEquals(HttpStatusCode.OK, status) }
+            }
+            val reloaded = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+            assertTrue(reloaded.currentSettingsWithRecovery().second.isEmpty())
+            assertEquals(repository.settingsFlow.value, reloaded.settingsFlow.value)
+        } finally {
+            temporaryDirectory.deleteRecursively()
         }
     }
 

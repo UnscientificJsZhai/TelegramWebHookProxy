@@ -1,8 +1,12 @@
 import api from './api';
 
+const SETTINGS_RECOVERY_FIELDS = ['proxy', 'mcpServers', 'openAiBaseUrl', 'httpToolSettings'] as const;
+export type SettingsRecoveryField = typeof SETTINGS_RECOVERY_FIELDS[number];
+
 export interface VersionedSettings<T> {
     settings: T;
     etag: string | null;
+    recoveryFields?: SettingsRecoveryField[];
 }
 
 const responseETag = (headers: Record<string, unknown>): string | null =>
@@ -10,9 +14,14 @@ const responseETag = (headers: Record<string, unknown>): string | null =>
 
 export const fetchVersionedSettings = async <T>(): Promise<VersionedSettings<T>> => {
     const response = await api.get<T>('/settings');
+    const recoveryHeader = response.headers['x-settings-recovery'];
+    const recoveryFields = typeof recoveryHeader === 'string'
+        ? SETTINGS_RECOVERY_FIELDS.filter(field => recoveryHeader.split(',').map(value => value.trim()).includes(field))
+        : [];
     return {
         settings: response.data,
-        etag: responseETag(response.headers)
+        etag: responseETag(response.headers),
+        ...(recoveryFields.length ? {recoveryFields} : {}),
     };
 };
 

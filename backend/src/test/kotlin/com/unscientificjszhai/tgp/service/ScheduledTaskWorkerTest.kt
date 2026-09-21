@@ -2,8 +2,8 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
-import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.models.InputRichMessage
+import com.unscientificjszhai.tgp.models.LoopMode
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskService
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
@@ -11,16 +11,9 @@ import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
-import com.unscientificjszhai.tgp.utils.TelegramTextChunks
-import io.ktor.http.HttpStatusCode
+import io.ktor.http.*
 import io.mockk.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.yield
+import kotlinx.coroutines.*
 import java.io.File
 import java.io.IOException
 import java.nio.file.Path
@@ -33,13 +26,8 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.io.path.createTempDirectory
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /** 定时任务 worker 的耐久预消费、授权和副作用边界测试。 */
@@ -367,7 +355,9 @@ class ScheduledTaskWorkerTest {
             releaseScanToAdmission.countDown()
             val lifecycleLock = workerLifecycleLock()
             withTimeout(5.seconds) {
-                while (!lifecycleLock.hasQueuedThread(scanner)) yield()
+                while (!lifecycleLock.hasQueuedThread(scanner)) {
+                    delay(5.milliseconds)
+                }
             }
             assertEquals(1L, scanFinished.count)
         } finally {

@@ -126,6 +126,16 @@ class SettingsChangeCoordinator @Inject constructor(
             generation = settingsVersion,
         )
 
+    /** 原子读取设置及必须显式修复的历史配置字段，包含同值修复后已清除的保护状态。 */
+    @Synchronized
+    internal fun currentSettingsWithRecovery(): Pair<SettingsSnapshot, List<String>> =
+        currentSettingsSnapshot() to buildList {
+            if (hasHistoricalInvalidProxy) add("proxy")
+            if (hasHistoricalInvalidMcp) add("mcpServers")
+            if (hasHistoricalInvalidOpenAiBaseUrl) add("openAiBaseUrl")
+            if (hasHistoricalInvalidHttpToolSettings) add("httpToolSettings")
+        }
+
     /**
      * 在同一同步临界区内基于最新设置执行变换并持久化结果。
      *

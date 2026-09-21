@@ -424,6 +424,21 @@ internal class PollingSessionSupervisor(
             ?: return PollingAttempt.Stopped
         var lastStoredId = snapshot.lastUpdateId
         val initialRetryCheckpoint = snapshot.retryCheckpoint
+        // FINAL 与 outbox 分两次提交；崩溃可能留下尚无重试检查点的账本。
+        // 在任何上游轮询（尤其是 offset=-1）之前按序恢复；恢复失败后的同目标检查点也不依赖上游。
+        val pendingTurn = snapshot.agentTurnJournal
+            .filter { it.updateId > lastStoredId }
+            .minByOrNull { it.updateId }
+        if (pendingTurn != null &&
+            (initialRetryCheckpoint == null || initialRetryCheckpoint.targetUpdateId == pendingTurn.updateId)
+        ) {
+            return when (reconcileDurableAgentTurn(session, pendingTurn, initialRetryCheckpoint?.targetUpdateId)) {
+                UpdateCompletion.Persisted -> PollingAttempt.Succeeded
+                UpdateCompletion.Confirmed,
+                UpdateCompletion.Retry,
+                    -> persistLocalRetryCheckpoint(session, pendingTurn.updateId)
+            }
+        }
         val resolvingInitialOffset =
             lastStoredId == 0L && initialRetryCheckpoint == null && !session.initialOffsetResolved
         val (targetUpdateId, response) = if (resolvingInitialOffset) {
@@ -664,22 +679,11 @@ internal class PollingSessionSupervisor(
         val entry = withContext(NonCancellable) {
             updatesRepository.findAgentTurn(session.botId, checkpoint.targetUpdateId)
         } ?: return DurableRetryReconciliation.None
-        when (entry.status) {
-            AgentTurnJournalStatus.FINAL ->
-                when (processor.completeFinalAgentTurn(session, entry, checkpoint.targetUpdateId)) {
-                    UpdateCompletion.Persisted -> DurableRetryReconciliation.Settled
-                    UpdateCompletion.Confirmed,
-                    UpdateCompletion.Retry,
-                        -> DurableRetryReconciliation.Retry
-                }
-
-            AgentTurnJournalStatus.IN_PROGRESS ->
-                when (processor.confirmDurableInProgressTurn(session, entry, checkpoint.targetUpdateId)) {
-                    UpdateCompletion.Persisted -> DurableRetryReconciliation.Settled
-                    UpdateCompletion.Confirmed,
-                    UpdateCompletion.Retry,
-                        -> DurableRetryReconciliation.Retry
-                }
+        when (reconcileDurableAgentTurn(session, entry, checkpoint.targetUpdateId)) {
+            UpdateCompletion.Persisted -> DurableRetryReconciliation.Settled
+            UpdateCompletion.Confirmed,
+            UpdateCompletion.Retry,
+                -> DurableRetryReconciliation.Retry
         }
     } catch (e: CancellationException) {
         throw e
@@ -691,6 +695,20 @@ internal class PollingSessionSupervisor(
             SafeLogging.failureCategory(e).wireName,
         )
         DurableRetryReconciliation.Retry
+    }
+
+    /** 共用首次恢复与重试恢复路径，FINAL 只投递已保存结果，孤立 IN_PROGRESS 绝不重放 Agent。 */
+    private suspend fun reconcileDurableAgentTurn(
+        session: PollingSession,
+        entry: AgentTurnJournalEntry,
+        expectedRetryTarget: Long?,
+    ): UpdateCompletion = when (entry.status) {
+        AgentTurnJournalStatus.FINAL -> processor.completeFinalAgentTurn(session, entry, expectedRetryTarget)
+        AgentTurnJournalStatus.IN_PROGRESS -> processor.confirmDurableInProgressTurn(
+            session,
+            entry,
+            expectedRetryTarget
+        )
     }
 
     /**

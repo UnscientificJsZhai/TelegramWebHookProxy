@@ -49,7 +49,7 @@ const INITIAL_DRAFT: WebhookDraft = {
 };
 const parameterRows = [
     ['text', '必填 · string / array', 'Body', '普通消息最多 4,096 个 UTF-16 单元；Markdown、HTML 为字符串，blocks 为非空对象数组（表单中用 JSON 字符串）。一次请求只发送一条消息。'],
-    ['richformat', '选填 · enum', 'Query', '省略或空白为普通消息；富消息可选 markdown、html、blocks。富消息不设应用层请求体字节上限，保留 JSON 结构保护；完整格式与内容限制由 Telegram 判定，不自动拆分或降级。'],
+    ['richformat', '选填 · enum', 'Query', '省略或空白为普通消息；富消息可选 markdown、html、blocks，请求体上限为 1 MiB（包含编码开销），超限返回 413。完整格式与内容限制由 Telegram 判定，不自动拆分或降级。'],
     ['chatId', '选填 · string', 'Body', '目标会话 ID，必须使用字符串。缺失、为 null 或全空白时回退至全局默认目标。最多 64 个 UTF-8 字节。'],
     ['messagefield', '选填 · string', 'Query', '正文的顶层键名，默认为 text。仅支持顶层映射，不支持 JSONPath 或嵌套提取。最多 64 个 UTF-8 字节。'],
     ['chatidfield', '选填 · string', 'Query', '目标会话的顶层键名，默认为 chatId。最多 64 个 UTF-8 字节。'],
@@ -133,7 +133,8 @@ export default function Webhook() {
                     lineHeight: 1.7
                 }}>{description}</TableCell></TableRow>)}</TableBody></Table></TableContainer>
             <Typography variant="caption" color="text.secondary" sx={{display: 'block', mt: 2}}>普通消息请求体上限 64
-                KiB；富消息不设应用层字节上限。建议为正文与目标使用不同的字段名。基准地址为当前部署站点。</Typography>
+                KiB；富消息请求体上限 1 MiB，超限返回
+                413。建议为正文与目标使用不同的字段名。基准地址为当前部署站点。</Typography>
         </Paper>
         <Box ref={testerRef} sx={{scrollMarginTop: 96}}>
             <SectionCard title="接口测试器" icon={<BuildOutlined/>}>

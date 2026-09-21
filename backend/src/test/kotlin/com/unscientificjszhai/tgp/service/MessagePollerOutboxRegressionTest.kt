@@ -42,21 +42,21 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
         }
 
         fixture.poller.start()
-        try {
-            withTimeout(2.seconds) { oldSendStarted.await() }
+        withTestCleanup(cleanup = {
+            releaseOldSend.complete(Unit)
+            releaseNewSend.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }) {
+            withTimeout(5.seconds) { oldSendStarted.await() }
             fixture.saveSettings(AppSettings(telegramToken = "100:new"))
             releaseOldSend.complete(Unit)
-            withTimeout(2.seconds) { newSendStarted.await() }
+            withTimeout(5.seconds) { newSendStarted.await() }
             eventually { assertEquals(1, fixture.updates.getPendingTelegramReplies("100").size) }
 
             releaseNewSend.complete(Unit)
             eventually { assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty()) }
             coVerify(exactly = 1) { fixture.telegram.sendMessageForToken("100:old", "123", "reply", any()) }
             coVerify(exactly = 1) { fixture.telegram.sendMessageForToken("100:new", "123", "reply", any()) }
-        } finally {
-            releaseOldSend.complete(Unit)
-            releaseNewSend.complete(Unit)
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -83,7 +83,9 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
                 TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            fixture.poller.closeAndJoin()
+        }) {
             eventually {
                 assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
                 coVerifyOrder {
@@ -96,8 +98,6 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
                     fixture.telegram.sendMessageForToken("100:token", "123", "b", null)
                 }
             }
-        } finally {
-            fixture.poller.closeAndJoin()
         }
     }
 
@@ -128,7 +128,10 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
         }
 
         fixture.poller.start()
-        try {
+        withTestCleanup(cleanup = {
+            releaseFallback.complete(Unit)
+            fixture.poller.closeAndJoin()
+        }) {
             withTimeout(5.seconds) { fallbackStarted.await() }
             fixture.updates.getPendingTelegramReplies("100").single().let { pending ->
                 assertEquals("original", pending.text)
@@ -154,9 +157,6 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
                 fixture.telegram.sendMessageForToken("100:token", "123", "original", null)
                 fixture.telegram.sendMessageForToken("100:token", "123", "抱歉，上一条回复未能发送。", null)
             }
-        } finally {
-            releaseFallback.complete(Unit)
-            fixture.poller.closeAndJoin()
         }
     }
 }

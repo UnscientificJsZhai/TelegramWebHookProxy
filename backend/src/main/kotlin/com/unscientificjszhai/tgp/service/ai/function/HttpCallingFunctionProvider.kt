@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.net.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -165,7 +166,16 @@ class HttpCallingFunctionProvider private constructor(
             }
         }
 
-        val client = createClient(settings, target)
+        val fixedUrl = target.toFixedUrl().toHttpUrlOrNull() ?: return error(ERROR_TARGET_NOT_ALLOWED)
+        // OkHttp 对字面 IP 不调用自定义 DNS；必须使用实际 URL 的主机在创建客户端前执行同一地址策略。
+        // 无法按严格格式解析的数字主机也拒绝，避免 JVM 对缩写或前导零地址的兼容解析绕过校验。
+        if (fixedUrl.host.contains(':') || fixedUrl.host.all { it.isDigit() || it == '.' }) {
+            val address = parseHttpToolLiteralAddress(fixedUrl.host) ?: return error(ERROR_TARGET_NOT_ALLOWED)
+            if (!address.isAllowedForTarget(target.allowedCidrs.map(::parseExactHttpToolCidr))) {
+                return error(ERROR_TARGET_NOT_ALLOWED)
+            }
+        }
+        val client = createClient(settings, target, fixedUrl)
         val isRegistered = synchronized(lifecycleLock) {
             if (closed.get()) {
                 false
@@ -182,7 +192,7 @@ class HttpCallingFunctionProvider private constructor(
         return try {
             lifecycleObserver.afterRegistrationBeforeRequest()
             if (closed.get()) return error(ERROR_REQUEST_FAILED)
-            val response = client.request(target.toFixedUrl()) {
+            val response = client.request(fixedUrl.toString()) {
                 method = when (target.method) {
                     HttpToolMethod.GET -> HttpMethod.Get
                     HttpToolMethod.POST -> HttpMethod.Post
@@ -221,14 +231,14 @@ class HttpCallingFunctionProvider private constructor(
         }
     }
 
-    private fun createClient(settings: HttpToolSettings, target: HttpCallTarget): HttpClient =
+    private fun createClient(settings: HttpToolSettings, target: HttpCallTarget, fixedUrl: HttpUrl): HttpClient =
         HttpClient(OkHttp) {
             expectSuccess = false
             followRedirects = false
             engine {
                 clientCacheSize = 0
                 config {
-                    dns(ValidatingDns(target, dnsResolver))
+                    dns(ValidatingDns(target, fixedUrl.host, dnsResolver))
                     proxy(Proxy.NO_PROXY)
                     followRedirects(false)
                     followSslRedirects(false)
@@ -354,13 +364,15 @@ class HttpCallingFunctionProvider private constructor(
     private class ResponseTooLargeException : Exception()
 
     private class ValidatingDns(
-        private val target: HttpCallTarget,
+        target: HttpCallTarget,
+        private val canonicalHost: String,
         private val resolver: HttpToolDnsResolver,
     ) : Dns {
         private val allowedAddresses = target.allowedCidrs.map(::parseExactHttpToolCidr)
 
         override fun lookup(hostname: String): List<InetAddress> {
-            if (hostname != target.host) throw UnknownHostException("HTTP tool target mismatch")
+            // 与请求 URL 共用 OkHttp 的大小写及 IDN 规范化结果，仍要求精确匹配唯一目标。
+            if (hostname != canonicalHost) throw UnknownHostException("HTTP tool target mismatch")
             val addresses = resolver.lookup(hostname)
             if (addresses.isEmpty() || addresses.any { !it.isAllowedForTarget(allowedAddresses) }) {
                 throw UnknownHostException("HTTP tool DNS result rejected")

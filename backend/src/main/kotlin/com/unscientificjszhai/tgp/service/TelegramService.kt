@@ -342,7 +342,9 @@ class TelegramService private constructor(
 
     /** 在 Kotlin serialization 递归解码 Telegram DTO 前先限定不可信 JSON 的结构。 */
     private inline fun <reified T> decodeTelegramJson(bytes: ByteArray): T {
-        JsonStructureLimits.validateUtf8(bytes)
+        // updates 中即使是不处理的富消息也可能包含数万个节点；以已限制的响应字节数约束节点数，
+        // 保留默认深度限制，避免合法 blocks 在忽略未知字段之前阻塞整个轮询队列。
+        JsonStructureLimits.validateUtf8(bytes, TELEGRAM_RESPONSE_JSON_BUDGET)
         return telegramJson.decodeFromString(bytes.decodeToString())
     }
 
@@ -487,6 +489,7 @@ class TelegramService private constructor(
 }
 
 private const val MAX_TELEGRAM_API_BYTES = 1024 * 1024
+private val TELEGRAM_RESPONSE_JSON_BUDGET = JsonStructureLimits.Budget(maxNodes = MAX_TELEGRAM_API_BYTES)
 private const val MAX_TELEGRAM_DOWNLOAD_BYTES = 24 * 1024 * 1024
 private val telegramJson = Json { ignoreUnknownKeys = true }
 

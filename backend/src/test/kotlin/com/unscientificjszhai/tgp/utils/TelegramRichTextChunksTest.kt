@@ -3,6 +3,11 @@ package com.unscientificjszhai.tgp.utils
 import com.unscientificjszhai.tgp.models.TelegramReplyPart
 import com.unscientificjszhai.tgp.models.TelegramRichFormat
 import com.unscientificjszhai.tgp.repository.validateTelegramDeliveryPlan
+import org.commonmark.node.AbstractVisitor
+import org.commonmark.node.IndentedCodeBlock
+import org.commonmark.node.Link
+import org.commonmark.ext.footnotes.FootnotesExtension
+import org.commonmark.parser.Parser
 import kotlin.test.*
 
 class TelegramRichTextChunksTest {
@@ -69,6 +74,95 @@ class TelegramRichTextChunksTest {
             assertTrue(part.text.contains("[^note]: 注释内容"), part.text.take(100))
             assertTrue(part.text.contains("[doc]: https://example.test"), part.text.take(100))
         }
+    }
+
+    @Test
+    fun `merged paragraphs share one copy of their long footnote definition`() {
+        val definition = "[^n]: " + "x".repeat(30000)
+        val source = "Paragraph with reference[^n].\n\n".repeat(200) + definition + "\n"
+        val parts = plan(source)
+
+        assertTrue(parts.size in 2..4, "Unexpected fragment count: ${parts.size}")
+        assertTrue(parts.all { it.format == TelegramRichFormat.MARKDOWN })
+        parts.forEach { part ->
+            assertEquals(1, Regex("\\[\\^n]:").findAll(part.text).count())
+            assertTrue(part.text.contains(definition))
+        }
+        assertEquals(200, parts.sumOf { Regex("Paragraph with reference").findAll(it.text).count() })
+    }
+
+    @Test
+    fun `unmergeable reference expansion falls back to bounded unchanged plain text`() {
+        val source = ("p".repeat(2000) + "[^n]\n\n").repeat(20) + "[^n]: " + "n".repeat(30000) + "\n"
+        val parts = plan(source)
+
+        assertTrue(parts.all { it.format == null })
+        assertTrue(parts.all { it.text.length <= MAX_TELEGRAM_MESSAGE_TEXT_LENGTH })
+        assertEquals(source, parts.joinToString("") { it.text })
+    }
+
+    @Test
+    fun `merging later duplicate definitions preserves the original link destination`() {
+        val source = "[foo]: https://first.example\n\n```text\n" + "x".repeat(33000) +
+                "\n```\n\n[foo]\n\n[foo]: https://last.example\n"
+        val links = mutableListOf<String>()
+        plan(source).filter { it.format != null }.forEach { part ->
+            Parser.builder().build().parse(part.text).accept(object : AbstractVisitor() {
+                override fun visit(link: Link) {
+                    links += link.destination
+                }
+            })
+        }
+        assertEquals(listOf("https://first.example"), links)
+    }
+
+    @Test
+    fun `definition examples in code cannot replace a referenced definition when merging`() {
+        val definition = "[doc]: https://target.example"
+        for (example in listOf("```text\n$definition\n```", "    $definition", "`$definition`")) {
+            val source = "[doc]\n\n$example\n\n```text\n" + "x".repeat(33000) + "\n```\n\n$definition\n"
+            val first = plan(source).first()
+            assertNotNull(first.format)
+            assertTrue(first.text.contains(example))
+            val document = Parser.builder().build().parse(first.text)
+            assertEquals("https://target.example", assertIs<Link>(document.firstChild.firstChild).destination)
+        }
+    }
+
+    @Test
+    fun `merging preserves destinations referenced through a footnote definition`() {
+        val source = "[^note]: See [doc].\n\n[doc]: https://first.example\n\n```text\n" +
+                "x".repeat(33000) + "\n```\n\nSee note[^note]\n\n[doc]: https://last.example\n"
+        val referring = plan(source).single { it.text.contains("See note[^note]") }
+        assertNotNull(referring.format)
+        val links = mutableListOf<String>()
+        Parser.builder().extensions(listOf(FootnotesExtension.create())).build().parse(referring.text)
+            .accept(object : AbstractVisitor() {
+                override fun visit(link: Link) {
+                    links += link.destination
+                }
+            })
+        assertEquals(listOf("https://first.example"), links)
+    }
+
+    @Test
+    fun `many small conflicting fragments include metadata in their expansion budget`() {
+        val source = "[f]: a\n\n```text\n" + "x".repeat(33000) + "\n```\n\n" +
+                "See [f]\n\n[f]: b\n\n".repeat(2000)
+        val parts = plan(source)
+
+        assertTrue(parts.all { it.format == null })
+        assertEquals(source, parts.joinToString("") { it.text })
+    }
+
+    @Test
+    fun `footnote definitions cannot absorb preceding indented code`() {
+        val source = "    preserved code\n\nSee note[^n]\n\n```text\n" + "x".repeat(33000) +
+                "\n```\n\n[^n]: note\n"
+        val first = plan(source).first()
+        assertNotNull(first.format)
+        val document = Parser.builder().extensions(listOf(FootnotesExtension.create())).build().parse(first.text)
+        assertEquals("preserved code\n", assertIs<IndentedCodeBlock>(document.firstChild).literal)
     }
 
     @Test
