@@ -20,7 +20,7 @@ tasks.register<Delete>("clean") {
     delete("dist", "build")
 }
 
-val generateLicenses by tasks.registering(NpxTask::class) {
+val generateLicenses = tasks.register<NpxTask>("generateLicenses") {
     group = "documentation"
     description = "Generates OSS license file for frontend dependencies"
 

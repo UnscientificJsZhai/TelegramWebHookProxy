@@ -90,7 +90,7 @@ configure<LicenseReportExtension> {
     renderers = arrayOf(TextReportRenderer("backend-licenses.txt"))
 }
 
-val createLicenses by tasks.registering {
+val createLicenses = tasks.register("createLicenses") {
     group = "build"
     description = "Merges backend and frontend licenses"
 
@@ -128,7 +128,7 @@ val isPackagingTaskRequested = gradle.startParameter.taskNames.any {
             name.contains("dist") || name.substringAfterLast(':') in setOf("check", "verifypackagedserialization")
 }
 
-val processFrontendResources by tasks.registering(Copy::class) {
+val processFrontendResources = tasks.register<Copy>("processFrontendResources") {
     group = "build"
     description = "Assembles frontend resources and licenses for packaging"
 
@@ -167,7 +167,7 @@ tasks.withType<ShadowJar> {
     from(processFrontendResources.map { it.destinationDir })
 }
 
-val verifyPackagedSerialization by tasks.registering(JavaExec::class) {
+val verifyPackagedSerialization = tasks.register<JavaExec>("verifyPackagedSerialization") {
     group = "verification"
     description = "Checks generic response serialization using the actual Shadow Jar"
     val packagedJar = tasks.named<ShadowJar>("shadowJar")
