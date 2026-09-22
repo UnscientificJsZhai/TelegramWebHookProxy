@@ -11,12 +11,11 @@ export interface ProxySettings {
 }
 
 /**
- * 切换代理协议，并在切换到 SOCKS 时同时清除不受支持的 HTTP 认证凭据。
+ * 切换代理协议，保留用户已输入的认证凭据。
  */
 export const withProxyType = (proxy: ProxySettings, type: ProxyType): ProxySettings => ({
     ...proxy,
     type,
-    ...(type === 'SOCKS' ? {username: null, password: null} : {}),
 });
 
 /**
@@ -24,7 +23,12 @@ export const withProxyType = (proxy: ProxySettings, type: ProxyType): ProxySetti
  */
 export const isValidProxyAuthentication = (proxy: ProxySettings | null): boolean => {
     if (proxy === null) return true;
-    if (proxy.type === 'SOCKS') return proxy.username === null && proxy.password === null;
-    return (proxy.username === null && proxy.password === null) ||
-        (!!proxy.username?.trim() && !!proxy.password?.trim());
+    if (proxy.username === null && proxy.password === null) return true;
+    if (!proxy.username?.trim() || !proxy.password?.trim()) return false;
+    return proxy.type !== 'SOCKS' || [proxy.username, proxy.password].every(value =>
+        value.length <= 255 && Array.from(value).every(character => character.charCodeAt(0) <= 0xff));
 };
+
+export const proxyAuthenticationHint = (type: ProxyType): string => type === 'SOCKS'
+    ? 'SOCKS5 用户名与密码须同时填写或同时留空；支持 Latin-1 字符（含英文、数字，不含中文），每项最多 255 字节。'
+    : 'HTTP 代理的用户名与密码须同时填写，或同时留空。';

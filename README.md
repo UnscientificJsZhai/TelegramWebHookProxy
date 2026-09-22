@@ -16,7 +16,7 @@ TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统�
 
 - **Webhook 转 Telegram**：通过 `/api/send-message` 发送普通文本、Rich Markdown、HTML 或 blocks 消息到指定或默认 Telegram 会话。
 - **字段映射**：支持通过查询参数适配不同 Webhook 来源的字段名。
-- **代理支持**：Telegram API 与 AI Provider 请求可使用 HTTP 或 SOCKS 代理。
+- **代理支持**：Telegram API 与 AI Provider 请求可使用 HTTP 或 SOCKS 代理，均支持可选的用户名与密码认证。SOCKS 认证使用 SOCKS5，凭据支持 Latin-1 字符（含英文、数字，不含中文），用户名和密码各为 1–255 字节。
 - **Web 管理界面**：配置 Token、默认聊天、代理、AI Provider、MCP 服务器和 Skill。
 - **AI Agent**：支持 Google Gemini 与 OpenAI SDK，可在 Telegram 中连续对话。
 - **语音消息**：可接收 Telegram 语音消息并交给 AI 处理。
