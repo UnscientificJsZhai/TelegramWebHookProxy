@@ -264,20 +264,35 @@ class SettingsTest {
         assertFailsWith<IllegalArgumentException> { openAiBaseUrlForRequests(nestedEndpoint) }
     }
 
-    /** 验证认证凭据必须成对提供，且仅允许 HTTP 代理使用。 */
+    /** 验证 HTTP 与 SOCKS5 的认证凭据均须成对提供。 */
     @Test
-    fun `proxy validation accepts paired HTTP credentials only`() {
-        validateProxySettings(ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"))
-        validateProxySettings(ProxySettings("proxy.example.com", 8080, ProxyType.HTTP))
+    fun `proxy validation accepts paired HTTP and SOCKS credentials`() {
+        ProxyType.entries.forEach { type ->
+            validateProxySettings(ProxySettings("proxy.example.com", 8080, type, "user", "password"))
+            validateProxySettings(ProxySettings("proxy.example.com", 8080, type))
 
-        listOf(
-            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = "user"),
-            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, password = "password"),
-            ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = "password"),
-            ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
-        ).forEach { proxy ->
-            assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy) }
+            listOf(
+                ProxySettings("proxy.example.com", 8080, type, username = "user"),
+                ProxySettings("proxy.example.com", 8080, type, password = "password"),
+                ProxySettings("proxy.example.com", 8080, type, username = " ", password = "password"),
+                ProxySettings("proxy.example.com", 8080, type, username = "user", password = ""),
+            ).forEach { proxy ->
+                assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy) }
+            }
         }
+    }
+
+    /** JDK 使用 Latin-1 发送 SOCKS5 凭据，RFC 1929 的长度字段只有一个字节。 */
+    @Test
+    fun `SOCKS credentials must fit Latin1 and one byte lengths without changing HTTP limits`() {
+        val proxy = ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, "u", "p")
+        validateProxySettings(proxy)
+        validateProxySettings(proxy.copy(username = "é".repeat(255), password = "ÿ".repeat(255)))
+        listOf("u".repeat(256), "中文", "\u0100", "🔑").forEach { invalid ->
+            assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy.copy(username = invalid)) }
+            assertFailsWith<IllegalArgumentException> { validateProxySettings(proxy.copy(password = invalid)) }
+        }
+        validateProxySettings(proxy.copy(type = ProxyType.HTTP, username = "u".repeat(512), password = "中文"))
     }
 
     /**

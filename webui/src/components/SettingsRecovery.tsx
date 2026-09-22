@@ -4,7 +4,7 @@ import {type AppSettings, utf8Length} from '../settings';
 import {isSettingsConflict, type VersionedSettings} from '../settingsClient';
 import {useSettings} from '../settingsContext';
 import {buildSettingsRecoveryPatch, isValidRecoveryProxy} from '../settingsRecovery';
-import {type ProxySettings, withProxyType} from '../pages/proxySettings';
+import {proxyAuthenticationHint, type ProxySettings, withProxyType} from '../pages/proxySettings';
 import {ConfirmDialog} from './Feedback';
 import SecretField from './SecretField';
 
@@ -78,13 +78,11 @@ export default function SettingsRecovery({snapshot}: { snapshot: VersionedSettin
                        onChange={event => setProxy(withProxyType(proxy, event.target.value === 'SOCKS' ? 'SOCKS' : 'HTTP'))}>
                 <MenuItem value="HTTP">HTTP</MenuItem><MenuItem value="SOCKS">SOCKS</MenuItem>
             </TextField>
-            {proxy.type === 'HTTP' && <>
-                <TextField label="代理用户名" value={proxy.username ?? ''} disabled={busy}
-                           helperText="无需认证时，用户名与密码均留空。"
-                           onChange={event => setProxy({...proxy, username: event.target.value || null})}/>
-                <SecretField label="代理密码" value={proxy.password ?? ''} disabled={busy}
-                             onChange={event => setProxy({...proxy, password: event.target.value || null})}/>
-            </>}
+            <TextField label="代理用户名" value={proxy.username ?? ''} disabled={busy}
+                       helperText={proxyAuthenticationHint(proxy.type)}
+                       onChange={event => setProxy({...proxy, username: event.target.value || null})}/>
+            <SecretField label="代理密码" value={proxy.password ?? ''} disabled={busy}
+                         onChange={event => setProxy({...proxy, password: event.target.value || null})}/>
         </Stack>}
         {fields.includes('openAiBaseUrl') && <TextField label="OpenAI 基础地址" value={baseUrl} disabled={busy}
                                                         helperText="填写有效的兼容服务基础地址；留空使用官方地址。"

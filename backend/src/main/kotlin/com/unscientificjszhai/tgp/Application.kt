@@ -7,6 +7,7 @@ import com.unscientificjszhai.tgp.modules.*
 import com.unscientificjszhai.tgp.service.BotCommandReconciler
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
+import com.unscientificjszhai.tgp.service.installSocksProxyAuthentication
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import io.ktor.http.*
@@ -124,7 +125,7 @@ private suspend fun <T> awaitApplicationShutdownStep(
  * 此方法会阻塞当前线程，直至服务器停止。
  */
 fun main() {
-    embeddedServer(
+    val server = embeddedServer(
         factory = Netty,
         rootConfig = serverConfig {
             module { module() }
@@ -137,7 +138,12 @@ fun main() {
             configureHttpIngressProtection()
         },
     )
-        .start(wait = true)
+    try {
+        server.start(wait = true)
+    } finally {
+        // 端口绑定在模块初始化之后执行；绑定失败时也必须触发应用停止及全局认证器恢复。
+        server.stop(1_000, 5_000)
+    }
 }
 
 /**
@@ -151,6 +157,18 @@ fun main() {
  */
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
+    val settings = appComponent.settingsChangeCoordinator
+    val proxyAuthentication = installSocksProxyAuthentication { settings.settingsFlow.value.proxy }
+    try {
+        monitor.subscribe(ApplicationStopped) { proxyAuthentication.close() }
+        configureApplication(appComponent)
+    } catch (failure: Throwable) {
+        proxyAuthentication.close()
+        throw failure
+    }
+}
+
+private fun Application.configureApplication(appComponent: AppComponent) {
     val messagePoller = appComponent.messagePoller
     val scheduledTaskWorker = appComponent.scheduledTaskWorker
     val botCommandReconciler = appComponent.botCommandReconciler
@@ -187,7 +205,7 @@ fun Application.module() {
 
     routing {
         get("/license") {
-            val resource = this@module.javaClass.classLoader.getResourceAsStream("licenses/licenses.txt")
+            val resource = this@configureApplication.javaClass.classLoader.getResourceAsStream("licenses/licenses.txt")
             if (resource != null) {
                 call.respondText(resource.bufferedReader().readText())
             } else {

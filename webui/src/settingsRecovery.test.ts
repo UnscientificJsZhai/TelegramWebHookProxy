@@ -33,4 +33,12 @@ describe('旧版配置修复', () => {
         expect(isValidRecoveryProxy({...proxy, username: 'user'})).toBe(false);
         expect(isValidRecoveryProxy({...proxy, username: 'user', password: 'pass'})).toBe(true);
     });
+
+    it('修复 SOCKS 代理时保留合法认证并拒绝无法传输的凭据', () => {
+        const socks = {...proxy, type: 'SOCKS' as const, username: 'user', password: 'päss'};
+        expect(isValidRecoveryProxy(socks)).toBe(true);
+        expect(buildSettingsRecoveryPatch(['proxy'], socks, '')).toEqual({proxy: socks});
+        expect(isValidRecoveryProxy({...socks, password: '中文'})).toBe(false);
+        expect(isValidRecoveryProxy({...socks, username: 'u'.repeat(256)})).toBe(false);
+    });
 });
