@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.serialization.builtins.ListSerializer
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -158,7 +159,7 @@ class SkillRepository private constructor(
      * @throws IllegalArgumentException [skill] 的字段不符合格式或大小限制，或保存后技能总数超过 `64` 时抛出。
      * @throws SkillRevisionConflictException [skill] 指向已有技能但版本号已过期时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
-     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
+     * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun saveSkill(skill: Skill): Skill = storageLock.withLock {
         saveSkillInternal(
@@ -185,7 +186,7 @@ class SkillRepository private constructor(
      * @throws SkillNotFoundException [id] 非空但对应技能已不存在时抛出。
      * @throws SkillRevisionConflictException [expectedRevision] 与当前版本不一致时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
-     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
+     * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun saveManagedSkill(
         id: String?,
@@ -256,7 +257,7 @@ class SkillRepository private constructor(
      * @return 已持久化、状态为 [SkillStatus.PENDING] 的新草稿。
      * @throws IllegalArgumentException 描述、内容或总技能数量超过限制时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出。
-     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
+     * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun createPendingDraft(description: String, content: String): Skill =
         saveManagedSkill(id = null, description = description, content = content, expectedRevision = null)
@@ -272,7 +273,7 @@ class SkillRepository private constructor(
      * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStateConflictException 技能并非待审批状态时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出。
-     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
+     * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun approveSkill(id: String, expectedRevision: Long): Skill =
         transitionSkillStatus(id, expectedRevision, SkillStatus.PENDING, SkillStatus.APPROVED)
@@ -288,7 +289,7 @@ class SkillRepository private constructor(
      * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStateConflictException 技能并非已批准状态时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出。
-     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出。
+     * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出。
      */
     fun revokeSkill(id: String, expectedRevision: Long): Skill =
         transitionSkillStatus(id, expectedRevision, SkillStatus.APPROVED, SkillStatus.PENDING)
@@ -301,7 +302,7 @@ class SkillRepository private constructor(
      * @param id 要删除的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
      * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
-     * @throws java.io.IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
+     * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
     fun deleteSkill(id: String) {
         require(isValidSkillId(id)) { "技能标识不合法。" }

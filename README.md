@@ -61,10 +61,10 @@ docker run -d \
 可以使用 JDK 21 或 JDK 26 启动构建。编译和默认测试仍使用 JDK 21，Gradle 会按需下载对应工具链及前端所需的 Node.js/npm。Docker 构建和运行镜像使用 JDK 26。
 
 ```bash
-./gradlew build
+./gradlew :backend:releaseBuild
 ```
 
-构建完成后运行 Shadow Jar：
+该命令执行后端测试、前端构建、许可证生成和正式 Jar 验证。构建完成后运行 Shadow Jar：
 
 ```bash
 java -jar backend/build/libs/TelegramWebHookProxy-1.2.0-all.jar
@@ -231,10 +231,35 @@ Agent 可用能力包括：
 ./gradlew :backend:test
 ```
 
-构建完整应用：
+日常后端构建（包含后端测试）：
 
 ```bash
 ./gradlew build
+```
+
+`build`、`:backend:assemble`、`:backend:jar`、`:backend:check`、`:backend:test` 和
+`:backend:run` 均不触发前端构建或许可证生成。普通 Jar 仅包含后端代码及后端资源。
+
+构建完整应用并验证正式制品（Docker 使用同一入口）：
+
+```bash
+./gradlew :backend:releaseBuild
+```
+
+仅生成包含前端和许可证的正式 Jar：
+
+```bash
+./gradlew :backend:shadowJar
+```
+
+`:backend:runShadow`、`:backend:shadowDistZip`、`:backend:shadowDistTar` 和
+`:backend:installShadowDist` 使用同一完整 Shadow Jar，也会触发前端和许可证任务。
+正式 Jar 验证包括泛型序列化、首页、静态资源、前端路由及 `/license`。
+
+验证日常任务与正式打包任务的依赖边界：
+
+```bash
+bash scripts/verify-build-boundaries.sh
 ```
 
 前端单独开发：

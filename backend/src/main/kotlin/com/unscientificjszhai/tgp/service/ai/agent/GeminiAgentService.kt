@@ -29,6 +29,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.nio.charset.StandardCharsets
@@ -392,7 +393,7 @@ class GeminiAgentService @Inject internal constructor(
             throw e
         } catch (e: UpstreamResponseTooLargeException) {
             throw e
-        } catch (e: java.io.IOException) {
+        } catch (e: IOException) {
             throw e
         } catch (e: Exception) {
             throw AgentInvalidResponseException(e)

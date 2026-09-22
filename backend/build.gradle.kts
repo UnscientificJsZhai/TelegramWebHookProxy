@@ -2,8 +2,6 @@ import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import com.github.jk1.license.LicenseReportExtension
 import com.github.jk1.license.render.TextReportRenderer
 
-evaluationDependsOn(":webui")
-
 plugins {
     kotlin("jvm")
     kotlin("plugin.serialization") version "2.4.20"
@@ -90,7 +88,7 @@ configure<LicenseReportExtension> {
     renderers = arrayOf(TextReportRenderer("backend-licenses.txt"))
 }
 
-val createLicenses by tasks.registering {
+val createLicenses = tasks.register("createLicenses") {
     group = "build"
     description = "Merges backend and frontend licenses"
 
@@ -121,38 +119,28 @@ val createLicenses by tasks.registering {
     }
 }
 
-val isPackagingTaskRequested = gradle.startParameter.taskNames.any {
-    val name = it.lowercase()
-    name.contains("build") || name.contains("assemble") ||
-            name.contains("jar") || name.contains("shadowjar") ||
-            name.contains("dist") || name.substringAfterLast(':') in setOf("check", "verifypackagedserialization")
-}
-
-val processFrontendResources by tasks.registering(Copy::class) {
+val processFrontendResources = tasks.register<Sync>("processFrontendResources") {
     group = "build"
     description = "Assembles frontend resources and licenses for packaging"
 
-    if (isPackagingTaskRequested) {
-        dependsOn(createLicenses)
-        dependsOn(project(":webui").tasks.named("npmBuild"))
+    dependsOn(":webui:npmBuild")
 
-        from(project(":webui").layout.projectDirectory.dir("dist")) {
-            into("static")
-        }
-        from(layout.buildDirectory.file("reports/dependency-license/licenses.txt")) {
-            into("licenses")
-        }
+    from(project(":webui").layout.projectDirectory.dir("dist")) {
+        into("static")
+    }
+    from(createLicenses) {
+        into("licenses")
     }
 
     into(layout.buildDirectory.dir("frontend-resources"))
 }
 
-tasks.named<Jar>("jar") {
-    dependsOn(processFrontendResources)
-    from(processFrontendResources.map { it.destinationDir })
+// 日常构建只组装普通后端制品，完整 Shadow 分发包通过其专用任务显式生成。
+tasks.named("assemble") {
+    setDependsOn(listOf(tasks.named("jar"), tasks.named("distTar"), tasks.named("distZip")))
 }
 
-tasks.withType<ShadowJar> {
+tasks.named<ShadowJar>("shadowJar") {
     archiveBaseName.set("TelegramWebHookProxy")
     archiveVersion.set(version.toString())
     archiveClassifier.set("all")
@@ -163,11 +151,10 @@ tasks.withType<ShadowJar> {
     }
     failOnDuplicateEntries.set(true)
 
-    dependsOn(processFrontendResources)
-    from(processFrontendResources.map { it.destinationDir })
+    from(processFrontendResources)
 }
 
-val verifyPackagedSerialization by tasks.registering(JavaExec::class) {
+val verifyPackagedSerialization = tasks.register<JavaExec>("verifyPackagedSerialization") {
     group = "verification"
     description = "Checks generic response serialization using the actual Shadow Jar"
     val packagedJar = tasks.named<ShadowJar>("shadowJar")
@@ -177,6 +164,23 @@ val verifyPackagedSerialization by tasks.registering(JavaExec::class) {
     javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) })
 }
 
-tasks.named("check") {
-    dependsOn(verifyPackagedSerialization)
+val verifyPackagedResources = tasks.register<JavaExec>("verifyPackagedResources") {
+    group = "verification"
+    description = "Checks frontend and license hosting using the actual Shadow Jar"
+    val packagedJar = tasks.named<ShadowJar>("shadowJar")
+    dependsOn(tasks.named("testClasses"), packagedJar)
+    classpath(sourceSets["test"].output.classesDirs, packagedJar.flatMap { it.archiveFile })
+    mainClass.set("com.unscientificjszhai.tgp.PackagedResourcesProbe")
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) })
+    workingDir(layout.buildDirectory.dir("tmp/verifyPackagedResources"))
+    doFirst {
+        workingDir.mkdirs()
+        check(workingDir.resolve("config").deleteRecursively()) { "Cannot reset packaged resource probe config" }
+    }
+}
+
+tasks.register("releaseBuild") {
+    group = "build"
+    description = "Builds the complete application and runs backend and packaged application checks"
+    dependsOn(tasks.named("check"), verifyPackagedSerialization, verifyPackagedResources)
 }

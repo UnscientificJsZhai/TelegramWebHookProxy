@@ -17,7 +17,7 @@ RUN ./gradlew :backend:dependencies --no-daemon || true
 COPY backend/src backend/src
 COPY webui webui
 
-RUN ./gradlew build --no-daemon
+RUN ./gradlew :backend:releaseBuild --no-daemon
 
 FROM bellsoft/liberica-openjdk-alpine:26-37
 

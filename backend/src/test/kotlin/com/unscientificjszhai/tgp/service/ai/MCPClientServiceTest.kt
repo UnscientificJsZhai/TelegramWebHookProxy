@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.modelcontextprotocol.kotlin.sdk.types.*
 import kotlinx.serialization.json.*
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody
 import okio.Buffer
@@ -82,14 +83,14 @@ class MCPClientServiceTest {
 
     /** 可观察 close 的最小 ResponseBody，用于验证 scanner 错误会释放底层连接。 */
     private class CloseTrackingResponseBody(
-        private val contentType: okhttp3.MediaType,
+        private val contentType: MediaType,
         body: String,
     ) : ResponseBody() {
         private val source = Buffer().writeUtf8(body)
         var closed = false
             private set
 
-        override fun contentType(): okhttp3.MediaType = contentType
+        override fun contentType(): MediaType = contentType
 
         override fun contentLength(): Long = source.size
 

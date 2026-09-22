@@ -38,7 +38,7 @@ class APIModuleTest {
     fun `rich formats preserve mapped content and upstream responses without fallback`() =
         withTestApi { settings, telegram, _ ->
             settings.updateSettings { it.copy(telegramToken = "100:test", chatId = "default") }
-            val bodies = mutableListOf<com.unscientificjszhai.tgp.models.InputRichMessage>()
+            val bodies = mutableListOf<InputRichMessage>()
             coEvery { telegram.sendRichMessageForToken(any(), any(), capture(bodies), any()) } returns
                     TelegramApiResponse(HttpStatusCode.BadRequest, """{"ok":false,"description":"format rejected"}""")
             val cases = listOf(
@@ -1210,7 +1210,7 @@ class APIModuleTest {
                 ai = AISettings(
                     selectedModel = "models/kept",
                     mcpServers = listOf(
-                        com.unscientificjszhai.tgp.models.MCPServerConfig(
+                        MCPServerConfig(
                             name = "old",
                             url = "https://old.example.com/mcp",
                             headers = mapOf("X-Old" to "old"),

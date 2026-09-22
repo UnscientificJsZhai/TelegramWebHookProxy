@@ -12,6 +12,7 @@ import io.netty.handler.timeout.IdleStateEvent
 import io.netty.handler.timeout.IdleStateHandler
 import io.netty.util.ReferenceCountUtil
 import kotlin.test.*
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.INFINITE
 import kotlin.time.Duration.Companion.seconds
 
@@ -444,10 +445,10 @@ class HttpIngressProtectionTest {
 
     private fun testLimits(
         maxConnections: Int = 8,
-        rawReadIdleTimeout: kotlin.time.Duration = 1.seconds,
-        headerTimeout: kotlin.time.Duration = 1.seconds,
-        bodyTimeout: kotlin.time.Duration = 1.seconds,
-        requestTotalTimeout: kotlin.time.Duration = 3.seconds,
+        rawReadIdleTimeout: Duration = 1.seconds,
+        headerTimeout: Duration = 1.seconds,
+        bodyTimeout: Duration = 1.seconds,
+        requestTotalTimeout: Duration = 3.seconds,
     ) = HttpIngressLimits(
         maxConnections = maxConnections,
         runningRequestsPerConnection = 4,

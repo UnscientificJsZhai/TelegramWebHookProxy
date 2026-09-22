@@ -22,6 +22,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
 class MessagePollerAgentRecoveryTest {
@@ -107,7 +108,7 @@ class MessagePollerAgentRecoveryTest {
                 modelSwitchBarrier = barrier,
                 processingTimeout = 5.seconds,
                 retryDelay = {},
-                retryJitter = { kotlin.time.Duration.ZERO },
+                retryJitter = { Duration.ZERO },
             ).also { service ->
                 service.beforeModelRefreshForTesting = {
                     if (switched.compareAndSet(false, true)) {
@@ -193,7 +194,7 @@ class MessagePollerAgentRecoveryTest {
             modelSwitchBarrier = barrier,
             processingTimeout = 5.seconds,
             retryDelay = {},
-            retryJitter = { kotlin.time.Duration.ZERO },
+            retryJitter = { Duration.ZERO },
         )
         try {
             poller.start()
@@ -277,7 +278,7 @@ class MessagePollerAgentRecoveryTest {
             modelSwitchBarrier = barrier,
             processingTimeout = 5.seconds,
             retryDelay = {},
-            retryJitter = { kotlin.time.Duration.ZERO },
+            retryJitter = { Duration.ZERO },
         )
         try {
             poller.start()
@@ -357,7 +358,7 @@ class MessagePollerAgentRecoveryTest {
             modelSwitchBarrier = barrier,
             processingTimeout = 5.seconds,
             retryDelay = {},
-            retryJitter = { kotlin.time.Duration.ZERO },
+            retryJitter = { Duration.ZERO },
         )
         try {
             poller.start()
@@ -447,7 +448,7 @@ class MessagePollerAgentRecoveryTest {
                 modelSwitchBarrier = barrier,
                 processingTimeout = 5.seconds,
                 retryDelay = {},
-                retryJitter = { kotlin.time.Duration.ZERO },
+                retryJitter = { Duration.ZERO },
             )
             try {
                 poller.start()

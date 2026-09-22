@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.SkillBrief
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -224,7 +225,7 @@ abstract class AgentService {
      * @throws AgentTurnFailedException 当实现无法完成本次回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务已关闭或当前会话不可用，且具体实现选择以异常报告时抛出。
      * @throws Exception 当具体实现以其自身语义报告失败时抛出。
-     * @throws kotlinx.coroutines.CancellationException 当调用协程或底层 I/O 被取消时原样抛出。
+     * @throws CancellationException 当调用协程或底层 I/O 被取消时原样抛出。
      */
     open suspend fun sendMessage(text: String): String = sendMessage(text, emptyList())
 
@@ -244,7 +245,7 @@ abstract class AgentService {
      * @throws AgentTurnFailedException 当实现无法完成本次回合且未提交其会话历史时抛出。
      * @throws IllegalStateException 当服务已关闭或当前会话不可用，且具体实现选择以异常报告时抛出。
      * @throws Exception 当具体实现以其自身语义报告失败时抛出。
-     * @throws kotlinx.coroutines.CancellationException 当调用协程或底层 I/O 被取消时原样抛出。
+     * @throws CancellationException 当调用协程或底层 I/O 被取消时原样抛出。
      */
     abstract suspend fun sendMessage(text: String?, mediaData: List<MediaData>): String
 

@@ -61,8 +61,32 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Run backend tests and build project
-        run: ./gradlew build
+      - name: Verify backend build boundaries
+        run: bash scripts/verify-build-boundaries.sh
+
+      - name: Run backend tests and build backend artifacts
+        run: ./gradlew :backend:build
+
+  packaging:
+    name: Packaged Application Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: "21"
+          distribution: liberica
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Verify packaged application
+        run: ./gradlew :backend:verifyPackagedSerialization :backend:verifyPackagedResources
 
   qodana:
     name: Qodana
