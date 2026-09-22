@@ -6,6 +6,7 @@
 
 package com.unscientificjszhai.tgp.service.ai
 
+import com.unscientificjszhai.tgp.di.AgentComponent
 import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.MCPServerConfig
 import com.unscientificjszhai.tgp.models.validateMcpServerConfigs
@@ -24,6 +25,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 import okhttp3.Interceptor
+import okhttp3.MediaType
 import okhttp3.ResponseBody
 import okio.Buffer
 import okio.ForwardingSource
@@ -38,7 +40,7 @@ import javax.inject.Inject
 /**
  * 管理一个 Agent 作用域到 MCP 服务器的连接，并提供已发现工具的查询与调用能力。
  *
- * 同一 [com.unscientificjszhai.tgp.di.AgentComponent] 会复用同一实例及其 HTTP 客户端；不同组件的
+ * 同一 [AgentComponent] 会复用同一实例及其 HTTP 客户端；不同组件的
  * 连接、工具快照和 HTTP 客户端彼此隔离。服务维护当前连接配置的快照；调用 [connect] 会将连接状态
  * 同步为传入配置。调用 [close] 后服务进入终态，不再接受新的连接或工具调用；返回的任务只有在关闭栅栏前
  * 已登记的客户端清理与 HTTP 客户端都实际结束后才完成。
@@ -777,10 +779,10 @@ private fun ByteArray.stripTrailingCarriageReturn(): ByteArray =
 private fun ByteArray.startsWithAscii(prefix: String): Boolean =
     size >= prefix.length && prefix.indices.all { index -> this[index].toInt() == prefix[index].code }
 
-private fun okhttp3.MediaType?.isMcpJson(): Boolean =
+private fun MediaType?.isMcpJson(): Boolean =
     this?.type == "application" && (subtype == "json" || subtype.endsWith("+json"))
 
-private fun okhttp3.MediaType?.isMcpSse(): Boolean = this?.type == "text" && subtype == "event-stream"
+private fun MediaType?.isMcpSse(): Boolean = this?.type == "text" && subtype == "event-stream"
 
 private fun validateDiscoveredTool(tool: Tool) {
     tool.inputSchema.properties?.let(JsonStructureLimits::validateElement)

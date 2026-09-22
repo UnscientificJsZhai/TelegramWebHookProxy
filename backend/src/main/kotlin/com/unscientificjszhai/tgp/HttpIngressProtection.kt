@@ -87,7 +87,7 @@ internal class HttpConnectionAdmission(maxConnections: Int) {
  *
  * HTTP/2 与 h2c 被显式关闭，因为该保护器按 HTTP/1 的请求边界维护截止时间。
  *
- * 该配置替换 Netty 的 HTTP codec，因而不支持 Ktor 的非字节缓冲 [io.ktor.http.content.OutgoingContent.ProtocolUpgrade]
+ * 该配置替换 Netty 的 HTTP codec，因而不支持 Ktor 的非字节缓冲 [OutgoingContent.ProtocolUpgrade]
  * 路径；该类响应会在应用发送管线中被替换为 `501 Not Implemented`。
  */
 internal fun NettyApplicationEngine.Configuration.configureHttpIngressProtection(
@@ -110,7 +110,7 @@ internal fun NettyApplicationEngine.Configuration.configureHttpIngressProtection
 
 /**
  * 在 Netty 引擎写入响应前拒绝 Ktor 的协议升级响应，避免替换后的 HTTP codec 被当作原生
- * [io.netty.handler.codec.http.HttpServerCodec] 使用。
+ * [HttpServerCodec] 使用。
  */
 internal fun Application.installProtocolUpgradeRejection() {
     sendPipeline.insertPhaseBefore(ApplicationSendPipeline.Engine, ProtocolUpgradeRejection)
@@ -164,7 +164,7 @@ internal data class RequestStartMarker(val startedAtNanos: Long)
 /**
  * 带请求首字节标记的 Netty HTTP/1 server codec。
  *
- * 此实现保留 Netty [io.netty.handler.codec.http.HttpServerCodec] 的请求方法队列与 HEAD、CONNECT
+ * 此实现保留 Netty [HttpServerCodec] 的请求方法队列与 HEAD、CONNECT
  * 响应编码语义，并在等待请求状态收到每个请求的首个原始字节时插入 [RequestStartMarker]。
  */
 internal class TrackingHttpServerCodec(

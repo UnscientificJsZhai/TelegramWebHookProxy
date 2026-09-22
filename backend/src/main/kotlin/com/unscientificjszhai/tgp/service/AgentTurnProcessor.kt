@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.MediaData
 import com.unscientificjszhai.tgp.models.Message
 import com.unscientificjszhai.tgp.models.ReplyParameters
+import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.repository.AgentTurnClaim
 import com.unscientificjszhai.tgp.repository.AgentTurnJournalEntry
 import com.unscientificjszhai.tgp.repository.AgentTurnJournalStatus
@@ -242,7 +243,7 @@ internal class AgentTurnProcessor(
 
     private suspend fun processAuthorizedUpdate(
         session: PollingSession,
-        update: com.unscientificjszhai.tgp.models.Update,
+        update: Update,
         ticket: AdmissionTicket,
         expectedRetryCheckpointTarget: Long?,
     ): UpdateCompletion {

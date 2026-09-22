@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.repository.AgentTurnJournalEntry
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -237,11 +238,11 @@ internal class MessagePollingRuntime(
      * 要求会话仍为当前会话。
      *
      * @param session 待复核的轮询会话。
-     * @throws kotlinx.coroutines.CancellationException 会话已经失效时抛出。
+     * @throws CancellationException 会话已经失效时抛出。
      */
     fun ensureCurrent(session: PollingSession) {
         if (!isCurrent(session)) {
-            throw kotlinx.coroutines.CancellationException("Polling session is no longer current.")
+            throw CancellationException("Polling session is no longer current.")
         }
     }
 

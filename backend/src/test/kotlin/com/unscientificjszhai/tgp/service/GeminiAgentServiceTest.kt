@@ -6,6 +6,7 @@ import com.google.genai.types.*
 import com.unscientificjszhai.tgp.models.AISettings
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.Skill
+import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.*
@@ -35,7 +36,7 @@ import kotlin.time.Duration.Companion.seconds
 class GeminiAgentServiceTest {
 
     private lateinit var settingsChangeCoordinator: SettingsChangeCoordinator
-    private lateinit var skillRepository: com.unscientificjszhai.tgp.repository.SkillRepository
+    private lateinit var skillRepository: SkillRepository
     private lateinit var service: GeminiAgentService
     private lateinit var tempDirectory: File
     private lateinit var testJob: Job
@@ -53,7 +54,7 @@ class GeminiAgentServiceTest {
             ModelSwitchBarrier(),
         )
         skillRepository =
-            com.unscientificjszhai.tgp.repository.SkillRepository.forTesting(File(tempDirectory, "skills.json"))
+            SkillRepository.forTesting(File(tempDirectory, "skills.json"))
         service = GeminiAgentService(
             testScope,
             settingsChangeCoordinator,
