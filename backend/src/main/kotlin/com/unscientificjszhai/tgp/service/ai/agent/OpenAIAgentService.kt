@@ -207,11 +207,7 @@ class OpenAIAgentService @Inject internal constructor(
                 }
             }
             if (!installed) {
-                try {
-                    transport.close()
-                } finally {
-                    authenticationLease.close()
-                }
+                authenticationLease.use { transport.close() }
                 error("OpenAI agent is closed.")
             }
 

@@ -271,11 +271,7 @@ class GeminiAgentService @Inject internal constructor(
                 }
             }
             if (!installed) {
-                try {
-                    transport.close()
-                } finally {
-                    authenticationLease.close()
-                }
+                authenticationLease.use { transport.close() }
                 error("Gemini agent is closed.")
             }
 

@@ -95,7 +95,11 @@ class SocksProxyAuthentication internal constructor(
                 ) = clearContexts()
 
                 override fun connectFailed(
-                    call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?, ioe: IOException,
+                    call: Call,
+                    inetSocketAddress: InetSocketAddress,
+                    proxy: Proxy,
+                    protocol: Protocol?,
+                    ioe: IOException,
                 ) = clearContexts()
 
                 override fun callEnd(call: Call) = clearContexts()
@@ -120,10 +124,20 @@ class SocksProxyAuthentication internal constructor(
             proxy.authentication()
         }
 
-    private fun credentialsForSnapshot(lease: Lease, protocol: String?, host: String?, port: Int): PasswordAuthentication? =
+    private fun credentialsForSnapshot(
+        lease: Lease,
+        protocol: String?,
+        host: String?,
+        port: Int
+    ): PasswordAuthentication? =
         synchronized(Authenticator::class.java) {
             val proxy = lease.proxySettings
-            if (uninstalled || !lease.active.get() || proxy == null || !proxy.matches(protocol, host, port)) return@synchronized null
+            if (uninstalled || !lease.active.get() || proxy == null || !proxy.matches(
+                    protocol,
+                    host,
+                    port
+                )
+            ) return@synchronized null
             if (retained[proxy] == null) return@synchronized null
             proxy.authentication()
         }
@@ -177,9 +191,9 @@ class SocksProxyAuthentication internal constructor(
                 owner.credentialsFor(requestingProtocol, requestingHost, requestingPort)?.let { return it }
             }
             return previous?.requestPasswordAuthenticationInstance(
-                    requestingHost, requestingSite, requestingPort, requestingProtocol,
-                    requestingPrompt, requestingScheme, requestingURL, requestorType,
-                )
+                requestingHost, requestingSite, requestingPort, requestingProtocol,
+                requestingPrompt, requestingScheme, requestingURL, requestorType,
+            )
         }
     }
 
@@ -198,7 +212,7 @@ internal fun installSocksProxyAuthentication(currentProxy: () -> ProxySettings?)
 
 private fun ProxySettings.matches(protocol: String?, host: String?, port: Int): Boolean =
     type == ProxyType.SOCKS && protocol.equals("SOCKS5", ignoreCase = true) &&
-        this.port == port && matchesProxyHost(this.host, host) && username != null && password != null
+            this.port == port && matchesProxyHost(this.host, host) && username != null && password != null
 
 private fun ProxySettings.authentication(): PasswordAuthentication =
     PasswordAuthentication(username!!, password!!.toCharArray())
@@ -208,5 +222,9 @@ private fun matchesProxyHost(configured: String, requested: String?): Boolean {
     if (requested.isNullOrEmpty()) return false
     if (configured.equals(requested, ignoreCase = true)) return true
     fun String.isNumericAddress(): Boolean = contains(':') || all { it in '0'..'9' || it == '.' }
-    return !(!configured.isNumericAddress() || !requested.isNumericAddress()) && runCatching { InetAddress.getByName(configured) == InetAddress.getByName(requested) }.getOrDefault(false)
+    return !(!configured.isNumericAddress() || !requested.isNumericAddress()) && runCatching {
+        InetAddress.getByName(
+            configured
+        ) == InetAddress.getByName(requested)
+    }.getOrDefault(false)
 }

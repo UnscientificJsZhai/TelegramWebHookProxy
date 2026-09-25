@@ -82,7 +82,15 @@ class TelegramService private constructor(
         settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
-    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, { proxy, _ -> clientFactory(proxy) }, SocksProxyAuthentication.noOp, {}, Unit)
+    ) : this(
+        parentScope,
+        settingsChangeCoordinator,
+        updatesRepository,
+        { proxy, _ -> clientFactory(proxy) },
+        SocksProxyAuthentication.noOp,
+        {},
+        Unit
+    )
 
     internal constructor(
         parentScope: CoroutineScope,
@@ -90,7 +98,15 @@ class TelegramService private constructor(
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
         clientInstalledObserver: (ProxySettings?) -> Unit,
-    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, { proxy, _ -> clientFactory(proxy) }, SocksProxyAuthentication.noOp, clientInstalledObserver, Unit)
+    ) : this(
+        parentScope,
+        settingsChangeCoordinator,
+        updatesRepository,
+        { proxy, _ -> clientFactory(proxy) },
+        SocksProxyAuthentication.noOp,
+        clientInstalledObserver,
+        Unit
+    )
 
     internal constructor(
         parentScope: CoroutineScope,
@@ -99,7 +115,15 @@ class TelegramService private constructor(
         clientFactory: (ProxySettings?, SocksProxyAuthentication.Lease) -> HttpClient,
         socksProxyAuthentication: SocksProxyAuthentication,
         clientInstalledObserver: (ProxySettings?) -> Unit,
-    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, clientFactory, socksProxyAuthentication, clientInstalledObserver, Unit)
+    ) : this(
+        parentScope,
+        settingsChangeCoordinator,
+        updatesRepository,
+        clientFactory,
+        socksProxyAuthentication,
+        clientInstalledObserver,
+        Unit
+    )
 
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private val logger = LoggerFactory.getLogger(TelegramService::class.java)
@@ -513,11 +537,7 @@ class TelegramService private constructor(
         var closed: Boolean = false,
     ) {
         fun closeResources() {
-            try {
-                client.close()
-            } finally {
-                authenticationLease.close()
-            }
+            authenticationLease.use { client.close() }
         }
     }
 }

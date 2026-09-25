@@ -24,25 +24,26 @@ import kotlin.test.*
 /** 使用正式应用模块与真实 Netty 生命周期，替换业务组件以避免启动外部请求。 */
 class ApplicationProxyAuthenticationTest {
     @Test
-    fun `application installs SOCKS authentication before services and restores it after stopping`() = withComponent { component ->
-        val previous = Authenticator.getDefault()
-        val poller = component.messagePoller
-        every { component.messagePoller } answers {
-            assertNotSame(previous, Authenticator.getDefault())
-            poller
+    fun `application installs SOCKS authentication before services and restores it after stopping`() =
+        withComponent { component ->
+            val previous = Authenticator.getDefault()
+            val poller = component.messagePoller
+            every { component.messagePoller } answers {
+                assertNotSame(previous, Authenticator.getDefault())
+                poller
+            }
+            val server = embeddedServer(Netty, host = "127.0.0.1", port = 0) { module() }
+            try {
+                server.start(wait = false)
+                val credentials = Authenticator.requestPasswordAuthentication(
+                    "proxy.example", null, 1080, "SOCKS5", "SOCKS authentication", null,
+                )
+                assertEquals("user", assertNotNull(credentials).userName)
+            } finally {
+                server.stop(0, 1_000)
+            }
+            assertSame(previous, Authenticator.getDefault())
         }
-        val server = embeddedServer(Netty, host = "127.0.0.1", port = 0) { module() }
-        try {
-            server.start(wait = false)
-            val credentials = Authenticator.requestPasswordAuthentication(
-                "proxy.example", null, 1080, "SOCKS5", "SOCKS authentication", null,
-            )
-            assertEquals("user", assertNotNull(credentials).userName)
-        } finally {
-            server.stop(0, 1_000)
-        }
-        assertSame(previous, Authenticator.getDefault())
-    }
 
     @Test
     fun `module initialization failure immediately restores the authenticator`() = withComponent { component ->
@@ -78,7 +79,8 @@ class ApplicationProxyAuthenticationTest {
         var authentication: Lazy<com.unscientificjszhai.tgp.service.SocksProxyAuthentication>? = null
         mockkStatic(DaggerAppComponent::class)
         try {
-            val settings = SettingsChangeCoordinator.forTesting(directory.resolve("settings.json"), ModelSwitchBarrier())
+            val settings =
+                SettingsChangeCoordinator.forTesting(directory.resolve("settings.json"), ModelSwitchBarrier())
             settings.replaceSettingsForTest(
                 AppSettings(proxy = ProxySettings("proxy.example", 1080, ProxyType.SOCKS, "user", "pass")),
             )

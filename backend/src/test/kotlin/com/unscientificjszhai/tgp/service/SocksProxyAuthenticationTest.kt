@@ -168,12 +168,18 @@ class SocksProxyAuthenticationTest {
                 withTimeout(5_000) { oldRequestStarted.await() }
                 settings.replaceSettingsForTest(AppSettings(proxy = newer))
                 withTimeout(5_000) { newClientInstalled.await() }
-                assertEquals("old-user", challengeWithClientSnapshot(authentication, old, checkNotNull(oldClientLease))?.userName)
+                assertEquals(
+                    "old-user",
+                    challengeWithClientSnapshot(authentication, old, checkNotNull(oldClientLease))?.userName
+                )
                 assertNull(challenge("old.example"))
                 assertEquals("new-user", challenge("new.example", port = 1081)?.userName)
                 service.close()
                 authentication.close()
-                assertEquals("old-user", challengeWithClientSnapshot(authentication, old, checkNotNull(oldClientLease))?.userName)
+                assertEquals(
+                    "old-user",
+                    challengeWithClientSnapshot(authentication, old, checkNotNull(oldClientLease))?.userName
+                )
                 finishOldRequest.complete(Unit)
                 withTimeout(5_000) { request.await() }
                 assertSame(previousAuthenticator, Authenticator.getDefault())
@@ -195,14 +201,23 @@ class SocksProxyAuthenticationTest {
             val rotated = old.copy(password = "new")
             current = rotated
             registration.retain(rotated).use { rotatedLease ->
-                assertEquals("old", String(assertNotNull(challengeWithClientSnapshot(registration, old, oldLease)).password))
-                assertEquals("new", String(assertNotNull(challengeWithClientSnapshot(registration, rotated, rotatedLease)).password))
+                assertEquals(
+                    "old",
+                    String(assertNotNull(challengeWithClientSnapshot(registration, old, oldLease)).password)
+                )
+                assertEquals(
+                    "new",
+                    String(assertNotNull(challengeWithClientSnapshot(registration, rotated, rotatedLease)).password)
+                )
                 val anonymous = old.copy(username = null, password = null)
                 current = anonymous
                 registration.retain(anonymous).use { anonymousLease ->
                     assertNull(challengeWithClientSnapshot(registration, anonymous, anonymousLease))
                 }
-                assertEquals("old", String(assertNotNull(challengeWithClientSnapshot(registration, old, oldLease)).password))
+                assertEquals(
+                    "old",
+                    String(assertNotNull(challengeWithClientSnapshot(registration, old, oldLease)).password)
+                )
             }
             oldLease.close()
         }
@@ -267,9 +282,10 @@ class SocksProxyAuthenticationTest {
                 val client = okhttpClient(old, registration, lease)
                 try {
                     val response = async(Dispatchers.IO) {
-                        client.newCall(Request.Builder().url("http://upstream.invalid/resource").build()).execute().use {
-                            it.body.string()
-                        }
+                        client.newCall(Request.Builder().url("http://upstream.invalid/resource").build()).execute()
+                            .use {
+                                it.body.string()
+                            }
                     }
                     assertTrue(greeting.await(5, TimeUnit.SECONDS))
                     current.set(old.copy(password = "new"))
@@ -409,7 +425,8 @@ class SocksProxyAuthenticationTest {
                 val client = okhttpClient(proxy)
                 try {
                     assertFailsWith<IOException> {
-                        client.newCall(Request.Builder().url("http://upstream.invalid/resource").build()).execute().close()
+                        client.newCall(Request.Builder().url("http://upstream.invalid/resource").build()).execute()
+                            .close()
                     }
                     val exchange = server.awaitExchange()
                     assertEquals("user" to "wrong", exchange.credentials)
@@ -452,7 +469,11 @@ class SocksProxyAuthenticationTest {
         Socks5Server(credentials, models).use { server ->
             val settings = AppSettings(
                 proxy = server.settings(credentials),
-                ai = AISettings(provider = AIProvider.OPENAI, openAiApiKey = "test-key", openAiBaseUrl = "http://provider.invalid/v1"),
+                ai = AISettings(
+                    provider = AIProvider.OPENAI,
+                    openAiApiKey = "test-key",
+                    openAiBaseUrl = "http://provider.invalid/v1"
+                ),
             )
             installSocksProxyAuthentication { settings.proxy }.use {
                 assertEquals(listOf("socks-model"), ModelDiscoveryService().listModels(settings).availableModels)
