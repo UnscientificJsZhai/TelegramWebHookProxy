@@ -4,6 +4,7 @@ import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.BotCommandReconciler
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.SocksProxyAuthentication
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
@@ -18,6 +19,9 @@ import javax.inject.Singleton
 interface AppComponent {
     /** 协调应用设置持久化、条件写入与生命周期事件。 */
     val settingsChangeCoordinator: SettingsChangeCoordinator
+
+    /** 与本应用生命周期绑定的 SOCKS5 认证注册。 */
+    val socksProxyAuthentication: SocksProxyAuthentication
 
     /** 技能数据的持久化仓库。 */
     val skillRepository: SkillRepository

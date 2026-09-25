@@ -40,7 +40,7 @@ describe('MCP settings validation', () => {
 });
 
 describe('proxy settings transitions', () => {
-    it('atomically clears HTTP credentials when switching to SOCKS', () => {
+    it('keeps HTTP credentials when switching to SOCKS', () => {
         expect(withProxyType({
             host: 'proxy.example.com',
             port: 1080,
@@ -51,16 +51,16 @@ describe('proxy settings transitions', () => {
             host: 'proxy.example.com',
             port: 1080,
             type: 'SOCKS',
-            username: null,
-            password: null,
+            username: 'user',
+            password: 'password',
         });
     });
 
-    it('keeps HTTP credentials when remaining on HTTP', () => {
+    it('keeps SOCKS credentials when switching to HTTP', () => {
         expect(withProxyType({
             host: 'proxy.example.com',
             port: 8080,
-            type: 'HTTP',
+            type: 'SOCKS',
             username: 'user',
             password: 'password',
         }, 'HTTP').username).toBe('user');
@@ -77,7 +77,25 @@ describe('proxy settings transitions', () => {
         expect(isValidProxyAuthentication(proxy)).toBe(true);
         expect(isValidProxyAuthentication({...proxy, password: null})).toBe(false);
         expect(isValidProxyAuthentication({...proxy, username: ' ', password: 'password'})).toBe(false);
-        expect(isValidProxyAuthentication({...proxy, type: 'SOCKS'})).toBe(false);
+        expect(isValidProxyAuthentication({...proxy, type: 'SOCKS'})).toBe(true);
         expect(isValidProxyAuthentication(withProxyType(proxy, 'SOCKS'))).toBe(true);
+    });
+
+    it('enforces SOCKS credential pairing and Latin-1 byte limits', () => {
+        const proxy = {
+            host: 'proxy.example.com', port: 1080, type: 'SOCKS' as const,
+            username: 'u', password: 'p',
+        };
+        expect(isValidProxyAuthentication({...proxy, username: null, password: null})).toBe(true);
+        expect(isValidProxyAuthentication({...proxy, username: null})).toBe(false);
+        expect(isValidProxyAuthentication({...proxy, password: null})).toBe(false);
+        expect(isValidProxyAuthentication({...proxy, username: ' '})).toBe(false);
+        expect(isValidProxyAuthentication({...proxy, password: ''})).toBe(false);
+        expect(isValidProxyAuthentication({...proxy, username: 'é'.repeat(255), password: 'ÿ'.repeat(255)})).toBe(true);
+        for (const invalid of ['u'.repeat(256), '中文', '\u0100', '🔑']) {
+            expect(isValidProxyAuthentication({...proxy, username: invalid})).toBe(false);
+            expect(isValidProxyAuthentication({...proxy, password: invalid})).toBe(false);
+        }
+        expect(isValidProxyAuthentication({...proxy, type: 'HTTP', username: 'u'.repeat(512), password: '中文'})).toBe(true);
     });
 });

@@ -620,7 +620,7 @@ class SettingsChangeCoordinatorTest {
             ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = "user"),
             ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, password = "password"),
             ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = " "),
-            ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
+            ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "中文"),
         ).forEach { invalidProxy ->
             assertFailsWith<IllegalArgumentException> {
                 repository.replaceSettingsForTest(initialSettings.copy(proxy = invalidProxy))
@@ -751,7 +751,7 @@ class SettingsChangeCoordinatorTest {
                     ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"),
             """{"host":"proxy.example.com","port":8080,"type":"HTTP","username":" ","password":" "}""" to
                     ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, "user", "password"),
-            """{"host":"proxy.example.com","port":1080,"type":"SOCKS","username":"user","password":"password"}""" to
+            """{"host":"proxy.example.com","port":1080,"type":"SOCKS","username":"user","password":"中文"}""" to
                     ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS),
         )
 
@@ -773,6 +773,25 @@ class SettingsChangeCoordinatorTest {
             assertEquals(replacement, repository.settingsFlow.value)
             assertFalse(repository.hasHistoricalInvalidProxy)
         }
+    }
+
+    /** 原有 JSON 结构即可加载 SOCKS5 凭据，无须迁移或进入修复模式。 */
+    @Test
+    fun `historical SOCKS credentials load and round trip without recovery`() {
+        val configFile = File(tempDirectory, "historical-socks-credentials.json")
+        val originalContent =
+            """{"proxy":{"host":"proxy.example.com","port":1080,"type":"SOCKS","username":"user","password":"päss"}}"""
+        configFile.writeText(originalContent)
+        val repository = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+        val expected = ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, "user", "päss")
+        assertEquals(expected, repository.settingsFlow.value.proxy)
+        assertFalse(repository.hasHistoricalInvalidProxy)
+        assertEquals(originalContent, configFile.readText())
+
+        repository.replaceSettingsForTest(repository.settingsFlow.value.copy(chatId = "saved"))
+        val reloaded = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+        assertEquals(expected, reloaded.settingsFlow.value.proxy)
+        assertFalse(reloaded.hasHistoricalInvalidProxy)
     }
 
     /**

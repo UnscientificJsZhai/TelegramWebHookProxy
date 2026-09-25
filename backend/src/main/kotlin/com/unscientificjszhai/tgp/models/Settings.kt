@@ -519,10 +519,10 @@ private val MCP_FORBIDDEN_HEADER_NAMES = setOf(
  * @property host 代理服务器主机名或 IP 地址；不得为空。
  * @property port 代理服务器端口；必须在 `1..65535` 范围内。
  * @property type 代理协议类型。
- * @property username HTTP 代理认证用户名；与 [password] 必须同时提供或同时为 `null`。
- * SOCKS 代理必须为 `null`。
- * @property password HTTP 代理认证密码；与 [username] 必须同时提供或同时为 `null`。
- * SOCKS 代理必须为 `null`。
+ * @property username HTTP 或 SOCKS5 代理认证用户名；与 [password] 必须同时提供或同时为 `null`。
+ * SOCKS5 凭据须为 Latin-1 可表示的 1–255 字节。
+ * @property password HTTP 或 SOCKS5 代理认证密码；与 [username] 必须同时提供或同时为 `null`。
+ * SOCKS5 凭据须为 Latin-1 可表示的 1–255 字节。
  */
 @Serializable
 data class ProxySettings(
@@ -572,8 +572,12 @@ fun validateProxySettings(proxy: ProxySettings?) {
     if (proxy.username != null) {
         require(proxy.username.isNotBlank() && proxy.password!!.isNotBlank()) { "代理认证用户名和密码不能为空白。" }
     }
-    if (proxy.type == ProxyType.SOCKS) {
-        require(proxy.username == null && proxy.password == null) { "SOCKS 代理不支持用户名和密码认证。" }
+    if (proxy.type == ProxyType.SOCKS && proxy.username != null) {
+        listOf(proxy.username, proxy.password!!).forEach { credential ->
+            require(credential.length in 1..255 && credential.all { it.code <= 0xff }) {
+                "SOCKS5 代理用户名和密码仅支持 Latin-1 字符，每项须为 1–255 字节。"
+            }
+        }
     }
 }
 

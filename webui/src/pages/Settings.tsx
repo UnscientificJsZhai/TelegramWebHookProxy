@@ -37,7 +37,7 @@ import {useSettings} from '../settingsContext';
 import {useChats} from '../useChats';
 import {type AppSettings, utf8Length} from '../settings';
 import {isSettingsConflict, type VersionedSettings} from '../settingsClient';
-import {isValidProxyAuthentication, withProxyType} from './proxySettings';
+import {isValidProxyAuthentication, proxyAuthenticationHint, withProxyType} from './proxySettings';
 import PageHeader from '../components/PageHeader';
 import SectionCard from '../components/SectionCard';
 import SecretField from '../components/SecretField';
@@ -166,7 +166,7 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
                                                          label={<Box><Typography
                                                              variant="body2">{type} 代理</Typography><Typography
                                                              variant="caption"
-                                                             color="text.secondary">{type === 'HTTP' ? '支持可选的用户名与密码' : '不支持认证，切换时清空凭据'}</Typography></Box>}
+                                                             color="text.secondary">{type === 'HTTP' ? '支持可选的用户名与密码' : '支持 SOCKS5 用户名与密码'}</Typography></Box>}
                                                          sx={{m: 0}}/></Paper>)}
                                 </RadioGroup>
                                 <Stack direction={{xs: 'column', sm: 'row'}} spacing={2}>
@@ -182,13 +182,13 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
                                 <Stack direction={{xs: 'column', sm: 'row'}} spacing={2}>
                                     <TextField label="用户名（可选）" value={draft.proxy.username ?? ''}
                                                onChange={event => setProxy({username: event.target.value || null})}
-                                               disabled={draft.proxy.type === 'SOCKS'} error={!authValid}/>
+                                               error={!authValid}/>
                                     <SecretField label="密码（可选）" value={draft.proxy.password ?? ''}
                                                  onChange={event => setProxy({password: event.target.value || null})}
-                                                 disabled={draft.proxy.type === 'SOCKS'} error={!authValid}/>
+                                                 error={!authValid}/>
                                 </Stack>
                                 <Typography variant="caption"
-                                            color={authValid ? 'text.secondary' : 'error'}>{draft.proxy.type === 'SOCKS' ? 'SOCKS 代理不支持用户名和密码认证。' : 'HTTP 代理的用户名与密码须同时填写，或同时留空。'}</Typography>
+                                            color={authValid ? 'text.secondary' : 'error'}>{proxyAuthenticationHint(draft.proxy.type)}</Typography>
                             </> : <Alert severity="info" variant="outlined">当前将直接连接 Telegram API。</Alert>}
                         </Stack>
                     </SectionCard>

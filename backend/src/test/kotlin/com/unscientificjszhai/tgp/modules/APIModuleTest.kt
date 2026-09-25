@@ -746,7 +746,9 @@ class APIModuleTest {
                 ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = "user"),
                 ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, password = "password"),
                 ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = " "),
-                ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "password"),
+                ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user"),
+                ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "中文"),
+                ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "p".repeat(256)),
             ).forEach { invalidProxy ->
                 client.put("/api/settings") {
                     header(HttpHeaders.IfMatch, revision)
@@ -1190,6 +1192,33 @@ class APIModuleTest {
                 assertEquals(HttpStatusCode.BadRequest, status)
             }
             assertEquals(original, repository.settingsFlow.value)
+        }
+
+    @Test
+    fun `settings PUT and PATCH preserve SOCKS authentication credentials`() =
+        withTestApi { repository, _, _ ->
+            val settings = AppSettings(proxy = ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, "user", "päss"))
+            client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(settings))
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+                assertEquals(settings.proxy, Json.decodeFromString<AppSettings>(bodyAsText()).proxy)
+            }
+            client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, currentSettingsETag())
+                contentType(ContentType.Application.Json)
+                setBody("""{"proxy":{"password":"new-password"}}""")
+            }.apply {
+                assertEquals(HttpStatusCode.OK, status)
+                assertEquals("new-password", Json.decodeFromString<AppSettings>(bodyAsText()).proxy?.password)
+            }
+            assertEquals(settings.proxy!!.copy(password = "new-password"), repository.settingsFlow.value.proxy)
+            assertEquals(
+                repository.settingsFlow.value.proxy,
+                Json.decodeFromString<AppSettings>(client.get("/api/settings").bodyAsText()).proxy,
+            )
         }
 
     /**

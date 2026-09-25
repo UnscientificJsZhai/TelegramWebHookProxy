@@ -10,6 +10,7 @@ import com.unscientificjszhai.tgp.di.AgentScope
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.SocksProxyAuthentication
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
@@ -61,6 +62,7 @@ class OpenAIAgentService @Inject internal constructor(
     private val mcpClientService: MCPClientService,
     private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     scheduledTaskService: ScheduledTaskService,
+    private val socksProxyAuthentication: SocksProxyAuthentication = SocksProxyAuthentication.noOp,
 ) : ProviderAgentService() {
     private companion object {
         const val DEFAULT_MODEL = "gpt-5.6-luna"
@@ -100,6 +102,7 @@ class OpenAIAgentService @Inject internal constructor(
     /** 生产 API 请求使用的原生可取消传输；SDK 客户端仅保留给未配置传输的旧会话兼容路径。 */
     @Volatile
     private var rawTransport: CancellableOkHttpTransport? = null
+    private var proxyAuthenticationLease: SocksProxyAuthentication.Lease? = null
     private var rawBaseUrl: String? = null
     private var rawApiKey: String? = null
     private val history = mutableListOf<ChatCompletionMessageParam>()
@@ -159,7 +162,9 @@ class OpenAIAgentService @Inject internal constructor(
     }
 
     /** 创建 OpenAI 兼容服务的原生客户端，并支持 HTTP Basic 代理认证与 SOCKS 代理路由。 */
-    private fun createOpenAIHttpClient(proxySettings: ProxySettings?): OkHttpClient {
+    private fun createOpenAIHttpClient(
+        proxySettings: ProxySettings?, authenticationLease: SocksProxyAuthentication.Lease,
+    ): OkHttpClient {
         val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
             val type = when (proxySettings.type) {
@@ -168,6 +173,7 @@ class OpenAIAgentService @Inject internal constructor(
             }
             builder.proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
             builder.configureHttpProxyBasicAuthentication(proxySettings)
+            socksProxyAuthentication.configureClient(builder, authenticationLease)
         }
         return builder.build()
     }
@@ -186,7 +192,24 @@ class OpenAIAgentService @Inject internal constructor(
             configuredProxy = settings.proxy
             rawApiKey = aiSettings.openAiApiKey
             rawBaseUrl = openAiBaseUrlForRequests(aiSettings.openAiBaseUrl)
-            rawTransport = CancellableOkHttpTransport(createOpenAIHttpClient(settings.proxy))
+            val authenticationLease = socksProxyAuthentication.retain(settings.proxy)
+            val transport = try {
+                CancellableOkHttpTransport(createOpenAIHttpClient(settings.proxy, authenticationLease))
+            } catch (failure: Throwable) {
+                authenticationLease.close()
+                throw failure
+            }
+            val installed = synchronized(lifecycleLock) {
+                if (closed) false else {
+                    proxyAuthenticationLease = authenticationLease
+                    rawTransport = transport
+                    true
+                }
+            }
+            if (!installed) {
+                authenticationLease.use { transport.close() }
+                error("OpenAI agent is closed.")
+            }
 
             awaitPublicationJob(resetSession())
             val snapshot = updateModelOrThrow()
@@ -1077,6 +1100,8 @@ class OpenAIAgentService @Inject internal constructor(
                 SafeLogging.failureCategory(e).wireName,
             )
         } finally {
+            proxyAuthenticationLease?.close()
+            proxyAuthenticationLease = null
             completion.complete(Unit)
         }
     }

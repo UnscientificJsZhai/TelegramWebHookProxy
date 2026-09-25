@@ -10,6 +10,7 @@ import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.repository.SkillRepository
 import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.SocksProxyAuthentication
 import com.unscientificjszhai.tgp.service.ai.AgentExecutionDeadlines
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_ARGUMENT_BYTES
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
@@ -60,6 +61,7 @@ class GeminiAgentService @Inject internal constructor(
     private val mcpClientService: MCPClientService,
     private val deadlines: AgentExecutionDeadlines = AgentExecutionDeadlines(),
     scheduledTaskService: ScheduledTaskService,
+    private val socksProxyAuthentication: SocksProxyAuthentication = SocksProxyAuthentication.noOp,
 ) : ProviderAgentService() {
     /** 仅供模拟 HTTP 服务测试覆盖固定 Gemini 根地址；生产构造器始终保持为 `null`。 */
     private var baseUrlOverrideForTesting: String? = null
@@ -119,6 +121,7 @@ class GeminiAgentService @Inject internal constructor(
     /** 生产请求使用的原生可取消 HTTP 传输；SDK 客户端仅保留给旧会话兼容路径。 */
     @Volatile
     private var rawTransport: CancellableOkHttpTransport? = null
+    private var proxyAuthenticationLease: SocksProxyAuthentication.Lease? = null
     private var rawBaseUrl: String? = null
     private var rawApiKey: String? = null
 
@@ -253,7 +256,24 @@ class GeminiAgentService @Inject internal constructor(
             configuredProxy = settings.proxy
             rawApiKey = aiSettings.geminiApiKey
             rawBaseUrl = geminiBaseUrl()
-            rawTransport = CancellableOkHttpTransport(createGeminiHttpClient(settings.proxy))
+            val authenticationLease = socksProxyAuthentication.retain(settings.proxy)
+            val transport = try {
+                CancellableOkHttpTransport(createGeminiHttpClient(settings.proxy, authenticationLease))
+            } catch (failure: Throwable) {
+                authenticationLease.close()
+                throw failure
+            }
+            val installed = synchronized(lifecycleLock) {
+                if (closed) false else {
+                    proxyAuthenticationLease = authenticationLease
+                    rawTransport = transport
+                    true
+                }
+            }
+            if (!installed) {
+                authenticationLease.use { transport.close() }
+                error("Gemini agent is closed.")
+            }
 
             val initialResetJob = resetSession()
             resetSessionJob = initialResetJob
@@ -288,7 +308,9 @@ class GeminiAgentService @Inject internal constructor(
     }
 
     /** 创建 Gemini 原生传输客户端，并支持 HTTP Basic 代理认证与 SOCKS 代理路由。 */
-    private fun createGeminiHttpClient(proxySettings: ProxySettings?): OkHttpClient {
+    private fun createGeminiHttpClient(
+        proxySettings: ProxySettings?, authenticationLease: SocksProxyAuthentication.Lease,
+    ): OkHttpClient {
         val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
             val type = when (proxySettings.type) {
@@ -297,6 +319,7 @@ class GeminiAgentService @Inject internal constructor(
             }
             builder.proxy(Proxy(type, InetSocketAddress(proxySettings.host, proxySettings.port)))
             builder.configureHttpProxyBasicAuthentication(proxySettings)
+            socksProxyAuthentication.configureClient(builder, authenticationLease)
         }
         return builder.build()
     }
@@ -1710,6 +1733,8 @@ class GeminiAgentService @Inject internal constructor(
                             SafeLogging.failureCategory(e).wireName,
                         )
                     } finally {
+                        proxyAuthenticationLease?.close()
+                        proxyAuthenticationLease = null
                         newCompletion.complete(Unit)
                     }
                 }

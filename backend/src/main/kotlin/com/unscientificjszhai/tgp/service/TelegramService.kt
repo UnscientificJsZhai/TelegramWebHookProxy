@@ -52,7 +52,8 @@ class TelegramService private constructor(
     parentScope: CoroutineScope,
     private val settingsChangeCoordinator: SettingsChangeCoordinator,
     private val updatesRepository: UpdatesRepository,
-    private val clientFactory: (ProxySettings?) -> HttpClient,
+    private val clientFactory: (ProxySettings?, SocksProxyAuthentication.Lease) -> HttpClient,
+    private val socksProxyAuthentication: SocksProxyAuthentication,
     private val clientInstalledObserver: (ProxySettings?) -> Unit,
     @Suppress("UNUSED_PARAMETER") testConstructorMarker: Unit,
 ) : AutoCloseable {
@@ -69,14 +70,27 @@ class TelegramService private constructor(
         parentScope: CoroutineScope,
         settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
-    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, ::createDefaultClient, {}, Unit)
+        socksProxyAuthentication: SocksProxyAuthentication,
+    ) : this(
+        parentScope, settingsChangeCoordinator, updatesRepository,
+        { proxy, lease -> createDefaultClient(proxy, socksProxyAuthentication, lease) },
+        socksProxyAuthentication, {}, Unit,
+    )
 
     internal constructor(
         parentScope: CoroutineScope,
         settingsChangeCoordinator: SettingsChangeCoordinator,
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
-    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, clientFactory, {}, Unit)
+    ) : this(
+        parentScope,
+        settingsChangeCoordinator,
+        updatesRepository,
+        { proxy, _ -> clientFactory(proxy) },
+        SocksProxyAuthentication.noOp,
+        {},
+        Unit
+    )
 
     internal constructor(
         parentScope: CoroutineScope,
@@ -84,7 +98,32 @@ class TelegramService private constructor(
         updatesRepository: UpdatesRepository,
         clientFactory: (ProxySettings?) -> HttpClient,
         clientInstalledObserver: (ProxySettings?) -> Unit,
-    ) : this(parentScope, settingsChangeCoordinator, updatesRepository, clientFactory, clientInstalledObserver, Unit)
+    ) : this(
+        parentScope,
+        settingsChangeCoordinator,
+        updatesRepository,
+        { proxy, _ -> clientFactory(proxy) },
+        SocksProxyAuthentication.noOp,
+        clientInstalledObserver,
+        Unit
+    )
+
+    internal constructor(
+        parentScope: CoroutineScope,
+        settingsChangeCoordinator: SettingsChangeCoordinator,
+        updatesRepository: UpdatesRepository,
+        clientFactory: (ProxySettings?, SocksProxyAuthentication.Lease) -> HttpClient,
+        socksProxyAuthentication: SocksProxyAuthentication,
+        clientInstalledObserver: (ProxySettings?) -> Unit,
+    ) : this(
+        parentScope,
+        settingsChangeCoordinator,
+        updatesRepository,
+        clientFactory,
+        socksProxyAuthentication,
+        clientInstalledObserver,
+        Unit
+    )
 
     private val scope = parentScope + Dispatchers.IO + SupervisorJob(parentScope.coroutineContext[Job])
     private val logger = LoggerFactory.getLogger(TelegramService::class.java)
@@ -101,7 +140,7 @@ class TelegramService private constructor(
             proxy = initialSettings.proxy,
             hasHistoricalInvalidProxy = settingsChangeCoordinator.hasHistoricalInvalidProxy,
         )
-        activeClient = ClientLease(createClient(initialProxy))
+        activeClient = createClientLease(initialProxy)
         installedProxy = initialProxy
         settingsSubscription = settingsChangeCoordinator.settingsFlow
             .onEach { newSettings ->
@@ -128,7 +167,7 @@ class TelegramService private constructor(
             return
         }
 
-        val candidate = createClient(desiredProxy)
+        val candidate = createClientLease(desiredProxy)
         installCandidate(candidate, desiredProxy)
     }
 
@@ -156,29 +195,39 @@ class TelegramService private constructor(
         }
     }
 
-    private fun createClient(proxy: ProxySettings?): HttpClient {
+    private fun createClient(proxy: ProxySettings?, authenticationLease: SocksProxyAuthentication.Lease): HttpClient {
         validateProxySettings(proxy)
-        return clientFactory(proxy)
+        return clientFactory(proxy, authenticationLease)
     }
 
-    private fun installCandidate(candidate: HttpClient, proxy: ProxySettings?) {
-        var retiredClient: HttpClient? = null
+    private fun createClientLease(proxy: ProxySettings?): ClientLease {
+        val authenticationLease = socksProxyAuthentication.retain(proxy)
+        try {
+            return ClientLease(createClient(proxy, authenticationLease), authenticationLease)
+        } catch (failure: Throwable) {
+            authenticationLease.close()
+            throw failure
+        }
+    }
+
+    private fun installCandidate(candidate: ClientLease, proxy: ProxySettings?) {
+        var retiredClient: ClientLease? = null
         var closeCandidate = false
         synchronized(clientLock) {
             if (closed) {
                 closeCandidate = true
             } else {
                 val previous = checkNotNull(activeClient)
-                activeClient = ClientLease(candidate)
+                activeClient = candidate
                 installedProxy = proxy
                 previous.retired = true
                 retiredClient = closeIfRetiredAndUnusedLocked(previous)
             }
         }
         if (closeCandidate) {
-            candidate.close()
+            candidate.closeResources()
         } else {
-            retiredClient?.close()
+            retiredClient?.closeResources()
             clientInstalledObserver(proxy)
         }
     }
@@ -196,16 +245,16 @@ class TelegramService private constructor(
                 lease.activeRequests--
                 closeIfRetiredAndUnusedLocked(lease)
             }
-            retiredClient?.close()
+            retiredClient?.closeResources()
         }
     }
 
-    private fun closeIfRetiredAndUnusedLocked(lease: ClientLease): HttpClient? {
+    private fun closeIfRetiredAndUnusedLocked(lease: ClientLease): ClientLease? {
         if (!lease.retired || lease.activeRequests != 0 || lease.closed) {
             return null
         }
         lease.closed = true
-        return lease.client
+        return lease
     }
 
     /**
@@ -228,7 +277,7 @@ class TelegramService private constructor(
         }
         settingsSubscription.cancel()
         scope.cancel()
-        retiredClient?.close()
+        retiredClient?.closeResources()
     }
 
     /**
@@ -482,10 +531,15 @@ class TelegramService private constructor(
 
     private class ClientLease(
         val client: HttpClient,
+        val authenticationLease: SocksProxyAuthentication.Lease,
         var activeRequests: Int = 0,
         var retired: Boolean = false,
         var closed: Boolean = false,
-    )
+    ) {
+        fun closeResources() {
+            authenticationLease.use { client.close() }
+        }
+    }
 }
 
 private const val MAX_TELEGRAM_API_BYTES = 1024 * 1024
@@ -521,7 +575,11 @@ private suspend fun HttpResponse.readTelegramBytes(limit: Int): ByteArray {
     }
 }
 
-private fun createDefaultClient(proxySettingsToUse: ProxySettings?): HttpClient = HttpClient(OkHttp) {
+private fun createDefaultClient(
+    proxySettingsToUse: ProxySettings?,
+    socksProxyAuthentication: SocksProxyAuthentication,
+    authenticationLease: SocksProxyAuthentication.Lease,
+): HttpClient = HttpClient(OkHttp) {
     install(HttpTimeout) {
         requestTimeoutMillis = 40000
         connectTimeoutMillis = 10000
@@ -537,6 +595,7 @@ private fun createDefaultClient(proxySettingsToUse: ProxySettings?): HttpClient 
         }
         config {
             configureHttpProxyBasicAuthentication(proxySettingsToUse)
+            socksProxyAuthentication.configureClient(this, authenticationLease)
         }
     }
     install(ContentNegotiation) {

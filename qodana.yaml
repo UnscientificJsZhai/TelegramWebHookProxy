@@ -1,5 +1,6 @@
 version: "1.0"
-linter: jetbrains/qodana-jvm-community:2026.1
+linter: qodana-jvm-community
+withinDocker: false
 
 projectJDK: "21"
 
