@@ -2,6 +2,7 @@ package com.unscientificjszhai.tgp.service.ai.agent
 
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
+import com.unscientificjszhai.tgp.service.SocksProxyAuthentication
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
@@ -29,6 +30,7 @@ internal class ModelDiscoveryTimeoutException : Exception()
 internal class ModelDiscoveryService(
     private val timeout: Duration = 30.seconds,
     private val geminiBaseUrl: String? = null,
+    private val socksProxyAuthentication: SocksProxyAuthentication = SocksProxyAuthentication.noOp,
 ) {
     private val requests = Semaphore(2)
 
@@ -50,34 +52,37 @@ internal class ModelDiscoveryService(
 
         return withTimeoutOrNull(timeout) {
             requests.withPermit {
-                val builder = OkHttpClient.Builder()
-                settings.proxy?.let { proxy ->
-                    builder.proxy(
-                        Proxy(
-                            if (proxy.type == ProxyType.HTTP) Proxy.Type.HTTP else Proxy.Type.SOCKS,
-                            InetSocketAddress(proxy.host, proxy.port),
+                socksProxyAuthentication.retain(settings.proxy).use { authenticationLease ->
+                    val builder = OkHttpClient.Builder()
+                    settings.proxy?.let { proxy ->
+                        builder.proxy(
+                            Proxy(
+                                if (proxy.type == ProxyType.HTTP) Proxy.Type.HTTP else Proxy.Type.SOCKS,
+                                InetSocketAddress(proxy.host, proxy.port),
+                            )
                         )
-                    )
-                    builder.configureHttpProxyBasicAuthentication(proxy)
-                }
-                val client = builder.build()
-                val transport = CancellableOkHttpTransport(client)
-                try {
-                    val models = when (ai.provider) {
-                        AIProvider.GEMINI -> fetchGeminiModelNames(transport, baseUrl, apiKey)
-                        AIProvider.OPENAI -> fetchOpenAIModels(
-                            transport, Request.Builder()
-                                .url(baseUrl.toHttpUrl().newBuilder().addPathSegments("models").build())
-                                .header("Authorization", "Bearer $apiKey")
-                                .header("Accept", "application/json")
-                                .get().build()
-                        ).map { it.id() }
+                        builder.configureHttpProxyBasicAuthentication(proxy)
+                        socksProxyAuthentication.configureClient(builder, authenticationLease)
                     }
-                    if (models.any(String::isBlank)) throw AgentInvalidResponseException()
-                    ModelListResponse(ai.provider, models.distinct(), ai.selectedModel)
-                } finally {
-                    transport.close()
-                    client.dispatcher.executorService.shutdown()
+                    val client = builder.build()
+                    val transport = CancellableOkHttpTransport(client)
+                    try {
+                        val models = when (ai.provider) {
+                            AIProvider.GEMINI -> fetchGeminiModelNames(transport, baseUrl, apiKey)
+                            AIProvider.OPENAI -> fetchOpenAIModels(
+                                transport, Request.Builder()
+                                    .url(baseUrl.toHttpUrl().newBuilder().addPathSegments("models").build())
+                                    .header("Authorization", "Bearer $apiKey")
+                                    .header("Accept", "application/json")
+                                    .get().build()
+                            ).map { it.id() }
+                        }
+                        if (models.any(String::isBlank)) throw AgentInvalidResponseException()
+                        ModelListResponse(ai.provider, models.distinct(), ai.selectedModel)
+                    } finally {
+                        transport.close()
+                        client.dispatcher.executorService.shutdown()
+                    }
                 }
             }
         } ?: throw ModelDiscoveryTimeoutException()

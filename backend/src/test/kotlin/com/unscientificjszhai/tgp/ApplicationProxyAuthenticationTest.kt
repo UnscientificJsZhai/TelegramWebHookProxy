@@ -6,6 +6,7 @@ import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
 import com.unscientificjszhai.tgp.models.ProxyType
 import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
+import com.unscientificjszhai.tgp.service.installSocksProxyAuthentication
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.service.replaceSettingsForTest
 import io.ktor.server.engine.embeddedServer
@@ -74,6 +75,7 @@ class ApplicationProxyAuthenticationTest {
     private fun withComponent(block: (AppComponent) -> Unit) {
         val directory = createTempDirectory("application-socks").toFile()
         val previous = Authenticator.getDefault()
+        var authentication: Lazy<com.unscientificjszhai.tgp.service.SocksProxyAuthentication>? = null
         mockkStatic(DaggerAppComponent::class)
         try {
             val settings = SettingsChangeCoordinator.forTesting(directory.resolve("settings.json"), ModelSwitchBarrier())
@@ -82,11 +84,14 @@ class ApplicationProxyAuthenticationTest {
             )
             val component = mockk<AppComponent>(relaxed = true)
             every { component.settingsChangeCoordinator } returns settings
+            authentication = lazy { installSocksProxyAuthentication { settings.settingsFlow.value.proxy } }
+            every { component.socksProxyAuthentication } answers { requireNotNull(authentication).value }
             val factory = mockk<AppComponent.Factory>()
             every { factory.create(any()) } returns component
             every { DaggerAppComponent.factory() } returns factory
             block(component)
         } finally {
+            authentication?.takeIf { it.isInitialized() }?.value?.close()
             unmockkStatic(DaggerAppComponent::class)
             Authenticator.setDefault(previous)
             directory.deleteRecursively()

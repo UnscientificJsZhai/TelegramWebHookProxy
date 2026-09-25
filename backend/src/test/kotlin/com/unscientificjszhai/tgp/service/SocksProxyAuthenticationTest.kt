@@ -1,6 +1,7 @@
 package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.*
+import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.ModelDiscoveryService
 import com.unscientificjszhai.tgp.service.ai.agent.ModelSwitchBarrier
 import com.unscientificjszhai.tgp.utils.AtomicJsonFileOperations
@@ -8,10 +9,16 @@ import com.unscientificjszhai.tgp.utils.ConfigJson
 import com.unscientificjszhai.tgp.utils.DefaultAtomicJsonFileOperations
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
-import kotlinx.coroutines.runBlocking
+import io.ktor.http.HttpStatusCode
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import java.io.DataInputStream
 import java.io.IOException
@@ -23,7 +30,9 @@ import java.net.Proxy
 import java.net.ServerSocket
 import java.nio.file.Path
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.createTempDirectory
 import kotlin.test.*
 
@@ -56,7 +65,7 @@ class SocksProxyAuthenticationTest {
 
             proxy = proxy!!.copy(type = ProxyType.HTTP)
             assertNull(challenge("proxy.example"))
-            proxy = proxy!!.copy(type = ProxyType.SOCKS, username = null, password = null)
+            proxy = proxy.copy(type = ProxyType.SOCKS, username = null, password = null)
             assertNull(challenge("proxy.example"))
             proxy = null
             assertNull(challenge("proxy.example"))
@@ -103,6 +112,234 @@ class SocksProxyAuthenticationTest {
         registration.close()
         registration.close()
         assertSame(replacement, Authenticator.getDefault())
+    }
+
+    @Test
+    fun `retired proxy credentials remain until the final client releases them`() {
+        val old = ProxySettings("old.example", 1080, ProxyType.SOCKS, "old-user", "old-pass")
+        val newer = ProxySettings("new.example", 1081, ProxyType.SOCKS, "new-user", "new-pass")
+        var current: ProxySettings? = old
+        installSocksProxyAuthentication { current }.use { registration ->
+            val firstClient = registration.retain(old)
+            val secondClient = registration.retain(old)
+            current = newer
+            assertEquals("old-user", challengeWithClientSnapshot(registration, old, firstClient)?.userName)
+            assertNull(challenge("old.example"))
+            assertEquals("new-user", challenge("new.example", port = 1081)?.userName)
+            firstClient.close()
+            assertEquals("old-user", challengeWithClientSnapshot(registration, old, secondClient)?.userName)
+            secondClient.close()
+            secondClient.close()
+            assertNull(challenge("old.example"))
+        }
+    }
+
+    @Test
+    fun `Telegram keeps the old proxy credentials through an in-flight client lease`() = runBlocking {
+        val directory = createTempDirectory("telegram-socks-lease").toFile()
+        val scopeJob = SupervisorJob()
+        val old = ProxySettings("old.example", 1080, ProxyType.SOCKS, "old-user", "old-pass")
+        val newer = ProxySettings("new.example", 1081, ProxyType.SOCKS, "new-user", "new-pass")
+        val settings = SettingsChangeCoordinator.forTesting(directory.resolve("settings.json"), ModelSwitchBarrier())
+        settings.replaceSettingsForTest(AppSettings(proxy = old))
+        val previousAuthenticator = Authenticator.getDefault()
+        val oldRequestStarted = CompletableDeferred<Unit>()
+        val finishOldRequest = CompletableDeferred<Unit>()
+        val newClientInstalled = CompletableDeferred<Unit>()
+        var oldClientLease: SocksProxyAuthentication.Lease? = null
+        installSocksProxyAuthentication { settings.settingsFlow.value.proxy }.use { authentication ->
+            val service = TelegramService(
+                CoroutineScope(scopeJob), settings, UpdatesRepository(directory.resolve("updates.json")),
+                { proxy, lease ->
+                    if (proxy == old) oldClientLease = lease
+                    HttpClient(MockEngine {
+                        if (proxy == old) {
+                            oldRequestStarted.complete(Unit)
+                            finishOldRequest.await()
+                        }
+                        respond("{}", HttpStatusCode.OK)
+                    }) { install(ContentNegotiation) { json() } }
+                },
+                authentication,
+                { proxy -> if (proxy == newer) newClientInstalled.complete(Unit) },
+            )
+            try {
+                val request = async { service.sendMessageForToken("100:test", "123", "hello") }
+                withTimeout(5_000) { oldRequestStarted.await() }
+                settings.replaceSettingsForTest(AppSettings(proxy = newer))
+                withTimeout(5_000) { newClientInstalled.await() }
+                assertEquals("old-user", challengeWithClientSnapshot(authentication, old, checkNotNull(oldClientLease))?.userName)
+                assertNull(challenge("old.example"))
+                assertEquals("new-user", challenge("new.example", port = 1081)?.userName)
+                service.close()
+                authentication.close()
+                assertEquals("old-user", challengeWithClientSnapshot(authentication, old, checkNotNull(oldClientLease))?.userName)
+                finishOldRequest.complete(Unit)
+                withTimeout(5_000) { request.await() }
+                assertSame(previousAuthenticator, Authenticator.getDefault())
+            } finally {
+                finishOldRequest.complete(Unit)
+                service.close()
+                scopeJob.cancelAndJoin()
+                directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
+    fun `same endpoint rotation and anonymous clients use their own credential snapshots`() {
+        val old = ProxySettings("proxy.example", 1080, ProxyType.SOCKS, "user", "old")
+        var current = old
+        installSocksProxyAuthentication { current }.use { registration ->
+            val oldLease = registration.retain(old)
+            val rotated = old.copy(password = "new")
+            current = rotated
+            registration.retain(rotated).use { rotatedLease ->
+                assertEquals("old", String(assertNotNull(challengeWithClientSnapshot(registration, old, oldLease)).password))
+                assertEquals("new", String(assertNotNull(challengeWithClientSnapshot(registration, rotated, rotatedLease)).password))
+                val anonymous = old.copy(username = null, password = null)
+                current = anonymous
+                registration.retain(anonymous).use { anonymousLease ->
+                    assertNull(challengeWithClientSnapshot(registration, anonymous, anonymousLease))
+                }
+                assertEquals("old", String(assertNotNull(challengeWithClientSnapshot(registration, old, oldLease)).password))
+            }
+            oldLease.close()
+        }
+    }
+
+    @Test
+    fun `application stop waits for an in-flight SOCKS lease before uninstalling authentication`() {
+        val previous = Authenticator.getDefault()
+        val proxy = ProxySettings("proxy.example", 1080, ProxyType.SOCKS, "user", "pass")
+        val registration = installSocksProxyAuthentication { proxy }
+        val lease = registration.retain(proxy)
+        try {
+            registration.close()
+            assertNotSame(previous, Authenticator.getDefault())
+            assertEquals("user", challengeWithClientSnapshot(registration, proxy, lease)?.userName)
+            registration.retain(proxy).use { lateLease ->
+                assertNull(challengeWithClientSnapshot(registration, proxy, lateLease))
+            }
+        } finally {
+            lease.close()
+            registration.close()
+        }
+        assertSame(previous, Authenticator.getDefault())
+    }
+
+    @Test
+    fun `anonymous SOCKS client retains its authentication boundary through application stop`() {
+        var previousLookups = 0
+        val previous = object : Authenticator() {
+            override fun getPasswordAuthentication(): PasswordAuthentication {
+                previousLookups++
+                return PasswordAuthentication("previous", "secret".toCharArray())
+            }
+        }
+        Authenticator.setDefault(previous)
+        val anonymous = ProxySettings("proxy.example", 1080, ProxyType.SOCKS, null, null)
+        val registration = installSocksProxyAuthentication { anonymous }
+        val lease = registration.retain(anonymous)
+        try {
+            registration.close()
+            assertNotSame(previous, Authenticator.getDefault())
+            assertNull(challengeWithClientSnapshot(registration, anonymous, lease))
+            assertEquals(0, previousLookups)
+        } finally {
+            lease.close()
+        }
+        assertSame(previous, Authenticator.getDefault())
+    }
+
+    @Test
+    fun `a real delayed SOCKS handshake keeps the old password after same endpoint rotation`() = runBlocking {
+        val greeting = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        Socks5Server("user" to "old", beforeMethodSelection = {
+            greeting.countDown()
+            assertTrue(proceed.await(5, TimeUnit.SECONDS))
+        }).use { server ->
+            val old = server.settings("user" to "old")
+            val current = AtomicReference(old)
+            installSocksProxyAuthentication { current.get() }.use { registration ->
+                val lease = registration.retain(old)
+                val client = okhttpClient(old, registration, lease)
+                try {
+                    val response = async(Dispatchers.IO) {
+                        client.newCall(Request.Builder().url("http://upstream.invalid/resource").build()).execute().use {
+                            it.body.string()
+                        }
+                    }
+                    assertTrue(greeting.await(5, TimeUnit.SECONDS))
+                    current.set(old.copy(password = "new"))
+                    proceed.countDown()
+                    assertEquals("proxied", withTimeout(5_000) { response.await() })
+                    assertEquals("user" to "old", server.awaitExchange().credentials)
+                } finally {
+                    proceed.countDown()
+                    client.connectionPool.evictAll()
+                    client.dispatcher.executorService.shutdown()
+                    lease.close()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `connection completion and failure clear unused SOCKS handshake context`() {
+        val old = ProxySettings("proxy.example", 1080, ProxyType.SOCKS, "user", "old")
+        var current = old
+        installSocksProxyAuthentication { current }.use { registration ->
+            registration.retain(old).use { lease ->
+                val client = okhttpClient(old, registration, lease)
+                val call = client.newCall(Request.Builder().url("http://upstream.invalid/resource").build())
+                val listener = client.eventListenerFactory.create(call)
+                val route = Proxy(Proxy.Type.SOCKS, InetSocketAddress(old.host, old.port))
+                val address = InetSocketAddress(old.host, old.port)
+                try {
+                    listener.connectStart(call, address, route)
+                    current = old.copy(password = "new")
+                    listener.connectEnd(call, address, route, Protocol.HTTP_1_1)
+                    assertEquals("new", String(assertNotNull(challenge(old.host)).password))
+
+                    listener.connectStart(call, address, route)
+                    listener.connectFailed(call, address, route, null, IOException("injected failure"))
+                    assertEquals("new", String(assertNotNull(challenge(old.host)).password))
+                } finally {
+                    listener.callEnd(call)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `closing an older registration unlinks it before the newer registration closes`() {
+        val previous = object : Authenticator() {
+            override fun getPasswordAuthentication() = PasswordAuthentication("original", "pass".toCharArray())
+        }
+        Authenticator.setDefault(previous)
+        var oldLookups = 0
+        val older = installSocksProxyAuthentication {
+            oldLookups++
+            ProxySettings("old.example", 1080, ProxyType.SOCKS, "old-user", "old-pass")
+        }
+        val newer = installSocksProxyAuthentication {
+            ProxySettings("new.example", 1081, ProxyType.SOCKS, "new-user", "new-pass")
+        }
+        try {
+            older.close()
+            assertEquals("new-user", challenge("new.example", port = 1081)?.userName)
+            assertEquals("original", challenge("old.example")?.userName)
+            assertEquals(0, oldLookups)
+            newer.close()
+            assertSame(previous, Authenticator.getDefault())
+            assertEquals("original", challenge("old.example")?.userName)
+            assertEquals(0, oldLookups)
+        } finally {
+            newer.close()
+            older.close()
+        }
     }
 
     @Test
@@ -230,9 +467,33 @@ class SocksProxyAuthenticationTest {
     private fun challenge(host: String?, port: Int = 1080, protocol: String = "SOCKS5"): PasswordAuthentication? =
         Authenticator.requestPasswordAuthentication(host, null, port, protocol, "SOCKS authentication", null)
 
-    private fun okhttpClient(settings: ProxySettings): OkHttpClient = OkHttpClient.Builder()
+    private fun challengeWithClientSnapshot(
+        registration: SocksProxyAuthentication,
+        proxySettings: ProxySettings,
+        lease: SocksProxyAuthentication.Lease,
+    ): PasswordAuthentication? {
+        val client = okhttpClient(proxySettings, registration, lease)
+        val call = client.newCall(Request.Builder().url("http://upstream.invalid/resource").build())
+        val listener = client.eventListenerFactory.create(call)
+        val route = Proxy(Proxy.Type.SOCKS, InetSocketAddress(proxySettings.host, proxySettings.port))
+        listener.connectStart(call, InetSocketAddress(proxySettings.host, proxySettings.port), route)
+        return try {
+            challenge(proxySettings.host, proxySettings.port)
+        } finally {
+            listener.callEnd(call)
+        }
+    }
+
+    private fun okhttpClient(
+        settings: ProxySettings,
+        registration: SocksProxyAuthentication? = null,
+        lease: SocksProxyAuthentication.Lease? = null,
+    ): OkHttpClient = OkHttpClient.Builder()
         .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress(settings.host, settings.port)))
-        .apply { configureHttpProxyBasicAuthentication(settings) }
+        .apply {
+            configureHttpProxyBasicAuthentication(settings)
+            if (registration != null) registration.configureClient(this, checkNotNull(lease))
+        }
         .retryOnConnectionFailure(false)
         .callTimeout(5, TimeUnit.SECONDS)
         .build()
@@ -242,6 +503,7 @@ class SocksProxyAuthenticationTest {
 private class Socks5Server(
     private val requiredCredentials: Pair<String, String>?,
     private val body: String = "proxied",
+    private val beforeMethodSelection: (() -> Unit)? = null,
 ) : AutoCloseable {
     private val listener = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 5000 }
     private val executor = Executors.newSingleThreadExecutor()
@@ -254,6 +516,7 @@ private class Socks5Server(
             val methods = input.readNBytes(input.readUnsignedByte())
             val method = if (requiredCredentials == null) 0 else 2
             assertTrue(method.toByte() in methods)
+            beforeMethodSelection?.invoke()
             output.write(byteArrayOf(5, method.toByte()))
             output.flush()
             val credentials = if (method == 2) {

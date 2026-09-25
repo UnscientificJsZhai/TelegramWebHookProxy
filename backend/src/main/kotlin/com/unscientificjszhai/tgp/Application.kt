@@ -7,7 +7,7 @@ import com.unscientificjszhai.tgp.modules.*
 import com.unscientificjszhai.tgp.service.BotCommandReconciler
 import com.unscientificjszhai.tgp.service.MessagePoller
 import com.unscientificjszhai.tgp.service.TelegramService
-import com.unscientificjszhai.tgp.service.installSocksProxyAuthentication
+import com.unscientificjszhai.tgp.service.ai.agent.ModelDiscoveryService
 import com.unscientificjszhai.tgp.service.ai.ScheduledTaskWorker
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
 import io.ktor.http.*
@@ -157,8 +157,7 @@ fun main() {
  */
 fun Application.module() {
     val appComponent: AppComponent = DaggerAppComponent.factory().create(AppModule(this))
-    val settings = appComponent.settingsChangeCoordinator
-    val proxyAuthentication = installSocksProxyAuthentication { settings.settingsFlow.value.proxy }
+    val proxyAuthentication = appComponent.socksProxyAuthentication
     try {
         monitor.subscribe(ApplicationStopped) { proxyAuthentication.close() }
         configureApplication(appComponent)
@@ -198,7 +197,11 @@ private fun Application.configureApplication(appComponent: AppComponent) {
     installProtocolUpgradeRejection()
 
     apiModule(appComponent.settingsChangeCoordinator, telegramService)
-    aiModelAPIModule(appComponent.settingsChangeCoordinator, agentService = agentService)
+    aiModelAPIModule(
+        appComponent.settingsChangeCoordinator,
+        agentService = agentService,
+        discovery = ModelDiscoveryService(socksProxyAuthentication = appComponent.socksProxyAuthentication),
+    )
     skillAPIModule(appComponent.skillRepository)
     messagePollerModule(messagePoller)
     taskSchedulerModule(scheduledTaskWorker)
