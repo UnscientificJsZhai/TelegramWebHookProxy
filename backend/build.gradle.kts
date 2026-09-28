@@ -34,7 +34,7 @@ dependencies {
     implementation("io.ktor:ktor-server-body-limit-jvm:$ktorVersion")
     implementation("io.ktor:ktor-server-status-pages-jvm:$ktorVersion")
     implementation("io.ktor:ktor-server-config-yaml:$ktorVersion")
-    implementation("ch.qos.logback:logback-classic:1.6.3")
+    implementation("ch.qos.logback:logback-classic:1.6.4")
 
     implementation("io.ktor:ktor-client-core:$ktorVersion")
     implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
@@ -44,15 +44,15 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Gemini SDK
-    implementation("com.google.genai:google-genai:1.72.0") {
+    implementation("com.google.genai:google-genai:1.73.0") {
         exclude(group = "com.fasterxml.jackson.core", module = "jackson-core")
         exclude(group = "commons-codec", module = "commons-codec")
     }
-    implementation("com.fasterxml.jackson.core:jackson-core:2.22.2")
+    implementation("com.fasterxml.jackson.core:jackson-core:2.22.3")
     implementation("commons-codec:commons-codec:1.22.1")
 
     // OpenAI SDK
-    implementation("com.openai:openai-java:4.64.0")
+    implementation("com.openai:openai-java:4.69.2")
 
     // AI provider transport.  Requests must retain their native OkHttp Call so coroutine cancellation can abort it.
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
