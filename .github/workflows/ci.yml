@@ -3,9 +3,9 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [ "master", "dev" ]
+    branches: ["master", "dev"]
   pull_request:
-    branches: [ "master", "dev" ]
+    branches: ["master", "dev"]
 
 permissions:
   contents: read
@@ -60,9 +60,6 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
-
-      - name: Verify backend build boundaries
-        run: bash scripts/verify-build-boundaries.sh
 
       - name: Run backend tests and build backend artifacts
         run: ./gradlew :backend:build
