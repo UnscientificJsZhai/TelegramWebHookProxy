@@ -26,11 +26,11 @@ TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统�
 ## 技术栈
 
 | 模块 | 技术                                                                  |
-|----|---------------------------------------------------------------------|
-| 后端 | Kotlin 2.4.20、Ktor 3、Dagger、kotlinx.serialization                   |
-| AI | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
-| 前端 | React 19、Vite、Material UI、React Router、Axios                        |
-| 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                          |
+| ---- | --------------------------------------------------------------------- |
+| 后端 | Kotlin 2.4.20、Ktor 3、Dagger、kotlinx.serialization                  |
+| AI   | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
+| 前端 | React 19、Vite、Material UI、React Router、Axios                      |
+| 构建 | Gradle、ShadowJar、Node Gradle Plugin、Docker                         |
 
 ## 快速开始
 
@@ -93,7 +93,11 @@ java -jar backend/build/libs/TelegramWebHookProxy-1.2.0-all.jar
 按已保存的 AI 提供商、API Key、Base URL 和代理查询当前模型列表。无需启用 Agent，查询不会修改已选模型或重置会话。
 
 ```json
-{"provider":"OPENAI","currentModel":"model-a","availableModels":["model-a","model-b"]}
+{
+  "provider": "OPENAI",
+  "currentModel": "model-a",
+  "availableModels": ["model-a", "model-b"]
+}
 ```
 
 Gemini 会汇总分页结果，并只保留支持 `generateContent` 的模型。空列表正常返回 `200`；配置不完整返回 `400`，上游请求失败返回 `502`，超时返回 `504`，错误响应为 `{"error":"说明"}`。
@@ -108,10 +112,10 @@ Gemini 会汇总分页结果，并只保留支持 `generateContent` 的模型。
 
 支持 `application/json` 与 `application/x-www-form-urlencoded`。
 
-| 查询参数           | 默认值      | 说明                             |
-|----------------|----------|--------------------------------|
-| `messagefield` | `text`   | 请求体中表示消息内容的字段名                 |
-| `chatidfield`  | `chatId` | 请求体中表示目标 Telegram Chat ID 的字段名 |
+| 查询参数       | 默认值   | 说明                                                          |
+| -------------- | -------- | ------------------------------------------------------------- |
+| `messagefield` | `text`   | 请求体中表示消息内容的字段名                                  |
+| `chatidfield`  | `chatId` | 请求体中表示目标 Telegram Chat ID 的字段名                    |
 | `richformat`   | 空       | 可选 `markdown`、`html`、`blocks`；省略或全空白时发送普通消息 |
 
 默认 JSON 请求：
@@ -139,12 +143,12 @@ curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chati
 
 `richformat` 只接受小写枚举；未知值或重复指定返回 `400`。正文仍使用 `text`（或 `messagefield` 映射的字段），目标规则不变：
 
-| 格式 | JSON 正文 | URL 编码表单正文 | Telegram 方法 |
-| --- | --- | --- | --- |
-| 普通消息（省略或空白） | 非空字符串 | 非空字符串 | `sendMessage` |
-| `markdown` | 非空 Markdown 字符串 | 非空 Markdown 字符串 | `sendRichMessage` |
-| `html` | 非空 HTML 字符串 | 非空 HTML 字符串 | `sendRichMessage` |
-| `blocks` | 非空 JSON 对象数组 | 同一数组的 JSON 字符串 | `sendRichMessage` |
+| 格式                   | JSON 正文            | URL 编码表单正文       | Telegram 方法     |
+| ---------------------- | -------------------- | ---------------------- | ----------------- |
+| 普通消息（省略或空白） | 非空字符串           | 非空字符串             | `sendMessage`     |
+| `markdown`             | 非空 Markdown 字符串 | 非空 Markdown 字符串   | `sendRichMessage` |
+| `html`                 | 非空 HTML 字符串     | 非空 HTML 字符串       | `sendRichMessage` |
+| `blocks`               | 非空 JSON 对象数组   | 同一数组的 JSON 字符串 | `sendRichMessage` |
 
 ```bash
 curl -X POST 'http://localhost:10178/api/send-message?richformat=markdown' \
@@ -170,20 +174,20 @@ Web UI 的 Webhook 页面可选择四种格式并载入示例，首页快捷发�
 
 ### 常用接口
 
-| 方法       | 路径                           | 说明                 |
-|----------|------------------------------|--------------------|
-| `GET`    | `/api/settings`              | 获取当前设置             |
-| `PUT`    | `/api/settings`              | 使用完整严格 JSON 替换全局设置 |
-| `PATCH`  | `/api/settings`              | 使用严格 JSON 局部更新全局设置 |
+| 方法     | 路径                         | 说明                             |
+| -------- | ---------------------------- | -------------------------------- |
+| `GET`    | `/api/settings`              | 获取当前设置                     |
+| `PUT`    | `/api/settings`              | 使用完整严格 JSON 替换全局设置   |
+| `PATCH`  | `/api/settings`              | 使用严格 JSON 局部更新全局设置   |
 | `POST`   | `/api/settings`              | 兼容的完整设置替换，语义同 `PUT` |
-| `POST`   | `/api/settings/chat`         | 兼容的默认 Telegram 会话更新 |
-| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话 |
-| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话          |
-| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill         |
-| `POST`   | `/api/skills`                | 新增或编辑待审批 Skill 草稿 |
-| `POST`   | `/api/skills/{id}/approve`   | 以版本号批准 Skill 并启用 |
-| `POST`   | `/api/skills/{id}/revoke`    | 以版本号撤销已批准 Skill |
-| `DELETE` | `/api/skills/{id}`           | 删除 Skill           |
+| `POST`   | `/api/settings/chat`         | 兼容的默认 Telegram 会话更新     |
+| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话       |
+| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话               |
+| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill                   |
+| `POST`   | `/api/skills`                | 新增或编辑待审批 Skill 草稿      |
+| `POST`   | `/api/skills/{id}/approve`   | 以版本号批准 Skill 并启用        |
+| `POST`   | `/api/skills/{id}/revoke`    | 以版本号撤销已批准 Skill         |
+| `DELETE` | `/api/skills/{id}`           | 删除 Skill                       |
 
 设置写入必须携带 `GET /api/settings` 返回的单个强 `ETag` 作为 `If-Match`。`PUT` 要求
 提供所有顶层与非空嵌套字段；`PATCH` 仅修改出现的字段，`proxy` 与 `ai` 可用 `null` 删除，
@@ -194,12 +198,12 @@ Web UI 的 Webhook 页面可选择四种格式并载入示例，首页快捷发�
 
 AI Agent 仅处理授权用户的私聊消息：消息必须来自私聊，且发送者 ID 与聊天 ID 都要等于 `agentChatId`。开启后可在 Telegram 中使用以下命令：
 
-| 命令              | 说明                |
-|-----------------|-------------------|
-| `/model`        | 查看当前模型与可用模型       |
-| `/model <模型名称>` | 切换模型并重置会话         |
-| `/reset`        | 重置当前会话上下文并清空待处理消息 |
-| `/keep`         | 刷新自动清理上下文的计时      |
+| 命令                | 说明                               |
+| ------------------- | ---------------------------------- |
+| `/model`            | 查看当前模型与可用模型             |
+| `/model <模型名称>` | 切换模型并重置会话                 |
+| `/reset`            | 重置当前会话上下文并清空待处理消息 |
+| `/keep`             | 刷新自动清理上下文的计时           |
 
 Agent 可用能力包括：
 
@@ -255,12 +259,6 @@ Agent 可用能力包括：
 `:backend:runShadow`、`:backend:shadowDistZip`、`:backend:shadowDistTar` 和
 `:backend:installShadowDist` 使用同一完整 Shadow Jar，也会触发前端和许可证任务。
 正式 Jar 验证包括泛型序列化、首页、静态资源、前端路由及 `/license`。
-
-验证日常任务与正式打包任务的依赖边界：
-
-```bash
-bash scripts/verify-build-boundaries.sh
-```
 
 前端单独开发：
 
