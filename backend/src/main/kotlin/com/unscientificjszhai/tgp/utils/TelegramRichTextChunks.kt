@@ -13,6 +13,7 @@ import org.commonmark.ext.task.list.items.TaskListItemsExtension
 import org.commonmark.node.*
 import org.commonmark.parser.IncludeSourceSpans
 import org.commonmark.parser.Parser
+import org.commonmark.parser.beta.LinkResult
 import java.util.ArrayDeque
 import java.util.Locale
 
@@ -30,7 +31,9 @@ internal object TelegramRichLimits {
  * 仅使用 AST 判断边界，发送内容取自原文；源码字符数作为解析后文字长度的保守上界。
  */
 internal object TelegramRichTextChunks {
-    private val parser = Parser.builder()
+    private val parser = parserBuilder().build()
+
+    private fun parserBuilder(builder: Parser.Builder = Parser.builder()): Parser.Builder = builder
         .extensions(
             listOf(
                 TablesExtension.create(),
@@ -40,7 +43,6 @@ internal object TelegramRichTextChunks {
             )
         )
         .includeSourceSpans(IncludeSourceSpans.BLOCKS_AND_INLINES)
-        .build()
 
     fun plan(source: String): List<TelegramReplyPart> {
         if (source.isBlank()) return emptyList()
@@ -222,7 +224,7 @@ internal object TelegramRichTextChunks {
 
         private fun emitRich(raw: String, start: Int, end: Int, merge: Boolean = true): Boolean {
             val text = withReferences(raw)
-            if (!fits(text)) return false
+            if (!fits(text) || hasConflictingDefinitions(text)) return false
             val previous = result.lastOrNull()
             if (merge && previous?.format == TelegramRichFormat.MARKDOWN && previous.sourceEnd == start) {
                 // 合并尚未补充定义的正文，避免共享脚注或链接定义被重复计入预算和发送内容。
@@ -264,8 +266,14 @@ internal object TelegramRichTextChunks {
             if (needed.isEmpty()) return text
             // 代码或 HTML 示例中的同文字符串不是定义，不能阻止补齐真正的引用目标。
             val local = referenceDefinitions(text)
-            val additions = needed.filter { (label, definition) -> local[label] != definition }.values
-            return if (additions.isEmpty()) text else text + "\n\n" + additions.joinToString("\n\n")
+            val additions = needed.filter { (label, definition) -> local[label] != definition }
+            if (additions.isEmpty()) return text
+            // 链接定义可安全前置，确保列表或引用内部的重复定义不能覆盖全文首次定义。
+            // 脚注前置可能吸收后续缩进代码；其冲突交给 emitRich 检查并局部降级。
+            val conflicts = additions.filter { (label, _) -> label in local && !label.startsWith("^") }
+            val prefix = if (conflicts.isEmpty()) "" else conflicts.values.joinToString("\n\n") + "\n\n"
+            val suffix = additions.filterKeys { it !in conflicts }.values
+            return prefix + text + if (suffix.isEmpty()) "" else "\n\n" + suffix.joinToString("\n\n")
         }
 
         private fun requiredDefinitions(text: String): Map<String, String> {
@@ -283,7 +291,7 @@ internal object TelegramRichTextChunks {
             return needed
         }
 
-        /** 后补的全局定义不能排在不同的局部定义之后；此时保留两个片段，避免改变引用目标。 */
+        /** 每个独立片段和合并片段都必须保留全文首次定义的优先级。 */
         private fun hasConflictingDefinitions(fragment: String): Boolean {
             val needed = requiredDefinitions(fragment)
             if (needed.isEmpty()) return false
@@ -301,44 +309,40 @@ internal object TelegramRichTextChunks {
                         else -> null
                     }?.let(::normalizeLabel)
                     if (label != null && !containsKey(label) && node.sourceSpans.isNotEmpty()) {
-                        put(label, text.substring(startOf(node, text), endOf(node, text)).trimEnd())
-                    }
-                }
-            }
-
-        /** 保留 label 中的原始标记及跨行文字，避免 Text 节点反转义或去掉强调/代码标记。 */
-        private fun referenceLabels(fragment: String): Set<String> {
-            val document = parser.parse(fragment)
-            val codeRanges = mutableListOf<IntRange>()
-            val containers = mutableListOf<Node>()
-            walk(document) { node, _ ->
-                if ((node is Code || node is FencedCodeBlock || node is IndentedCodeBlock) && node.sourceSpans.isNotEmpty()) {
-                    codeRanges += node.sourceSpans.first().inputIndex until node.sourceSpans.last()
-                        .let { it.inputIndex + it.length }
-                }
-                if (node is Paragraph || node is Heading || node is TableCell || node is HtmlBlock) containers += node
-            }
-            return buildSet {
-                for (node in containers) {
-                    val spans = node.sourceSpans
-                    val literal =
-                        spans.joinToString("\n") { fragment.substring(it.inputIndex, it.inputIndex + it.length) }
-
-                    fun originalOffset(offset: Int): Int {
-                        var remaining = offset
-                        for (span in spans) {
-                            if (remaining < span.length) return span.inputIndex + remaining
-                            remaining -= span.length + 1
+                        val definition = if (node is LinkReferenceDefinition) {
+                            // AST 跨度已去掉列表和引用前缀，补入其他片段时必须成为独立定义。
+                            node.sourceSpans.joinToString("\n") { span ->
+                                text.substring(span.inputIndex, span.inputIndex + span.length)
+                            }
+                        } else {
+                            text.substring(startOf(node, text), endOf(node, text))
                         }
-                        error("引用位置必须落在原文跨度中。")
-                    }
-                    LABEL.findAll(literal).forEach { match ->
-                        val start = originalOffset(match.range.first)
-                        val end = originalOffset(match.range.last)
-                        // 整个引用处在代码中时忽略；label 内的行内代码仍是 label 的一部分。
-                        if (codeRanges.none { start in it && end in it }) add(normalizeLabel(match.groupValues[1]))
+                        put(label, definition.trimEnd())
                     }
                 }
+            }
+
+        /** 由解析器识别完整、折叠和快捷引用，保留标签的转义及跨行原文。 */
+        private fun referenceLabels(fragment: String): Set<String> = buildSet {
+            val builder = Parser.builder().linkProcessor { info, _, _ ->
+                if (info.destination() == null) {
+                    val label = info.label()?.takeIf { it.isNotEmpty() } ?: info.text()
+                    add(normalizeLabel(label))
+                }
+                LinkResult.none()
+            }
+            // 收集器先于脚注处理器注册，未补齐定义的脚注也能被识别。
+            val referenceParser = parserBuilder(builder).build()
+            val document = referenceParser.parse(fragment)
+            // Telegram 的 HTML 容器正文也允许 Markdown；按段落扫描其引用。
+            val htmlReferenceParser = builder.enabledBlockTypes(
+                setOf(
+                    BlockQuote::class.java, Heading::class.java, FencedCodeBlock::class.java,
+                    ThematicBreak::class.java, ListBlock::class.java, IndentedCodeBlock::class.java
+                )
+            ).build()
+            walk(document) { node, _ ->
+                if (node is HtmlBlock) htmlReferenceParser.parse(node.literal)
             }
         }
 
@@ -477,12 +481,13 @@ internal object TelegramRichTextChunks {
         return ranges
     }
 
-    private fun normalizeLabel(label: String): String = label.trim().replace(Regex("\\s+"), " ").lowercase(Locale.ROOT)
+    private fun normalizeLabel(label: String): String =
+        label.trim().lowercase(Locale.ROOT).uppercase(Locale.ROOT).replace(Regex("[ \t\r\n]+"), " ")
+
     private fun characterCount(text: String): Int = text.codePointCount(0, text.length)
     private fun codePointEnd(text: String, start: Int, end: Int, count: Int): Int =
         text.offsetByCodePoints(start, minOf(count, text.codePointCount(start, end)))
 
-    private val LABEL = Regex("\\[([^]\\u0000]+)]")
     private val HTML_TAG = Regex("<(/?)([a-zA-Z][\\w-]*)\\b[^>]*>")
     private val CONTAINER_OPEN = Regex(
         "^<(details|tg-collage|tg-slideshow|table|tg-math-block|tg-math|figure|blockquote|aside|pre)(?=[\\s/>])",

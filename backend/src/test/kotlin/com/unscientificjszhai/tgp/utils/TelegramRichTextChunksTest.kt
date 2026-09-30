@@ -116,6 +116,96 @@ class TelegramRichTextChunksTest {
         assertEquals(listOf("https://first.example"), links)
     }
 
+
+    private fun linkTargets(markdown: String): List<Pair<String, String?>> {
+        val targets = mutableListOf<Pair<String, String?>>()
+        Parser.builder().build().parse(markdown).accept(object : AbstractVisitor() {
+            override fun visit(link: Link) {
+                targets += link.destination to link.title
+            }
+        })
+        return targets
+    }
+
+    private fun htmlContainerLinkTargets(markdown: String): List<String> {
+        val targets = mutableListOf<String>()
+        Parser.builder().enabledBlockTypes(emptySet()).build().parse(markdown).accept(object : AbstractVisitor() {
+            override fun visit(link: Link) {
+                targets += link.destination
+            }
+        })
+        return targets
+    }
+
+    @Test
+    fun `independent list and quote fragments preserve first reference definition`() {
+        val definition = "[doc]: https://first.example \"first\""
+        val expected = listOf("https://first.example" to "first")
+        for (container in listOf(
+            "- [文档][doc]\n\n  [doc]: https://last.example \"last\"\n",
+            "> [文档][doc]\n>\n> [doc]: https://last.example \"last\"\n"
+        )) {
+            val source = "$definition\n\n" + "```text\n" + "x".repeat(33000) +
+                    "\n```\n\n$container"
+            val parts = plan(source)
+            assertTrue(parts.size > 1)
+            val referring = parts.single { it.text.contains("[文档][doc]") }
+            assertNotNull(referring.format)
+            assertEquals(expected, parts.filter { it.format != null }.flatMap { linkTargets(it.text) })
+        }
+    }
+
+    @Test
+    fun `definitions inside containers can be reused as standalone definitions`() {
+        val expected = listOf("https://first.example" to "first")
+        for (definition in listOf(
+            "- [doc]: https://first.example\n    \"first\"",
+            "> [doc]: https://first.example\n>   \"first\""
+        )) {
+            val source = "$definition\n\n" + "```text\n" + "x".repeat(33000) +
+                    "\n```\n\n[文档][doc]\n"
+            val parts = plan(source)
+            assertTrue(parts.size > 1)
+            assertEquals(expected, parts.filter { it.format != null }.flatMap { linkTargets(it.text) })
+        }
+    }
+
+    @Test
+    fun `HTML container references retain escaped labels across fragments`() {
+        val container = "<details><summary>文档</summary>\n[文档][doc\\]part]\n</details>"
+        val definition = "[doc\\]part]: https://target.example"
+        val source = "$container\n\n```text\n${"x".repeat(33000)}\n```\n\n$definition\n"
+        val parts = plan(source)
+        assertTrue(parts.size > 1)
+        val first = parts.first()
+        assertNotNull(first.format)
+        assertEquals(listOf("https://target.example"), htmlContainerLinkTargets(first.text))
+    }
+
+    @Test
+    fun `escaped and normalized reference labels preserve link semantics across fragments`() {
+        val expected = List(3) { "https://target.example" to "title" }
+        for ((referenceLabel, definitionLabel) in listOf(
+            "doc\\]part" to "doc\\]part",
+            "doc\\[part" to "doc\\[part",
+            "doc\\\\part" to "doc\\\\part",
+            "doc\\\\" to "doc\\\\",
+            " Doc\\]Part " to "doc\\]part",
+            " Doc\n\tPart " to "doc part",
+            "doc part" to "Doc\n  Part",
+            "ẞ" to "ss"
+        )) {
+            val references = "[文档][$referenceLabel] [$referenceLabel][] [$referenceLabel]"
+            val definition = "[$definitionLabel]: https://target.example \"title\""
+            val source = "$references\n\n" + "```text\n" + "x".repeat(33000) +
+                    "\n```\n\n$definition\n"
+            val parts = plan(source)
+            assertTrue(parts.size > 1)
+            assertNotNull(parts.first().format)
+            assertEquals(expected, parts.filter { it.format != null }.flatMap { linkTargets(it.text) }, referenceLabel)
+        }
+    }
+
     @Test
     fun `definition examples in code cannot replace a referenced definition when merging`() {
         val definition = "[doc]: https://target.example"
