@@ -74,7 +74,10 @@ class SkillAPIModuleTest {
                 }.let { Json.decodeFromString<PageResult<Skill>>(it.bodyAsText()).items }
 
                 // 4. DELETE：删除第一个技能
-                client.delete("/api/skills/${skills[0].id}").apply {
+                client.delete("/api/skills/${skills[0].id}") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":${skills[0].revision}}""")
+                }.apply {
                     assertEquals(HttpStatusCode.OK, status)
                 }
 
@@ -212,10 +215,16 @@ class SkillAPIModuleTest {
             testApplication {
                 application { configureSkillApi(skillRepository) }
 
-                client.delete("/api/skills/safe?x=1").apply {
+                client.delete("/api/skills/safe?x=1") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":0}""")
+                }.apply {
                     assertEquals(HttpStatusCode.BadRequest, status)
                 }
-                client.delete("/api/skills/safe%3Fother").apply {
+                client.delete("/api/skills/safe%3Fother") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":0}""")
+                }.apply {
                     assertEquals(HttpStatusCode.BadRequest, status)
                 }
 
@@ -246,7 +255,10 @@ class SkillAPIModuleTest {
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
                     setBody(Json.encodeToString(Skill(id = "safe", description = "safe", content = "safe")))
                 }
-                val deleteResponse = client.delete("/api/skills/safe")
+                val deleteResponse = client.delete("/api/skills/safe") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":0}""")
+                }
                 val responses = listOf(getResponse, postResponse, deleteResponse)
 
                 assertTrue(responses.all { it.status == HttpStatusCode.ServiceUnavailable })
@@ -347,11 +359,62 @@ class SkillAPIModuleTest {
                 assertEquals(2, edited.revision)
                 assertTrue(skillRepository.getApprovedSkillSummaries().isEmpty())
 
-                client.delete("/api/skills/${edited.id}").apply { assertEquals(HttpStatusCode.OK, status) }
+                client.delete("/api/skills/${edited.id}") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":${edited.revision}}""")
+                }.apply { assertEquals(HttpStatusCode.OK, status) }
                 client.post("/api/skills") {
                     contentType(ContentType.Application.Json)
                     setBody("""{"id":"${edited.id}","description":"resurrect","content":"resurrect","revision":2}""")
                 }.apply { assertEquals(HttpStatusCode.NotFound, status) }
+            }
+        } finally {
+            temporaryDirectory.deleteRecursively()
+        }
+    }
+
+    /** 两名管理员交错编辑和删除时，旧确认框不能移除最新已批准版本。 */
+    @Test
+    fun `delete API rejects stale revision and preserves latest approved skill`() {
+        val temporaryDirectory = createTempDirectory("skill-api-delete-revision-test").toFile()
+        try {
+            val skillRepository = SkillRepository.forTesting(File(temporaryDirectory, "skills.json"))
+            val viewed = skillRepository.saveSkill(Skill(id = "shared", description = "original", content = "original"))
+
+            testApplication {
+                application { configureSkillApi(skillRepository) }
+                val edited = client.post("/api/skills") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"id":"shared","description":"updated","content":"latest","revision":0}""")
+                }.let { response ->
+                    assertEquals(HttpStatusCode.OK, response.status)
+                    Json.decodeFromString<Skill>(response.bodyAsText())
+                }
+                val approved = client.post("/api/skills/shared/approve") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":${edited.revision}}""")
+                }.let { response ->
+                    assertEquals(HttpStatusCode.OK, response.status)
+                    Json.decodeFromString<Skill>(response.bodyAsText())
+                }
+
+                client.delete("/api/skills/shared") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":${viewed.revision}}""")
+                }.apply { assertEquals(HttpStatusCode.Conflict, status) }
+                assertEquals(approved, skillRepository.getSkillById(viewed.id))
+
+                listOf("{}", """{"revision":-1}""", """{"revision":"invalid"}""").forEach { body ->
+                    client.delete("/api/skills/shared") {
+                        contentType(ContentType.Application.Json)
+                        setBody(body)
+                    }.apply { assertEquals(HttpStatusCode.BadRequest, status) }
+                }
+                client.delete("/api/skills/missing") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"revision":0}""")
+                }.apply { assertEquals(HttpStatusCode.NotFound, status) }
+                assertEquals(approved, skillRepository.getSkillById(viewed.id))
             }
         } finally {
             temporaryDirectory.deleteRecursively()

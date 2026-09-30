@@ -2,7 +2,7 @@ package com.unscientificjszhai.tgp.service
 
 import com.unscientificjszhai.tgp.models.InputRichMessage
 import com.unscientificjszhai.tgp.models.ReplyParameters
-import com.unscientificjszhai.tgp.repository.MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
+import com.unscientificjszhai.tgp.repository.FallbackFailureCommitResult
 import com.unscientificjszhai.tgp.repository.PendingTelegramReply
 import com.unscientificjszhai.tgp.repository.RetryCheckpointCommitResult
 import com.unscientificjszhai.tgp.repository.TelegramReplyDeliveryStage
@@ -13,12 +13,25 @@ import com.unscientificjszhai.tgp.repository.originalDeliveryText
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.Logger
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 private const val TELEGRAM_REPLY_FALLBACK_MESSAGE = "抱歉，上一条回复未能发送。"
+
+/** 限制秒数相加时饱和到 Long.MAX_VALUE，避免异常响应导致期限溢出。 */
+internal fun telegramReplyRateLimitDeadline(nowEpochMillis: Long, retryAfterSeconds: Long): Long {
+    require(retryAfterSeconds > 0)
+    val now = nowEpochMillis.coerceAtLeast(0)
+    return if (retryAfterSeconds > (Long.MAX_VALUE - now) / 1_000) {
+        Long.MAX_VALUE
+    } else {
+        now + retryAfterSeconds * 1_000
+    }
+}
 
 /**
  * 按持久化顺序投递 Telegram 回复；worker 始终运行在所属 [PollingSession.scope]。
@@ -43,7 +56,7 @@ internal class TelegramReplyOutboxWorker(
      */
     suspend fun run(session: PollingSession) {
         while (currentCoroutineContext().isActive) {
-            when (deliverNextPendingReply(session)) {
+            when (val delivery = deliverNextPendingReply(session)) {
                 OutboxDelivery.DELIVERED -> Unit
                 OutboxDelivery.EMPTY -> {
                     if (session.outboxSignal.receiveCatching().getOrNull() == null) {
@@ -55,6 +68,13 @@ internal class TelegramReplyOutboxWorker(
                     withTimeoutOrNull(1.seconds) {
                         session.outboxSignal.receiveCatching().getOrNull()
                     }
+                }
+
+                is OutboxDelivery.DEFERRED -> {
+                    val remaining =
+                        (delivery.nextDeliveryAtEpochMillis - System.currentTimeMillis()
+                            .coerceAtLeast(0)).coerceAtLeast(1)
+                    delay(remaining.coerceAtMost(60_000).milliseconds)
                 }
             }
         }
@@ -81,6 +101,10 @@ internal class TelegramReplyOutboxWorker(
             )
             return OutboxDelivery.RETRY
         } ?: return if (runtime.isCurrent(session)) OutboxDelivery.EMPTY else OutboxDelivery.RETRY
+
+        if (pendingReply.nextDeliveryAtEpochMillis > System.currentTimeMillis()) {
+            return OutboxDelivery.DEFERRED(pendingReply.nextDeliveryAtEpochMillis)
+        }
 
         var replyToSend: PendingTelegramReply? = null
         val deliveryPrepared = try {
@@ -132,25 +156,43 @@ internal class TelegramReplyOutboxWorker(
             null
         }
         if (response?.isTelegramAccepted() != true) {
-            if (
-                reply.deliveryStage == TelegramReplyDeliveryStage.FALLBACK &&
-                reply.deliveryAttempts >= MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
-            ) {
-                val exhaustedRemoved = try {
-                    runtime.saveForCurrent(session) {
-                        updatesRepository.discardExhaustedPendingTelegramReplyFallback(session.botId, reply)
-                    }
+            val retryAfterSeconds = response?.rateLimitRetryAfterSeconds()
+            if (retryAfterSeconds != null) {
+                val deadline = telegramReplyRateLimitDeadline(System.currentTimeMillis(), retryAfterSeconds)
+                val deferred = try {
+                    // 旧会话的 429 对同一 Bot 仍有效；仓储快照 CAS 阻止它覆盖新会话已推进的回复。
+                    updatesRepository.deferRateLimitedPendingTelegramReply(session.botId, reply, deadline)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     logger.error(
-                        "Failed to discard exhausted Telegram fallback chunk for reply {}; retaining it; category={}",
+                        "Failed to persist Telegram rate limit for reply {}; retaining its attempt; category={}",
                         reply.updateId,
                         SafeLogging.failureCategory(e).wireName,
                     )
                     false
                 }
-                if (exhaustedRemoved) {
+                return if (deferred) OutboxDelivery.DEFERRED(deadline) else OutboxDelivery.RETRY
+            }
+            if (reply.deliveryStage == TelegramReplyDeliveryStage.FALLBACK) {
+                if (response?.isExplicitTelegramFailure() != true) return OutboxDelivery.RETRY
+                var result = FallbackFailureCommitResult.STALE
+                val failureRecorded = try {
+                    runtime.saveForCurrent(session) {
+                        result = updatesRepository.recordPendingTelegramReplyFallbackFailure(session.botId, reply)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.error(
+                        "Failed to persist Telegram fallback failure for reply {}; retaining it; category={}",
+                        reply.updateId,
+                        SafeLogging.failureCategory(e).wireName,
+                    )
+                    false
+                }
+                if (!failureRecorded) return OutboxDelivery.RETRY
+                if (result == FallbackFailureCommitResult.DISCARDED) {
                     logger.warn(
                         "Telegram fallback reply {} of bot {} was rejected three times; terminating that reply.",
                         reply.updateId,
@@ -160,86 +202,78 @@ internal class TelegramReplyOutboxWorker(
                 }
                 return OutboxDelivery.RETRY
             }
-            if (reply.deliveryStage != TelegramReplyDeliveryStage.FALLBACK) {
-                val replacement = when {
-                    response?.isPermanentTelegramRejection() == true &&
-                            reply.shouldRetryFirstChunkWithoutReplyParameters() ->
-                        reply.withoutFirstChunkReplyParameters()
+            val replacement = when {
+                response?.isPermanentTelegramRejection() == true &&
+                        reply.shouldRetryFirstChunkWithoutReplyParameters() ->
+                    reply.withoutFirstChunkReplyParameters()
 
-                    response?.isPermanentTelegramRejection() == true && reply.isRichDelivery() -> reply.copy(
-                        replyParameters = null,
-                        deliveryStage = TelegramReplyDeliveryStage.PLAIN_FALLBACK,
-                        deliveryAttempts = 0,
-                        permanentRejectionCount = 0,
-                        plainFallbackStart = 0,
-                    )
+                response?.isPermanentTelegramRejection() == true && reply.isRichDelivery() -> reply.copy(
+                    replyParameters = null,
+                    deliveryStage = TelegramReplyDeliveryStage.PLAIN_FALLBACK,
+                    deliveryAttempts = 0,
+                    permanentRejectionCount = 0,
+                    plainFallbackStart = 0,
+                )
 
-                    response?.isPermanentTelegramRejection() == true -> reply.afterPermanentTelegramRejection()
-                    else -> reply.afterRetryableTelegramFailure()
+                response?.isPermanentTelegramRejection() == true -> reply.afterPermanentTelegramRejection()
+                else -> reply.afterRetryableTelegramFailure()
+            }
+            if (replacement == reply) {
+                logger.warn(
+                    "Telegram did not accept outbox reply chunk for update {} of bot {}; retrying later.",
+                    reply.updateId,
+                    session.botId,
+                )
+                return OutboxDelivery.RETRY
+            }
+            var replaced = false
+            val replacementPersisted = try {
+                runtime.saveForCurrent(session) {
+                    replaced = updatesRepository.replacePendingTelegramReply(session.botId, reply, replacement)
                 }
-                if (replacement == reply) {
-                    logger.warn(
-                        "Telegram did not accept outbox reply chunk for update {} of bot {}; retrying later.",
-                        reply.updateId,
-                        session.botId,
-                    )
-                    return OutboxDelivery.RETRY
-                }
-                var replaced = false
-                val replacementPersisted = try {
-                    runtime.saveForCurrent(session) {
-                        replaced = updatesRepository.replacePendingTelegramReply(session.botId, reply, replacement)
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.error(
-                        "Failed to persist Telegram outbox delivery state for reply {}; retrying later; category={}",
-                        reply.updateId,
-                        SafeLogging.failureCategory(e).wireName,
-                    )
-                    false
-                }
-                if (!replacementPersisted || !replaced) {
-                    return OutboxDelivery.RETRY
-                }
-                if (replacement.deliveryStage == TelegramReplyDeliveryStage.FALLBACK) {
-                    logger.warn(
-                        "Telegram permanently rejected outbox reply {} of bot {} twice; sending fallback next.",
-                        reply.updateId,
-                        session.botId,
-                    )
-                } else if (
-                    response?.isPermanentTelegramRejection() == true &&
-                    reply.shouldRetryFirstChunkWithoutReplyParameters()
-                ) {
-                    logger.warn(
-                        "Telegram permanently rejected the quoted first chunk for outbox reply {} of bot {}; retrying original without reply parameters.",
-                        reply.updateId,
-                        session.botId,
-                    )
-                } else if (reply.isRichDelivery() && replacement.deliveryStage == TelegramReplyDeliveryStage.PLAIN_FALLBACK) {
-                    logger.warn(
-                        "Telegram 明确拒绝回复 {} 的富片段 {}；下一次投递仅降级该片段原文。",
-                        reply.updateId,
-                        reply.nextPartIndex,
-                    )
-                } else if (replacement.permanentRejectionCount == 0) {
-                    logger.warn(
-                        "Telegram retryable failure reset permanent rejection count for outbox reply {} of bot {}.",
-                        reply.updateId,
-                        session.botId,
-                    )
-                } else {
-                    logger.warn(
-                        "Telegram permanently rejected outbox reply {} of bot {}; retaining original for one final retry.",
-                        reply.updateId,
-                        session.botId,
-                    )
-                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(
+                    "Failed to persist Telegram outbox delivery state for reply {}; retrying later; category={}",
+                    reply.updateId,
+                    SafeLogging.failureCategory(e).wireName,
+                )
+                false
+            }
+            if (!replacementPersisted || !replaced) {
+                return OutboxDelivery.RETRY
+            }
+            if (replacement.deliveryStage == TelegramReplyDeliveryStage.FALLBACK) {
+                logger.warn(
+                    "Telegram permanently rejected outbox reply {} of bot {} twice; sending fallback next.",
+                    reply.updateId,
+                    session.botId,
+                )
+            } else if (
+                response?.isPermanentTelegramRejection() == true &&
+                reply.shouldRetryFirstChunkWithoutReplyParameters()
+            ) {
+                logger.warn(
+                    "Telegram permanently rejected the quoted first chunk for outbox reply {} of bot {}; retrying original without reply parameters.",
+                    reply.updateId,
+                    session.botId,
+                )
+            } else if (reply.isRichDelivery() && replacement.deliveryStage == TelegramReplyDeliveryStage.PLAIN_FALLBACK) {
+                logger.warn(
+                    "Telegram 明确拒绝回复 {} 的富片段 {}；下一次投递仅降级该片段原文。",
+                    reply.updateId,
+                    reply.nextPartIndex,
+                )
+            } else if (replacement.permanentRejectionCount == 0) {
+                logger.warn(
+                    "Telegram retryable failure reset permanent rejection count for outbox reply {} of bot {}.",
+                    reply.updateId,
+                    session.botId,
+                )
             } else {
                 logger.warn(
-                    "Telegram did not accept outbox reply for update {} of bot {}; retrying later.",
+                    "Telegram permanently rejected outbox reply {} of bot {}; retaining original for one final retry.",
                     reply.updateId,
                     session.botId,
                 )
@@ -368,9 +402,10 @@ internal class TelegramReplyOutboxWorker(
             isFirstOriginalPart()
         }
 
-    private enum class OutboxDelivery {
-        DELIVERED,
-        EMPTY,
-        RETRY,
+    private sealed interface OutboxDelivery {
+        data object DELIVERED : OutboxDelivery
+        data object EMPTY : OutboxDelivery
+        data object RETRY : OutboxDelivery
+        data class DEFERRED(val nextDeliveryAtEpochMillis: Long) : OutboxDelivery
     }
 }

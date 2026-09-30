@@ -3,7 +3,7 @@ import {beforeEach, describe, expect, it, vi} from 'vitest';
 import type {SettingsContextValue} from '../settingsContext';
 import type {AppSettings} from '../settings';
 import {normalizeSettings} from '../settings';
-import type {VersionedSettings} from '../settingsClient';
+import type {SettingsServerVersion, VersionedSettings} from '../settingsClient';
 import SettingsProvider from './SettingsProvider';
 
 const hooks = vi.hoisted(() => ({
@@ -54,8 +54,12 @@ const deferred = <T, >() => {
     return {promise, resolve, reject};
 };
 
-const snapshot = (chatId: string, etag: string): VersionedSettings<AppSettings> => ({
+const EPOCH = '11111111-1111-4111-8111-111111111111';
+const OTHER_EPOCH = '22222222-2222-4222-8222-222222222222';
+const version = (generation: bigint, epoch = EPOCH): SettingsServerVersion => ({generation, epoch});
+const snapshot = (chatId: string, etag: string, serverVersion?: SettingsServerVersion): VersionedSettings<AppSettings> => ({
     settings: normalizeSettings({telegramToken: '100:test', chatId, proxy: null, ai: null}), etag,
+    ...(serverVersion ? {serverVersion} : {}),
 });
 
 describe('配置 Provider 的请求顺序', () => {
@@ -105,6 +109,128 @@ describe('配置 Provider 的请求顺序', () => {
         oldRead.resolve(snapshot('old', '"old"'));
         expect(await oldResult).toMatchObject({name: 'AbortError'});
         expect(render().snapshot).toEqual(snapshot('new', '"new"'));
+    });
+
+    it.each(['保存前', '保存后'])('读取在%s发起并先发布时，延迟的保存响应重新读取最新配置', async readStart => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const newer = snapshot('newer-chat', '"R3"');
+        hooks.fetch.mockResolvedValue(newer);
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+
+        const readResult = readStart === '保存前' ? render().reload() : null;
+        const updateResult = render().update({chatId: 'saved-chat'}, '"R1"');
+        await (readResult ?? render().reload());
+        expect(render().snapshot).toEqual(newer);
+
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"'));
+        await expect(updateResult).resolves.toEqual(newer);
+        expect(render()).toMatchObject({snapshot: newer, loading: false, error: null});
+        expect(hooks.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('R3 已发布且补读失败时返回 R3 快照及 ETag', async () => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const newer = snapshot('newer-chat', '"R3"', version(3n));
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+        hooks.fetch.mockResolvedValueOnce(newer).mockRejectedValueOnce(new Error('offline'));
+
+        const updateResult = render().update({chatId: 'saved-chat'}, '"R1"');
+        await render().reload();
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"', version(2n)));
+
+        await expect(updateResult).resolves.toEqual(newer);
+        expect(render()).toMatchObject({snapshot: newer, loading: false, error: null});
+        expect(hooks.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('仅有未完成读取且补读失败时不返回 PATCH 响应或旧草稿', async () => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const pendingRead = deferred<VersionedSettings<AppSettings>>();
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+        hooks.fetch.mockReturnValueOnce(pendingRead.promise).mockRejectedValueOnce(new Error('offline'));
+
+        const updateResult = render().update({chatId: 'saved-chat'}, '"R1"');
+        const oldReadResult = render().reload().catch(error => error);
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"'));
+        await expect(updateResult).rejects.toThrow('offline');
+        pendingRead.resolve(snapshot('old-chat', '"R1"'));
+        expect(await oldReadResult).toMatchObject({name: 'AbortError'});
+        expect(render()).toMatchObject({snapshot: null, loading: false});
+    });
+
+    it('旧 R1 已发布且补读失败时不将它当成保存结果', async () => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const old = snapshot('old-chat', '"R1"', version(1n));
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+        hooks.fetch.mockResolvedValueOnce(old).mockRejectedValueOnce(new Error('offline'));
+
+        const updateResult = render().update({chatId: 'saved-chat'}, old.etag);
+        await render().reload();
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"', version(2n)));
+
+        await expect(updateResult).rejects.toThrow('offline');
+        expect(render()).toMatchObject({
+            snapshot: old, loading: false,
+            error: '无法读取服务配置，请检查服务是否可用后重试。'
+        });
+    });
+
+    it.each([
+        ['ABA 旧 X', version(1n), version(3n)],
+        ['同代次', version(3n), version(3n)],
+        ['服务实例变化', version(4n, OTHER_EPOCH), version(3n)],
+        ['缺少服务端代次', undefined, version(3n)],
+        ['缺少保存响应代次', version(4n), undefined],
+    ])('%s 的已发布配置在补读失败时不能回退', async (_caseName, readVersion, savedVersion) => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const old = snapshot('old-x', '"X"', readVersion);
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+        hooks.fetch.mockResolvedValueOnce(old).mockRejectedValueOnce(new Error('offline'));
+
+        const updateResult = render().update({chatId: 'saved-chat'}, '"R1"');
+        await render().reload();
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"', savedVersion));
+
+        await expect(updateResult).rejects.toThrow('offline');
+        expect(render()).toMatchObject({
+            snapshot: old, loading: false,
+            error: '无法读取服务配置，请检查服务是否可用后重试。'
+        });
+    });
+
+    it('R3 已发布后补读成功时返回更晚的 R4', async () => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const newer = snapshot('newer-chat', '"R3"');
+        const latest = snapshot('latest-chat', '"R4"');
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+        hooks.fetch.mockResolvedValueOnce(newer).mockResolvedValueOnce(latest);
+
+        const updateResult = render().update({chatId: 'saved-chat'}, '"R1"');
+        await render().reload();
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"'));
+
+        await expect(updateResult).resolves.toEqual(latest);
+        expect(render()).toMatchObject({snapshot: latest, loading: false, error: null});
+        expect(hooks.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('补读期间发布 R4 后不再回退到先前的 R3', async () => {
+        const delayedPatch = deferred<VersionedSettings<AppSettings>>();
+        const failedRead = deferred<VersionedSettings<AppSettings>>();
+        const latest = snapshot('latest-chat', '"R4"');
+        hooks.patch.mockReturnValueOnce(delayedPatch.promise);
+        hooks.fetch.mockResolvedValueOnce(snapshot('newer-chat', '"R3"'))
+            .mockReturnValueOnce(failedRead.promise).mockResolvedValueOnce(latest);
+
+        const updateResult = render().update({chatId: 'saved-chat'}, '"R1"');
+        await render().reload();
+        delayedPatch.resolve(snapshot('saved-chat', '"R2"'));
+        await vi.waitFor(() => expect(hooks.fetch).toHaveBeenCalledTimes(2));
+        await render().reload();
+        failedRead.reject(new Error('offline'));
+
+        await expect(updateResult).rejects.toThrow('offline');
+        expect(render()).toMatchObject({snapshot: latest, loading: false, error: null});
     });
 
     it('保存失败不会使正在读取的配置失效', async () => {

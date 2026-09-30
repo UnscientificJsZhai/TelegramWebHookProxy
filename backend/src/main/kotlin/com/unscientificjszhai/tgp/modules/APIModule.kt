@@ -9,6 +9,7 @@ import com.unscientificjszhai.tgp.service.HistoricalInvalidMcpConfigurationExcep
 import com.unscientificjszhai.tgp.service.HistoricalInvalidOpenAiBaseUrlConfigurationException
 import com.unscientificjszhai.tgp.service.SettingsChangeCoordinator
 import com.unscientificjszhai.tgp.service.SettingsRevisionMismatchException
+import com.unscientificjszhai.tgp.service.SettingsSnapshot
 import com.unscientificjszhai.tgp.service.SettingsUpdateResult
 import com.unscientificjszhai.tgp.service.TelegramService
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
@@ -29,6 +30,8 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.*
 import java.nio.charset.StandardCharsets
 
+private const val SETTINGS_VERSION_HEADER = "X-Settings-Version"
+
 /**
  * 注册应用设置、聊天记录和消息发送的 HTTP API 路由。
  *
@@ -47,6 +50,7 @@ fun Application.apiModule(
             get("/settings") {
                 val (snapshot, recoveryFields) = settingsChangeCoordinator.currentSettingsWithRecovery()
                 call.response.headers.append(HttpHeaders.ETag, snapshot.revision.toStrongETag())
+                call.appendSettingsVersion(settingsChangeCoordinator, snapshot)
                 call.response.headers.append(HttpHeaders.CacheControl, "no-store")
                 if (recoveryFields.isNotEmpty()) {
                     call.response.headers.append("X-Settings-Recovery", recoveryFields.joinToString(","))
@@ -82,7 +86,7 @@ fun Application.apiModule(
                     ) { current ->
                         current.mergeSettingsPatch(patch)
                     } ?: return@patch
-                    call.respondSettingsUpdate(update)
+                    call.respondSettingsUpdate(update, settingsChangeCoordinator)
                 }
             }
             route("/settings/chat") {
@@ -104,7 +108,7 @@ fun Application.apiModule(
                         call.commitSettingsUpdate(settingsChangeCoordinator, expectedRevision) { current ->
                             current.copy(chatId = chatId)
                         } ?: return@post
-                    call.respondSettingsUpdate(update)
+                    call.respondSettingsUpdate(update, settingsChangeCoordinator)
                 }
             }
             route("/send-message") {
@@ -456,7 +460,7 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
         replacesHistoricalInvalidOpenAiBaseUrl = true,
         replacesHistoricalInvalidHttpToolSettings = true,
     ) { settings } ?: return
-    respondSettingsUpdate(update)
+    respondSettingsUpdate(update, settingsChangeCoordinator)
 }
 
 /**
@@ -503,9 +507,23 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
 }
 
 /** 返回提交后的完整设置及其用于下一次条件写入的强 ETag。 */
-private suspend fun ApplicationCall.respondSettingsUpdate(update: SettingsUpdateResult) {
+private suspend fun ApplicationCall.respondSettingsUpdate(
+    update: SettingsUpdateResult,
+    settingsChangeCoordinator: SettingsChangeCoordinator,
+) {
     response.headers.append(HttpHeaders.ETag, update.current.revision.toStrongETag())
+    appendSettingsVersion(settingsChangeCoordinator, update.current)
     respondCompleteSettings(update.current.settings, HttpStatusCode.OK)
+}
+
+private fun ApplicationCall.appendSettingsVersion(
+    settingsChangeCoordinator: SettingsChangeCoordinator,
+    snapshot: SettingsSnapshot,
+) {
+    response.headers.append(
+        SETTINGS_VERSION_HEADER,
+        "${settingsChangeCoordinator.settingsEpoch}:${snapshot.generation}",
+    )
 }
 
 /** 使用完整严格 JSON 表示返回设置，使响应可作为下一次 PUT 的完整请求体。 */

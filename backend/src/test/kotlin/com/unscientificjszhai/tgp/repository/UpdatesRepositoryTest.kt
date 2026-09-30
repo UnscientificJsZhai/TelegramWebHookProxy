@@ -1205,7 +1205,7 @@ class UpdatesRepositoryTest {
         assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
     }
 
-    /** 验证长原文中间片段的回退耗尽后删除整条回复，而不是发送原文尾部。 */
+    /** 验证中间片段回退消息第三次明确失败后删除整条回复，而不是发送原文尾部。 */
     @Test
     fun `exhausted fallback in a middle chunk removes the entire source reply`() {
         val repository = UpdatesRepository(tempDirectory.resolve("outbox-middle-fallback-chunk.json"))
@@ -1216,17 +1216,21 @@ class UpdatesRepositoryTest {
         val middle = repository.getPendingTelegramReplies("100").single()
         val exhaustedFallback = middle.copy(
             deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
-            deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS,
+            deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_FAILURES,
+            fallbackFailureCount = MAX_FALLBACK_TELEGRAM_REPLY_FAILURES - 1,
         )
         assertTrue(repository.replacePendingTelegramReply("100", middle, exhaustedFallback))
 
-        assertTrue(repository.discardExhaustedPendingTelegramReplyFallback("100", exhaustedFallback))
+        assertEquals(
+            FallbackFailureCommitResult.DISCARDED,
+            repository.recordPendingTelegramReplyFallbackFailure("100", exhaustedFallback),
+        )
         assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
     }
 
-    /** 验证重启后加载到已耗尽的回退消息时会删除整条长回复，且不会前移原文 cursor。 */
+    /** 旧版三次预登记不能证明回退消息失败，重启后应继续投递同一片段。 */
     @Test
-    fun `prepare removes a persisted exhausted fallback without advancing a long reply`() {
+    fun `prepare retries a persisted fallback with three unconfirmed attempts`() {
         val file = tempDirectory.resolve("outbox-prepared-exhausted-fallback.json")
         val source = "a".repeat(4096) + "b"
         UpdatesRepository(file).completeAgentUpdate(
@@ -1238,13 +1242,15 @@ class UpdatesRepositoryTest {
                 text = source,
                 nextChunkStart = 4096,
                 deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
-                deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS,
+                deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_FAILURES,
             ),
         )
 
         val repository = UpdatesRepository(file)
-        assertNull(repository.preparePendingTelegramReplyDelivery("100", 11))
-        assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
+        val prepared = requireNotNull(repository.preparePendingTelegramReplyDelivery("100", 11))
+        assertEquals(4096, prepared.nextChunkStart)
+        assertEquals(MAX_FALLBACK_TELEGRAM_REPLY_FAILURES + 1, prepared.deliveryAttempts)
+        assertEquals(0, prepared.fallbackFailureCount)
     }
 
     /** 验证持久化 cursor 不允许落在 surrogate pair 中间。 */
@@ -1334,21 +1340,25 @@ class UpdatesRepositoryTest {
         assertEquals(current, repository.getPendingTelegramReplies("100").single())
     }
 
-    /** 验证迟到的回退耗尽响应不能删除已经变更的当前 outbox 快照。 */
+    /** 验证迟到的回退失败响应不能修改已经变更的当前 outbox 快照。 */
     @Test
-    fun `exhausted fallback discard is compare and swap fenced`() {
+    fun `fallback failure recording is compare and swap fenced`() {
         val repository = UpdatesRepository(tempDirectory.resolve("outbox-fallback-discard-cas.json"))
         val original = PendingTelegramReply(11, "chat", "original")
         repository.completeAgentUpdate("100", 11, original)
         val exhausted = original.copy(
             deliveryStage = TelegramReplyDeliveryStage.FALLBACK,
-            deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS,
+            deliveryAttempts = MAX_FALLBACK_TELEGRAM_REPLY_FAILURES,
+            fallbackFailureCount = MAX_FALLBACK_TELEGRAM_REPLY_FAILURES - 1,
         )
         assertTrue(repository.replacePendingTelegramReply("100", original, exhausted))
         val current = exhausted.copy(deliveryAttempts = exhausted.deliveryAttempts + 1)
         assertTrue(repository.replacePendingTelegramReply("100", exhausted, current))
 
-        assertFalse(repository.discardExhaustedPendingTelegramReplyFallback("100", exhausted))
+        assertEquals(
+            FallbackFailureCommitResult.STALE,
+            repository.recordPendingTelegramReplyFallbackFailure("100", exhausted),
+        )
         assertEquals(current, repository.getPendingTelegramReplies("100").single())
     }
 

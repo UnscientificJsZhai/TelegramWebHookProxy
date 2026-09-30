@@ -3,14 +3,29 @@ import api from './api';
 const SETTINGS_RECOVERY_FIELDS = ['proxy', 'mcpServers', 'openAiBaseUrl', 'httpToolSettings'] as const;
 export type SettingsRecoveryField = typeof SETTINGS_RECOVERY_FIELDS[number];
 
+export interface SettingsServerVersion {
+    epoch: string;
+    generation: bigint;
+}
+
 export interface VersionedSettings<T> {
     settings: T;
     etag: string | null;
+    serverVersion?: SettingsServerVersion;
     recoveryFields?: SettingsRecoveryField[];
 }
 
 const responseETag = (headers: Record<string, unknown>): string | null =>
     typeof headers.etag === 'string' ? headers.etag : null;
+
+const responseServerVersion = (headers: Record<string, unknown>): SettingsServerVersion | undefined => {
+    const value = headers['x-settings-version'];
+    if (typeof value !== 'string') return undefined;
+    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(0|[1-9]\d{0,18})$/i.exec(value);
+    if (!match) return undefined;
+    const generation = BigInt(match[2]);
+    return generation <= 9223372036854775807n ? {epoch: match[1].toLowerCase(), generation} : undefined;
+};
 
 export const fetchVersionedSettings = async <T>(): Promise<VersionedSettings<T>> => {
     const response = await api.get<T>('/settings');
@@ -18,9 +33,11 @@ export const fetchVersionedSettings = async <T>(): Promise<VersionedSettings<T>>
     const recoveryFields = typeof recoveryHeader === 'string'
         ? SETTINGS_RECOVERY_FIELDS.filter(field => recoveryHeader.split(',').map(value => value.trim()).includes(field))
         : [];
+    const serverVersion = responseServerVersion(response.headers);
     return {
         settings: response.data,
         etag: responseETag(response.headers),
+        ...(serverVersion ? {serverVersion} : {}),
         ...(recoveryFields.length ? {recoveryFields} : {}),
     };
 };
@@ -35,9 +52,11 @@ export const saveVersionedSettings = async <T>(
     const response = await api.put<T>('/settings', settings, {
         headers: {'If-Match': etag}
     });
+    const serverVersion = responseServerVersion(response.headers);
     return {
         settings: response.data,
-        etag: responseETag(response.headers)
+        etag: responseETag(response.headers),
+        ...(serverVersion ? {serverVersion} : {})
     };
 };
 
@@ -51,9 +70,11 @@ export const patchVersionedSettings = async <T, P = Partial<T>>(
     const response = await api.patch<T>('/settings', patch, {
         headers: {'If-Match': etag}
     });
+    const serverVersion = responseServerVersion(response.headers);
     return {
         settings: response.data,
-        etag: responseETag(response.headers)
+        etag: responseETag(response.headers),
+        ...(serverVersion ? {serverVersion} : {})
     };
 };
 

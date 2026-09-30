@@ -1208,12 +1208,16 @@ class GeminiAgentService @Inject internal constructor(
         .orEmpty()
 
     /** 执行一个 Gemini 函数调用，并构造对应的协议函数响应。 */
-    private suspend fun createGeminiFunctionResponse(
+    internal suspend fun createGeminiFunctionResponse(
         functionCall: JsonObject,
         routeSnapshot: LocalFunctionRouteSnapshot,
     ): JsonObject {
         val name = functionCall["name"]?.jsonPrimitive?.contentOrNull
-        val args = functionCall["args"] as? JsonObject
+        val args = when (val suppliedArgs = functionCall["args"]) {
+            null -> JsonObject(emptyMap())
+            is JsonObject -> suppliedArgs
+            else -> null
+        }
         val result = try {
             when {
                 name.isNullOrBlank() -> buildJsonObject { put("error", "Function call name is missing") }

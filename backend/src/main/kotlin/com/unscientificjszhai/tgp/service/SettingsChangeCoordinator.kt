@@ -12,6 +12,7 @@ import kotlinx.serialization.json.*
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -31,6 +32,9 @@ class SettingsChangeCoordinator @Inject constructor(
     private val settingsStore: SettingsStore,
     private val modelSwitchBarrier: ModelSwitchBarrier,
 ) {
+    /** 仅在本协调器实例内比较设置代次；重启后生成新标识。 */
+    val settingsEpoch: String = UUID.randomUUID().toString()
+
     companion object {
         /**
          * 为临时配置文件、故障注入和显式模型屏障创建设置协调器。

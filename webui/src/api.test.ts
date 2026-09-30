@@ -83,16 +83,16 @@ describe('技能 API', () => {
     it('删除指定技能', async () => {
         deleteRequest.mockResolvedValueOnce({});
 
-        await deleteSkill('skill-1');
+        await deleteSkill('skill-1', 7);
 
-        expect(deleteRequest).toHaveBeenCalledWith('/skills/skill-1');
+        expect(deleteRequest).toHaveBeenCalledWith('/skills/skill-1', {data: {revision: 7}});
     });
 
     it('删除技能时编码路径标识', async () => {
         deleteRequest.mockResolvedValueOnce({});
 
-        await deleteSkill('safe?x=1/#fragment');
+        await deleteSkill('safe?x=1/#fragment', 3);
 
-        expect(deleteRequest).toHaveBeenCalledWith('/skills/safe%3Fx%3D1%2F%23fragment');
+        expect(deleteRequest).toHaveBeenCalledWith('/skills/safe%3Fx%3D1%2F%23fragment', {data: {revision: 3}});
     });
 });

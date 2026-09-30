@@ -18,6 +18,19 @@ private fun TelegramApiResponse.resultObject(): JsonObject? = try {
 internal fun TelegramApiResponse.isTelegramAccepted(): Boolean =
     status.isSuccess() && (resultObject()?.get("ok") as? JsonPrimitive)?.booleanOrNull == true
 
+/** 非 429 返回 null；缺失或异常 retry_after 使用一秒本地退避。 */
+internal fun TelegramApiResponse.rateLimitRetryAfterSeconds(): Long? {
+    val payload = resultObject()
+    val errorCode = (payload?.get("error_code") as? JsonPrimitive)?.intOrNull
+    if (status.value != 429 && errorCode != 429) return null
+    val parameters = payload?.get("parameters") as? JsonObject
+    return (parameters?.get("retry_after") as? JsonPrimitive)?.longOrNull?.takeIf { it > 0 } ?: 1L
+}
+
+/** 网络层已返回错误状态，或 Telegram 正文明确拒绝；成功状态下无法解析的正文结果仍未知。 */
+internal fun TelegramApiResponse.isExplicitTelegramFailure(): Boolean =
+    status.value >= 400 || (resultObject()?.get("ok") as? JsonPrimitive)?.booleanOrNull == false
+
 /** 限流、超时和服务端临时错误不能用于推断富消息不受支持。 */
 internal fun TelegramApiResponse.isPermanentTelegramRejection(): Boolean {
     if (status.value == 408 || status.value == 429 || status.value >= 500) return false

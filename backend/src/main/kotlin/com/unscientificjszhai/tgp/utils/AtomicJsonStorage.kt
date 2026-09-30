@@ -220,7 +220,7 @@ internal class AtomicJsonStorage(
         require(maxBytes > 0) { "JSON storage maximum size must be positive." }
     }
 
-    private val directory: Path = target.parent
+    private val directory: Path = this.target.parent
         ?: throw IllegalArgumentException("JSON storage target must have a parent directory: $target")
     private var directoryPreparedDurably = false
 

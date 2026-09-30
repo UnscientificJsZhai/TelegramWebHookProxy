@@ -17,8 +17,13 @@ import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.*
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -202,6 +207,65 @@ class GeminiAgentServiceTest {
         assertEquals("failed", response.response().get()["error"])
     }
 
+    @Test
+    fun `raw Gemini function call accepts omitted and empty object args`() = runBlocking {
+        val calls = mutableListOf<Map<String, Any?>>()
+        val routeSnapshot = recordingNoArgumentRoute(calls)
+
+        listOf(false, true).forEach { includeArgs ->
+            val functionCall = buildJsonObject {
+                put("id", "call-${calls.size + 1}")
+                put("name", "list_scheduled_tasks")
+                if (includeArgs) put("args", buildJsonObject {})
+            }
+            val functionResponse = service.createGeminiFunctionResponse(functionCall, routeSnapshot)
+            val response = functionResponse["functionResponse"]!!.jsonObject
+
+            assertEquals("list_scheduled_tasks", response["name"]!!.jsonPrimitive.content)
+            assertEquals(functionCall["id"], response["id"])
+            assertEquals("ok", response["response"]!!.jsonObject["status"]!!.jsonPrimitive.content)
+            assertEquals(if (includeArgs) 2 else 1, calls.size)
+            assertEquals(emptyMap(), calls.last())
+        }
+    }
+
+    @Test
+    fun `raw Gemini function call rejects explicitly non-object args without execution`() = runBlocking {
+        val calls = mutableListOf<Map<String, Any?>>()
+        val routeSnapshot = recordingNoArgumentRoute(calls)
+
+        listOf(JsonNull, JsonArray(emptyList()), JsonPrimitive("invalid"), JsonPrimitive(1)).forEach { args ->
+            val functionCall = buildJsonObject {
+                put("name", "list_scheduled_tasks")
+                put("args", args)
+            }
+            val functionResponse = service.createGeminiFunctionResponse(functionCall, routeSnapshot)
+            val response = functionResponse["functionResponse"]!!.jsonObject
+
+            assertEquals("list_scheduled_tasks", response["name"]!!.jsonPrimitive.content)
+            assertEquals(
+                "Function list_scheduled_tasks arguments are invalid",
+                response["response"]!!.jsonObject["error"]!!.jsonPrimitive.content,
+            )
+            assertTrue(calls.isEmpty())
+        }
+    }
+
+    private fun recordingNoArgumentRoute(calls: MutableList<Map<String, Any?>>) = LocalFunctionRouter(
+        listOf(object : LocalFunctionProvider() {
+            override val providedFunctions = listOf(
+                FunctionDeclaration.builder()
+                    .name("list_scheduled_tasks")
+                    .parameters(Schema.fromJson("""{"type":"OBJECT"}"""))
+                    .build(),
+            )
+
+            override suspend fun execute(functionName: String, args: Map<String, Any?>): JsonObject {
+                calls += args
+                return buildJsonObject { put("status", "ok") }
+            }
+        }),
+    ).refresh()
 
     private fun responseWithParts(
         vararg parts: Part,
