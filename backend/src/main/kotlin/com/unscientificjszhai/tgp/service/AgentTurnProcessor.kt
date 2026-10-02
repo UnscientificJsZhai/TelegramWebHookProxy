@@ -35,6 +35,8 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 private const val AGENT_TURN_FAILURE_REPLY = "抱歉，该消息未能处理。"
+private const val MAX_VOICE_DOWNLOAD_BYTES = 20 * 1024 * 1024L
+private const val VOICE_INPUT_FAILURE_REPLY = "抱歉，无法下载该语音，请发送不超过 20 MB 的语音或改用文字。"
 
 /**
  * 串行消费单个 PollingSession 的工作，并执行不可重放的 Agent 回合状态机。
@@ -444,6 +446,10 @@ internal class AgentTurnProcessor(
         expectedRetryCheckpointTarget: Long?,
     ): UpdateCompletion {
         val voice = checkNotNull(message.voice)
+        suspend fun failVoiceInput(): UpdateCompletion = outboxWorker.persistAuthorizedReply(
+            session, ticket, authorization, updateId, expectedRetryCheckpointTarget, VOICE_INPUT_FAILURE_REPLY,
+        )
+        if ((voice.fileSize ?: 0) > MAX_VOICE_DOWNLOAD_BYTES) return failVoiceInput()
         if (!isWithinAgentTextLimit(message.caption)) {
             logger.warn("Voice caption for update {} exceeds the local pre-claim limit.", updateId)
             return UpdateCompletion.Retry
@@ -457,6 +463,12 @@ internal class AgentTurnProcessor(
                 AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
                 is AuthorizedEffect.Executed -> result.value
             }
+            if (!fileResponse.ok) {
+                val code = fileResponse.errorCode
+                if (code != null && code in 400..499 && code != 408 && code != 429) return failVoiceInput()
+                return UpdateCompletion.Retry
+            }
+            if ((fileResponse.result?.fileSize ?: 0) > MAX_VOICE_DOWNLOAD_BYTES) return failVoiceInput()
             val filePath = fileResponse.result?.filePath
                 ?: throw IllegalStateException("Failed to get file path for voice message")
             when (
@@ -469,6 +481,10 @@ internal class AgentTurnProcessor(
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (_: TelegramFileDownloadRejectedException) {
+            return failVoiceInput()
+        } catch (_: TelegramPayloadTooLargeException) {
+            return failVoiceInput()
         } catch (e: Exception) {
             logger.warn(
                 "Voice input for update {} was unavailable before Agent claim; category={}",

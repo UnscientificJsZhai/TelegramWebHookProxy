@@ -403,15 +403,18 @@ class TelegramService private constructor(
         val url = "https://api.telegram.org/file/bot$token/$filePath"
 
         return withClientLease { client ->
-            val response = client.get(url)
-            if (!response.status.isSuccess()) {
-                val exception = IllegalStateException(
-                    "Telegram file download failed with HTTP status ${response.status.value}.",
-                )
-                response.bodyAsChannel().cancel(exception)
-                throw exception
+            client.prepareGet(url).execute { response ->
+                if (!response.status.isSuccess()) {
+                    val exception = if (response.status.value in 400..499 && response.status.value != 408 &&
+                        response.status.value != 429
+                    ) TelegramFileDownloadRejectedException() else IllegalStateException(
+                        "Telegram file download failed with HTTP status ${response.status.value}.",
+                    )
+                    response.bodyAsChannel().cancel(exception)
+                    throw exception
+                }
+                response.readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES)
             }
-            response.readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES)
         }
     }
 
@@ -544,11 +547,14 @@ class TelegramService private constructor(
 
 private const val MAX_TELEGRAM_API_BYTES = 1024 * 1024
 private val TELEGRAM_RESPONSE_JSON_BUDGET = JsonStructureLimits.Budget(maxNodes = MAX_TELEGRAM_API_BYTES)
-private const val MAX_TELEGRAM_DOWNLOAD_BYTES = 24 * 1024 * 1024
+private const val MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
 private val telegramJson = Json { ignoreUnknownKeys = true }
 
 /** Telegram 响应在解压后的实际读取字节超过当前调用的硬上限。 */
 class TelegramPayloadTooLargeException : IllegalStateException("Telegram 响应超过资源上限。")
+
+/** 文件已失效等永久下载拒绝，调用方应终止该语音更新。 */
+internal class TelegramFileDownloadRejectedException : IllegalStateException("Telegram 文件下载被永久拒绝。")
 
 private suspend fun HttpResponse.readTelegramBytes(limit: Int): ByteArray {
     val channel = bodyAsChannel()

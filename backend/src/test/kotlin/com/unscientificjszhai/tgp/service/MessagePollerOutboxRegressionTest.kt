@@ -340,7 +340,7 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
     }
 
     @Test
-    fun `three explicit non rate limit fallback failures discard reply`() = runBlocking {
+    fun `three permanent fallback failures discard reply`() = runBlocking {
         val fixture = fixture()
         fixture.updates.completeAgentUpdate(
             "100", 11, PendingTelegramReply(11, "123", "original", deliveryStage = TelegramReplyDeliveryStage.FALLBACK),
@@ -384,6 +384,34 @@ internal class MessagePollerOutboxRegressionTest : MessagePollerFacadeTestSuppor
         withTestCleanup(cleanup = { fixture.poller.closeAndJoin() }) {
             eventually(timeout = 5.seconds) { assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty()) }
             assertEquals(2, sends.get())
+        }
+    }
+
+    @Test
+    fun `temporary fallback failures retain their permanent failure budget`() = runBlocking {
+        val fixture = fixture()
+        val sends = AtomicInteger()
+        fixture.updates.completeAgentUpdate(
+            "100", 11,
+            PendingTelegramReply(
+                11, "123", "original",
+                deliveryStage = TelegramReplyDeliveryStage.FALLBACK, fallbackFailureCount = 2
+            ),
+        )
+        fixture.saveSettings(AppSettings(telegramToken = "100:token"))
+        coEvery { fixture.telegram.getUpdatesForToken("100:token", 12, 30) } returns GetUpdatesResponse(ok = true)
+        coEvery { fixture.telegram.sendMessageForToken("100:token", "123", any(), null) } coAnswers {
+            assertEquals(2, fixture.updates.getPendingTelegramReplies("100").single().fallbackFailureCount)
+            when (sends.incrementAndGet()) {
+                1 -> TelegramApiResponse(HttpStatusCode.InternalServerError, "not-json")
+                2 -> TelegramApiResponse(HttpStatusCode.OK, """{"ok":false,"error_code":503}""")
+                else -> TelegramApiResponse(HttpStatusCode.OK, """{"ok":true}""")
+            }
+        }
+        fixture.poller.start()
+        withTestCleanup(cleanup = { fixture.poller.closeAndJoin() }) {
+            eventually(timeout = 5.seconds) { assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty()) }
+            assertEquals(3, sends.get())
         }
     }
 }

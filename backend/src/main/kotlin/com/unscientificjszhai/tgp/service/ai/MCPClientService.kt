@@ -716,10 +716,17 @@ private interface McpWireStructureScanner {
 /** 对 application/json 响应全量但分 chunk 进行 JSON 结构预检查。 */
 private class JsonWireStructureScanner : McpWireStructureScanner {
     private val delegate = JsonStructureLimits.newUtf8Scanner()
+    private val payload = ByteArrayOutputStream()
 
-    override fun consume(bytes: ByteArray) = delegate.consume(bytes)
+    override fun consume(bytes: ByteArray) {
+        delegate.consume(bytes)
+        payload.write(bytes)
+    }
 
-    override fun finish() = delegate.finish()
+    override fun finish() {
+        delegate.finish()
+        validateWireToolSchemas(payload.toByteArray())
+    }
 }
 
 /**
@@ -731,21 +738,30 @@ private class SseWireStructureScanner : McpWireStructureScanner {
     private val currentLine = ByteArrayOutputStream()
     private var jsonScanner: JsonStructureLimits.Utf8Scanner? = null
     private var eventHasData = false
+    private val eventPayload = ByteArrayOutputStream()
+    private var skipLineFeed = false
 
     override fun consume(bytes: ByteArray) {
         bytes.forEach { byte ->
-            if (byte.toInt() == '\n'.code) {
-                consumeLine(currentLine.toByteArray().stripTrailingCarriageReturn())
+            val value = byte.toInt()
+            if (skipLineFeed && value == '\n'.code) {
+                skipLineFeed = false
+                return@forEach
+            }
+            skipLineFeed = false
+            if (value == '\n'.code || value == '\r'.code) {
+                consumeLine(currentLine.toByteArray())
                 currentLine.reset()
+                skipLineFeed = value == '\r'.code
             } else {
-                currentLine.write(byte.toInt())
+                currentLine.write(value)
             }
         }
     }
 
     override fun finish() {
         if (currentLine.size() > 0) {
-            consumeLine(currentLine.toByteArray().stripTrailingCarriageReturn())
+            consumeLine(currentLine.toByteArray())
             currentLine.reset()
         }
         finishEvent()
@@ -759,22 +775,53 @@ private class SseWireStructureScanner : McpWireStructureScanner {
         if (!line.startsWithAscii("data:")) return
         val payloadStart = if (line.size > 5 && line[5].toInt() == ' '.code) 6 else 5
         val scanner = jsonScanner ?: JsonStructureLimits.newUtf8Scanner().also { jsonScanner = it }
-        if (eventHasData) scanner.consume(byteArrayOf('\n'.code.toByte()))
+        if (eventHasData) {
+            scanner.consume(byteArrayOf('\n'.code.toByte()))
+            eventPayload.write('\n'.code)
+        }
         scanner.consume(line, payloadStart, line.size - payloadStart)
+        eventPayload.write(line, payloadStart, line.size - payloadStart)
         eventHasData = true
     }
 
     private fun finishEvent() {
         if (eventHasData) {
             jsonScanner?.finish()
+            validateWireToolSchemas(eventPayload.toByteArray())
         }
         jsonScanner = null
         eventHasData = false
+        eventPayload.reset()
     }
 }
 
-private fun ByteArray.stripTrailingCarriageReturn(): ByteArray =
-    if (isNotEmpty() && last().toInt() == '\r'.code) copyOf(size - 1) else this
+/**
+ * SDK 的 ToolSchema 仅保留少数根字段。解码前验证原始声明，防止约束丢失后发布宽松工具。
+ * 一页含有无法保留的根约束时终止该服务器的发现，连接候选不会发布任何部分工具快照。
+ */
+private fun validateWireToolSchemas(bytes: ByteArray) {
+    val payload = bytes.decodeToString()
+    // SSE priming 事件和 HTTP 202 通知响应可为空，SDK 会忽略其 data。
+    if (payload.isBlank()) return
+    val response = Json.parseToJsonElement(payload) as? JsonObject ?: return
+    val result = response["result"] as? JsonObject ?: return
+    val tools = result["tools"] as? JsonArray ?: return
+    for (tool in tools) {
+        val schema = (tool as? JsonObject)?.get("inputSchema") as? JsonObject
+            ?: throw McpToolSchemaNotRepresentableException()
+        if (schema.keys.any { it !in MCP_PRESERVED_ROOT_SCHEMA_KEYS } ||
+            schema["type"] != JsonPrimitive("object") ||
+            schema[$$"$schema"]?.let { it != JsonPrimitive(MCP_JSON_SCHEMA_DIALECT) } == true) {
+            throw McpToolSchemaNotRepresentableException()
+        }
+    }
+}
+
+private val MCP_PRESERVED_ROOT_SCHEMA_KEYS = setOf("type", "properties", "required", $$"$defs", $$"$schema")
+internal const val MCP_JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+
+/** 原始工具声明无法由当前 SDK 无损保留；异常不包含服务器数据。 */
+internal class McpToolSchemaNotRepresentableException : IOException("MCP 工具根架构无法无损保留。")
 
 private fun ByteArray.startsWithAscii(prefix: String): Boolean =
     size >= prefix.length && prefix.indices.all { index -> this[index].toInt() == prefix[index].code }

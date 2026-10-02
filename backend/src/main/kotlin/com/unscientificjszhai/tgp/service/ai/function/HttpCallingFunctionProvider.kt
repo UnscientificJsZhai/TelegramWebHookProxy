@@ -192,7 +192,7 @@ class HttpCallingFunctionProvider private constructor(
         return try {
             lifecycleObserver.afterRegistrationBeforeRequest()
             if (closed.get()) return error(ERROR_REQUEST_FAILED)
-            val response = client.request(fixedUrl.toString()) {
+            client.prepareRequest(fixedUrl.toString()) {
                 method = when (target.method) {
                     HttpToolMethod.GET -> HttpMethod.Get
                     HttpToolMethod.POST -> HttpMethod.Post
@@ -203,8 +203,7 @@ class HttpCallingFunctionProvider private constructor(
                     header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
                     if (body != null) setBody(body)
                 }
-            }
-            response.toSafeResult()
+            }.execute { response -> response.toSafeResult() }
         } catch (e: CancellationException) {
             throw e
         } catch (_: ResponseTooLargeException) {
@@ -279,18 +278,23 @@ class HttpCallingFunctionProvider private constructor(
     }
 
     private suspend fun HttpResponse.readBoundedBody(): ByteArray {
-        val declaredLength = headers[HttpHeaders.ContentLength]?.toLongOrNull()
-        if (declaredLength != null && declaredLength > MAX_RESPONSE_BODY_BYTES) throw ResponseTooLargeException()
-        val bytes = ByteArray(MAX_RESPONSE_BODY_BYTES + 1)
         val channel = bodyAsChannel()
-        var total = 0
-        while (total < bytes.size) {
-            val count = channel.readAvailable(bytes, total, bytes.size - total)
-            if (count < 0) break
-            if (count > 0) total += count
+        try {
+            val declaredLength = headers[HttpHeaders.ContentLength]?.toLongOrNull()
+            if (declaredLength != null && declaredLength > MAX_RESPONSE_BODY_BYTES) throw ResponseTooLargeException()
+            val bytes = ByteArray(MAX_RESPONSE_BODY_BYTES + 1)
+            var total = 0
+            while (total < bytes.size) {
+                val count = channel.readAvailable(bytes, total, bytes.size - total)
+                if (count < 0) break
+                if (count > 0) total += count
+            }
+            if (total > MAX_RESPONSE_BODY_BYTES) throw ResponseTooLargeException()
+            return bytes.copyOf(total)
+        } catch (e: ResponseTooLargeException) {
+            channel.cancel(e)
+            throw e
         }
-        if (total > MAX_RESPONSE_BODY_BYTES) throw ResponseTooLargeException()
-        return bytes.copyOf(total)
     }
 
     /**

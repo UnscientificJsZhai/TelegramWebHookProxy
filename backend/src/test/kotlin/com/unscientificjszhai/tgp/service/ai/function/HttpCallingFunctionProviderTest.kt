@@ -37,6 +37,38 @@ class HttpCallingFunctionProviderTest {
         temporaryDirectory.deleteRecursively()
     }
 
+    @Test
+    fun `streamed oversized response is rejected before the body finishes`() = runBlocking {
+        // 完整正文需要 64 秒；旧的非流式请求会先超时，无法在 256 KiB 边界返回超限错误。
+        server.enqueue(
+            MockResponse.Builder().setHeader("Content-Type", "text/plain")
+                .chunkedBody("x".repeat(4 * 1024 * 1024), 8192)
+                .throttleBody(64 * 1024, 1, TimeUnit.SECONDS).build(),
+        )
+        providerWith(
+            enabledSettings(HttpToolMethod.GET, requestTimeoutMillis = 10_000),
+            HttpToolDnsResolver { throw UnknownHostException("literal must not need DNS") }).use { provider ->
+            assertEquals(
+                HttpCallingFunctionProvider.error(HttpCallingFunctionProvider.ERROR_RESPONSE_TOO_LARGE),
+                provider.execute("call_http_api", mapOf("targetId" to "fixed")),
+            )
+        }
+    }
+
+    @Test
+    fun `response at the size boundary is preserved`() = runBlocking {
+        val body = "x".repeat(256 * 1024)
+        server.enqueue(response(body, "text/plain"))
+        providerWith(
+            enabledSettings(HttpToolMethod.GET),
+            HttpToolDnsResolver { throw UnknownHostException("literal must not need DNS") }).use { provider ->
+            assertEquals(
+                body,
+                provider.execute("call_http_api", mapOf("targetId" to "fixed"))["body"]?.jsonPrimitive?.content
+            )
+        }
+    }
+
     /** 字面地址不会触发 OkHttp DNS 回调，拒绝必须发生在任何连接或解析之前。 */
     @Test
     fun `private and ambiguous literals cannot bypass the address policy`() = runBlocking {

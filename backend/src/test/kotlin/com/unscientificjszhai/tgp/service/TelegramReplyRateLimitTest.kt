@@ -31,16 +31,30 @@ internal class TelegramReplyRateLimitTest {
     }
 
     @Test
-    fun `explicit Telegram failure recognizes HTTP error status and payload ok false`() {
-        assertTrue(TelegramApiResponse(HttpStatusCode.BadRequest, "not-json").isExplicitTelegramFailure())
+    fun `permanent Telegram failure excludes timeouts rate limits and server failures`() {
+        assertTrue(TelegramApiResponse(HttpStatusCode.BadRequest, "not-json").isPermanentTelegramRejection())
         assertTrue(
             TelegramApiResponse(
                 HttpStatusCode.OK,
                 """{"ok":false,"error_code":400,"description":"Chat not found"}""",
-            ).isExplicitTelegramFailure(),
+            ).isPermanentTelegramRejection(),
         )
-        assertFalse(TelegramApiResponse(HttpStatusCode.OK, """{"ok":true,"result":{}}""").isExplicitTelegramFailure())
-        assertFalse(TelegramApiResponse(HttpStatusCode.OK, "not-json").isExplicitTelegramFailure())
+        assertFalse(
+            TelegramApiResponse(
+                HttpStatusCode.OK,
+                """{"ok":true,"result":{}}"""
+            ).isPermanentTelegramRejection()
+        )
+        assertFalse(TelegramApiResponse(HttpStatusCode.OK, "not-json").isPermanentTelegramRejection())
+        for (code in listOf(408, 429, 500, 503)) {
+            assertFalse(TelegramApiResponse(HttpStatusCode.fromValue(code), "not-json").isPermanentTelegramRejection())
+            assertFalse(
+                TelegramApiResponse(
+                    HttpStatusCode.OK,
+                    """{"ok":false,"error_code":$code}"""
+                ).isPermanentTelegramRejection()
+            )
+        }
     }
 
     @Test

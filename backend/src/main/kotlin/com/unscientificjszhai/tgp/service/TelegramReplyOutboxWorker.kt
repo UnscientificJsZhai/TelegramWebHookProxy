@@ -175,7 +175,7 @@ internal class TelegramReplyOutboxWorker(
                 return if (deferred) OutboxDelivery.DEFERRED(deadline) else OutboxDelivery.RETRY
             }
             if (reply.deliveryStage == TelegramReplyDeliveryStage.FALLBACK) {
-                if (response?.isExplicitTelegramFailure() != true) return OutboxDelivery.RETRY
+                if (response?.isPermanentTelegramRejection() != true) return OutboxDelivery.RETRY
                 var result = FallbackFailureCommitResult.STALE
                 val failureRecorded = try {
                     runtime.saveForCurrent(session) {
