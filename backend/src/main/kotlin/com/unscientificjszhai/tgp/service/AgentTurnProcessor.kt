@@ -98,7 +98,7 @@ internal class AgentTurnProcessor(
             if (cause == null || cause is CancellationException) {
                 return@invokeOnCompletion
             }
-            if (!isRecoverableQueueConsumerFailure(cause)) {
+            if (!isRecoverableQueueConsumerFailure(session, cause)) {
                 terminateFatalQueueConsumerSession(session, consumer)
                 logger.error(
                     "Queue consumer stopped with a fatal error for bot {}; the session was terminated and will not restart; type={}",
@@ -132,7 +132,9 @@ internal class AgentTurnProcessor(
         }
     }
 
-    private fun isRecoverableQueueConsumerFailure(cause: Throwable): Boolean = cause is StackOverflowError
+    /** 恢复额度耗尽后按 fatal error 处理，必须在发布 Retry 前取消会话。 */
+    private fun isRecoverableQueueConsumerFailure(session: PollingSession, cause: Throwable): Boolean =
+        cause is StackOverflowError && runtime.withSessionLock { !session.consumerRestartedAfterError }
 
     /**
      * 在 fatal error 后原子摘除当前会话，防止 polling 继续向无人消费的队列投递。
@@ -219,7 +221,7 @@ internal class AgentTurnProcessor(
                 }
             }
         } catch (cause: Throwable) {
-            if (cause !is CancellationException && !isRecoverableQueueConsumerFailure(cause)) {
+            if (cause !is CancellationException && !isRecoverableQueueConsumerFailure(session, cause)) {
                 // 先停止会话，再发布 Retry；scope 也覆盖 pollJob 尚未完成字段赋值的启动窗口。
                 session.scope.cancel(CancellationException("Queue consumer stopped after fatal error.", cause))
             }
@@ -706,7 +708,7 @@ internal class AgentTurnProcessor(
     }
 
     /**
-     * 为 durable `FINAL` 回合提交 outbox 与 offset，并在成功后尽力清理 journal。
+     * 为 durable `FINAL` 回合原子提交 outbox、offset 和对应 journal 删除，再清理历史残留记录。
      *
      * 本方法绝不重新调用 Agent。
      *

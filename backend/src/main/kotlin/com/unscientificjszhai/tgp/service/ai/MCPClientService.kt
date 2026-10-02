@@ -89,7 +89,9 @@ class MCPClientService internal constructor(
                 config {
                     addInterceptor(Interceptor { chain ->
                         val response = chain.proceed(chain.request())
-                        if (response.body.contentLength() > MAX_MCP_RESPONSE_BYTES) {
+                        if (!response.body.contentType().isMcpSse() &&
+                            response.body.contentLength() > MAX_MCP_RESPONSE_BYTES
+                        ) {
                             response.close()
                             throw McpResponseTooLargeException()
                         }
@@ -240,10 +242,11 @@ class MCPClientService internal constructor(
             if (previousClients == null) {
                 throw IllegalStateException("MCP client service is closed.")
             }
+            // 已摘除客户端必须先登记清理，即使新请求或关闭推进代次；终态关闭会在连接栅栏后等待清理。
+            scheduleClientsForCleanup(previousClients)
             if (!isCurrentConnectionRequest(generation)) {
                 return
             }
-            scheduleClientsForCleanup(previousClients)
 
             val candidates = linkedMapOf<String, Pair<Client, List<Tool>>>()
             try {
@@ -638,8 +641,8 @@ internal const val MAX_MCP_TOOL_SCHEMA_BYTES = 64 * 1024
 internal const val MAX_MCP_TOOL_ARGUMENT_BYTES = 64 * 1024
 internal const val MAX_MCP_TOOL_RESULT_BYTES = 256 * 1024
 
-/** MCP 上游响应在解压后的实际读取字节超过上限。 */
-internal class McpResponseTooLargeException : IOException("MCP 响应超过 1 MiB 限制。")
+/** MCP JSON 响应或单个 SSE 事件在解压后的实际读取字节超过上限。 */
+internal class McpResponseTooLargeException : IOException("MCP 响应或 SSE 事件超过 1 MiB 限制。")
 
 /** MCP 工具调用参数超过可安全传递给服务器的上限。 */
 internal class McpToolArgumentsTooLargeException : IllegalArgumentException("MCP 工具调用参数超过限制。")
@@ -658,9 +661,10 @@ internal class BoundedMcpResponseBody(
     private val delegate: ResponseBody,
     private val limit: Long,
 ) : ResponseBody() {
+    private val isSse = delegate.contentType().isMcpSse()
     private val structureScanner: McpWireStructureScanner? = when {
         delegate.contentType().isMcpJson() -> JsonWireStructureScanner()
-        delegate.contentType().isMcpSse() -> SseWireStructureScanner()
+        isSse -> SseWireStructureScanner(limit)
         else -> null
     }
     private val boundedSource = object : ForwardingSource(delegate.source()) {
@@ -671,13 +675,12 @@ internal class BoundedMcpResponseBody(
             val previousSize = sink.size
             val read = super.read(sink, byteCount)
             if (read > 0) {
-                total += read
-                if (total > limit) {
-                    close()
-                    throw McpResponseTooLargeException()
-                }
                 val copied = sink.clone().apply { skip(previousSize) }.readByteArray(read)
                 try {
+                    if (!isSse) {
+                        if (total > limit - read) throw McpResponseTooLargeException()
+                        total += read
+                    }
                     structureScanner?.consume(copied)
                 } catch (error: Throwable) {
                     // SSE 可无限期保持连接；结构限制命中时不能等待 SDK 或 GC 关闭底层 socket。
@@ -733,30 +736,42 @@ private class JsonWireStructureScanner : McpWireStructureScanner {
  * 对 text/event-stream 的 data 字段逐事件进行 JSON 结构预检查。
  *
  * SSE 行和 CRLF 均可横跨网络 chunk；同一事件的多个 data 行按 SSE 规则以换行拼接后再继续扫描。
+ * 字节预算包含事件内的全部字段、注释和行尾，不包含分隔事件的空行，避免长进度流累计触发上限。
  */
-private class SseWireStructureScanner : McpWireStructureScanner {
+private class SseWireStructureScanner(private val byteLimit: Long) : McpWireStructureScanner {
     private val currentLine = ByteArrayOutputStream()
     private var jsonScanner: JsonStructureLimits.Utf8Scanner? = null
     private var eventHasData = false
     private val eventPayload = ByteArrayOutputStream()
     private var skipLineFeed = false
+    private var countPendingLineFeed = false
+    private var eventBytes = 0L
 
     override fun consume(bytes: ByteArray) {
         bytes.forEach { byte ->
             val value = byte.toInt()
             if (skipLineFeed && value == '\n'.code) {
+                if (countPendingLineFeed) countEventByte()
                 skipLineFeed = false
                 return@forEach
             }
             skipLineFeed = false
             if (value == '\n'.code || value == '\r'.code) {
+                countPendingLineFeed = currentLine.size() > 0
+                if (countPendingLineFeed) countEventByte()
                 consumeLine(currentLine.toByteArray())
                 currentLine.reset()
                 skipLineFeed = value == '\r'.code
             } else {
+                countEventByte()
                 currentLine.write(value)
             }
         }
+    }
+
+    private fun countEventByte() {
+        if (eventBytes >= byteLimit) throw McpResponseTooLargeException()
+        eventBytes++
     }
 
     override fun finish() {
@@ -792,6 +807,7 @@ private class SseWireStructureScanner : McpWireStructureScanner {
         jsonScanner = null
         eventHasData = false
         eventPayload.reset()
+        eventBytes = 0
     }
 }
 

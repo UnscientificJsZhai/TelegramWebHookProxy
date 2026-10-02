@@ -40,6 +40,9 @@ import java.util.*
 import javax.inject.Inject
 import kotlin.jvm.optionals.getOrNull
 
+/** 会话发布和历史裁剪为下一回合保留的 JSON 节点数。 */
+private const val GEMINI_TURN_RESERVATION_NODES = 1_024
+
 /**
  * 基于 Gemini API 维护对话会话并执行模型工具调用的 AI 代理服务。
  *
@@ -312,7 +315,9 @@ class GeminiAgentService @Inject internal constructor(
     private fun createGeminiHttpClient(
         proxySettings: ProxySettings?, authenticationLease: SocksProxyAuthentication.Lease,
     ): OkHttpClient {
-        val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
+        val builder = OkHttpClient.Builder()
+            .callTimeout(Duration.ofMinutes(9))
+            .readTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
             val type = when (proxySettings.type) {
                 ProxyType.HTTP -> Proxy.Type.HTTP
@@ -574,11 +579,11 @@ class GeminiAgentService @Inject internal constructor(
                     check(rawTransport === currentTransport) { "Gemini HTTP transport was replaced" }
                     val routeSnapshot = localFunctionRouter.refresh()
                     val config = createGeminiWireConfig(aiSettings, routeSnapshot)
-                    val candidateHistory = if (captureHistory) {
-                        prepareRawGeminiCandidate(rawSession?.history.orEmpty(), config)
-                    } else {
-                        emptyList()
-                    }
+                    validateRawGeminiSessionConfig(config)
+                    val candidateHistory = prepareRawGeminiCandidate(
+                        if (captureHistory) rawSession?.history.orEmpty() else emptyList(),
+                        config,
+                    )
                     val model = switchRequest?.model ?: currentModel
                     val candidate = RawGeminiSession(
                         model = model,
@@ -1021,7 +1026,19 @@ class GeminiAgentService @Inject internal constructor(
         }
     }
 
-    /** 复制已提交的 REST 历史，并以完整回合为单位预留下一回合的空间。 */
+    /** 在发布前校验累计系统提示和工具配置，并预留新回合的结构空间。 */
+    private fun validateRawGeminiSessionConfig(config: JsonObject) {
+        try {
+            JsonStructureLimits.validateElement(
+                createRawGeminiRequestBody(emptyList(), config),
+                JsonStructureLimits.Budget(maxNodes = JsonStructureLimits.MAX_NODES - GEMINI_TURN_RESERVATION_NODES),
+            )
+        } catch (error: JsonStructureLimitExceededException) {
+            throw IllegalArgumentException("Gemini 系统提示或工具配置超过资源上限，无法预留新回合空间。", error)
+        }
+    }
+
+    /** 复制已提交的 REST 历史，并以完整回合为单位预留下一回合的字节与结构空间。 */
     private fun prepareRawGeminiCandidate(history: List<JsonObject>, config: JsonObject): MutableList<JsonObject> {
         val candidate = history.toMutableList()
         normalizeRawGeminiCandidate(
@@ -1030,6 +1047,7 @@ class GeminiAgentService @Inject internal constructor(
             maxEntries = MAX_AGENT_HISTORY_ENTRIES - 1,
             maxBytes = MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES,
             config = config,
+            maxNodes = JsonStructureLimits.MAX_NODES - GEMINI_TURN_RESERVATION_NODES,
         )
         return candidate
     }
@@ -1046,8 +1064,9 @@ class GeminiAgentService @Inject internal constructor(
         maxEntries: Int = MAX_AGENT_HISTORY_ENTRIES,
         maxBytes: Int = MAX_AGENT_HISTORY_BYTES,
         config: JsonObject = buildJsonObject {},
+        maxNodes: Int = JsonStructureLimits.MAX_NODES,
     ) {
-        while (!rawGeminiCandidateFits(candidate, maxEntries, maxBytes, config)) {
+        while (!rawGeminiCandidateFits(candidate, maxEntries, maxBytes, config, maxNodes)) {
             val protectedTurnStart = currentTurnStart?.let { currentRawGeminiTurnStart(candidate) }
             val firstHistoricalTurn = candidate.indexOfFirst { it.isNormalGeminiUserTurnStart() }
             if (firstHistoricalTurn < 0 ||
@@ -1074,12 +1093,16 @@ class GeminiAgentService @Inject internal constructor(
         maxEntries: Int,
         maxBytes: Int,
         config: JsonObject,
+        maxNodes: Int,
     ): Boolean {
         return try {
             if (candidate.size > maxEntries || rawGeminiHistoryBytes(candidate) > maxBytes) {
                 false
             } else {
-                JsonStructureLimits.validateElement(createRawGeminiRequestBody(candidate, config))
+                JsonStructureLimits.validateElement(
+                    createRawGeminiRequestBody(candidate, config),
+                    JsonStructureLimits.Budget(maxNodes = maxNodes),
+                )
                 true
             }
         } catch (_: JsonStructureLimitExceededException) {

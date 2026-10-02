@@ -147,8 +147,8 @@ class MessagePollerTest {
             val bot = state.bots["100"]
             if (
                 bot?.lastUpdateId == 11L &&
-                bot.pendingTelegramReplies.any { it.updateId == 11L } &&
-                bot.agentTurnJournal.any { it.updateId == 11L && it.reply == "reply" } &&
+                bot.pendingTelegramReplies.any { it.updateId == 11L && it.text == "reply" } &&
+                bot.agentTurnJournal.none { it.updateId == 11L } &&
                 rejectFirstCompletion.compareAndSet(true, false)
             ) {
                 throw IOException("injected completeAgentUpdate failure")

@@ -694,9 +694,9 @@ class UpdatesRepositoryTest {
         assertTrue(repository.getPendingTelegramReplies("100").isEmpty())
     }
 
-    /** 验证 Agent 回合账本跨重载保留状态，并只在偏移量确认后删除 FINAL 残留。 */
+    /** 验证 Agent 回合账本跨重载保留状态，并在偏移量确认的同一次提交中删除 FINAL。 */
     @Test
-    fun `agent turn journal persists final state and cleans it after confirmed offset`() {
+    fun `agent turn journal persists final state and transfers it atomically with confirmed offset`() {
         val file = tempDirectory.resolve("agent-turn-journal.json")
         val repository = UpdatesRepository(file)
 
@@ -717,7 +717,21 @@ class UpdatesRepositoryTest {
         assertEquals(final, UpdatesRepository(file).getData("100").agentTurnJournal.single())
 
         repository.completeAgentUpdate("100", 11, PendingTelegramReply(11, "chat", "reply", ReplyParameters(1)))
+        assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
+        assertTrue(UpdatesRepository(file).getData("100").agentTurnJournal.isEmpty())
+    }
+
+    /** 验证 cleanupConfirmedAgentTurns 能够安全清理历史遗留的已确认 FINAL 记录。 */
+    @Test
+    fun `cleanupConfirmedAgentTurns removes legacy confirmed final turns`() {
+        val file = tempDirectory.resolve("legacy-confirmed-journal.json")
+        val repository = UpdatesRepository(file)
+        repository.claimAgentTurn("100", 11, "chat", ReplyParameters(1))
+        repository.finalizeAgentTurn("100", 11, "reply")
+        repository.saveLastUpdateId("100", 11)
+
         assertEquals(1, repository.cleanupConfirmedAgentTurns("100"))
+        assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
         assertTrue(UpdatesRepository(file).getData("100").agentTurnJournal.isEmpty())
     }
 
@@ -1050,6 +1064,7 @@ class UpdatesRepositoryTest {
         assertEquals(12, repository.getData("100").lastUpdateId)
         assertNull(repository.getData("100").retryCheckpoint)
         assertEquals(12, repository.getPendingTelegramReplies("100").single().updateId)
+        assertTrue(repository.getData("100").agentTurnJournal.isEmpty())
 
         assertEquals(AgentTurnClaim.CLAIMED, repository.claimAgentTurn("100", 13, "chat", ReplyParameters(2)))
         assertEquals(

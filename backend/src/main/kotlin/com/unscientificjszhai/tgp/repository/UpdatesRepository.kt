@@ -624,7 +624,8 @@ class UpdatesRepository private constructor(
      * 原子记录一轮已成功完成的 Agent 处理，并推进该机器人的更新偏移量。
      *
      * 非空 [reply] 会和 [updateId] 的偏移量在同一次文件提交中写入 outbox，先后重试不会覆盖已有
-     * 同标识回复。空回复仍会在同一次提交中确认偏移量，表示该 Agent 回合已经完成且无需投递。文件
+     * 同标识回复。对应的 FINAL 账本记录在同一次提交中删除，避免正文和投递计划重复占用存储预算。
+     * 空回复仍会在同一次提交中确认偏移量，表示该 Agent 回合已经完成且无需投递。文件
      * 提交失败时内存状态保持不变，调用方必须保留该更新并停止继续确认后续更新。存在重试检查点时，该旧版
      * 无条件确认 API 会 fail-closed 并返回原快照，不会创建 outbox、推进偏移量或跨过检查点；调用方必须改用
      * [completeAgentUpdateAtRetryCheckpoint] 进行条件确认。
@@ -665,6 +666,9 @@ class UpdatesRepository private constructor(
             current.copy(
                 lastUpdateId = maxOf(current.lastUpdateId, updateId),
                 pendingTelegramReplies = replies,
+                agentTurnJournal = current.agentTurnJournal.filterNot {
+                    it.updateId == updateId && it.status == AgentTurnJournalStatus.FINAL
+                },
             )
         }
     }
@@ -674,7 +678,7 @@ class UpdatesRepository private constructor(
      *
      * 与 [completeAgentUpdate] 的 outbox 语义相同，但 [expectedRetryTarget] 必须与读取快照一致；为 `null`
      * 时要求没有检查点，非空时必须等于 [updateId]。这样 FINAL 回放不会跨越较早的失败更新，且成功提交会
-     * 同时写入 outbox、偏移量并清除该检查点。
+     * 同时写入 outbox、偏移量，删除对应 FINAL 账本记录并清除该检查点。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param updateId 已成功完成的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
@@ -709,6 +713,9 @@ class UpdatesRepository private constructor(
             current.copy(
                 lastUpdateId = maxOf(current.lastUpdateId, updateId),
                 pendingTelegramReplies = replies,
+                agentTurnJournal = current.agentTurnJournal.filterNot {
+                    it.updateId == updateId && it.status == AgentTurnJournalStatus.FINAL
+                },
                 retryCheckpoint = null,
             )
         }

@@ -103,6 +103,24 @@ class GeminiAgentServiceTest {
         assertEquals(currentTurn, history)
     }
 
+    @Test
+    fun `raw history preparation reserves node capacity before starting the next turn`() {
+        val history = (0..2).flatMap { rawHistoryTurn("old-$it", 1300) }
+        JsonStructureLimits.validateElement(JsonArray(history))
+        val method = GeminiAgentService::class.java.getDeclaredMethod(
+            "prepareRawGeminiCandidate", List::class.java, JsonObject::class.java,
+        ).apply { isAccessible = true }
+
+        @Suppress("UNCHECKED_CAST")
+        val prepared = method.invoke(service, history, buildJsonObject {}) as List<JsonObject>
+
+        assertEquals(8, prepared.size)
+        assertEquals(history.takeLast(8), prepared)
+        JsonStructureLimits.validateElement(buildJsonObject {
+            put("contents", JsonArray(prepared + rawHistoryTurn("current", 1000)))
+        })
+    }
+
     private fun rawHistoryTurn(label: String, resultNodes: Int): List<JsonObject> {
         val items = List(resultNodes) { "0" }.joinToString(",")
         return listOf(
@@ -117,6 +135,7 @@ class GeminiAgentServiceTest {
         val method = GeminiAgentService::class.java.getDeclaredMethod(
             "normalizeRawGeminiCandidate", List::class.java, Int::class.javaObjectType,
             Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, JsonObject::class.java,
+            Int::class.javaPrimitiveType,
         ).apply { isAccessible = true }
         val currentTurnStart = history.indexOfLast { it["parts"].toString().contains("\"text\":\"current\"") }
         try {
@@ -126,7 +145,8 @@ class GeminiAgentServiceTest {
                 currentTurnStart,
                 MAX_AGENT_HISTORY_ENTRIES,
                 MAX_AGENT_HISTORY_BYTES,
-                config
+                config,
+                JsonStructureLimits.MAX_NODES,
             )
         } catch (failure: InvocationTargetException) {
             throw failure.targetException

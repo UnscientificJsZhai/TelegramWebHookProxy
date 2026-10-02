@@ -8,6 +8,8 @@ import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody
 import okio.Buffer
+import okio.ForwardingSource
+import okio.buffer
 import kotlin.test.*
 
 /**
@@ -58,6 +60,73 @@ class MCPClientServiceTest {
     fun `empty JSON notification response is allowed`() {
         val delegate = CloseTrackingResponseBody("application/json".toMediaType(), "")
         assertEquals("", BoundedMcpResponseBody(delegate, MAX_MCP_RESPONSE_BYTES).source().readUtf8())
+    }
+
+    @Test
+    fun `SSE progress stream larger than response limit delivers final result`() {
+        val progress = "data: " + buildJsonObject {
+            put("jsonrpc", "2.0")
+            put("method", "notifications/progress")
+            put("params", buildJsonObject {
+                put("progressToken", "test")
+                put("progress", 1)
+                put("message", "x".repeat(1024))
+            })
+        } + "\r\n\r\n"
+        val final =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\r\n\r\n"
+        val body = progress.repeat(1000) + final
+        assertTrue(body.toByteArray().size > MAX_MCP_RESPONSE_BYTES)
+        val delegate = CloseTrackingResponseBody("text/event-stream".toMediaType(), body)
+
+        assertEquals(body, BoundedMcpResponseBody(delegate, MAX_MCP_RESPONSE_BYTES).source().readUtf8())
+    }
+
+    @Test
+    fun `SSE event budget resets across fragmented CR LF and CRLF separators`() {
+        for (ending in listOf("\r", "\n", "\r\n")) {
+            val event = "id: cursor${ending}data: {\"ok\":true}${ending}data: ${ending}comment: ignored${ending}"
+            val body = (event + ending).repeat(10)
+            val delegate = CloseTrackingResponseBody("text/event-stream".toMediaType(), body, chunkSize = 1)
+            val responseBody = BoundedMcpResponseBody(delegate, event.toByteArray().size.toLong())
+
+            assertEquals(body, responseBody.source().readUtf8())
+
+            val oversized = CloseTrackingResponseBody("text/event-stream".toMediaType(), body, chunkSize = 1)
+            assertFailsWith<McpResponseTooLargeException> {
+                BoundedMcpResponseBody(oversized, event.toByteArray().size.toLong() - 1).source().readUtf8()
+            }
+            assertTrue(oversized.closed)
+        }
+    }
+
+    @Test
+    fun `oversized SSE data comments and multiline events close before EOF`() {
+        val events = listOf(
+            "data: {\"text\":\"${"x".repeat(200)}\"}",
+            ":${"x".repeat(200)}",
+            "data: {\"text\":\"${"x".repeat(50)}\"}\ndata: ${" ".repeat(50)}\n",
+        )
+        for (event in events) {
+            val delegate = CloseTrackingResponseBody("text/event-stream".toMediaType(), event, chunkSize = 3)
+
+            assertFailsWith<McpResponseTooLargeException> {
+                BoundedMcpResponseBody(delegate, 100).source().readByteArray()
+            }
+            assertTrue(delegate.closed)
+        }
+    }
+
+    @Test
+    fun `JSON responses keep the total byte limit`() {
+        val delegate = CloseTrackingResponseBody(
+            "application/json".toMediaType(), "{\"text\":\"${"x".repeat(200)}\"}", chunkSize = 3,
+        )
+
+        assertFailsWith<McpResponseTooLargeException> {
+            BoundedMcpResponseBody(delegate, 100).source().readByteArray()
+        }
+        assertTrue(delegate.closed)
     }
 
     @Test
@@ -143,14 +212,18 @@ class MCPClientServiceTest {
     private class CloseTrackingResponseBody(
         private val contentType: MediaType,
         body: String,
+        chunkSize: Long = 8192,
     ) : ResponseBody() {
-        private val source = Buffer().writeUtf8(body)
+        private val length = body.toByteArray().size.toLong()
+        private val source = object : ForwardingSource(Buffer().writeUtf8(body)) {
+            override fun read(sink: Buffer, byteCount: Long): Long = super.read(sink, minOf(byteCount, chunkSize))
+        }.buffer()
         var closed = false
             private set
 
         override fun contentType(): MediaType = contentType
 
-        override fun contentLength(): Long = source.size
+        override fun contentLength(): Long = length
 
         override fun source() = source
 
