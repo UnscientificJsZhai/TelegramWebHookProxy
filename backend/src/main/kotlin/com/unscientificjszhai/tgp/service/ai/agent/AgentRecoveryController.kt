@@ -148,6 +148,20 @@ internal class AgentRecoveryController<T : Any, C : Any>(
         start.start()
     }
 
+    /** 无关设置变化只推进已就绪服务的版本，不重新初始化或清空历史。 */
+    fun advanceReadySettingsVersion(settingsVersion: Long): Boolean = synchronized(lock) {
+        val current = _availability.value
+        if (closed || current.state != AgentAvailabilityState.READY) return@synchronized false
+        activeRequest = null
+        transitionLocked(
+            state = AgentAvailabilityState.READY,
+            provider = current.provider,
+            settingsVersion = settingsVersion,
+            attempt = current.attempt,
+        )
+        true
+    }
+
     /** 禁用当前目标并唤醒所有 availability 等待者。 */
     fun disable(settingsVersion: Long, onFirstAttemptFinished: () -> Unit = {}) {
         var activeJob: Job? = null

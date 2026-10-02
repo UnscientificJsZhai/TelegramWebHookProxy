@@ -24,6 +24,80 @@ import kotlin.time.Duration.Companion.seconds
 
 class DelegatingAgentRecoveryIntegrationTest {
     @Test
+    fun `saving unrelated settings retains the published OpenAI service and conversation history`() = runBlocking {
+        val directory = Files.createTempDirectory("delegating-agent-retain-history").toFile()
+        val server = MockWebServer()
+        val parentJob = SupervisorJob(coroutineContext[Job])
+        val scope = CoroutineScope(coroutineContext + parentJob)
+        var delegating: DelegatingAgentService? = null
+        try {
+            server.start()
+            server.enqueue(
+                MockResponse.Builder().code(200).body(
+                    """{"data":[{"id":"gpt-5.6-luna","object":"model","created":0,"owned_by":"test"}]}""",
+                ).build()
+            )
+            repeat(2) {
+                server.enqueue(
+                    MockResponse.Builder().code(200).setHeader("Content-Type", "application/json").body(
+                        """{"id":"completion","object":"chat.completion","created":0,"model":"gpt-5.6-luna","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"reply"}}]}""",
+                    ).build()
+                )
+            }
+            val barrier = ModelSwitchBarrier()
+            val settings = SettingsChangeCoordinator.forTesting(File(directory, "settings.json"), barrier)
+            val skills = SkillRepository.forTesting(File(directory, "skills.json"))
+            settings.replaceSettingsForTest(
+                AppSettings(
+                    ai = AISettings(
+                        provider = AIProvider.OPENAI,
+                        openAiApiKey = "test-key",
+                        openAiBaseUrl = server.url("/v1").toString().trimEnd('/'),
+                        selectedModel = "gpt-5.6-luna",
+                        agentEnabled = true,
+                    )
+                )
+            )
+            val components = CopyOnWriteArrayList<TestAgentComponent>()
+            val factory = object : AgentComponent.Factory {
+                override fun create(): AgentComponent =
+                    TestAgentComponent(scope, settings, skills).also(components::add)
+            }
+            val service = DelegatingAgentService(factory, settings, skills, barrier, scope)
+            delegating = service
+            withTimeout(5.seconds) { service.availability.first { it.state == AgentAvailabilityState.READY } }
+            assertEquals("reply", service.sendMessage("first history canary"))
+            settings.updateSettings { current ->
+                current.copy(
+                    chatId = "new webhook default", ai = current.ai!!.copy(
+                        geminiApiKey = "unused-key",
+                        autoCleanContextIntervalMinutes = 5,
+                        silentContextCleanup = true,
+                    )
+                )
+            }
+            val version = settings.currentSettingsSnapshot().generation
+            withTimeout(5.seconds) {
+                service.availability.first { it.state == AgentAvailabilityState.READY && it.settingsVersion == version }
+            }
+            assertFalse(barrier.isSwitching)
+            assertEquals("reply", service.sendMessage("second history canary"))
+            assertEquals(1, components.size)
+            assertEquals(3, server.requestCount)
+            assertEquals("/v1/models", server.takeRequest().url.encodedPath)
+            assertTrue(server.takeRequest().body!!.utf8().contains("first history canary"))
+            val secondBody = server.takeRequest().body!!.utf8()
+            assertTrue(secondBody.contains("first history canary"))
+            assertTrue(secondBody.contains("second history canary"))
+        } finally {
+            delegating?.close()?.join()
+            parentJob.cancelAndJoin()
+            server.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `transient OpenAI startup failure recovers with a new component without settings resave`() = runBlocking {
         val directory = Files.createTempDirectory("delegating-agent-recovery").toFile()
         val server = MockWebServer()

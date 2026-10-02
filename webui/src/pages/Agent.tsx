@@ -152,7 +152,7 @@ function AgentSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
                 <SectionCard title="服务凭据" icon={<KeyOutlined/>}
                              action={<Typography variant="caption" color="text.secondary">独立保存</Typography>}>
                     <Stack spacing={2.5}>
-                        <TextField select label="AI 提供商" value={draft.provider}
+                        <TextField select label="AI 提供商" value={draft.provider} disabled={!!saving}
                                    onChange={event => set('provider', event.target.value as AISettings['provider'])}><MenuItem
                             value="GEMINI">Google Gemini</MenuItem><MenuItem value="OPENAI">OpenAI（兼容 API）</MenuItem></TextField>
                         {draft.provider === 'GEMINI' ? <SecretField label="Gemini API 密钥" value={draft.geminiApiKey}

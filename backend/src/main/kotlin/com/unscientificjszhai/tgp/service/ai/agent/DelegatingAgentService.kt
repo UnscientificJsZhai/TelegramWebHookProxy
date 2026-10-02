@@ -11,6 +11,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.sync.Semaphore
@@ -64,6 +65,9 @@ class DelegatingAgentService @Inject internal constructor(
      * @property apiKey 目标提供商凭据。
      * @property baseUrl 目标提供商基础地址。
      * @property proxySettings 目标网络代理设置。
+     * @property telegramToken 控制 Telegram 授权生命周期的令牌。
+     * @property sessionSettings 排除非活动凭据和自动清理策略后的有效会话配置。
+     * @property skillsVersion 已批准技能变更事件的本地代次。
      */
     private data class AgentConfiguration(
         val settingsVersion: Long,
@@ -71,13 +75,16 @@ class DelegatingAgentService @Inject internal constructor(
         val apiKey: String,
         val baseUrl: String,
         val proxySettings: ProxySettings?,
+        val telegramToken: String,
+        val sessionSettings: AISettings,
+        val skillsVersion: Long,
     ) {
         val networkIdentity: NetworkIdentity
             get() = NetworkIdentity(provider, apiKey, baseUrl, proxySettings)
     }
 
     /**
-     * 决定 Agent 组件能否复用的网络身份。
+     * 决定恢复退避计数是否清零的网络身份。
      *
      * @property provider 目标 AI 提供商。
      * @property apiKey 目标提供商凭据。
@@ -160,26 +167,30 @@ class DelegatingAgentService @Inject internal constructor(
         get() = recoveryController.availability
 
     init {
+        var skillsVersion = 0L
         settingsJob = combine(
             settingsChangeCoordinator.settingsUpdateFlow,
-            skillRepository.skillsUpdateEvent.onStart { emit(Unit) },
-        ) { settingsUpdate, _ -> settingsUpdate }
-            .onEach(::submitLifecycleTarget)
+            skillRepository.skillsUpdateEvent.onStart { emit(Unit) }.map { skillsVersion++ },
+        ) { settingsUpdate, version -> settingsUpdate to version }
+            .onEach { (settingsUpdate, version) -> submitLifecycleTarget(settingsUpdate, version) }
             .launchIn(parentScope)
             .also { job -> job.invokeOnCompletion { completeInitialReadiness() } }
     }
 
     /** 把一次设置或技能事件线性化为恢复目标；本方法不执行网络或长时间等待。 */
-    private fun submitLifecycleTarget(settingsUpdate: SettingsUpdate) {
-        val configuration = settingsUpdate.toAgentConfigurationOrNull()
-        val (epoch, supersededTerminalTransition) = synchronized(lifecycleLock) {
+    private fun submitLifecycleTarget(settingsUpdate: SettingsUpdate, skillsVersion: Long) {
+        val configuration = settingsUpdate.toAgentConfigurationOrNull(skillsVersion)
+        val (epoch, supersededTerminalTransition, reused) = synchronized(lifecycleLock) {
             if (closed || settingsUpdate.version < desiredSettingsVersion) return
             val previousTerminalTransition = terminalTransitionJob
             terminalTransitionJob = null
+            val reuse = configuration != null && _currentService != null &&
+                    readyConfiguration?.copy(settingsVersion = settingsUpdate.version) == configuration &&
+                    recoveryController.advanceReadySettingsVersion(settingsUpdate.version)
             desiredSettingsVersion = settingsUpdate.version
             desiredConfiguration = configuration
-            readyConfiguration = null
-            ++lifecycleEpoch to previousTerminalTransition
+            readyConfiguration = configuration.takeIf { reuse }
+            Triple(++lifecycleEpoch, previousTerminalTransition, reuse)
         }
         supersededTerminalTransition?.cancel(
             CancellationException("Agent terminal lifecycle target was superseded."),
@@ -187,6 +198,10 @@ class DelegatingAgentService @Inject internal constructor(
         val firstAttemptFinished = {
             modelSwitchBarrier.completeSettingsThrough(settingsUpdate.switchGeneration)
             completeInitialReadiness()
+        }
+        if (reused) {
+            firstAttemptFinished()
+            return
         }
 
         val aiSettings = settingsUpdate.settings.ai
@@ -324,7 +339,9 @@ class DelegatingAgentService @Inject internal constructor(
         AIProvider.GEMINI -> geminiApiKey
     }
 
-    private fun SettingsUpdate.toAgentConfigurationOrNull(): AgentConfiguration? {
+    private fun SettingsUpdate.toAgentConfigurationOrNull(
+        skillsVersion: Long = synchronized(lifecycleLock) { desiredConfiguration?.skillsVersion ?: 0L },
+    ): AgentConfiguration? {
         val aiSettings = settings.ai ?: return null
         val apiKey = aiSettings.requiredApiKey()
         if (!aiSettings.agentEnabled || apiKey.isBlank()) return null
@@ -332,8 +349,17 @@ class DelegatingAgentService @Inject internal constructor(
             settingsVersion = version,
             provider = aiSettings.provider,
             apiKey = apiKey,
-            baseUrl = aiSettings.openAiBaseUrl,
+            baseUrl = aiSettings.openAiBaseUrl.takeIf { aiSettings.provider == AIProvider.OPENAI }.orEmpty(),
             proxySettings = settings.proxy,
+            telegramToken = settings.telegramToken,
+            sessionSettings = aiSettings.copy(
+                geminiApiKey = "",
+                openAiApiKey = "",
+                openAiBaseUrl = "",
+                autoCleanContextIntervalMinutes = 0,
+                silentContextCleanup = false,
+            ),
+            skillsVersion = skillsVersion,
         )
     }
 

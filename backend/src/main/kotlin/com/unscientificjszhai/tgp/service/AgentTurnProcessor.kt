@@ -68,6 +68,11 @@ internal class AgentTurnProcessor(
 ) {
     private val agentTurnOwners = mutableMapOf<AgentTurnKey, CompletableDeferred<Unit>>()
 
+    /** 序列切换必须等待同一 Bot 的旧 owner 完成，包括前一个 token 会话的不可取消收尾。 */
+    fun hasActiveAgentTurn(botId: String): Boolean = runtime.withSessionLock {
+        agentTurnOwners.any { (key, owner) -> key.botId == botId && !owner.isCompleted }
+    }
+
     /** 单项队列工作的最大处理时间。 */
     var processingTimeout: Duration = processingTimeout
         set(value) {
@@ -146,7 +151,7 @@ internal class AgentTurnProcessor(
             } else {
                 runtime.currentSession = null
                 session.updateChannel.close()
-                session.consumerResume.close()
+                session.consumerResumeWaiter?.cancel()
                 session.outboxSignal.close()
                 true
             }
@@ -192,11 +197,24 @@ internal class AgentTurnProcessor(
 
                 currentCoroutineContext().ensureActive()
                 if (runtime.isCurrent(session)) {
+                    val resumeWaiter = if (completion == UpdateCompletion.Retry) {
+                        CompletableDeferred<Unit>().also { waiter ->
+                            runtime.withSessionLock { session.consumerResumeWaiter = waiter }
+                        }
+                    } else {
+                        null
+                    }
                     queuedWork.completion.complete(completion)
                     currentWork = null
-                    if (completion == UpdateCompletion.Retry) {
+                    if (resumeWaiter != null) {
                         drainQueuedUpdatesAsRetry(session)
-                        session.consumerResume.receiveCatching().getOrNull() ?: return
+                        try {
+                            resumeWaiter.await()
+                        } finally {
+                            runtime.withSessionLock {
+                                if (session.consumerResumeWaiter === resumeWaiter) session.consumerResumeWaiter = null
+                            }
+                        }
                     }
                 }
             }
@@ -212,7 +230,8 @@ internal class AgentTurnProcessor(
         }
     }
 
-    private fun drainQueuedUpdatesAsRetry(session: PollingSession) {
+    /** 重试前排空旧批次，包括消费者进入暂停之后才由轮询器入队的后项。 */
+    fun drainQueuedUpdatesAsRetry(session: PollingSession) {
         while (true) {
             val queued = session.updateChannel.tryReceive().getOrNull() ?: return
             queued.completion.complete(UpdateCompletion.Retry)

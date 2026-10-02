@@ -21,7 +21,6 @@ import kotlin.concurrent.withLock
  * @property generation 设置快照中与 [token] 绑定的代次。
  * @property scope 当前会话全部协程共享的作用域。
  * @property updateChannel 串行传递待处理更新的有界通道。
- * @property consumerResume 本地重试结束后恢复队列消费者的汇合信号。
  * @property outboxSignal 唤醒回复 outbox worker 的汇合信号。
  * @property pollJob 当前会话的 Telegram 轮询任务。
  * @property consumerJob 当前会话的更新消费任务。
@@ -37,7 +36,6 @@ internal class PollingSession(
     val generation: Long,
     val scope: CoroutineScope,
     val updateChannel: Channel<QueuedWork>,
-    val consumerResume: Channel<Unit>,
     val outboxSignal: Channel<Unit>,
     var pollJob: Job? = null,
     var consumerJob: Job? = null,
@@ -46,7 +44,13 @@ internal class PollingSession(
     var lastAiReplyAtMillis: Long? = null,
     var consecutivePollingFailures: Int = 0,
     var initialOffsetResolved: Boolean = false,
-)
+) {
+    /** 轮询任务单独维护的未完成批次信号，用于序列切换前等待所有旧工作退出。 */
+    val pendingUpdateCompletions = mutableSetOf<CompletableDeferred<UpdateCompletion>>()
+
+    /** 当前 Retry 专属的恢复握手；仅在 runtime 会话锁内读取或替换，不为未来批次预存信号。 */
+    var consumerResumeWaiter: CompletableDeferred<Unit>? = null
+}
 
 /**
  * 已授权更新绑定的不可变设置租约。

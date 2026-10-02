@@ -19,6 +19,59 @@ import kotlin.time.Duration.Companion.seconds
 
 class DelegatingAgentLifecycleGuardTest {
     @Test
+    fun `Gemini ignores inactive OpenAI credentials but rebuilds for a changed system prompt`() = runBlocking {
+        val fixture = Fixture(this)
+        var delegating: DelegatingAgentService? = null
+        try {
+            fixture.settingsChangeCoordinator.replaceSettingsForTest(
+                AppSettings(
+                    ai = AISettings(
+                        provider = AIProvider.GEMINI,
+                        geminiApiKey = "test-key",
+                        agentEnabled = true,
+                    )
+                )
+            )
+            val created = AtomicInteger()
+            val factory = object : AgentComponent.Factory {
+                override fun create(): AgentComponent {
+                    val id = created.incrementAndGet()
+                    val candidate = mockk<GeminiAgentService> {
+                        coEvery { initializeForPublication() } returns AgentInitializationResult.Ready
+                        every { currentModel } returns "model-$id"
+                        every { isAiFeatureEnabled(any()) } returns true
+                        every { close() } returns completedJob()
+                    }
+                    return mockk { every { geminiAgentService } returns candidate }
+                }
+            }
+            val service = fixture.delegating(factory)
+            delegating = service
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+
+            fixture.settingsChangeCoordinator.updateSettings { current ->
+                current.copy(
+                    ai = current.ai!!.copy(
+                        openAiApiKey = "unused-key",
+                        openAiBaseUrl = "https://unused.example/v1",
+                    )
+                )
+            }
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+            assertEquals(1, created.get())
+            assertEquals("model-1", service.currentModel)
+
+            fixture.updateGlobalContext("changed prompt")
+            awaitReadyForCurrentSettings(service, fixture.settingsChangeCoordinator)
+            assertEquals(2, created.get())
+            assertEquals("model-2", service.currentModel)
+        } finally {
+            delegating?.close()?.join()
+            fixture.close()
+        }
+    }
+
+    @Test
     fun `same version skill rebuild rejects model operations on the retained service`() = runBlocking {
         val fixture = Fixture(this)
         val secondInitialization = CompletableDeferred<Unit>()

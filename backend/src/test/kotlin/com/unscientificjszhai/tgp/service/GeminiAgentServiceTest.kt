@@ -12,12 +12,14 @@ import com.unscientificjszhai.tgp.service.ai.MCPClientService
 import com.unscientificjszhai.tgp.service.ai.agent.*
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionRouter
+import com.unscientificjszhai.tgp.utils.JsonStructureLimits
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -29,6 +31,7 @@ import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import okhttp3.OkHttpClient
 import java.io.File
+import java.lang.reflect.InvocationTargetException
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 import kotlin.test.*
@@ -47,6 +50,88 @@ class GeminiAgentServiceTest {
     private lateinit var testJob: Job
     private lateinit var testScope: CoroutineScope
     private val services = mutableListOf<GeminiAgentService>()
+
+    @Test
+    fun `raw history trims complete old turns when individually legal tool results exceed cumulative nodes`() {
+        val history = (0..2).flatMap { rawHistoryTurn("old-$it", 1300) }.toMutableList()
+        val currentTurn = rawHistoryTurn("current", 1300).take(3)
+        currentTurn.forEach { JsonStructureLimits.validateElement(it) }
+        history += currentTurn
+
+        normalizeRawHistory(history)
+
+        assertEquals(11, history.size)
+        assertFalse(history.toString().contains("old-0"))
+        assertTrue(history.toString().contains("old-1"))
+        assertEquals(currentTurn, history.takeLast(3))
+        JsonStructureLimits.validateElement(JsonArray(history))
+    }
+
+    @Test
+    fun `raw history reserves cumulative nodes for the final request configuration`() {
+        val history = (0..2).flatMap { rawHistoryTurn("old-$it", 1300) }.toMutableList()
+        val currentTurn = rawHistoryTurn("current", 1300).take(3)
+        history += currentTurn
+        val config = buildJsonObject {
+            put("tools", JsonArray(listOf(buildJsonObject {
+                put("functionDeclarations", JsonArray(List(50) { index ->
+                    buildJsonObject {
+                        put("name", "function_$index")
+                        put("description", "test function")
+                    }
+                }))
+            })))
+        }
+
+        normalizeRawHistory(history, config)
+
+        assertEquals(7, history.size)
+        assertEquals(currentTurn, history.takeLast(3))
+        JsonStructureLimits.validateElement(buildJsonObject {
+            put("contents", JsonArray(history))
+            config.forEach { (key, value) -> put(key, value) }
+        })
+    }
+
+    @Test
+    fun `raw history rejects an oversized current turn without splitting its tool pairs`() {
+        val currentTurn = rawHistoryTurn("current", 5000).take(3)
+        val history = currentTurn.toMutableList()
+
+        assertFailsWith<AgentTurnFailedException> { normalizeRawHistory(history) }
+
+        assertEquals(currentTurn, history)
+    }
+
+    private fun rawHistoryTurn(label: String, resultNodes: Int): List<JsonObject> {
+        val items = List(resultNodes) { "0" }.joinToString(",")
+        return listOf(
+            """{"role":"user","parts":[{"text":"$label"}]}""",
+            """{"role":"model","parts":[{"functionCall":{"name":"tool","args":{}}}]}""",
+            """{"role":"user","parts":[{"functionResponse":{"name":"tool","response":{"items":[$items]}}}]}""",
+            """{"role":"model","parts":[{"text":"reply"}]}""",
+        ).map { Json.parseToJsonElement(it).jsonObject }
+    }
+
+    private fun normalizeRawHistory(history: MutableList<JsonObject>, config: JsonObject = buildJsonObject {}) {
+        val method = GeminiAgentService::class.java.getDeclaredMethod(
+            "normalizeRawGeminiCandidate", List::class.java, Int::class.javaObjectType,
+            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, JsonObject::class.java,
+        ).apply { isAccessible = true }
+        val currentTurnStart = history.indexOfLast { it["parts"].toString().contains("\"text\":\"current\"") }
+        try {
+            method.invoke(
+                service,
+                history,
+                currentTurnStart,
+                MAX_AGENT_HISTORY_ENTRIES,
+                MAX_AGENT_HISTORY_BYTES,
+                config
+            )
+        } catch (failure: InvocationTargetException) {
+            throw failure.targetException
+        }
+    }
 
     @BeforeTest
     fun setup() {

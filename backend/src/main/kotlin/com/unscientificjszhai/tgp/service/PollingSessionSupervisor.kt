@@ -265,7 +265,6 @@ internal class PollingSessionSupervisor(
             generation = generation,
             scope = sessionScope,
             updateChannel = Channel(capacity = 10),
-            consumerResume = Channel(capacity = Channel.CONFLATED),
             outboxSignal = Channel(capacity = Channel.CONFLATED),
         )
         val barrierGenerationToRelease = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
@@ -314,9 +313,10 @@ internal class PollingSessionSupervisor(
         while (currentCoroutineContext().isActive) {
             try {
                 if (resumeConsumerAfterRetry) {
-                    // 前一项回合未能安全提交时，消费者已把当批后续更新标记为 Retry 并暂停。检查点已先
-                    // 持久化，因此下一轮从仓储快照重取目标后才允许它消费新批次。
-                    session.consumerResume.trySend(Unit)
+                    // 先等旧批次结算或排空，再完成当前 Retry 专属的握手；纯网络故障不会留下跨批次信号。
+                    processor.drainQueuedUpdatesAsRetry(session)
+                    for (completion in session.pendingUpdateCompletions) completion.await()
+                    runtime.withSessionLock { session.consumerResumeWaiter?.complete(Unit) }
                     resumeConsumerAfterRetry = false
                 }
                 when (val attempt = pollOnce(session)) {
@@ -357,6 +357,9 @@ internal class PollingSessionSupervisor(
             } catch (_: CancellationException) {
                 return
             } catch (e: Exception) {
+                // pollOnce 可能在较早更新确认失败时退出，而消费者已因较晚更新的 Retry 暂停。
+                // 异常重试同样必须结算旧批次并恢复实际暂停的消费者。
+                resumeConsumerAfterRetry = true
                 logger.warn(
                     "Polling request failed for bot {} at generation {}; category={}",
                     session.botId,
@@ -417,6 +420,7 @@ internal class PollingSessionSupervisor(
      * @return 本轮成功、停止、本地重试、API 失败或等待 Agent 的精确结果。
      */
     private suspend fun pollOnce(session: PollingSession): PollingAttempt {
+        session.pendingUpdateCompletions.removeAll { it.isCompleted }
         if (!runtime.isCurrent(session)) {
             return PollingAttempt.Stopped
         }
@@ -481,6 +485,34 @@ internal class PollingSessionSupervisor(
         // 快照重新决定是否可处理本批响应，不能让较早的请求快照覆盖新事实。
         val responseSnapshot = runtime.readForCurrent(session) { updatesRepository.getData(session.botId) }
             ?: return PollingAttempt.Stopped
+        val firstReturnedId = response.result.minOfOrNull { it.updateId }
+        if (firstReturnedId != null && firstReturnedId > 0 &&
+            response.result.all { it.updateId < snapshot.lastUpdateId } &&
+            responseSnapshot.lastUpdateId == snapshot.lastUpdateId &&
+            responseSnapshot.retryCheckpoint == initialRetryCheckpoint
+        ) {
+            // 正 offset 的合法响应通常不会包含更早的编号；整批回退表示 Telegram 闲置后重建了序列。
+            // 未完成批次、旧 owner、账本和 outbox 全部结清后才允许降低持久化游标。
+            val reset = runtime.writeForCurrent(session) {
+                session.pendingUpdateCompletions.all { it.isCompleted } &&
+                        !processor.hasActiveAgentTurn(session.botId) &&
+                        updatesRepository.resetUpdateSequence(
+                            session.botId,
+                            snapshot.lastUpdateId,
+                            initialRetryCheckpoint,
+                            firstReturnedId,
+                            System.currentTimeMillis(),
+                        )
+            } ?: return PollingAttempt.Stopped
+            if (reset) {
+                logger.info(
+                    "Telegram update sequence reset for bot {}; firstUpdateId={}",
+                    session.botId,
+                    firstReturnedId
+                )
+            }
+            return PollingAttempt.LocalRetry
+        }
         lastStoredId = maxOf(lastStoredId, responseSnapshot.lastUpdateId)
         val retryCheckpoint = responseSnapshot.retryCheckpoint
         if (retryCheckpoint != null && retryCheckpoint.targetUpdateId != targetUpdateId) {
@@ -551,6 +583,7 @@ internal class PollingSessionSupervisor(
                     }
 
                     is UpdateAdmission.Enqueued -> {
+                        session.pendingUpdateCompletions += admission.completion
                         update.chatInfo()?.let { chat ->
                             discoveredChats.remove(chat.id)
                             discoveredChats[chat.id] = chat
@@ -1088,7 +1121,7 @@ internal class PollingSessionSupervisor(
         val session =
             runtime.withSessionLock { runtime.currentSession.also { runtime.currentSession = null } } ?: return
         session.updateChannel.close()
-        session.consumerResume.close()
+        session.consumerResumeWaiter?.cancel()
         session.outboxSignal.close()
         session.scope.cancel(CancellationException("Message poller stopped."))
     }

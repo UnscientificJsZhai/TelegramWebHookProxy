@@ -427,6 +427,44 @@ class UpdatesRepository private constructor(
     }
 
     /**
+     * Telegram 闲置后返回一批低于旧游标的新编号时，原子切换到新序列的首项。
+     *
+     * 先结清旧 outbox 和未确认账本，再重置游标与检查点，避免旧回复和新序列共用更新标识。
+     * 新检查点保证提交后即使立即重启，也不会通过 offset=-1 跳过这批更新。
+     */
+    @Synchronized
+    internal fun resetUpdateSequence(
+        botId: String,
+        expectedLastUpdateId: Long,
+        expectedRetryCheckpoint: RetryCheckpoint?,
+        firstUpdateId: Long,
+        nowMillis: Long,
+    ): Boolean {
+        requirePersistableTelegramUpdateId(firstUpdateId, "firstUpdateId")
+        require(firstUpdateId in 1L until expectedLastUpdateId)
+        require(nowMillis >= 0)
+        if (!botId.isValidBotId()) return false
+        migrateLegacyDataIfNeeded(botId)
+        val current = state.bots[botId] ?: return false
+        if (current.lastUpdateId != expectedLastUpdateId || current.retryCheckpoint != expectedRetryCheckpoint ||
+            current.pendingTelegramReplies.isNotEmpty() ||
+            current.agentTurnJournal.any { it.updateId > current.lastUpdateId }
+        ) {
+            return false
+        }
+        saveState(
+            state.copy(
+                bots = state.bots + (botId to current.copy(
+                    lastUpdateId = firstUpdateId - 1,
+                    agentTurnJournal = emptyList(),
+                    retryCheckpoint = RetryCheckpoint(firstUpdateId, nowMillis, retryCount = 1),
+                ))
+            ),
+        )
+        return true
+    }
+
+    /**
      * 条件记录一项轮询重试检查点。
      *
      * 调用方必须把读取快照中的检查点目标作为 [expectedTargetUpdateId] 传回；目标不同或检查点已被其他
