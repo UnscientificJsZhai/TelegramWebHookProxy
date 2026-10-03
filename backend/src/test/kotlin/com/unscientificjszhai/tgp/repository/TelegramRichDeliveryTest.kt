@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.repository
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.TelegramReplyPart
 import com.unscientificjszhai.tgp.models.TelegramRichFormat
+import com.unscientificjszhai.tgp.utils.ResourceLimits
 import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
 import java.io.IOException
 import kotlin.io.path.createTempDirectory
@@ -93,6 +94,91 @@ class TelegramRichDeliveryTest {
     }
 
     @Test
+    fun `large final reply moves to outbox within storage limit on unconditional completion path`() {
+        verifyLargeFinalReplyOutboxTransfer("unconditional", checkpointTarget = null, unconditional = true)
+    }
+
+    @Test
+    fun `large final reply moves to outbox within storage limit without checkpoint`() {
+        verifyLargeFinalReplyOutboxTransfer("without-checkpoint", checkpointTarget = null, unconditional = false)
+    }
+
+    @Test
+    fun `large final reply moves to outbox within storage limit with checkpoint`() {
+        verifyLargeFinalReplyOutboxTransfer("with-checkpoint", checkpointTarget = 11L, unconditional = false)
+    }
+
+    private fun verifyLargeFinalReplyOutboxTransfer(
+        filename: String,
+        checkpointTarget: Long?,
+        unconditional: Boolean,
+    ) {
+        val reply = ("Paragraph[^n] " + "a".repeat(980) + "\n\n").repeat(480) +
+                "[^n]: " + "x".repeat(24000) + "\n"
+        val deliveryPlan = TelegramRichTextChunks.plan(reply)
+        val stateFile = directory.resolve("$filename.json")
+        var repository = UpdatesRepository(stateFile)
+        repository.claimAgentTurn("100", 11, "chat", ReplyParameters(1))
+        repository.finalizeAgentTurn("100", 11, reply, deliveryPlan)
+        if (checkpointTarget != null) {
+            repository.recordRetryCheckpoint("100", checkpointTarget, null, nowMillis = 100)
+        }
+        assertTrue(stateFile.length() > ResourceLimits.UPDATES_BYTES / 2)
+        repository = UpdatesRepository(stateFile)
+        val pending = PendingTelegramReply(11, "chat", reply, ReplyParameters(1), deliveryPlan = deliveryPlan)
+
+        if (unconditional) {
+            repository.completeAgentUpdate("100", 11, pending)
+        } else {
+            assertEquals(
+                RetryCheckpointCommitResult.Committed,
+                repository.completeAgentUpdateAtRetryCheckpoint("100", 11, pending, checkpointTarget),
+            )
+        }
+
+        val restored = UpdatesRepository(stateFile).getData("100")
+        assertEquals(11, restored.lastUpdateId)
+        assertNull(restored.retryCheckpoint)
+        assertTrue(restored.agentTurnJournal.isEmpty())
+        assertEquals(pending, restored.pendingTelegramReplies.single())
+        assertTrue(stateFile.length() <= ResourceLimits.UPDATES_BYTES)
+        assertEquals(AgentTurnClaim.AlreadyConfirmed, repository.claimAgentTurn("100", 11, "chat", null))
+    }
+
+    @Test
+    fun `failed or stale outbox transfer retains final reply and checkpoint`() {
+        var failWrite = false
+        val repository = UpdatesRepository(file) { if (failWrite) throw IOException("injected transfer failure") }
+        repository.claimAgentTurn("100", 11, "chat", null)
+        repository.finalizeAgentTurn("100", 11, source, plan)
+        repository.recordRetryCheckpoint("100", 11, null, nowMillis = 100)
+        val before = repository.getData("100")
+        val pending = PendingTelegramReply(11, "chat", source, deliveryPlan = plan)
+
+        assertEquals(
+            RetryCheckpointCommitResult.Stale,
+            repository.completeAgentUpdateAtRetryCheckpoint("100", 11, pending, null),
+        )
+        assertEquals(before, repository.getData("100"))
+        failWrite = true
+        assertFailsWith<IOException> {
+            repository.completeAgentUpdateAtRetryCheckpoint("100", 11, pending, 11)
+        }
+        assertEquals(before, repository.getData("100"))
+        assertEquals(before, UpdatesRepository(file).getData("100"))
+
+        failWrite = false
+        assertEquals(
+            RetryCheckpointCommitResult.Committed,
+            repository.completeAgentUpdateAtRetryCheckpoint("100", 11, pending, 11),
+        )
+        val restored = UpdatesRepository(file).getData("100")
+        assertTrue(restored.agentTurnJournal.isEmpty())
+        assertEquals(pending, restored.pendingTelegramReplies.single())
+        assertNull(restored.retryCheckpoint)
+    }
+
+    @Test
     fun `unused duplicate definitions remain compact through journal and outbox persistence`() {
         val reply = "[f]: a\n\n```text\n" + "x".repeat(33000) + "\n```\n\n" + "[f]: b\n\n".repeat(10000)
         val deliveryPlan = TelegramRichTextChunks.plan(reply)
@@ -109,7 +195,7 @@ class TelegramRichDeliveryTest {
         )
         val restored = UpdatesRepository(file).getData("100")
         assertEquals(11, restored.lastUpdateId)
-        assertEquals(finalized, restored.agentTurnJournal.single())
+        assertTrue(restored.agentTurnJournal.isEmpty())
         assertEquals(reply, restored.pendingTelegramReplies.single().text)
         assertEquals(deliveryPlan, restored.pendingTelegramReplies.single().deliveryPlan)
         assertTrue(deliveryPlan.all { it.format == TelegramRichFormat.MARKDOWN })

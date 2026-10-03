@@ -115,7 +115,7 @@ export default function SkillCatalog({onEditingChange}: { onEditingChange: (edit
         try {
             if (action.kind === 'approve') await approveSkill(action.skill.id, action.skill.revision);
             else if (action.kind === 'revoke') await revokeSkill(action.skill.id, action.skill.revision);
-            else await deleteSkill(action.skill.id);
+            else await deleteSkill(action.skill.id, action.skill.revision);
             setNotice({
                 message: action.kind === 'approve' ? '技能已批准，可供 Agent 读取' : action.kind === 'revoke' ? '已撤销批准，技能不再提供给 Agent' : '技能已删除',
                 severity: 'success'

@@ -57,8 +57,8 @@ export const revokeSkill = async (id: string, revision: number) => {
     return normalizeSkill(response.data);
 };
 
-export const deleteSkill = async (id: string) => {
-    await api.delete(`/skills/${encodeURIComponent(id)}`);
+export const deleteSkill = async (id: string, revision: number) => {
+    await api.delete(`/skills/${encodeURIComponent(id)}`, {data: {revision}});
 };
 
 export default api;

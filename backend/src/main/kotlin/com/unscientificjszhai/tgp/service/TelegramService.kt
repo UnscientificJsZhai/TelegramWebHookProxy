@@ -372,7 +372,7 @@ class TelegramService private constructor(
                 timeout?.let { parameter("timeout", it) }
                 parameter("limit", 10)
             }
-            decodeTelegramJson(response.readTelegramBytes(MAX_TELEGRAM_API_BYTES))
+            decodeTelegramJson(response.readTelegramBytes(MAX_TELEGRAM_UPDATES_BYTES), TELEGRAM_UPDATES_JSON_BUDGET)
         }
     }
 
@@ -390,10 +390,13 @@ class TelegramService private constructor(
     }
 
     /** 在 Kotlin serialization 递归解码 Telegram DTO 前先限定不可信 JSON 的结构。 */
-    private inline fun <reified T> decodeTelegramJson(bytes: ByteArray): T {
+    private inline fun <reified T> decodeTelegramJson(
+        bytes: ByteArray,
+        budget: JsonStructureLimits.Budget = TELEGRAM_RESPONSE_JSON_BUDGET,
+    ): T {
         // updates 中即使是不处理的富消息也可能包含数万个节点；以已限制的响应字节数约束节点数，
         // 保留默认深度限制，避免合法 blocks 在忽略未知字段之前阻塞整个轮询队列。
-        JsonStructureLimits.validateUtf8(bytes, TELEGRAM_RESPONSE_JSON_BUDGET)
+        JsonStructureLimits.validateUtf8(bytes, budget)
         return telegramJson.decodeFromString(bytes.decodeToString())
     }
 
@@ -403,15 +406,18 @@ class TelegramService private constructor(
         val url = "https://api.telegram.org/file/bot$token/$filePath"
 
         return withClientLease { client ->
-            val response = client.get(url)
-            if (!response.status.isSuccess()) {
-                val exception = IllegalStateException(
-                    "Telegram file download failed with HTTP status ${response.status.value}.",
-                )
-                response.bodyAsChannel().cancel(exception)
-                throw exception
+            client.prepareGet(url).execute { response ->
+                if (!response.status.isSuccess()) {
+                    val exception = if (response.status.value in 400..499 && response.status.value != 408 &&
+                        response.status.value != 429
+                    ) TelegramFileDownloadRejectedException() else IllegalStateException(
+                        "Telegram file download failed with HTTP status ${response.status.value}.",
+                    )
+                    response.bodyAsChannel().cancel(exception)
+                    throw exception
+                }
+                response.readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES)
             }
-            response.readTelegramBytes(MAX_TELEGRAM_DOWNLOAD_BYTES)
         }
     }
 
@@ -543,12 +549,19 @@ class TelegramService private constructor(
 }
 
 private const val MAX_TELEGRAM_API_BYTES = 1024 * 1024
+
+/** Telegram 服务端的更新数组预算为 4 MiB，另为响应封装预留少量空间。 */
+internal const val MAX_TELEGRAM_UPDATES_BYTES = 4 * 1024 * 1024 + 1024
 private val TELEGRAM_RESPONSE_JSON_BUDGET = JsonStructureLimits.Budget(maxNodes = MAX_TELEGRAM_API_BYTES)
-private const val MAX_TELEGRAM_DOWNLOAD_BYTES = 24 * 1024 * 1024
+private val TELEGRAM_UPDATES_JSON_BUDGET = JsonStructureLimits.Budget(maxNodes = MAX_TELEGRAM_UPDATES_BYTES)
+private const val MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
 private val telegramJson = Json { ignoreUnknownKeys = true }
 
 /** Telegram 响应在解压后的实际读取字节超过当前调用的硬上限。 */
 class TelegramPayloadTooLargeException : IllegalStateException("Telegram 响应超过资源上限。")
+
+/** 文件已失效等永久下载拒绝，调用方应终止该语音更新。 */
+internal class TelegramFileDownloadRejectedException : IllegalStateException("Telegram 文件下载被永久拒绝。")
 
 private suspend fun HttpResponse.readTelegramBytes(limit: Int): ByteArray {
     val channel = bodyAsChannel()

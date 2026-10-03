@@ -128,8 +128,8 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
             val bot = state.bots["100"]
             if (
                 bot?.lastUpdateId == 11L &&
-                bot.pendingTelegramReplies.any { it.updateId == 11L } &&
-                bot.agentTurnJournal.any { it.updateId == 11L && it.reply == "eleven" } &&
+                bot.pendingTelegramReplies.any { it.updateId == 11L && it.text == "eleven" } &&
+                bot.agentTurnJournal.none { it.updateId == 11L } &&
                 rejectLowerCompletion.compareAndSet(true, false)
             ) {
                 throw IOException("injected lower completion failure")
@@ -170,6 +170,9 @@ internal class MessagePollerDurabilityRegressionTest : MessagePollerFacadeTestSu
             withTimeout(5.seconds) { retryStarted.await() }
             assertFalse(rejectLowerCompletion.get())
             assertEquals(10, fixture.updates.getData("100").lastUpdateId)
+            assertEquals("eleven", fixture.updates.getData("100").agentTurnJournal.single().reply)
+            assertTrue(fixture.updates.getPendingTelegramReplies("100").isEmpty())
+            assertEquals(11, fixture.updates.getData("100").retryCheckpoint?.targetUpdateId)
             coVerify(exactly = 1) { fixture.agent.sendMessage("eleven") }
             coVerify(exactly = 0) { fixture.agent.sendMessage("twelve") }
         }

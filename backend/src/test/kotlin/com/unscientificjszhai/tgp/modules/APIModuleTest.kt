@@ -503,6 +503,45 @@ class APIModuleTest {
         assertEquals(testSettings, repository.settingsFlow.value)
     }
 
+    @Test
+    fun `settings response versions distinguish ABA and restarted coordinators`() =
+        withTestApi { repository, _, configFile ->
+            val initial = client.get("/api/settings")
+            val original = completeSettingsJson.decodeFromString<AppSettings>(initial.bodyAsText())
+            val initialTag = assertNotNull(initial.headers[HttpHeaders.ETag])
+            val initialVersion = assertNotNull(initial.headers["X-Settings-Version"])
+            assertEquals("${repository.settingsEpoch}:0", initialVersion)
+
+            val changed = client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, initialTag)
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(original.copy(chatId = "changed")))
+            }
+            assertEquals(HttpStatusCode.OK, changed.status)
+            assertEquals("${repository.settingsEpoch}:1", changed.headers["X-Settings-Version"])
+
+            val restored = client.put("/api/settings") {
+                header(HttpHeaders.IfMatch, assertNotNull(changed.headers[HttpHeaders.ETag]))
+                contentType(ContentType.Application.Json)
+                setBody(completeSettingsJson.encodeToString(original))
+            }
+            assertEquals(HttpStatusCode.OK, restored.status)
+            assertEquals(initialTag, restored.headers[HttpHeaders.ETag])
+            assertEquals("${repository.settingsEpoch}:2", restored.headers["X-Settings-Version"])
+
+            val final = client.patch("/api/settings") {
+                header(HttpHeaders.IfMatch, initialTag)
+                contentType(ContentType.Application.Json)
+                setBody("""{"chatId":"final"}""")
+            }
+            assertEquals(HttpStatusCode.OK, final.status)
+            assertEquals("${repository.settingsEpoch}:3", final.headers["X-Settings-Version"])
+
+            val restarted = SettingsChangeCoordinator.forTesting(configFile, ModelSwitchBarrier())
+            assertNotEquals(repository.settingsEpoch, restarted.settingsEpoch)
+            assertEquals(0L, restarted.currentSettingsSnapshot().generation)
+        }
+
     /**
      * 验证完整设置写入强制使用单个强 ETag，且过期请求不会提交。
      */
@@ -748,7 +787,13 @@ class APIModuleTest {
                 ProxySettings("proxy.example.com", 8080, ProxyType.HTTP, username = " ", password = " "),
                 ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user"),
                 ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "中文"),
-                ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, username = "user", password = "p".repeat(256)),
+                ProxySettings(
+                    "proxy.example.com",
+                    1080,
+                    ProxyType.SOCKS,
+                    username = "user",
+                    password = "p".repeat(256)
+                ),
             ).forEach { invalidProxy ->
                 client.put("/api/settings") {
                     header(HttpHeaders.IfMatch, revision)
@@ -1197,7 +1242,8 @@ class APIModuleTest {
     @Test
     fun `settings PUT and PATCH preserve SOCKS authentication credentials`() =
         withTestApi { repository, _, _ ->
-            val settings = AppSettings(proxy = ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, "user", "päss"))
+            val settings =
+                AppSettings(proxy = ProxySettings("proxy.example.com", 1080, ProxyType.SOCKS, "user", "päss"))
             client.put("/api/settings") {
                 header(HttpHeaders.IfMatch, currentSettingsETag())
                 contentType(ContentType.Application.Json)

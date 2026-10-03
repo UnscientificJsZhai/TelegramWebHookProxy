@@ -74,12 +74,19 @@ fun Application.skillAPIModule(skillRepository: SkillRepository) {
                 delete {
                     val id = call.validSkillPathId() ?: return@delete
                     try {
-                        skillRepository.deleteSkill(id)
+                        val request = call.receive<SkillTransitionRequest>()
+                        skillRepository.deleteSkill(id, request.revision)
                         call.respond(HttpStatusCode.OK)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: SkillStorageIsolationException) {
                         call.respondSkillStorageUnavailable()
+                    } catch (_: SkillNotFoundException) {
+                        call.respond(HttpStatusCode.NotFound, mapOf("error" to "技能不存在。"))
+                    } catch (_: SkillRevisionConflictException) {
+                        call.respondSkillConflict("技能已被修改，请刷新后重试。")
+                    } catch (_: IllegalArgumentException) {
+                        call.respondSkillInputError("技能标识或版本不合法")
                     }
                 }
             }

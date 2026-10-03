@@ -4,6 +4,7 @@ import com.google.genai.types.FunctionDeclaration
 import com.google.genai.types.Schema
 import com.unscientificjszhai.tgp.service.ai.MAX_MCP_TOOL_SCHEMA_BYTES
 import com.unscientificjszhai.tgp.service.ai.MCPClientService
+import com.unscientificjszhai.tgp.service.ai.MCP_JSON_SCHEMA_DIALECT
 import com.unscientificjszhai.tgp.service.ai.McpToolResultTooLargeException
 import com.unscientificjszhai.tgp.service.ai.validateMcpToolResult
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
@@ -253,6 +254,9 @@ class McpFunctionProvider(
      * 无法无损验证的引用形式均拒绝当前工具，而不把悬空约束交给模型 SDK。
      */
     private fun Tool.toInlinedGeminiSchema(): Schema {
+        require(inputSchema.schema == null || inputSchema.schema == MCP_JSON_SCHEMA_DIALECT) {
+            "MCP 工具架构方言无法安全转换。"
+        }
         val source = buildJsonObject {
             put("type", "object")
             put("properties", inputSchema.properties ?: JsonObject(emptyMap()))

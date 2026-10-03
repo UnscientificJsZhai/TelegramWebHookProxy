@@ -90,7 +90,7 @@ class SkillRepositoryTest {
                 repository.saveSkill(Skill(id = invalidId, description = "ok", content = "ok"))
             }
             assertFailsWith<IllegalArgumentException> { repository.getSkillById(invalidId) }
-            assertFailsWith<IllegalArgumentException> { repository.deleteSkill(invalidId) }
+            assertFailsWith<IllegalArgumentException> { repository.deleteSkill(invalidId, 0) }
         }
         assertFailsWith<IllegalArgumentException> {
             repository.saveSkill(Skill(id = "ok", description = "ok", content = "x".repeat(64 * 1024 + 1)))
@@ -163,8 +163,33 @@ class SkillRepositoryTest {
         repository.saveSkill(skill)
         assertEquals(1, repository.getAllSkills().items.size)
 
-        repository.deleteSkill(skill.id)
+        repository.deleteSkill(skill.id, skill.revision)
         assertEquals(0, repository.getAllSkills().items.size)
+    }
+
+    /** 旧确认框携带的版本不能删除随后编辑并批准的新内容。 */
+    @Test
+    fun `stale deletion preserves the latest approved skill`() {
+        val original = repository.saveSkill(Skill(id = "shared", description = "original", content = "original"))
+        val edited = repository.saveManagedSkill(
+            id = original.id,
+            description = "updated",
+            content = "latest",
+            expectedRevision = original.revision,
+        )
+        val approved = repository.approveSkill(edited.id, edited.revision)
+
+        assertFailsWith<SkillRevisionConflictException> {
+            repository.deleteSkill(original.id, original.revision)
+        }
+        assertEquals(approved, repository.getSkillById(original.id))
+        assertEquals(approved, SkillRepository.forTesting(skillsFile).getSkillById(original.id))
+        assertEquals(listOf(original.id), repository.getApprovedSkillSummaries().map { it.id })
+
+        assertFailsWith<IllegalArgumentException> { repository.deleteSkill(original.id, -1) }
+        assertFailsWith<SkillNotFoundException> { repository.deleteSkill("missing", 0) }
+        repository.deleteSkill(original.id, approved.revision)
+        assertNull(repository.getSkillById(original.id))
     }
 
 

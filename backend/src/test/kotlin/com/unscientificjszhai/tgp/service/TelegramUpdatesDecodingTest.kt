@@ -18,7 +18,7 @@ internal class TelegramUpdatesDecodingTest : MessagePollerFacadeTestSupport() {
         val fixture = fixture()
         fixture.saveRawSettings(AppSettings(telegramToken = "100:test"))
         fixture.updates.saveLastUpdateId("100", 10)
-        val blocks = List(500) { """{"type":"paragraph","text":{"type":"bold","text":"字"}}""" }
+        val blocks = List(500) { """{"type":"paragraph","text":{"type":"bold","text":"${"字".repeat(64)}"}}""" }
             .joinToString(",")
         val richUpdates = (11..20).joinToString(",") { id ->
             """{"update_id":$id,"message":{"message_id":$id,"date":1,"chat":{"id":123,"type":"private"},"rich_message":{"blocks":[$blocks]}}}"""
@@ -67,7 +67,7 @@ internal class TelegramUpdatesDecodingTest : MessagePollerFacadeTestSupport() {
                     JsonStructureLimits.MAX_DEPTH + 1
                 )
             }}""",
-            """{"ok":true,"result":[],"unknown":"${"x".repeat(1024 * 1024)}"}""",
+            """{"ok":true,"result":[],"unknown":"${"x".repeat(MAX_TELEGRAM_UPDATES_BYTES)}"}""",
         ).iterator()
         val telegram = TelegramService(parentScope, fixture.settings, fixture.updates) {
             HttpClient(MockEngine { respond(bodies.next(), HttpStatusCode.OK) })

@@ -16,8 +16,14 @@ import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** 回退 Telegram 回复在进程崩溃语义下允许持久化登记的最大投递次数。 */
-internal const val MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS = 3
+/** 回退 Telegram 回复允许持久化确认的非限流失败次数。 */
+internal const val MAX_FALLBACK_TELEGRAM_REPLY_FAILURES = 3
+
+internal enum class FallbackFailureCommitResult {
+    STALE,
+    RETAINED,
+    DISCARDED,
+}
 
 /** 单个聊天发现记录允许占用的最大 UTF-8 JSON 字节数。 */
 internal const val MAX_DISCOVERED_CHAT_UTF8_BYTES = 64 * 1024
@@ -156,9 +162,10 @@ internal sealed interface AgentTurnClaim {
  *
  * 每个机器人内同一 [updateId] 最多保留一项。回复以至少一次语义投递：网络结果不确定或 Telegram
  * 拒绝时会保留该记录，因而调用方不得把多次投递当作恰好一次。每次网络投递前都会先持久化
- * [deliveryAttempts]，因此进程在请求中断后可能少于该次数实际发送，但绝不会突破回退消息的投递上限。
+ * [deliveryAttempts]。进程中断后的网络结果未知，只有 Telegram 明确返回的非限流失败会增加
+ * [fallbackFailureCount]；固定失败提示累计三次明确失败才会终止。
  * 原文首片段携带引用参数时，永久 `4xx` 会先清除引用并从同一片段重新投递原文；富片段普通降级完成后
- * 继续下一片段。固定失败提示被接受或耗尽投递次数才会终止整条回复。
+ * 继续下一片段。固定失败提示被接受或累计三次明确失败才会终止整条回复。
  *
  * @property updateId 生成该回复的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`，且在同一机器人 outbox 中唯一。
  * @property chatId 回复目标聊天标识；不能为空。
@@ -171,6 +178,9 @@ internal sealed interface AgentTurnClaim {
  * @property permanentRejectionCount 原文阶段连续出现的永久 `4xx` 拒绝次数；仅
  * 普通原文投递及 [TelegramReplyDeliveryStage.PLAIN_FALLBACK] 使用且取值只能为 `0` 或 `1`。首片段仍带引用参数的永久拒绝会
  * 先清除引用并将该计数归零；任一可重试失败也会将其清零，旧文件缺少该字段时默认为 `0`。
+ * @property nextDeliveryAtEpochMillis Telegram 限流结束前不可再次投递的 Unix 毫秒时间；旧文件默认为 `0`。
+ * @property fallbackFailureCount 固定失败提示收到明确非 429 失败响应的次数；旧文件默认为 `0`，避免把
+ * 旧版发送前预登记但结果未知的次数当成明确失败。
  */
 @Serializable
 data class PendingTelegramReply(
@@ -188,6 +198,8 @@ data class PendingTelegramReply(
     val nextPartIndex: Int = 0,
     /** 当前富片段降级后，下一普通分片在该片原文中的 UTF-16 起点。 */
     val plainFallbackStart: Int = 0,
+    val nextDeliveryAtEpochMillis: Long = 0,
+    val fallbackFailureCount: Int = 0,
 )
 
 /**
@@ -196,7 +208,7 @@ data class PendingTelegramReply(
  * 首片段仍带引用参数时会先清除引用重试。富片段被明确拒绝后切换到 [PLAIN_FALLBACK]，其原文发送成功后
  * 继续下一片段。普通投递收到两次连续的永久 `4xx` 后切换到 [FALLBACK]。可重试失败会清除连续拒绝计数。
  * 固定失败提示始终作为不引用原消息的独立消息发送，成功
- * 或耗尽后都会终止整条原文回复。
+ * 或累计三次明确失败后都会终止整条原文回复。
  */
 @Serializable
 enum class TelegramReplyDeliveryStage {
@@ -206,7 +218,7 @@ enum class TelegramReplyDeliveryStage {
     /** 当前富片段明确被拒后，以普通消息继续投递该片段原文。 */
     PLAIN_FALLBACK,
 
-    /** 投递说明原始回复未能发送的固定回退消息；接受或耗尽后终止整条回复。 */
+    /** 投递说明原始回复未能发送的固定回退消息；接受或累计三次明确失败后终止整条回复。 */
     FALLBACK,
 }
 
@@ -415,6 +427,44 @@ class UpdatesRepository private constructor(
     }
 
     /**
+     * Telegram 闲置后返回一批低于旧游标的新编号时，原子切换到新序列的首项。
+     *
+     * 先结清旧 outbox 和未确认账本，再重置游标与检查点，避免旧回复和新序列共用更新标识。
+     * 新检查点保证提交后即使立即重启，也不会通过 offset=-1 跳过这批更新。
+     */
+    @Synchronized
+    internal fun resetUpdateSequence(
+        botId: String,
+        expectedLastUpdateId: Long,
+        expectedRetryCheckpoint: RetryCheckpoint?,
+        firstUpdateId: Long,
+        nowMillis: Long,
+    ): Boolean {
+        requirePersistableTelegramUpdateId(firstUpdateId, "firstUpdateId")
+        require(firstUpdateId in 1L until expectedLastUpdateId)
+        require(nowMillis >= 0)
+        if (!botId.isValidBotId()) return false
+        migrateLegacyDataIfNeeded(botId)
+        val current = state.bots[botId] ?: return false
+        if (current.lastUpdateId != expectedLastUpdateId || current.retryCheckpoint != expectedRetryCheckpoint ||
+            current.pendingTelegramReplies.isNotEmpty() ||
+            current.agentTurnJournal.any { it.updateId > current.lastUpdateId }
+        ) {
+            return false
+        }
+        saveState(
+            state.copy(
+                bots = state.bots + (botId to current.copy(
+                    lastUpdateId = firstUpdateId - 1,
+                    agentTurnJournal = emptyList(),
+                    retryCheckpoint = RetryCheckpoint(firstUpdateId, nowMillis, retryCount = 1),
+                ))
+            ),
+        )
+        return true
+    }
+
+    /**
      * 条件记录一项轮询重试检查点。
      *
      * 调用方必须把读取快照中的检查点目标作为 [expectedTargetUpdateId] 传回；目标不同或检查点已被其他
@@ -574,7 +624,8 @@ class UpdatesRepository private constructor(
      * 原子记录一轮已成功完成的 Agent 处理，并推进该机器人的更新偏移量。
      *
      * 非空 [reply] 会和 [updateId] 的偏移量在同一次文件提交中写入 outbox，先后重试不会覆盖已有
-     * 同标识回复。空回复仍会在同一次提交中确认偏移量，表示该 Agent 回合已经完成且无需投递。文件
+     * 同标识回复。对应的 FINAL 账本记录在同一次提交中删除，避免正文和投递计划重复占用存储预算。
+     * 空回复仍会在同一次提交中确认偏移量，表示该 Agent 回合已经完成且无需投递。文件
      * 提交失败时内存状态保持不变，调用方必须保留该更新并停止继续确认后续更新。存在重试检查点时，该旧版
      * 无条件确认 API 会 fail-closed 并返回原快照，不会创建 outbox、推进偏移量或跨过检查点；调用方必须改用
      * [completeAgentUpdateAtRetryCheckpoint] 进行条件确认。
@@ -615,6 +666,9 @@ class UpdatesRepository private constructor(
             current.copy(
                 lastUpdateId = maxOf(current.lastUpdateId, updateId),
                 pendingTelegramReplies = replies,
+                agentTurnJournal = current.agentTurnJournal.filterNot {
+                    it.updateId == updateId && it.status == AgentTurnJournalStatus.FINAL
+                },
             )
         }
     }
@@ -624,7 +678,7 @@ class UpdatesRepository private constructor(
      *
      * 与 [completeAgentUpdate] 的 outbox 语义相同，但 [expectedRetryTarget] 必须与读取快照一致；为 `null`
      * 时要求没有检查点，非空时必须等于 [updateId]。这样 FINAL 回放不会跨越较早的失败更新，且成功提交会
-     * 同时写入 outbox、偏移量并清除该检查点。
+     * 同时写入 outbox、偏移量，删除对应 FINAL 账本记录并清除该检查点。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param updateId 已成功完成的 Telegram 更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
@@ -659,6 +713,9 @@ class UpdatesRepository private constructor(
             current.copy(
                 lastUpdateId = maxOf(current.lastUpdateId, updateId),
                 pendingTelegramReplies = replies,
+                agentTurnJournal = current.agentTurnJournal.filterNot {
+                    it.updateId == updateId && it.status == AgentTurnJournalStatus.FINAL
+                },
                 retryCheckpoint = null,
             )
         }
@@ -922,14 +979,13 @@ class UpdatesRepository private constructor(
     /**
      * 为一项待投递回复持久化登记下一次网络投递。
      *
-     * 登记与读取、修改和文件提交在同一仓储锁内完成；文件提交失败时不会返回可发送记录。处于回退阶段且
-     * 已登记三次投递的回退消息会在本次调用中基于该完整快照删除整条回复；不会推进原文 cursor 或发送后续
-     * 片段。
+     * 登记与读取、修改和文件提交在同一仓储锁内完成；文件提交失败时不会返回可发送记录。发送前登记
+     * 不代表收到明确失败，恢复时不得根据登记次数删除回退消息。
      *
      * @param botId token 冒号前的非空机器人标识。
      * @param updateId 要登记投递的回复所属更新标识；取值范围为 `0..Long.MAX_VALUE - 1`。
-     * @return 已把 [PendingTelegramReply.deliveryAttempts] 加一并持久化的当前片段快照；不存在记录、bot 无效或
-     * 回退消息耗尽并已终止整条回复时返回 `null`。
+     * @return 已把 [PendingTelegramReply.deliveryAttempts] 加一并持久化的当前片段快照；不存在记录或 bot
+     * 无效时返回 `null`。
      * @throws IllegalArgumentException 当 [updateId] 不在可持久化 Telegram 更新标识范围内，或存储中的目标回复违反
      * 投递阶段约束时抛出。
      * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
@@ -950,19 +1006,37 @@ class UpdatesRepository private constructor(
         }
         val reply = current.pendingTelegramReplies[replyIndex]
         validatePendingTelegramReply(reply, updateId)
-        if (reply.deliveryStage == TelegramReplyDeliveryStage.FALLBACK &&
-            reply.deliveryAttempts >= MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS
-        ) {
-            val removed = removePendingReplyIfCurrent(current, reply)
-                ?: return null
-            saveState(state.copy(bots = state.bots + (botId to removed)))
+        if (reply.nextDeliveryAtEpochMillis > System.currentTimeMillis()) {
             return null
         }
         require(reply.deliveryAttempts < Int.MAX_VALUE) { "reply deliveryAttempts must be below Int.MAX_VALUE." }
-        val prepared = reply.copy(deliveryAttempts = reply.deliveryAttempts + 1)
+        val prepared = reply.copy(
+            deliveryAttempts = reply.deliveryAttempts + 1,
+            nextDeliveryAtEpochMillis = 0,
+        )
         val replies = current.pendingTelegramReplies.toMutableList().also { it[replyIndex] = prepared }
         saveState(state.copy(bots = state.bots + (botId to current.copy(pendingTelegramReplies = replies))))
         return prepared
+    }
+
+    /** 限流响应撤销本次预登记，并持久化 Telegram 指定的最早重试时间。 */
+    @Synchronized
+    internal fun deferRateLimitedPendingTelegramReply(
+        botId: String,
+        expected: PendingTelegramReply,
+        nextDeliveryAtEpochMillis: Long,
+    ): Boolean {
+        validatePendingTelegramReply(expected)
+        require(expected.deliveryAttempts > 0) { "rate-limited reply must have a prepared attempt." }
+        require(nextDeliveryAtEpochMillis >= 0) { "next delivery time must not be negative." }
+        return replacePendingTelegramReply(
+            botId,
+            expected,
+            expected.copy(
+                deliveryAttempts = expected.deliveryAttempts - 1,
+                nextDeliveryAtEpochMillis = nextDeliveryAtEpochMillis,
+            ),
+        )
     }
 
     /**
@@ -1040,34 +1114,40 @@ class UpdatesRepository private constructor(
         return true
     }
 
-    /**
-     * 条件放弃已经耗尽投递次数的回退消息，并终止整条原文回复。
-     *
-     * 只有当前记录仍与 [expected] 完全相等时才删除相同更新标识的回复，避免迟到失败响应删除已改变的快照。
-     * 调用方必须先持久化登记到回退投递上限，避免网络中断时错误终止尚可重试的回复。
-     *
-     * @param botId token 冒号前的非空机器人标识。
-     * @param expected 当前已耗尽的回退片段快照。
-     * @return 已持久化终止整条回复时为 `true`；bot 无效、快照已变化或不是耗尽回退消息时为 `false`。
-     * @throws IllegalArgumentException 当 [expected] 不满足 outbox 不变量时抛出。
-     * @throws IllegalStateException 配置文件已损坏或暂不可读取时抛出；内存状态不变。
-     * @throws Exception 配置文件无法编码或原子提交时抛出；内存状态不变。
-     */
+    /** 在同一仓储锁内记录一次明确非 429 失败；第三次失败原子删除整条回复。 */
     @Synchronized
-    internal fun discardExhaustedPendingTelegramReplyFallback(botId: String, expected: PendingTelegramReply): Boolean {
+    internal fun recordPendingTelegramReplyFallbackFailure(
+        botId: String,
+        expected: PendingTelegramReply,
+    ): FallbackFailureCommitResult {
         validatePendingTelegramReply(expected)
         if (
             expected.deliveryStage != TelegramReplyDeliveryStage.FALLBACK ||
-            expected.deliveryAttempts < MAX_FALLBACK_TELEGRAM_REPLY_DELIVERY_ATTEMPTS ||
+            expected.fallbackFailureCount >= MAX_FALLBACK_TELEGRAM_REPLY_FAILURES ||
             !botId.isValidBotId()
         ) {
-            return false
+            return FallbackFailureCommitResult.STALE
         }
         migrateLegacyDataIfNeeded(botId)
-        val current = state.bots[botId] ?: return false
-        val removed = removePendingReplyIfCurrent(current, expected) ?: return false
-        saveState(state.copy(bots = state.bots + (botId to removed)))
-        return true
+        val current = state.bots[botId] ?: return FallbackFailureCommitResult.STALE
+        val replyIndex = current.pendingTelegramReplies.indexOfFirst { it == expected }
+        if (replyIndex < 0) return FallbackFailureCommitResult.STALE
+        val failures = expected.fallbackFailureCount + 1
+        val result = if (failures == MAX_FALLBACK_TELEGRAM_REPLY_FAILURES) {
+            FallbackFailureCommitResult.DISCARDED
+        } else {
+            FallbackFailureCommitResult.RETAINED
+        }
+        val updated = if (result == FallbackFailureCommitResult.DISCARDED) {
+            removePendingReplyIfCurrent(current, expected) ?: return FallbackFailureCommitResult.STALE
+        } else {
+            val replies = current.pendingTelegramReplies.toMutableList().also {
+                it[replyIndex] = expected.copy(fallbackFailureCount = failures)
+            }
+            current.copy(pendingTelegramReplies = replies)
+        }
+        saveState(state.copy(bots = state.bots + (botId to updated)))
+        return result
     }
 
     /** 仅当完整快照仍匹配时删除其所属更新的整条 outbox 回复。 */
@@ -1637,9 +1717,16 @@ private fun validatePendingTelegramReply(reply: PendingTelegramReply, expectedUp
         }
     }
     require(reply.deliveryAttempts >= 0) { "reply deliveryAttempts must not be negative." }
+    require(reply.fallbackFailureCount in 0..MAX_FALLBACK_TELEGRAM_REPLY_FAILURES) {
+        "reply fallbackFailureCount must be between zero and the failure limit."
+    }
+    require(reply.nextDeliveryAtEpochMillis >= 0) { "reply nextDeliveryAtEpochMillis must not be negative." }
     require(reply.permanentRejectionCount >= 0) { "reply permanentRejectionCount must not be negative." }
     when (reply.deliveryStage) {
         TelegramReplyDeliveryStage.ORIGINAL, TelegramReplyDeliveryStage.PLAIN_FALLBACK -> {
+            require(reply.fallbackFailureCount == 0) {
+                "non-fallback reply fallbackFailureCount must be zero."
+            }
             require(reply.permanentRejectionCount <= 1) {
                 "original reply permanentRejectionCount must not exceed one."
             }

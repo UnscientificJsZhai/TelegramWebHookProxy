@@ -11,6 +11,7 @@ import com.unscientificjszhai.tgp.repository.PendingTelegramReply
 import com.unscientificjszhai.tgp.repository.RetryCheckpointCommitResult
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_INLINE_MEDIA_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
@@ -35,6 +36,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 private const val AGENT_TURN_FAILURE_REPLY = "抱歉，该消息未能处理。"
+private const val VOICE_INPUT_FAILURE_REPLY = "抱歉，无法处理该语音，请发送不超过 2 MiB 的语音或改用文字。"
 
 /**
  * 串行消费单个 PollingSession 的工作，并执行不可重放的 Agent 回合状态机。
@@ -66,6 +68,11 @@ internal class AgentTurnProcessor(
 ) {
     private val agentTurnOwners = mutableMapOf<AgentTurnKey, CompletableDeferred<Unit>>()
 
+    /** 序列切换必须等待同一 Bot 的旧 owner 完成，包括前一个 token 会话的不可取消收尾。 */
+    fun hasActiveAgentTurn(botId: String): Boolean = runtime.withSessionLock {
+        agentTurnOwners.any { (key, owner) -> key.botId == botId && !owner.isCompleted }
+    }
+
     /** 单项队列工作的最大处理时间。 */
     var processingTimeout: Duration = processingTimeout
         set(value) {
@@ -91,7 +98,7 @@ internal class AgentTurnProcessor(
             if (cause == null || cause is CancellationException) {
                 return@invokeOnCompletion
             }
-            if (!isRecoverableQueueConsumerFailure(cause)) {
+            if (!isRecoverableQueueConsumerFailure(session, cause)) {
                 terminateFatalQueueConsumerSession(session, consumer)
                 logger.error(
                     "Queue consumer stopped with a fatal error for bot {}; the session was terminated and will not restart; type={}",
@@ -125,7 +132,9 @@ internal class AgentTurnProcessor(
         }
     }
 
-    private fun isRecoverableQueueConsumerFailure(cause: Throwable): Boolean = cause is StackOverflowError
+    /** 恢复额度耗尽后按 fatal error 处理，必须在发布 Retry 前取消会话。 */
+    private fun isRecoverableQueueConsumerFailure(session: PollingSession, cause: Throwable): Boolean =
+        cause is StackOverflowError && runtime.withSessionLock { !session.consumerRestartedAfterError }
 
     /**
      * 在 fatal error 后原子摘除当前会话，防止 polling 继续向无人消费的队列投递。
@@ -144,7 +153,7 @@ internal class AgentTurnProcessor(
             } else {
                 runtime.currentSession = null
                 session.updateChannel.close()
-                session.consumerResume.close()
+                session.consumerResumeWaiter?.cancel()
                 session.outboxSignal.close()
                 true
             }
@@ -190,16 +199,29 @@ internal class AgentTurnProcessor(
 
                 currentCoroutineContext().ensureActive()
                 if (runtime.isCurrent(session)) {
+                    val resumeWaiter = if (completion == UpdateCompletion.Retry) {
+                        CompletableDeferred<Unit>().also { waiter ->
+                            runtime.withSessionLock { session.consumerResumeWaiter = waiter }
+                        }
+                    } else {
+                        null
+                    }
                     queuedWork.completion.complete(completion)
                     currentWork = null
-                    if (completion == UpdateCompletion.Retry) {
+                    if (resumeWaiter != null) {
                         drainQueuedUpdatesAsRetry(session)
-                        session.consumerResume.receiveCatching().getOrNull() ?: return
+                        try {
+                            resumeWaiter.await()
+                        } finally {
+                            runtime.withSessionLock {
+                                if (session.consumerResumeWaiter === resumeWaiter) session.consumerResumeWaiter = null
+                            }
+                        }
                     }
                 }
             }
         } catch (cause: Throwable) {
-            if (cause !is CancellationException && !isRecoverableQueueConsumerFailure(cause)) {
+            if (cause !is CancellationException && !isRecoverableQueueConsumerFailure(session, cause)) {
                 // 先停止会话，再发布 Retry；scope 也覆盖 pollJob 尚未完成字段赋值的启动窗口。
                 session.scope.cancel(CancellationException("Queue consumer stopped after fatal error.", cause))
             }
@@ -210,7 +232,8 @@ internal class AgentTurnProcessor(
         }
     }
 
-    private fun drainQueuedUpdatesAsRetry(session: PollingSession) {
+    /** 重试前排空旧批次，包括消费者进入暂停之后才由轮询器入队的后项。 */
+    fun drainQueuedUpdatesAsRetry(session: PollingSession) {
         while (true) {
             val queued = session.updateChannel.tryReceive().getOrNull() ?: return
             queued.completion.complete(UpdateCompletion.Retry)
@@ -444,6 +467,10 @@ internal class AgentTurnProcessor(
         expectedRetryCheckpointTarget: Long?,
     ): UpdateCompletion {
         val voice = checkNotNull(message.voice)
+        suspend fun failVoiceInput(): UpdateCompletion = outboxWorker.persistAuthorizedReply(
+            session, ticket, authorization, updateId, expectedRetryCheckpointTarget, VOICE_INPUT_FAILURE_REPLY,
+        )
+        if ((voice.fileSize ?: 0) > MAX_AGENT_INLINE_MEDIA_BYTES) return failVoiceInput()
         if (!isWithinAgentTextLimit(message.caption)) {
             logger.warn("Voice caption for update {} exceeds the local pre-claim limit.", updateId)
             return UpdateCompletion.Retry
@@ -457,6 +484,12 @@ internal class AgentTurnProcessor(
                 AuthorizedEffect.Confirmed -> return UpdateCompletion.Confirmed
                 is AuthorizedEffect.Executed -> result.value
             }
+            if (!fileResponse.ok) {
+                val code = fileResponse.errorCode
+                if (code != null && code in 400..499 && code != 408 && code != 429) return failVoiceInput()
+                return UpdateCompletion.Retry
+            }
+            if ((fileResponse.result?.fileSize ?: 0) > MAX_AGENT_INLINE_MEDIA_BYTES) return failVoiceInput()
             val filePath = fileResponse.result?.filePath
                 ?: throw IllegalStateException("Failed to get file path for voice message")
             when (
@@ -469,6 +502,10 @@ internal class AgentTurnProcessor(
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (_: TelegramFileDownloadRejectedException) {
+            return failVoiceInput()
+        } catch (_: TelegramPayloadTooLargeException) {
+            return failVoiceInput()
         } catch (e: Exception) {
             logger.warn(
                 "Voice input for update {} was unavailable before Agent claim; category={}",
@@ -477,6 +514,7 @@ internal class AgentTurnProcessor(
             )
             return UpdateCompletion.Retry
         }
+        if (audioData.size > MAX_AGENT_INLINE_MEDIA_BYTES) return failVoiceInput()
         if (audioData.isEmpty()) {
             logger.warn("Voice input for update {} was empty before Agent claim.", updateId)
             return UpdateCompletion.Retry
@@ -671,7 +709,7 @@ internal class AgentTurnProcessor(
     }
 
     /**
-     * 为 durable `FINAL` 回合提交 outbox 与 offset，并在成功后尽力清理 journal。
+     * 为 durable `FINAL` 回合原子提交 outbox、offset 和对应 journal 删除，再清理历史残留记录。
      *
      * 本方法绝不重新调用 Agent。
      *

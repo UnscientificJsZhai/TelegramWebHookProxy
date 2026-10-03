@@ -295,25 +295,27 @@ class SkillRepository private constructor(
         transitionSkillStatus(id, expectedRevision, SkillStatus.APPROVED, SkillStatus.PENDING)
 
     /**
-     * 删除指定标识的技能。
-     *
-     * 配置文件不存在或为空时不执行任何操作；删除已批准技能成功后会发布一次 [skillsUpdateEvent]。
+     * 仅在版本匹配时删除指定技能；删除已批准技能成功后会发布一次 [skillsUpdateEvent]。
      *
      * @param id 要删除的技能标识，必须匹配 [com.unscientificjszhai.tgp.models.SKILL_ID_PATTERN]。
-     * @throws IllegalArgumentException [id] 不匹配技能标识格式时抛出。
+     * @param expectedRevision 管理端查看到的当前版本号，必须等于持久化版本。
+     * @throws IllegalArgumentException [id] 或 [expectedRevision] 不合法时抛出。
+     * @throws SkillNotFoundException 技能不存在时抛出。
+     * @throws SkillRevisionConflictException 版本已过期时抛出。
      * @throws SkillStorageIsolationException 构造时检测到标识非法或重复的历史数据并隔离存储时抛出；不会发布变更事件。
      * @throws IOException 原子替换失败或目录项耐久性无法确认时抛出；不会发布变更事件。
      */
-    fun deleteSkill(id: String) {
+    fun deleteSkill(id: String, expectedRevision: Long) {
         require(isValidSkillId(id)) { "技能标识不合法。" }
+        require(expectedRevision >= 0) { "技能版本号不能为负数。" }
         storageLock.withLock {
             val snapshot = readSkillsForMutation()
-            if (!snapshot.exists) {
-                return
+            val removed = snapshot.items.find { it.id == id } ?: throw SkillNotFoundException(id)
+            if (removed.revision != expectedRevision) {
+                throw SkillRevisionConflictException(id)
             }
-            val removed = snapshot.items.find { it.id == id }
             commitDurableSnapshot(snapshot.items.filterNot { it.id == id })
-            if (removed?.status == SkillStatus.APPROVED) {
+            if (removed.status == SkillStatus.APPROVED) {
                 _skillsUpdateEvent.tryEmit(Unit)
             }
         }

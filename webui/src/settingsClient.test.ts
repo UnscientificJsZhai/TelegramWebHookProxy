@@ -33,6 +33,34 @@ describe('带修订值的设置 API', () => {
         });
     });
 
+    it('精确解析同一服务实例的设置代次，包括超过安全整数的代次', async () => {
+        const epoch = '11111111-1111-4111-8111-111111111111';
+        get.mockResolvedValueOnce({
+            data: {chatId: 'first'},
+            headers: {etag: '"R1"', 'x-settings-version': `${epoch}:9007199254740993`},
+        });
+        patch.mockResolvedValueOnce({
+            data: {chatId: 'second'},
+            headers: {etag: '"R2"', 'x-settings-version': `${epoch}:9007199254740994`},
+        });
+
+        await expect(fetchVersionedSettings()).resolves.toMatchObject({
+            serverVersion: {epoch, generation: 9007199254740993n},
+        });
+        await expect(patchVersionedSettings({chatId: 'second'}, '"R1"')).resolves.toMatchObject({
+            serverVersion: {epoch, generation: 9007199254740994n},
+        });
+    });
+
+    it.each(['bad-version', '11111111-1111-4111-8111-111111111111:-1',
+        '11111111-1111-4111-8111-111111111111:9223372036854775808'])('忽略不合法的服务端代次 %s', async header => {
+        get.mockResolvedValueOnce({
+            data: {chatId: 'first'},
+            headers: {etag: '"R1"', 'x-settings-version': header},
+        });
+        await expect(fetchVersionedSettings()).resolves.toEqual({settings: {chatId: 'first'}, etag: '"R1"'});
+    });
+
     it('读取需要显式修复的字段，忽略未知字段并去重', async () => {
         get.mockResolvedValueOnce({
             data: {chatId: 'first'},

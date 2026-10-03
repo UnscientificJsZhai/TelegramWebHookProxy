@@ -19,6 +19,7 @@ import com.unscientificjszhai.tgp.service.ai.function.*
 import com.unscientificjszhai.tgp.service.ai.function.LocalFunctionProvider.Companion.toMap
 import com.unscientificjszhai.tgp.service.configureHttpProxyBasicAuthentication
 import com.unscientificjszhai.tgp.utils.JsonStructureLimits
+import com.unscientificjszhai.tgp.utils.JsonStructureLimitExceededException
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -38,6 +39,9 @@ import java.time.Duration
 import java.util.*
 import javax.inject.Inject
 import kotlin.jvm.optionals.getOrNull
+
+/** 会话发布和历史裁剪为下一回合保留的 JSON 节点数。 */
+private const val GEMINI_TURN_RESERVATION_NODES = 1_024
 
 /**
  * 基于 Gemini API 维护对话会话并执行模型工具调用的 AI 代理服务。
@@ -311,7 +315,9 @@ class GeminiAgentService @Inject internal constructor(
     private fun createGeminiHttpClient(
         proxySettings: ProxySettings?, authenticationLease: SocksProxyAuthentication.Lease,
     ): OkHttpClient {
-        val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
+        val builder = OkHttpClient.Builder()
+            .callTimeout(Duration.ofMinutes(9))
+            .readTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
             val type = when (proxySettings.type) {
                 ProxyType.HTTP -> Proxy.Type.HTTP
@@ -567,20 +573,21 @@ class GeminiAgentService @Inject internal constructor(
             try {
                 sessionMutex.withLock {
                     ensureResetCanCommit(switchRequest, attempt)
-                    val candidateHistory = if (captureHistory) {
-                        prepareRawGeminiCandidate(rawSession?.history.orEmpty())
-                    } else {
-                        emptyList()
-                    }
                     mcpClientService.connect(aiSettings.mcpServers)
                     currentCoroutineContext().ensureActive()
                     ensureResetCanCommit(switchRequest, attempt)
                     check(rawTransport === currentTransport) { "Gemini HTTP transport was replaced" }
                     val routeSnapshot = localFunctionRouter.refresh()
+                    val config = createGeminiWireConfig(aiSettings, routeSnapshot)
+                    validateRawGeminiSessionConfig(config)
+                    val candidateHistory = prepareRawGeminiCandidate(
+                        if (captureHistory) rawSession?.history.orEmpty() else emptyList(),
+                        config,
+                    )
                     val model = switchRequest?.model ?: currentModel
                     val candidate = RawGeminiSession(
                         model = model,
-                        config = createGeminiWireConfig(aiSettings, routeSnapshot),
+                        config = config,
                         functionRouteSnapshot = routeSnapshot,
                         history = candidateHistory,
                     )
@@ -907,9 +914,13 @@ class GeminiAgentService @Inject internal constructor(
                             val session = checkNotNull(rawSession)
                             val currentTransport = rawTransport
                                 ?: throw IllegalStateException("Gemini HTTP transport is not initialized.")
-                            val tentativeHistory = prepareRawGeminiCandidate(session.history)
+                            val tentativeHistory = prepareRawGeminiCandidate(session.history, session.config)
                             tentativeHistory += createGeminiUserContent(text, mediaData)
-                            normalizeRawGeminiCandidate(tentativeHistory, currentRawGeminiTurnStart(tentativeHistory))
+                            normalizeRawGeminiCandidate(
+                                tentativeHistory,
+                                currentRawGeminiTurnStart(tentativeHistory),
+                                config = session.config,
+                            )
 
                             var toolCallRounds = 0
                             var toolCallsExecuted = 0
@@ -919,7 +930,8 @@ class GeminiAgentService @Inject internal constructor(
                                 tentativeHistory += candidate.content
                                 normalizeRawGeminiCandidate(
                                     tentativeHistory,
-                                    currentRawGeminiTurnStart(tentativeHistory)
+                                    currentRawGeminiTurnStart(tentativeHistory),
+                                    config = session.config,
                                 )
                                 val functionCalls = geminiFunctionCalls(candidate.content)
                                 if (functionCalls.isEmpty()) {
@@ -951,7 +963,8 @@ class GeminiAgentService @Inject internal constructor(
                                     }
                                     normalizeRawGeminiCandidate(
                                         tentativeHistory,
-                                        currentRawGeminiTurnStart(tentativeHistory)
+                                        currentRawGeminiTurnStart(tentativeHistory),
+                                        config = session.config,
                                     )
                                 }
                             }
@@ -1013,14 +1026,28 @@ class GeminiAgentService @Inject internal constructor(
         }
     }
 
-    /** 复制已提交的 REST 历史，并以完整回合为单位预留下一回合的空间。 */
-    private fun prepareRawGeminiCandidate(history: List<JsonObject>): MutableList<JsonObject> {
+    /** 在发布前校验累计系统提示和工具配置，并预留新回合的结构空间。 */
+    private fun validateRawGeminiSessionConfig(config: JsonObject) {
+        try {
+            JsonStructureLimits.validateElement(
+                createRawGeminiRequestBody(emptyList(), config),
+                JsonStructureLimits.Budget(maxNodes = JsonStructureLimits.MAX_NODES - GEMINI_TURN_RESERVATION_NODES),
+            )
+        } catch (error: JsonStructureLimitExceededException) {
+            throw IllegalArgumentException("Gemini 系统提示或工具配置超过资源上限，无法预留新回合空间。", error)
+        }
+    }
+
+    /** 复制已提交的 REST 历史，并以完整回合为单位预留下一回合的字节与结构空间。 */
+    private fun prepareRawGeminiCandidate(history: List<JsonObject>, config: JsonObject): MutableList<JsonObject> {
         val candidate = history.toMutableList()
         normalizeRawGeminiCandidate(
             candidate,
             currentTurnStart = null,
             maxEntries = MAX_AGENT_HISTORY_ENTRIES - 1,
             maxBytes = MAX_AGENT_HISTORY_BYTES - MAX_AGENT_TURN_RESERVATION_BYTES,
+            config = config,
+            maxNodes = JsonStructureLimits.MAX_NODES - GEMINI_TURN_RESERVATION_NODES,
         )
         return candidate
     }
@@ -1036,8 +1063,10 @@ class GeminiAgentService @Inject internal constructor(
         currentTurnStart: Int?,
         maxEntries: Int = MAX_AGENT_HISTORY_ENTRIES,
         maxBytes: Int = MAX_AGENT_HISTORY_BYTES,
+        config: JsonObject = buildJsonObject {},
+        maxNodes: Int = JsonStructureLimits.MAX_NODES,
     ) {
-        while (candidate.size > maxEntries || rawGeminiHistoryBytes(candidate) > maxBytes) {
+        while (!rawGeminiCandidateFits(candidate, maxEntries, maxBytes, config, maxNodes)) {
             val protectedTurnStart = currentTurnStart?.let { currentRawGeminiTurnStart(candidate) }
             val firstHistoricalTurn = candidate.indexOfFirst { it.isNormalGeminiUserTurnStart() }
             if (firstHistoricalTurn < 0 ||
@@ -1055,6 +1084,29 @@ class GeminiAgentService @Inject internal constructor(
                 throw AgentTurnFailedException("AI 会话历史无法按完整回合裁剪。")
             }
             candidate.subList(firstHistoricalTurn, turnEnd).clear()
+        }
+    }
+
+    /** 结构预算与字节预算一样参与裁剪，并计入最终请求的系统提示和工具声明。 */
+    private fun rawGeminiCandidateFits(
+        candidate: List<JsonObject>,
+        maxEntries: Int,
+        maxBytes: Int,
+        config: JsonObject,
+        maxNodes: Int,
+    ): Boolean {
+        return try {
+            if (candidate.size > maxEntries || rawGeminiHistoryBytes(candidate) > maxBytes) {
+                false
+            } else {
+                JsonStructureLimits.validateElement(
+                    createRawGeminiRequestBody(candidate, config),
+                    JsonStructureLimits.Budget(maxNodes = maxNodes),
+                )
+                true
+            }
+        } catch (_: JsonStructureLimitExceededException) {
+            false
         }
     }
 
@@ -1165,10 +1217,7 @@ class GeminiAgentService @Inject internal constructor(
         val url = "$baseUrl/models/$model:generateContent".toHttpUrl().newBuilder()
             .addQueryParameter("key", apiKey)
             .build()
-        val requestBody = buildJsonObject {
-            put("contents", JsonArray(contents))
-            session.config.forEach { (key, value) -> put(key, value) }
-        }
+        val requestBody = createRawGeminiRequestBody(contents, session.config)
         JsonStructureLimits.validateElement(requestBody)
         val encodedBody = wireJson.encodeToString(JsonObject.serializer(), requestBody)
         JsonStructureLimits.validateJsonString(encodedBody)
@@ -1183,6 +1232,12 @@ class GeminiAgentService @Inject internal constructor(
         val root = JsonStructureLimits.parseToJsonElement(wireJson, response.body).jsonObject
         return requireStoppedRawGeminiCandidate(root)
     }
+
+    private fun createRawGeminiRequestBody(contents: List<JsonObject>, config: JsonObject): JsonObject =
+        buildJsonObject {
+            put("contents", JsonArray(contents))
+            config.forEach { (key, value) -> put(key, value) }
+        }
 
     /**
      * 只接受首个候选以字符串 `STOP` 终止的原生 Gemini 响应。
@@ -1208,12 +1263,16 @@ class GeminiAgentService @Inject internal constructor(
         .orEmpty()
 
     /** 执行一个 Gemini 函数调用，并构造对应的协议函数响应。 */
-    private suspend fun createGeminiFunctionResponse(
+    internal suspend fun createGeminiFunctionResponse(
         functionCall: JsonObject,
         routeSnapshot: LocalFunctionRouteSnapshot,
     ): JsonObject {
         val name = functionCall["name"]?.jsonPrimitive?.contentOrNull
-        val args = functionCall["args"] as? JsonObject
+        val args = when (val suppliedArgs = functionCall["args"]) {
+            null -> JsonObject(emptyMap())
+            is JsonObject -> suppliedArgs
+            else -> null
+        }
         val result = try {
             when {
                 name.isNullOrBlank() -> buildJsonObject { put("error", "Function call name is missing") }

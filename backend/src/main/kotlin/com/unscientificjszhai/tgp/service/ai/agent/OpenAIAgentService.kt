@@ -165,7 +165,9 @@ class OpenAIAgentService @Inject internal constructor(
     private fun createOpenAIHttpClient(
         proxySettings: ProxySettings?, authenticationLease: SocksProxyAuthentication.Lease,
     ): OkHttpClient {
-        val builder = OkHttpClient.Builder().callTimeout(Duration.ofMinutes(9))
+        val builder = OkHttpClient.Builder()
+            .callTimeout(Duration.ofMinutes(9))
+            .readTimeout(Duration.ofMinutes(9))
         if (proxySettings != null) {
             val type = when (proxySettings.type) {
                 ProxyType.HTTP -> Proxy.Type.HTTP
@@ -751,7 +753,7 @@ class OpenAIAgentService @Inject internal constructor(
 
         return when (choice.finishReason()) {
             ChatCompletion.Choice.FinishReason.STOP -> {
-                if (toolCalls.isPresent) {
+                if (toolCalls.getOrNull()?.isNotEmpty() == true) {
                     throw AgentTurnFailedException("OpenAI 最终响应不应包含工具调用。")
                 }
                 tentativeHistory.add(ChatCompletionMessageParam.ofAssistant(message.toParam()))
