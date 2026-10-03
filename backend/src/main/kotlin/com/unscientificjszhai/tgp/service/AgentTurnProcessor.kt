@@ -11,6 +11,7 @@ import com.unscientificjszhai.tgp.repository.PendingTelegramReply
 import com.unscientificjszhai.tgp.repository.RetryCheckpointCommitResult
 import com.unscientificjszhai.tgp.repository.UpdatesRepository
 import com.unscientificjszhai.tgp.service.ai.agent.AgentService
+import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_INLINE_MEDIA_BYTES
 import com.unscientificjszhai.tgp.service.ai.agent.MAX_AGENT_TEXT_BYTES
 import com.unscientificjszhai.tgp.utils.SafeLogging
 import com.unscientificjszhai.tgp.utils.TelegramRichTextChunks
@@ -35,8 +36,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 private const val AGENT_TURN_FAILURE_REPLY = "抱歉，该消息未能处理。"
-private const val MAX_VOICE_DOWNLOAD_BYTES = 20 * 1024 * 1024L
-private const val VOICE_INPUT_FAILURE_REPLY = "抱歉，无法下载该语音，请发送不超过 20 MB 的语音或改用文字。"
+private const val VOICE_INPUT_FAILURE_REPLY = "抱歉，无法处理该语音，请发送不超过 2 MiB 的语音或改用文字。"
 
 /**
  * 串行消费单个 PollingSession 的工作，并执行不可重放的 Agent 回合状态机。
@@ -470,7 +470,7 @@ internal class AgentTurnProcessor(
         suspend fun failVoiceInput(): UpdateCompletion = outboxWorker.persistAuthorizedReply(
             session, ticket, authorization, updateId, expectedRetryCheckpointTarget, VOICE_INPUT_FAILURE_REPLY,
         )
-        if ((voice.fileSize ?: 0) > MAX_VOICE_DOWNLOAD_BYTES) return failVoiceInput()
+        if ((voice.fileSize ?: 0) > MAX_AGENT_INLINE_MEDIA_BYTES) return failVoiceInput()
         if (!isWithinAgentTextLimit(message.caption)) {
             logger.warn("Voice caption for update {} exceeds the local pre-claim limit.", updateId)
             return UpdateCompletion.Retry
@@ -489,7 +489,7 @@ internal class AgentTurnProcessor(
                 if (code != null && code in 400..499 && code != 408 && code != 429) return failVoiceInput()
                 return UpdateCompletion.Retry
             }
-            if ((fileResponse.result?.fileSize ?: 0) > MAX_VOICE_DOWNLOAD_BYTES) return failVoiceInput()
+            if ((fileResponse.result?.fileSize ?: 0) > MAX_AGENT_INLINE_MEDIA_BYTES) return failVoiceInput()
             val filePath = fileResponse.result?.filePath
                 ?: throw IllegalStateException("Failed to get file path for voice message")
             when (
@@ -514,6 +514,7 @@ internal class AgentTurnProcessor(
             )
             return UpdateCompletion.Retry
         }
+        if (audioData.size > MAX_AGENT_INLINE_MEDIA_BYTES) return failVoiceInput()
         if (audioData.isEmpty()) {
             logger.warn("Voice input for update {} was empty before Agent claim.", updateId)
             return UpdateCompletion.Retry
