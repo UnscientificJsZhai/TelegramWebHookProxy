@@ -39,9 +39,9 @@ export default function SettingsProvider({children}: { children: ReactNode }) {
         setError(null);
         return load();
     }, [load]);
-    const update = useCallback(async (patch: SettingsPatch, etag: string | null) => {
+    const update = useCallback(async (patch: SettingsPatch, etag: string | null, confirmAccessLoss = false) => {
         const generation = requestGeneration.current;
-        const response = await patchVersionedSettings<AppSettings, SettingsPatch>(patch, etag);
+        const response = await patchVersionedSettings<AppSettings, SettingsPatch>(patch, etag, ...(confirmAccessLoss ? [true] as const : []));
         // 保存期间若有读取开始或发布，PATCH 响应可能已经落后于共享快照。
         if (generation !== requestGeneration.current) {
             const beforeReload = requestGeneration.current;

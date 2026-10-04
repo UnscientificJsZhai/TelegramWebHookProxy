@@ -1,5 +1,7 @@
 package com.unscientificjszhai.tgp.repository
 
+import com.unscientificjszhai.tgp.models.AccessControlSettings
+import com.unscientificjszhai.tgp.models.validateAccessControl
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.HttpToolSettings
 import com.unscientificjszhai.tgp.models.ProxySettings
@@ -58,6 +60,10 @@ class SettingsStore private constructor(
         ): SettingsStore = SettingsStore(configFile, fileOperations)
     }
 
+    internal val accessControlOverride = com.unscientificjszhai.tgp.service.AccessControlOverride(
+        configFile.toPath().toAbsolutePath().parent.resolve("disable-access-control"),
+    )
+
     private val logger = LoggerFactory.getLogger(SettingsStore::class.java)
     private val storage = SchemaValidatedJsonStorage(
         storage = AtomicJsonStorage(configFile.toPath(), ResourceLimits.SETTINGS_BYTES, fileOperations),
@@ -65,6 +71,7 @@ class SettingsStore private constructor(
         migrations = listOf(LEGACY_HTTP_PROXY_TYPE_MIGRATION),
         validator = ::validateAppSettingsResourceLimits,
         logger = logger,
+        protectedOptionalPaths = setOf("$.accessControl"),
     )
 
     /**
@@ -98,6 +105,7 @@ class SettingsStore private constructor(
      * @param settings 已通过上层业务校验的完整应用设置。
      */
     internal fun commit(settings: AppSettings) {
+        validateAccessControl(settings.accessControl)
         storage.commit(settings).requireDurable()
     }
 }
@@ -117,6 +125,7 @@ internal data class LoadedSettings(
     val hasInvalidMcp: Boolean = false,
     val hasInvalidOpenAiBaseUrl: Boolean = false,
     val hasInvalidHttpToolSettings: Boolean = false,
+    val hasInvalidAccessControl: Boolean = false,
 )
 
 private val LEGACY_HTTP_PROXY_TYPE_MIGRATION = JsonElementMigration(
@@ -148,6 +157,7 @@ private fun AppSettings.toLoadedSettings(
     logger: Logger,
     hasInvalidProxy: Boolean = proxy.isInvalidProxy(),
 ): LoadedSettings {
+    val hasInvalidAccessControl = runCatching { validateAccessControl(accessControl) }.isFailure
     val aiSettings = ai
     val hasInvalidMcp = aiSettings?.mcpServers?.let { configs ->
         runCatching { validateMcpServerConfigs(configs) }.isFailure
@@ -174,7 +184,11 @@ private fun AppSettings.toLoadedSettings(
         }
     }
     return LoadedSettings(
-        settings = failClosedSettings,
+        settings = if (hasInvalidAccessControl) {
+            logger.warn("Invalid access control field; path=$.accessControl; category=validation")
+            failClosedSettings.copy(accessControl = AccessControlSettings(true, emptyList()))
+        } else failClosedSettings,
+        hasInvalidAccessControl = hasInvalidAccessControl,
         hasInvalidProxy = hasInvalidProxy,
         hasInvalidMcp = hasInvalidMcp,
         hasInvalidOpenAiBaseUrl = hasInvalidOpenAiBaseUrl,

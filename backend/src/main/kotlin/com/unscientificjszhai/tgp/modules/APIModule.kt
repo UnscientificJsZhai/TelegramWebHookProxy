@@ -1,5 +1,7 @@
 package com.unscientificjszhai.tgp.modules
 
+import com.unscientificjszhai.tgp.service.AccessLossConfirmationRequired
+import com.unscientificjszhai.tgp.service.HistoricalInvalidAccessControlException
 import com.unscientificjszhai.tgp.models.AIProvider
 import com.unscientificjszhai.tgp.models.AppSettings
 import com.unscientificjszhai.tgp.models.InputRichMessage
@@ -80,6 +82,10 @@ fun Application.apiModule(
                     val update = call.commitSettingsUpdate(
                         settingsChangeCoordinator = settingsChangeCoordinator,
                         expectedRevision = expectedRevision,
+                        replacesHistoricalInvalidAccessControl = (patch["accessControl"] as? JsonObject)?.keys == setOf(
+                            "enabled",
+                            "rules"
+                        ),
                         replacesHistoricalInvalidMcpServers = patch.explicitlyReplacesHistoricalMcpServers(),
                         replacesHistoricalInvalidOpenAiBaseUrl = patch.explicitlyReplacesHistoricalOpenAiBaseUrl(),
                         replacesHistoricalInvalidHttpToolSettings = patch.explicitlyReplacesHistoricalHttpToolSettings(),
@@ -356,7 +362,7 @@ private suspend fun ApplicationCall.respondApiInputError(message: String) {
     respond(HttpStatusCode.BadRequest, mapOf("error" to message))
 }
 
-private val APP_SETTINGS_FIELDS = setOf("telegramToken", "chatId", "proxy", "ai")
+private val APP_SETTINGS_FIELDS = setOf("telegramToken", "chatId", "proxy", "ai", "accessControl")
 private val CHAT_SETTINGS_FIELDS = setOf("chatId")
 private val PROXY_SETTINGS_FIELDS = setOf("host", "port", "type", "username", "password")
 private val AI_SETTINGS_FIELDS = setOf(
@@ -422,7 +428,7 @@ private suspend fun ApplicationCall.readSettingsJsonObject(): JsonObject? = try 
 }
 
 /** 读取单个强 ETag；缺失或格式不合法时写入安全的结构化错误响应。 */
-private suspend fun ApplicationCall.requiredSettingsRevision(): String? = when (
+internal suspend fun ApplicationCall.requiredSettingsRevision(): String? = when (
     val parsed = request.headers.parseSingleStrongETag()
 ) {
     IfMatchResult.Missing -> {
@@ -456,10 +462,12 @@ private suspend fun ApplicationCall.handleFullSettingsUpdate(
     val update = commitSettingsUpdate(
         settingsChangeCoordinator = settingsChangeCoordinator,
         expectedRevision = expectedRevision,
+        replacesHistoricalInvalidAccessControl = request.containsKey("accessControl"),
         replacesHistoricalInvalidMcpServers = true,
         replacesHistoricalInvalidOpenAiBaseUrl = true,
         replacesHistoricalInvalidHttpToolSettings = true,
-    ) { settings } ?: return
+    ) { current -> if (request.containsKey("accessControl")) settings else settings.copy(accessControl = current.accessControl) }
+        ?: return
     respondSettingsUpdate(update, settingsChangeCoordinator)
 }
 
@@ -472,17 +480,32 @@ private suspend fun ApplicationCall.commitSettingsUpdate(
     replacesHistoricalInvalidMcpServers: Boolean = false,
     replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
     replacesHistoricalInvalidHttpToolSettings: Boolean = false,
+    replacesHistoricalInvalidAccessControl: Boolean = false,
     transform: (AppSettings) -> AppSettings,
 ): SettingsUpdateResult? {
     val update = try {
         settingsChangeCoordinator.updateSettings(
             expectedRevision = expectedRevision,
+            replacesHistoricalInvalidAccessControl = replacesHistoricalInvalidAccessControl,
             replacesHistoricalInvalidMcpServers = replacesHistoricalInvalidMcpServers,
             replacesHistoricalInvalidOpenAiBaseUrl = replacesHistoricalInvalidOpenAiBaseUrl,
             replacesHistoricalInvalidHttpToolSettings = replacesHistoricalInvalidHttpToolSettings,
         ) { current ->
-            transform(current).clearSelectedModelWhenProviderOrApiKeyChanges(current)
+            transform(current).clearSelectedModelWhenProviderOrApiKeyChanges(current).also { proposed ->
+                application.attributes.getOrNull(accessControlServiceKey)?.requireConfirmation(
+                    proposed.accessControl, peerIp(), accessLossConfirmed(),
+                )
+            }
         }
+    } catch (_: AccessLossConfirmationRequired) {
+        respondAccessLossConfirmation()
+        return null
+    } catch (_: HistoricalInvalidAccessControlException) {
+        respondSettingsError(HttpStatusCode.Conflict, "历史访问限制需要在本次请求中完整替换。")
+        return null
+    } catch (_: java.io.IOException) {
+        respondSettingsError(HttpStatusCode.ServiceUnavailable, "文件操作失败。")
+        return null
     } catch (_: SettingsRevisionMismatchException) {
         respondSettingsError(HttpStatusCode.PreconditionFailed, "设置已被其他操作修改。")
         return null
@@ -544,11 +567,18 @@ private suspend fun ApplicationCall.respondSettingsError(status: HttpStatusCode,
 }
 
 private fun JsonObject.validateCompleteAppSettings() {
-    requireExactKeys(APP_SETTINGS_FIELDS)
+    require(keys == APP_SETTINGS_FIELDS || keys == APP_SETTINGS_FIELDS - "accessControl")
+    this["accessControl"]?.requireJsonObject()?.validateCompleteAccessControl()
     getValue("telegramToken").requireNonNullJsonValue()
     getValue("chatId").requireNonNullJsonValue()
     validateNullableObject("proxy", JsonObject::validateCompleteProxySettings)
     validateNullableObject("ai", JsonObject::validateCompleteAiSettings)
+}
+
+private fun JsonObject.validateCompleteAccessControl() {
+    requireExactKeys(setOf("enabled", "rules"))
+    getValue("enabled").requireNonNullJsonValue()
+    getValue("rules").requireJsonArray().forEach(JsonElement::requireNonNullJsonValue)
 }
 
 private fun JsonObject.validateCompleteProxySettings() {
@@ -592,6 +622,7 @@ private fun JsonObject.validateSettingsPatch() {
     requireKnownKeys(APP_SETTINGS_FIELDS)
     forEach { (field, value) ->
         when (field) {
+            "accessControl" -> value.requireJsonObject().validateCompleteAccessControl()
             "telegramToken", "chatId" -> value.requireNonNullJsonValue()
             "proxy" -> value.validateNullablePatchObject(JsonObject::validateProxySettingsPatch)
             "ai" -> value.validateNullablePatchObject(JsonObject::validateAiSettingsPatch)

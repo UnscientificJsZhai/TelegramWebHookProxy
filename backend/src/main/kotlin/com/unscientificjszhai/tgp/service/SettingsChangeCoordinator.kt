@@ -54,6 +54,8 @@ class SettingsChangeCoordinator @Inject constructor(
         )
     }
 
+    internal val accessControlOverride get() = settingsStore.accessControlOverride
+
     private val loadedSettings = settingsStore.load()
 
     /** 原始设置文件是否包含尚未被显式替换的非法代理设置。 */
@@ -74,6 +76,9 @@ class SettingsChangeCoordinator @Inject constructor(
     /** 原始设置文件是否包含尚未被显式替换的非法 HTTP 工具设置。 */
     @Volatile
     internal var hasHistoricalInvalidHttpToolSettings = loadedSettings.hasInvalidHttpToolSettings
+        private set
+
+    internal var hasHistoricalInvalidAccessControl = loadedSettings.hasInvalidAccessControl
         private set
 
     private val _settingsFlow = MutableStateFlow(loadedSettings.settings)
@@ -134,6 +139,7 @@ class SettingsChangeCoordinator @Inject constructor(
     @Synchronized
     internal fun currentSettingsWithRecovery(): Pair<SettingsSnapshot, List<String>> =
         currentSettingsSnapshot() to buildList {
+            if (hasHistoricalInvalidAccessControl) add("accessControl")
             if (hasHistoricalInvalidProxy) add("proxy")
             if (hasHistoricalInvalidMcp) add("mcpServers")
             if (hasHistoricalInvalidOpenAiBaseUrl) add("openAiBaseUrl")
@@ -183,6 +189,7 @@ class SettingsChangeCoordinator @Inject constructor(
         replacesHistoricalInvalidOpenAiBaseUrl: Boolean = false,
         replacesHistoricalInvalidHttpToolSettings: Boolean = false,
         expectedGeneration: Long? = null,
+        replacesHistoricalInvalidAccessControl: Boolean = false,
         transform: (AppSettings) -> AppSettings,
     ): SettingsUpdateResult {
         val previousSettings = _settingsFlow.value
@@ -195,6 +202,10 @@ class SettingsChangeCoordinator @Inject constructor(
         }
 
         val settings = transform(previousSettings)
+        if (hasHistoricalInvalidAccessControl && !replacesHistoricalInvalidAccessControl) {
+            throw HistoricalInvalidAccessControlException()
+        }
+        validateAccessControl(settings.accessControl)
         if (hasHistoricalInvalidProxy && settings.proxy == null) {
             throw IllegalArgumentException("历史代理设置不合法，必须显式提供合法代理后才能保存设置。")
         }
@@ -219,6 +230,7 @@ class SettingsChangeCoordinator @Inject constructor(
             hasHistoricalInvalidHttpToolSettings && replacesHistoricalInvalidHttpToolSettings
         if (
             settings == previousSettings &&
+            !(hasHistoricalInvalidAccessControl && replacesHistoricalInvalidAccessControl) &&
             !resolvesHistoricalInvalidMcp &&
             !resolvesHistoricalInvalidOpenAiBaseUrl &&
             !resolvesHistoricalInvalidHttpToolSettings
@@ -241,6 +253,7 @@ class SettingsChangeCoordinator @Inject constructor(
         }
 
         if (settings == previousSettings) {
+            if (replacesHistoricalInvalidAccessControl) hasHistoricalInvalidAccessControl = false
             // 显式以 fail-closed 后的同值配置修复历史磁盘配置时，只更新已成功落盘的保护状态；不发布虚假的
             // 设置版本或 Agent 生命周期切换。
             if (resolvesHistoricalInvalidMcp) {
@@ -256,6 +269,7 @@ class SettingsChangeCoordinator @Inject constructor(
         }
 
         val publish = {
+            if (replacesHistoricalInvalidAccessControl) hasHistoricalInvalidAccessControl = false
             hasHistoricalInvalidProxy = false
             if (resolvesHistoricalInvalidMcp) {
                 hasHistoricalInvalidMcp = false
@@ -409,6 +423,8 @@ class HistoricalInvalidOpenAiBaseUrlConfigurationException : IllegalArgumentExce
 class HistoricalInvalidHttpToolConfigurationException : IllegalArgumentException(
     "历史 HTTP 工具配置不合法，必须显式替换 HTTP 工具设置后才能保存设置。",
 )
+
+class HistoricalInvalidAccessControlException : IllegalArgumentException("历史访问限制需要显式修复。")
 
 private fun AppSettings.revision(): String =
     MessageDigest.getInstance("SHA-256")

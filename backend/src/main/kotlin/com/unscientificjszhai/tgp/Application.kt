@@ -193,6 +193,7 @@ private fun Application.configureApplication(appComponent: AppComponent) {
             },
         )
     }
+    installAccessControl(appComponent.settingsChangeCoordinator)
     installApiErrorPages()
     installProtocolUpgradeRejection()
 

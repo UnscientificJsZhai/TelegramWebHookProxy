@@ -8,15 +8,19 @@
 
 ## 概览
 
-TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统、脚本或自动化工具的消息发送到 Telegram。它内置 Web 管理界面，可以配置 Bot Token、默认会话、代理服务器和 AI 助手能力。
+TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统、脚本或自动化工具的消息发送到 Telegram。它内置 Web 管理界面，可以配置
+Bot Token、默认会话、代理服务器和 AI 助手能力。
 
-启用 AI 后，Telegram Bot 还能作为个人 Agent 使用：接收文本或语音消息，调用本地 HTTP API、MCP 工具、Skill 知识库和定时任务能力，用来管理家中或服务器上的服务。
+启用 AI 后，Telegram Bot 还能作为个人 Agent 使用：接收文本或语音消息，调用本地 HTTP API、MCP 工具、Skill
+知识库和定时任务能力，用来管理家中或服务器上的服务。
 
 ## 功能特性
 
-- **Webhook 转 Telegram**：通过 `/api/send-message` 发送普通文本、Rich Markdown、HTML 或 blocks 消息到指定或默认 Telegram 会话。
+- **Webhook 转 Telegram**：通过 `/api/send-message` 发送普通文本、Rich Markdown、HTML 或 blocks 消息到指定或默认 Telegram
+  会话。
 - **字段映射**：支持通过查询参数适配不同 Webhook 来源的字段名。
-- **代理支持**：Telegram API 与 AI Provider 请求可使用 HTTP 或 SOCKS 代理，均支持可选的用户名与密码认证。SOCKS 认证使用 SOCKS5，凭据支持 Latin-1 字符（含英文、数字，不含中文），用户名和密码各为 1–255 字节。
+- **代理支持**：Telegram API 与 AI Provider 请求可使用 HTTP 或 SOCKS 代理，均支持可选的用户名与密码认证。SOCKS 认证使用
+  SOCKS5，凭据支持 Latin-1 字符（含英文、数字，不含中文），用户名和密码各为 1–255 字节。
 - **Web 管理界面**：配置 Token、默认聊天、代理、AI Provider、MCP 服务器和 Skill。
 - **AI Agent**：支持 Google Gemini 与 OpenAI SDK，可在 Telegram 中连续对话。
 - **语音消息**：可接收 Telegram 语音消息并交给 AI 处理。
@@ -26,7 +30,7 @@ TelegramWebHookProxy 提供一个简单的 HTTP API，用于把第三方系统�
 ## 技术栈
 
 | 模块 | 技术                                                                  |
-| ---- | --------------------------------------------------------------------- |
+|------|-----------------------------------------------------------------------|
 | 后端 | Kotlin 2.4.20、Ktor 3、Dagger、kotlinx.serialization                  |
 | AI   | Google Gemini SDK、OpenAI Java SDK、Model Context Protocol Kotlin SDK |
 | 前端 | React 19、Vite、Material UI、React Router、Axios                      |
@@ -58,7 +62,8 @@ docker run -d \
 
 ### 使用 Jar 包
 
-可以使用 JDK 21 或 JDK 26 启动构建。编译和默认测试仍使用 JDK 21，Gradle 会按需下载对应工具链及前端所需的 Node.js/npm。Docker 构建和运行镜像使用 JDK 26。
+可以使用 JDK 21 或 JDK 26 启动构建。编译和默认测试仍使用 JDK 21，Gradle 会按需下载对应工具链及前端所需的
+Node.js/npm。Docker 构建和运行镜像使用 JDK 26。
 
 ```bash
 ./gradlew :backend:releaseBuild
@@ -79,10 +84,19 @@ java -jar backend/build/libs/TelegramWebHookProxy-1.2.0-all.jar
 3. 如果访问 Telegram API 需要代理，配置 HTTP 或 SOCKS 代理。
 4. 向 Bot 发送一条消息，让服务通过 Telegram updates 发现会话。
 5. 在首页选择默认会话，之后 `/api/send-message` 可以省略 `chatId`。
-6. 如需 AI Agent，在 AI Agent 页面选择 Provider 并保存 API Key，然后从“模型名称”下拉列表选择模型并独立保存，最后配置 Agent Chat ID、系统提示词并启用 AI。
+6. 如需 AI Agent，在 AI Agent 页面选择 Provider 并保存 API Key，然后从“模型名称”下拉列表选择模型并独立保存，最后配置 Agent
+   Chat ID、系统提示词并启用 AI。
 
 > [!NOTE]
 > 会话列表由后台轮询 Telegram updates 自动维护。首次启动时会跳过历史消息，从最新 update 开始处理。
+
+## 管理访问限制
+
+服务配置页面可启用按连接对端 IP 匹配的管理白名单，支持 IPv4、IPv6 和 CIDR。新安装与旧配置默认无限制，`/api/send-message`
+不受管理白名单影响。允许代理 IP 会允许其转发的所有来源。
+
+误锁时创建 `config/disable-access-control`（Docker 中 `/app/config/disable-access-control`）恢复管理访问；删除文件即应用最新保存规则。已配置
+AI 监听私聊可发送 `/access_unlock` 静默创建同一文件。
 
 ## API 使用
 
@@ -100,11 +114,14 @@ java -jar backend/build/libs/TelegramWebHookProxy-1.2.0-all.jar
 }
 ```
 
-Gemini 会汇总分页结果，并只保留支持 `generateContent` 的模型。空列表正常返回 `200`；配置不完整返回 `400`，上游请求失败返回 `502`，超时返回 `504`，错误响应为 `{"error":"说明"}`。
+Gemini 会汇总分页结果，并只保留支持 `generateContent` 的模型。空列表正常返回 `200`；配置不完整返回 `400`，上游请求失败返回
+`502`，超时返回 `504`，错误响应为 `{"error":"说明"}`。
 
-`currentModel` 用于回显当前选项：优先返回已保存的 `ai.selectedModel`；未保存选择时返回同一份配置下已就绪 Agent 的实际模型。两者都不存在时返回空字符串，页面显示“请选择模型”。查询不会自动保存默认模型，已保存但不在列表中的模型仍会返回并标记为不可用。
+`currentModel` 用于回显当前选项：优先返回已保存的 `ai.selectedModel`；未保存选择时返回同一份配置下已就绪 Agent
+的实际模型。两者都不存在时返回空字符串，页面显示“请选择模型”。查询不会自动保存默认模型，已保存但不在列表中的模型仍会返回并标记为不可用。
 
-模型选择继续使用 `PATCH /api/settings`，携带从 `GET /api/settings` 获取的 `ETag` 作为 `If-Match`，请求体为 `{"ai":{"selectedModel":"model-a"}}`。
+模型选择继续使用 `PATCH /api/settings`，携带从 `GET /api/settings` 获取的 `ETag` 作为 `If-Match`，请求体为
+`{"ai":{"selectedModel":"model-a"}}`。
 
 ### 发送消息
 
@@ -113,7 +130,7 @@ Gemini 会汇总分页结果，并只保留支持 `generateContent` 的模型。
 支持 `application/json` 与 `application/x-www-form-urlencoded`。
 
 | 查询参数       | 默认值   | 说明                                                          |
-| -------------- | -------- | ------------------------------------------------------------- |
+|----------------|----------|---------------------------------------------------------------|
 | `messagefield` | `text`   | 请求体中表示消息内容的字段名                                  |
 | `chatidfield`  | `chatId` | 请求体中表示目标 Telegram Chat ID 的字段名                    |
 | `richformat`   | 空       | 可选 `markdown`、`html`、`blocks`；省略或全空白时发送普通消息 |
@@ -144,7 +161,7 @@ curl -X POST "http://localhost:10178/api/send-message?messagefield=content&chati
 `richformat` 只接受小写枚举；未知值或重复指定返回 `400`。正文仍使用 `text`（或 `messagefield` 映射的字段），目标规则不变：
 
 | 格式                   | JSON 正文            | URL 编码表单正文       | Telegram 方法     |
-| ---------------------- | -------------------- | ---------------------- | ----------------- |
+|------------------------|----------------------|------------------------|-------------------|
 | 普通消息（省略或空白） | 非空字符串           | 非空字符串             | `sendMessage`     |
 | `markdown`             | 非空 Markdown 字符串 | 非空 Markdown 字符串   | `sendRichMessage` |
 | `html`                 | 非空 HTML 字符串     | 非空 HTML 字符串       | `sendRichMessage` |
@@ -165,29 +182,36 @@ curl -X POST 'http://localhost:10178/api/send-message?richformat=blocks&messagef
 
 表单发送 blocks 时可使用 `--data-urlencode 'text=[{"type":"paragraph","text":"构建完成"}]'`。
 服务只检查正文类型、非空要求及 JSON 结构，保留 blocks 对象内容，完整语法和内容限制交由 Telegram 验证。
-富消息请求只设置 `rich_message` 中选定的一个字段，详见 [InputRichMessage](https://core.telegram.org/bots/api#inputrichmessage)。
+富消息请求只设置 `rich_message`
+中选定的一个字段，详见 [InputRichMessage](https://core.telegram.org/bots/api#inputrichmessage)。
 
-一次 API 请求仅投递一条消息，不自动拆分或降级，Telegram 状态码和响应正文继续透传。普通消息保留 4,096 个 UTF-16 单元和 64 KiB 请求体限制；三种富消息格式的 HTTP 请求体上限均为 1 MiB（1,048,576 字节），按实际传输的字节计量，包含 JSON 或表单编码开销。超过上限返回 `413`，未声明 `Content-Length` 的流式请求同样受限；仍保留 JSON 深度及节点数保护。
-正文可引用媒体 URL，blocks 可使用 Telegram 文件引用；接口不提供独立 `media` 参数或文件上传。富消息语法和平台限制见 [Telegram 官方文档](https://core.telegram.org/bots/api#rich-message-formatting-options)。
+一次 API 请求仅投递一条消息，不自动拆分或降级，Telegram 状态码和响应正文继续透传。普通消息保留 4,096 个 UTF-16 单元和 64
+KiB 请求体限制；三种富消息格式的 HTTP 请求体上限均为 1 MiB（1,048,576 字节），按实际传输的字节计量，包含 JSON 或表单编码开销。超过上限返回
+`413`，未声明 `Content-Length` 的流式请求同样受限；仍保留 JSON 深度及节点数保护。
+正文可引用媒体 URL，blocks 可使用 Telegram 文件引用；接口不提供独立 `media`
+参数或文件上传。富消息语法和平台限制见 [Telegram 官方文档](https://core.telegram.org/bots/api#rich-message-formatting-options)。
 
 Web UI 的 Webhook 页面可选择四种格式并载入示例，首页快捷发送继续使用普通消息。
 
 ### 常用接口
 
-| 方法     | 路径                         | 说明                             |
-| -------- | ---------------------------- | -------------------------------- |
-| `GET`    | `/api/settings`              | 获取当前设置                     |
-| `PUT`    | `/api/settings`              | 使用完整严格 JSON 替换全局设置   |
-| `PATCH`  | `/api/settings`              | 使用严格 JSON 局部更新全局设置   |
-| `POST`   | `/api/settings`              | 兼容的完整设置替换，语义同 `PUT` |
-| `POST`   | `/api/settings/chat`         | 兼容的默认 Telegram 会话更新     |
-| `GET`    | `/api/chats`                 | 获取已发现的 Telegram 会话       |
-| `DELETE` | `/api/chats/{id}`            | 删除本地保存的会话               |
-| `GET`    | `/api/skills?page=1&size=10` | 分页获取 Skill                   |
-| `POST`   | `/api/skills`                | 新增或编辑待审批 Skill 草稿      |
-| `POST`   | `/api/skills/{id}/approve`   | 以版本号批准 Skill 并启用        |
-| `POST`   | `/api/skills/{id}/revoke`    | 以版本号撤销已批准 Skill         |
-| `DELETE` | `/api/skills/{id}`           | 删除 Skill                       |
+| 方法     | 路径                           | 说明                             |
+|----------|--------------------------------|----------------------------------|
+| `GET`    | `/api/settings`                | 获取当前设置                     |
+| `PUT`    | `/api/settings`                | 使用完整严格 JSON 替换全局设置   |
+| `PATCH`  | `/api/settings`                | 使用严格 JSON 局部更新全局设置   |
+| `POST`   | `/api/settings`                | 兼容的完整设置替换，语义同 `PUT` |
+| `POST`   | `/api/settings/chat`           | 兼容的默认 Telegram 会话更新     |
+| `GET`    | `/api/access-control`          | 获取对端 IP、覆盖状态与网卡建议  |
+| `POST`   | `/api/access-control/check`    | 预检规则对当前来源的访问结果     |
+| `DELETE` | `/api/access-control/override` | 删除覆盖文件并恢复已保存规则     |
+| `GET`    | `/api/chats`                   | 获取已发现的 Telegram 会话       |
+| `DELETE` | `/api/chats/{id}`              | 删除本地保存的会话               |
+| `GET`    | `/api/skills?page=1&size=10`   | 分页获取 Skill                   |
+| `POST`   | `/api/skills`                  | 新增或编辑待审批 Skill 草稿      |
+| `POST`   | `/api/skills/{id}/approve`     | 以版本号批准 Skill 并启用        |
+| `POST`   | `/api/skills/{id}/revoke`      | 以版本号撤销已批准 Skill         |
+| `DELETE` | `/api/skills/{id}`             | 删除 Skill                       |
 
 设置写入必须携带 `GET /api/settings` 返回的单个强 `ETag` 作为 `If-Match`。`PUT` 要求
 提供所有顶层与非空嵌套字段；`PATCH` 仅修改出现的字段，`proxy` 与 `ai` 可用 `null` 删除，
@@ -196,10 +220,11 @@ Web UI 的 Webhook 页面可选择四种格式并载入示例，首页快捷发�
 
 ## AI Agent
 
-AI Agent 仅处理授权用户的私聊消息：消息必须来自私聊，且发送者 ID 与聊天 ID 都要等于 `agentChatId`。开启后可在 Telegram 中使用以下命令：
+AI Agent 仅处理授权用户的私聊消息：消息必须来自私聊，且发送者 ID 与聊天 ID 都要等于 `agentChatId`。开启后可在 Telegram
+中使用以下命令：
 
 | 命令                | 说明                               |
-| ------------------- | ---------------------------------- |
+|---------------------|------------------------------------|
 | `/model`            | 查看当前模型与可用模型             |
 | `/model <模型名称>` | 切换模型并重置会话                 |
 | `/reset`            | 重置当前会话上下文并清空待处理消息 |
@@ -213,13 +238,17 @@ Agent 可用能力包括：
 - 访问外部或内网 HTTP API。
 - 处理 Telegram 语音消息。
 
-文字、语音交互后的 AI 成功回复，以及定时任务结果，默认以 Rich Markdown 发送。OpenAI 与 Gemini 使用相同格式指引，并保留全局上下文。命令响应、系统错误及固定失败提示继续使用普通消息。
+文字、语音交互后的 AI 成功回复，以及定时任务结果，默认以 Rich Markdown 发送。OpenAI 与 Gemini
+使用相同格式指引，并保留全局上下文。命令响应、系统错误及固定失败提示继续使用普通消息。
 
-长回复按 Markdown 结构分片：代码续片保留围栏及语言，表格续片重复表头，各片补齐需要的脚注和引用链接定义。公式、折叠块、媒体组合保持完整；无法安全容纳的部分保留原文并转为普通消息。采用 commonmark-java 0.30.0 及表格、脚注、任务列表、删除线扩展；无法准确解析的 Telegram 扩展按保守预算处理，最终由上游判定。
+长回复按 Markdown 结构分片：代码续片保留围栏及语言，表格续片重复表头，各片补齐需要的脚注和引用链接定义。公式、折叠块、媒体组合保持完整；无法安全容纳的部分保留原文并转为普通消息。采用
+commonmark-java 0.30.0 及表格、脚注、任务列表、删除线扩展；无法准确解析的 Telegram 扩展按保守预算处理，最终由上游判定。
 
-聊天回复在 AI 回合完成时保存完整投递计划。重启后恢复片段和普通降级进度，不重新调用 AI；历史记录继续按原有普通消息游标发送。富片段被明确拒绝时，首片先去除回复引用重试，仍被拒绝才降级当前部分，之后继续后续富片段。网络异常、限流和服务端临时错误保留原格式重试。投递仍是至少一次语义，网络结果不确定时可能重复发送。
+聊天回复在 AI 回合完成时保存完整投递计划。重启后恢复片段和普通降级进度，不重新调用
+AI；历史记录继续按原有普通消息游标发送。富片段被明确拒绝时，首片先去除回复引用重试，仍被拒绝才降级当前部分，之后继续后续富片段。网络异常、限流和服务端临时错误保留原格式重试。投递仍是至少一次语义，网络结果不确定时可能重复发送。
 
-定时任务复用相同分片和局部降级规则，保留结果前缀并在每次发送前检查 token；网络结果不确定或普通消息发送失败时停止，不新增持久化重试，不因发送失败重新执行 AI。本次不提供流式草稿或 AI 格式开关，也不扩展接收端富消息解析。
+定时任务复用相同分片和局部降级规则，保留结果前缀并在每次发送前检查 token；网络结果不确定或普通消息发送失败时停止，不新增持久化重试，不因发送失败重新执行
+AI。本次不提供流式草稿或 AI 格式开关，也不扩展接收端富消息解析。
 
 自动化测试覆盖请求契约、内容分片及恢复状态；实际 Telegram 的三种富格式、长回复续接、局部降级、聊天及定时任务显示效果仍需在客户端验收。
 

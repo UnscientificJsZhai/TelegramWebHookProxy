@@ -109,6 +109,7 @@ internal class SchemaValidatedJsonStorage<T>(
     private val validator: (T) -> Unit = {},
     private val structureBudget: JsonStructureLimits.Budget = JsonStructureLimits.DEFAULT_BUDGET,
     private val logger: Logger = LoggerFactory.getLogger(SchemaValidatedJsonStorage::class.java),
+    private val protectedOptionalPaths: Set<String> = emptySet(),
     private val writeFormat: JsonStorageWriteFormat = JsonStorageWriteFormatPolicy.fromStartupEnvironment(),
 ) {
     private val formatLock = Any()
@@ -384,7 +385,10 @@ internal class SchemaValidatedJsonStorage<T>(
             when (val result = repairValue(child, descriptor.getElementDescriptor(index), childPath)) {
                 is RepairResult.Valid -> repaired[name] = result.value
                 RepairResult.DirectMismatch -> {
-                    if (!descriptor.isElementOptional(index)) {
+                    if (!descriptor.isElementOptional(index) || protectedOptionalPaths.any { protected ->
+                            childPath.render() == protected || childPath.render().startsWith("$protected.") ||
+                                    childPath.render().startsWith("$protected[")
+                        }) {
                         throw SchemaJsonCorruptionException(
                             childPath.render(),
                             "required field has an invalid JSON type"

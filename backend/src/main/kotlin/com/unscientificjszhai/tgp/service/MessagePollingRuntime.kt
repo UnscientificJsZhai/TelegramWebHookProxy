@@ -46,6 +46,8 @@ internal class PollingSession(
     var initialOffsetResolved: Boolean = false,
 ) {
     /** 轮询任务单独维护的未完成批次信号，用于序列切换前等待所有旧工作退出。 */
+    var lastReceivedBatch: List<Update> = emptyList()
+
     val pendingUpdateCompletions = mutableSetOf<CompletableDeferred<UpdateCompletion>>()
 
     /** 当前 Retry 专属的恢复握手；仅在 runtime 会话锁内读取或替换，不为未来批次预存信号。 */

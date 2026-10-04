@@ -1,3 +1,4 @@
+import AccessControl from '../components/AccessControl';
 import {useRef, useState} from 'react';
 import {
     Accordion,
@@ -48,13 +49,14 @@ import {FeedbackSnackbar, type Notice, SettingsConflictDialog} from '../componen
 export default function Settings() {
     return <><PageHeader title="服务配置"
                          description="管理 Telegram Bot 凭据、默认接收目标与网络代理，让每一条消息准确送达。"/><SettingsGate>{snapshot =>
-        <ServiceSettings initial={snapshot}/>}</SettingsGate></>;
+        <><ServiceSettings initial={snapshot}/><AccessControl initial={snapshot}/></>}</SettingsGate></>;
 }
 
 function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
     const {update, reload, loading} = useSettings();
     const {chats, error: chatsError, loading: chatsLoading, refresh} = useChats();
     const [saved, setSaved] = useState(initial);
+    const [observedInitial, setObservedInitial] = useState(initial);
     const [draft, setDraft] = useState(initial.settings);
     const [notice, setNotice] = useState<Notice | null>(null);
     const [saving, setSaving] = useState(false);
@@ -62,6 +64,11 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
     const [chooseChat, setChooseChat] = useState(false);
     const saveLock = useRef(false);
     const dirty = draft.telegramToken !== saved.settings.telegramToken || draft.chatId !== saved.settings.chatId || JSON.stringify(draft.proxy) !== JSON.stringify(saved.settings.proxy);
+    if (initial !== observedInitial && !dirty && !saving && !conflict) {
+        setObservedInitial(initial);
+        setSaved(initial);
+        setDraft(initial.settings);
+    }
     const tokenError = utf8Length(draft.telegramToken) > 256;
     const chatError = utf8Length(draft.chatId) > 64;
     const proxyValid = !draft.proxy || (!!draft.proxy.host.trim() && Number.isInteger(draft.proxy.port) && draft.proxy.port >= 1 && draft.proxy.port <= 65535);

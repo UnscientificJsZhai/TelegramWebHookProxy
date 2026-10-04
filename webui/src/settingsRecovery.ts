@@ -1,4 +1,4 @@
-import {type AISettings, DEFAULT_AI_SETTINGS, type SettingsPatch} from './settings';
+import {type AISettings, DEFAULT_AI_SETTINGS, type SettingsPatch, type AccessControlSettings} from './settings';
 import type {SettingsRecoveryField} from './settingsClient';
 import {isValidProxyAuthentication, type ProxySettings} from './pages/proxySettings';
 
@@ -6,8 +6,10 @@ export const buildSettingsRecoveryPatch = (
     fields: readonly SettingsRecoveryField[],
     proxy: ProxySettings,
     openAiBaseUrl: string,
+    accessControl: AccessControlSettings = {enabled: true, rules: []},
 ): SettingsPatch => {
     const patch: SettingsPatch = {};
+    if (fields.includes('accessControl')) patch.accessControl = accessControl;
     const ai: Partial<AISettings> = {};
     if (fields.includes('proxy')) patch.proxy = {...proxy, host: proxy.host.trim()};
     if (fields.includes('openAiBaseUrl')) ai.openAiBaseUrl = openAiBaseUrl.trim();

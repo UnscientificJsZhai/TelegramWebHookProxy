@@ -21,11 +21,17 @@ export interface AISettings {
     };
 }
 
+export interface AccessControlSettings {
+    enabled: boolean;
+    rules: string[];
+}
+
 export interface AppSettings {
     telegramToken: string;
     chatId: string;
     proxy: ProxySettings | null;
     ai: AISettings | null;
+    accessControl?: AccessControlSettings;
 }
 
 export type SettingsPatch = Partial<Omit<AppSettings, 'ai'>> & { ai?: Partial<AISettings> | null };
@@ -39,6 +45,7 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
 
 export const normalizeSettings = (settings: AppSettings): AppSettings => ({
     ...settings,
+    accessControl: settings.accessControl ?? {enabled: false, rules: []},
     proxy: settings.proxy ? {
         ...settings.proxy,
         username: settings.proxy.username ?? null,

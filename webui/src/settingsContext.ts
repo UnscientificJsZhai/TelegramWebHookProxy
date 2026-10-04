@@ -7,7 +7,7 @@ export interface SettingsContextValue {
     loading: boolean;
     error: string | null;
     reload: () => Promise<VersionedSettings<AppSettings>>;
-    update: (patch: SettingsPatch, etag: string | null) => Promise<VersionedSettings<AppSettings>>;
+    update: (patch: SettingsPatch, etag: string | null, confirmAccessLoss?: boolean) => Promise<VersionedSettings<AppSettings>>;
 }
 
 export const SettingsContext = createContext<SettingsContextValue | null>(null);
