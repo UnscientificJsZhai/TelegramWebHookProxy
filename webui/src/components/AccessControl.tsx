@@ -1,5 +1,11 @@
 import {useEffect, useRef, useState} from 'react';
-import {Alert, Button, Stack, Typography} from '@mui/material';
+import {Alert, Box, Button, Chip, Divider, Paper, Stack, Typography} from '@mui/material';
+import ShieldOutlined from '@mui/icons-material/ShieldOutlined';
+import LanOutlined from '@mui/icons-material/LanOutlined';
+import TipsAndUpdatesOutlined from '@mui/icons-material/TipsAndUpdatesOutlined';
+import LockResetOutlined from '@mui/icons-material/LockResetOutlined';
+import SaveOutlined from '@mui/icons-material/SaveOutlined';
+import RefreshOutlined from '@mui/icons-material/RefreshOutlined';
 import api from '../api';
 import {type AppSettings} from '../settings';
 import {useSettings} from '../settingsContext';
@@ -14,6 +20,7 @@ import {
 } from '../accessControl';
 import {ConfirmDialog} from './Feedback';
 import AccessControlEditor from './AccessControlEditor';
+import SectionCard from './SectionCard';
 
 export default function AccessControl({initial, onDirtyChange}: {
     initial: VersionedSettings<AppSettings>;
@@ -110,39 +117,158 @@ export default function AccessControl({initial, onDirtyChange}: {
             setBusy(false);
         }
     };
-    return <Stack spacing={2} sx={{mt: 3}}>
-        <Typography variant="h6">管理访问限制</Typography>
-        {info && <>
-            <Typography>当前连接来源：{info.peerIp}；监听：{info.listenAddresses.join('、') || '未提供'}。</Typography>
-            <Alert severity={info.overridePresent ? 'warning' : 'info'}>{info.overridePresent
-                ? `覆盖文件正在放行所有管理来源。删除文件后，当前来源${info.allowedBySavedSettings ? '允许' : '拒绝'}访问。`
-                : `当前保存规则${info.allowedBySavedSettings ? '允许' : '拒绝'}此来源。`}</Alert>
-            {info.environmentNotes.map(note => <Typography key={note}>{note}</Typography>)}
-            {info.suggestions.map(suggestion => <Button key={`${suggestion.label}:${suggestion.rules}`} disabled={busy}
-                                                        onClick={() => {
-                                                            setDraft({enabled: true, rules: suggestion.rules});
-                                                            setCheck(null);
-                                                        }}>
-                {suggestion.label}：{suggestion.rules.join('、')}（当前来源{suggestion.allowsPeer ? '允许' : '拒绝'}）— {suggestion.basis}
-            </Button>)}
-        </>}
-        <AccessControlEditor value={draft} onChange={value => {
-            setDraft(value);
-            setCheck(null);
-        }} disabled={busy}/>
-        {check && <Alert severity={check.allowedAfterSubmit ? 'info' : 'warning'}>
-            提交后当前来源{check.allowedAfterSubmit ? '允许' : '拒绝'}访问；忽略覆盖文件时{check.allowedByProposedSettings ? '允许' : '拒绝'}访问。
-        </Alert>}
-        <Typography variant="body2">恢复方法：创建 config/disable-access-control；Docker 中为
-            /app/config/disable-access-control。已配置 AI 监听私聊可发送 /access_unlock 静默解锁。</Typography>
+    return <Stack spacing={3} sx={{mt: 4}}>
+        <Box>
+            <Typography variant="h6" component="h2" sx={{mb: 0.75}}>管理访问限制</Typography>
+            <Typography variant="body2" color="text.secondary">设置允许访问管理功能的 IP
+                或网段，检查并保存后立即生效。</Typography>
+        </Box>
         {notice && <Alert severity="info">{notice}</Alert>}
-        <Stack direction="row" spacing={1}>
-            <Button disabled={busy || !saved.etag} variant="contained"
-                    onClick={() => void run('save')}>检查并保存</Button>
-            <Button disabled={busy} onClick={() => void loadLatest()}>重新读取（替换草稿）</Button>
-            {info?.overridePresent &&
-                <Button disabled={busy || !saved.etag} onClick={() => void run('restore')}>恢复访问控制</Button>}
-        </Stack>
+        <Box sx={{
+            display: 'grid',
+            gridTemplateColumns: {xs: 'minmax(0, 1fr)', md: 'minmax(0, 1.35fr) minmax(0, 1fr)'},
+            gap: 3,
+            alignItems: 'start'
+        }}>
+            <Stack spacing={3} sx={{minWidth: 0}}>
+                <SectionCard title="访问规则" icon={<ShieldOutlined/>}
+                             action={<Chip label={`${cleanAccessControl(draft).rules.length} 条规则`}
+                                           variant="outlined"/>}>
+                    <Stack spacing={2.5}>
+                        <AccessControlEditor value={draft} onChange={value => {
+                            setDraft(value);
+                            setCheck(null);
+                        }} disabled={busy}/>
+                        {check && <Alert severity={check.allowedAfterSubmit ? 'info' : 'warning'}>
+                            提交后当前来源{check.allowedAfterSubmit ? '允许' : '拒绝'}访问；忽略覆盖文件时{check.allowedByProposedSettings ? '允许' : '拒绝'}访问。
+                        </Alert>}
+                        <Divider/>
+                        <Stack spacing={1.5}>
+                            <Typography variant="caption" color={dirty ? 'primary' : 'text.secondary'}>
+                                {dirty ? '有未保存的修改' : '所有修改已保存'}
+                            </Typography>
+                            <Stack direction={{xs: 'column', sm: 'row'}} sx={{gap: 1, flexWrap: 'wrap'}}>
+                                <Button disabled={busy || !saved.etag} variant="contained" startIcon={<SaveOutlined/>}
+                                        onClick={() => void run('save')}>检查并保存</Button>
+                                <Button disabled={busy} color="secondary" startIcon={<RefreshOutlined/>}
+                                        onClick={() => void loadLatest()}>重新读取（替换草稿）</Button>
+                            </Stack>
+                        </Stack>
+                    </Stack>
+                </SectionCard>
+                {!!info?.suggestions.length && <SectionCard title="建议允许范围" icon={<TipsAndUpdatesOutlined/>}>
+                    <Typography variant="body2" color="text.secondary"
+                                sx={{mb: 2}}>选择一个范围替换当前草稿，检查并保存后生效。</Typography>
+                    <Box sx={{
+                        display: 'grid',
+                        gridTemplateColumns: {xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))'},
+                        gap: 1.5
+                    }}>
+                        {info.suggestions.map(suggestion => <Paper key={`${suggestion.label}:${suggestion.rules}`}
+                                                                   variant="outlined"
+                                                                   sx={{
+                                                                       p: 2,
+                                                                       minWidth: 0,
+                                                                       display: 'flex',
+                                                                       flexDirection: 'column',
+                                                                       gap: 1.5
+                                                                   }}>
+                            <Typography variant="subtitle2">{suggestion.label}</Typography>
+                            <Chip label={suggestion.allowsPeer ? '允许当前来源' : '拒绝当前来源'}
+                                  color={suggestion.allowsPeer ? 'success' : 'warning'} variant="outlined"
+                                  sx={{alignSelf: 'flex-start'}}/>
+                            <Box sx={{bgcolor: 'background.default', borderRadius: 1, p: 1.25}}>
+                                {suggestion.rules.map(rule => <Typography key={rule} component="code" variant="body2"
+                                                                          sx={{
+                                                                              display: 'block',
+                                                                              fontFamily: 'monospace',
+                                                                              overflowWrap: 'anywhere'
+                                                                          }}>{rule}</Typography>)}
+                            </Box>
+                            <Typography variant="caption" color="text.secondary"
+                                        sx={{flex: 1}}>{suggestion.basis}</Typography>
+                            <Button disabled={busy} variant="outlined" size="small"
+                                    aria-label={`使用范围：${suggestion.label}`} onClick={() => {
+                                setDraft({enabled: true, rules: suggestion.rules});
+                                setCheck(null);
+                            }}>使用此范围</Button>
+                        </Paper>)}
+                    </Box>
+                </SectionCard>}
+            </Stack>
+            <Stack spacing={3} sx={{minWidth: 0}}>
+                <SectionCard title="当前连接" icon={<LanOutlined/>}>
+                    {info ? <Stack spacing={2}>
+                        <Box component="dl" sx={{m: 0}}>
+                            <Typography component="dt" variant="caption" color="text.secondary">当前连接来源
+                                IP</Typography>
+                            <Typography component="dd" variant="body1" sx={{
+                                m: 0,
+                                mt: 0.5,
+                                fontFamily: 'monospace',
+                                overflowWrap: 'anywhere'
+                            }}>{info.peerIp}</Typography>
+                            <Typography component="dt" variant="caption" color="text.secondary"
+                                        sx={{mt: 2}}>服务监听地址</Typography>
+                            <Box component="dd" sx={{m: 0, mt: 0.5}}>
+                                {info.listenAddresses.length ? info.listenAddresses.map(address => <Typography
+                                        key={address} variant="body2"
+                                        sx={{fontFamily: 'monospace', overflowWrap: 'anywhere'}}>{address}</Typography>)
+                                    : <Typography variant="body2" color="text.secondary">未提供</Typography>}
+                            </Box>
+                        </Box>
+                        <Alert severity={info.overridePresent ? 'warning' : 'info'}>{info.overridePresent
+                            ? `覆盖文件正在放行所有管理来源。删除文件后，当前来源${info.allowedBySavedSettings ? '允许' : '拒绝'}访问。`
+                            : `当前保存规则${info.allowedBySavedSettings ? '允许' : '拒绝'}此来源。`}</Alert>
+                        {!!info.environmentNotes.length && <>
+                            <Divider/>
+                            <Stack spacing={1}>{info.environmentNotes.map(note => <Typography key={note} variant="body2"
+                                                                                              color="text.secondary">{note}</Typography>)}</Stack>
+                        </>}
+                    </Stack> : <Typography variant="body2" color="text.secondary">连接信息将在读取后显示。</Typography>}
+                </SectionCard>
+                <SectionCard title="访问恢复" icon={<LockResetOutlined/>}>
+                    <Stack spacing={2}>
+                        <Typography variant="body2"
+                                    color="text.secondary">意外失去管理权限时，可通过以下任一方式临时放行。</Typography>
+                        <Stack spacing={1}>
+                            <Typography variant="subtitle2">创建覆盖文件</Typography>
+                            <Box sx={{p: 1.5, bgcolor: 'background.default', borderRadius: 2}}>
+                                <Typography variant="caption" color="text.secondary">本地运行</Typography>
+                                <Typography component="code" variant="body2" sx={{
+                                    display: 'block',
+                                    fontFamily: 'monospace',
+                                    overflowWrap: 'anywhere'
+                                }}>config/disable-access-control</Typography>
+                                <Typography variant="caption" color="text.secondary" sx={{display: 'block', mt: 1}}>Docker
+                                    容器内</Typography>
+                                <Typography component="code" variant="body2" sx={{
+                                    display: 'block',
+                                    fontFamily: 'monospace',
+                                    overflowWrap: 'anywhere'
+                                }}>/app/config/disable-access-control</Typography>
+                            </Box>
+                        </Stack>
+                        <Divider/>
+                        <Stack spacing={1}>
+                            <Typography variant="subtitle2">通过 Telegram 私聊解锁</Typography>
+                            <Typography component="code" variant="body2"
+                                        sx={{fontFamily: 'monospace'}}>/access_unlock</Typography>
+                            <Typography variant="body2" color="text.secondary">已配置 AI
+                                监听私聊时，发送此命令可静默解锁。</Typography>
+                        </Stack>
+                        {info?.overridePresent && <>
+                            <Divider/>
+                            <Typography variant="body2"
+                                        color="text.secondary">删除覆盖文件后，恢复当前保存的访问规则。</Typography>
+                            <Button disabled={busy || !saved.etag} variant="outlined" color="warning"
+                                    startIcon={<LockResetOutlined/>}
+                                    onClick={() => void run('restore')}>恢复访问控制</Button>
+                        </>}
+                    </Stack>
+                </SectionCard>
+            </Stack>
+        </Box>
         <ConfirmDialog open={pending !== null} title="确认失去管理访问权限" busy={busy} danger
                        onClose={() => setPending(null)} onConfirm={() => {
             if (pending) void run(pending, true);
