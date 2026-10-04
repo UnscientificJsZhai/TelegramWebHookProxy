@@ -70,7 +70,7 @@ interface Props {
 let snapshot = initial;
 const render = () => {
     hooks.cursor = 0;
-    return AccessControl({initial: snapshot});
+    return AccessControl({initial: snapshot, onDirtyChange: vi.fn()});
 };
 const elements = (node: ReactNode): ReactElement<Props>[] => {
     if (Array.isArray(node)) return node.flatMap(elements);

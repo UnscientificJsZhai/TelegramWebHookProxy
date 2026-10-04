@@ -117,6 +117,10 @@ internal class PollingSessionSupervisor(
     private val processor: AgentTurnProcessor,
     private val logger: Logger,
 ) {
+    private companion object {
+        const val UPDATE_QUEUE_CAPACITY = 10
+    }
+
     private val lifecycleLock = Any()
     private var settingsJob: Job? = null
     private var pendingAgentReset: PendingAgentReset? = null
@@ -265,7 +269,7 @@ internal class PollingSessionSupervisor(
             botId = botId,
             generation = generation,
             scope = sessionScope,
-            updateChannel = Channel(capacity = 10),
+            updateChannel = Channel(capacity = UPDATE_QUEUE_CAPACITY),
             outboxSignal = Channel(capacity = Channel.CONFLATED),
         )
         val barrierGenerationToRelease = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
@@ -627,7 +631,14 @@ internal class PollingSessionSupervisor(
         var mustRetry = false
         var retryUpdateId: Long? = null
         var waitingForAgent: UpdateAdmission.WaitingForAgent? = null
-        for (update in response.result.asSequence().filter { it.updateId > lastStoredId }) {
+        val pendingUpdates = response.result.asSequence().filter { it.updateId > lastStoredId }
+        // 控制消息已扫描整份积压；仅限制 AI 准入批次，每批完成后再读取剩余耐久消息。
+        val admissionBatch = if (snapshot.receivedUpdates.isNotEmpty()) {
+            pendingUpdates.take(UPDATE_QUEUE_CAPACITY)
+        } else {
+            pendingUpdates
+        }
+        for (update in admissionBatch) {
             try {
                 val expectedRetryTarget = retryCheckpoint?.targetUpdateId?.takeIf { it == update.updateId }
                 when (val admission = awaitWithControlPolling(session) {

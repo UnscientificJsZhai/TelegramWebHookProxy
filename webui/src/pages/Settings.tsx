@@ -1,5 +1,5 @@
 import AccessControl from '../components/AccessControl';
-import {useRef, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {
     Accordion,
     AccordionDetails,
@@ -49,10 +49,23 @@ import {FeedbackSnackbar, type Notice, SettingsConflictDialog} from '../componen
 export default function Settings() {
     return <><PageHeader title="服务配置"
                          description="管理 Telegram Bot 凭据、默认接收目标与网络代理，让每一条消息准确送达。"/><SettingsGate>{snapshot =>
-        <><ServiceSettings initial={snapshot}/><AccessControl initial={snapshot}/></>}</SettingsGate></>;
+        <SettingsForms initial={snapshot}/>}</SettingsGate></>;
 }
 
-function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> }) {
+function SettingsForms({initial}: { initial: VersionedSettings<AppSettings> }) {
+    const [serviceDirty, setServiceDirty] = useState(false);
+    const [accessControlDirty, setAccessControlDirty] = useState(false);
+    return <>
+        <ServiceSettings initial={initial} onDirtyChange={setServiceDirty}/>
+        <AccessControl initial={initial} onDirtyChange={setAccessControlDirty}/>
+        <UnsavedChangesGuard dirty={serviceDirty || accessControlDirty}/>
+    </>;
+}
+
+function ServiceSettings({initial, onDirtyChange}: {
+    initial: VersionedSettings<AppSettings>;
+    onDirtyChange: (dirty: boolean) => void;
+}) {
     const {update, reload, loading} = useSettings();
     const {chats, error: chatsError, loading: chatsLoading, refresh} = useChats();
     const [saved, setSaved] = useState(initial);
@@ -64,6 +77,7 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
     const [chooseChat, setChooseChat] = useState(false);
     const saveLock = useRef(false);
     const dirty = draft.telegramToken !== saved.settings.telegramToken || draft.chatId !== saved.settings.chatId || JSON.stringify(draft.proxy) !== JSON.stringify(saved.settings.proxy);
+    useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
     if (initial !== observedInitial && !dirty && !saving && !conflict) {
         setObservedInitial(initial);
         setSaved(initial);
@@ -276,6 +290,5 @@ function ServiceSettings({initial}: { initial: VersionedSettings<AppSettings> })
         <SettingsConflictDialog open={conflict} busy={loading} onClose={() => setConflict(false)}
                                 onReload={() => void loadLatest()}/>
         <FeedbackSnackbar notice={notice} onClose={() => setNotice(null)}/>
-        <UnsavedChangesGuard dirty={dirty}/>
     </>;
 }

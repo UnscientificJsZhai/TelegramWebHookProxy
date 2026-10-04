@@ -3,6 +3,7 @@ package com.unscientificjszhai.tgp.service
 import com.unscientificjszhai.tgp.models.*
 import com.unscientificjszhai.tgp.service.ai.agent.AgentAvailabilitySnapshot
 import com.unscientificjszhai.tgp.service.ai.agent.AgentAvailabilityState
+import io.ktor.http.HttpStatusCode
 import io.mockk.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -11,6 +12,61 @@ import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
 
 internal class MessagePollerAccessUnlockTest : MessagePollerFacadeTestSupport() {
+    @Test
+    fun `recovered AI drains all persisted messages beyond queue capacity`() = runBlocking {
+        val fixture = fixture()
+        fixture.saveSettings(
+            AppSettings(telegramToken = "100:test", ai = AISettings(agentEnabled = true, agentChatId = "42"))
+        )
+        fixture.updates.saveLastUpdateId("100", 100)
+        val backlog = (101L..125L).map { Update(it, authorizedMessage(it, Chat(42, "private"), "waiting-$it")) }
+        val unlock = Update(126, authorizedMessage(126, Chat(42, "private"), "/access_unlock"))
+        fixture.updates.receiveUpdates("100", backlog + unlock)
+        val availability = MutableStateFlow(AgentAvailabilitySnapshot(AgentAvailabilityState.BLOCKED, 1, 0))
+        every { fixture.agent.availability } returns availability
+        val firstTurnStarted = CompletableDeferred<Unit>()
+        val releaseFirstTurn = CompletableDeferred<Unit>()
+        val controlIntakeDuringTurn = CompletableDeferred<Unit>()
+        val processed = java.util.Collections.synchronizedList(mutableListOf<String>())
+        coEvery { fixture.agent.sendMessage(any()) } coAnswers {
+            val text = firstArg<String>()
+            if (processed.isEmpty()) {
+                firstTurnStarted.complete(Unit)
+                releaseFirstTurn.await()
+            }
+            processed.add(text)
+            ""
+        }
+        coEvery { fixture.telegram.getUpdatesForToken(any(), any(), any()) } coAnswers {
+            if (firstTurnStarted.isCompleted) controlIntakeDuringTurn.complete(Unit)
+            GetUpdatesResponse(true)
+        }
+        coEvery { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) } returns
+                TelegramApiResponse(HttpStatusCode.OK, "{\"ok\":true}")
+        fixture.poller.start()
+        try {
+            eventually { assertEquals(101, fixture.updates.getData("100").retryCheckpoint?.targetUpdateId) }
+            assertTrue(fixture.settings.accessControlOverride.isPresent())
+            assertEquals(listOf(126L), fixture.updates.getData("100").consumedAccessUnlockIds)
+            assertEquals(26, fixture.updates.getData("100").receivedUpdates.size)
+            availability.value = AgentAvailabilitySnapshot(AgentAvailabilityState.READY, 2, 0)
+            withTimeout(5.seconds) { firstTurnStarted.await() }
+            withTimeout(5.seconds) { controlIntakeDuringTurn.await() }
+            assertEquals(100, fixture.updates.getData("100").lastUpdateId)
+            assertEquals(26, fixture.updates.getData("100").receivedUpdates.size)
+            releaseFirstTurn.complete(Unit)
+            eventually(10.seconds) { assertEquals(126, fixture.updates.getData("100").lastUpdateId) }
+            assertEquals(backlog.map { it.message!!.text }, processed.toList())
+            assertTrue(fixture.updates.getData("100").receivedUpdates.isEmpty())
+            assertNull(fixture.updates.getData("100").retryCheckpoint)
+            coVerify(exactly = 0) { fixture.telegram.sendMessageForToken(any(), any(), any(), any()) }
+        } finally {
+            releaseFirstTurn.complete(Unit)
+            fixture.poller.requestStop()
+            fixture.poller.awaitStopped()
+        }
+    }
+
     @Test
     fun `blocked AI retains durable backlog while later batches unlock once`() = runBlocking {
         val fixture = fixture()

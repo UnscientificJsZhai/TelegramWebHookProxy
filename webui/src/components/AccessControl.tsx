@@ -14,9 +14,11 @@ import {
 } from '../accessControl';
 import {ConfirmDialog} from './Feedback';
 import AccessControlEditor from './AccessControlEditor';
-import UnsavedChangesGuard from './UnsavedChangesGuard';
 
-export default function AccessControl({initial}: { initial: VersionedSettings<AppSettings> }) {
+export default function AccessControl({initial, onDirtyChange}: {
+    initial: VersionedSettings<AppSettings>;
+    onDirtyChange: (dirty: boolean) => void;
+}) {
     const {update, reload} = useSettings();
     const [saved, setSaved] = useState(initial);
     const [observedInitial, setObservedInitial] = useState(initial);
@@ -31,6 +33,7 @@ export default function AccessControl({initial}: { initial: VersionedSettings<Ap
         enabled: false,
         rules: []
     });
+    useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
     if (initial !== observedInitial && !dirty && !busy && pending === null) {
         setObservedInitial(initial);
         setSaved(initial);
@@ -150,6 +153,5 @@ export default function AccessControl({initial}: { initial: VersionedSettings<Ap
                 ? (pending === 'save' ? cleanAccessControl(draft).rules : saved.settings.accessControl?.rules)?.join('、') || '无'
                 : '所有来源'}</Typography>
         </ConfirmDialog>
-        <UnsavedChangesGuard dirty={dirty}/>
     </Stack>;
 }
