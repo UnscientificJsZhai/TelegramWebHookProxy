@@ -1,5 +1,6 @@
 package com.unscientificjszhai.tgp.repository
 
+import com.unscientificjszhai.tgp.models.Update
 import com.unscientificjszhai.tgp.models.ChatInfo
 import com.unscientificjszhai.tgp.models.ReplyParameters
 import com.unscientificjszhai.tgp.models.TelegramReplyPart
@@ -61,6 +62,9 @@ data class UpdatesData(
     val pendingTelegramReplies: List<PendingTelegramReply> = emptyList(),
     val agentTurnJournal: List<AgentTurnJournalEntry> = emptyList(),
     val retryCheckpoint: RetryCheckpoint? = null,
+    val receivedUpdates: List<Update> = emptyList(),
+    val receivedThroughId: Long? = null,
+    val consumedAccessUnlockIds: List<Long> = emptyList(),
 )
 
 /**
@@ -325,6 +329,35 @@ class UpdatesRepository private constructor(
         return state.bots[botId] ?: UpdatesData()
     }
 
+    /** AI 等待期间耐久接收更新；只在落盘后才能推进上游 offset。 */
+    @Synchronized
+    internal fun receiveUpdates(botId: String, updates: List<Update>): UpdatesData = updateData(botId) { current ->
+        val pending = (current.receivedUpdates + updates.filter { it.updateId > current.lastUpdateId })
+            .distinctBy { it.updateId }.sortedBy { it.updateId }
+        require(pending.size <= 1024) { "Telegram received update queue exceeds its bound." }
+        require(
+            ConfigJson.encodeToString(kotlinx.serialization.builtins.ListSerializer(Update.serializer()), pending)
+                .toByteArray(StandardCharsets.UTF_8).size <= 512 * 1024
+        ) { "Telegram received update queue exceeds its byte budget." }
+        val candidate = state.copy(bots = state.bots + (botId to current.copy(receivedUpdates = pending)))
+        require(serializedSize(candidate) <= ResourceLimits.UPDATES_BYTES - 1024 * 1024) {
+            "Telegram received update queue must reserve space for journal and outbox."
+        }
+        current.copy(
+            receivedUpdates = pending,
+            receivedThroughId = (listOfNotNull(current.receivedThroughId) + updates.map { it.updateId }).maxOrNull(),
+        )
+    }
+
+    /** 先耐久消费控制更新，再执行文件操作；重放和重启不会再次应用同一条解锁命令。 */
+    @Synchronized
+    internal fun consumeAccessUnlock(botId: String, updateId: Long): Boolean {
+        val current = getData(botId)
+        if (updateId <= current.lastUpdateId || updateId in current.consumedAccessUnlockIds) return false
+        updateData(botId) { it.copy(consumedAccessUnlockIds = (it.consumedAccessUnlockIds + updateId).sorted()) }
+        return true
+    }
+
     /**
      * 对指定机器人的状态执行原子的内存读改写并同步持久化结果。
      *
@@ -456,6 +489,9 @@ class UpdatesRepository private constructor(
             state.copy(
                 bots = state.bots + (botId to current.copy(
                     lastUpdateId = firstUpdateId - 1,
+                    receivedUpdates = emptyList(),
+                    receivedThroughId = null,
+                    consumedAccessUnlockIds = emptyList(),
                     agentTurnJournal = emptyList(),
                     retryCheckpoint = RetryCheckpoint(firstUpdateId, nowMillis, retryCount = 1),
                 ))
@@ -1398,7 +1434,15 @@ class UpdatesRepository private constructor(
             }
             val chats = LinkedHashMap<String, ChatInfo>()
             data.chats.filter(::isIndividuallyStorableChat).forEach { chat -> chats[chat.id] = chat }
-            canonicalBots[botId] = data.copy(chats = chats.values.toList())
+            val remainingReceived = data.receivedUpdates.filter { it.updateId > data.lastUpdateId }
+            canonicalBots[botId] = data.copy(
+                chats = chats.values.toList(),
+                receivedUpdates = remainingReceived,
+                receivedThroughId = data.receivedThroughId?.takeIf {
+                    it > data.lastUpdateId && remainingReceived.isNotEmpty()
+                },
+                consumedAccessUnlockIds = data.consumedAccessUnlockIds.filter { it > data.lastUpdateId },
+            )
         }
 
         val provisional = candidate.copy(bots = canonicalBots)
@@ -1593,6 +1637,9 @@ class UpdatesRepository private constructor(
             "pendingTelegramReplies",
             "agentTurnJournal",
             "retryCheckpoint",
+            "receivedUpdates",
+            "receivedThroughId",
+            "consumedAccessUnlockIds",
         )
 
         val LEGACY_ROOT_MIGRATION = JsonElementMigration("updates-legacy-root-to-bots") { root ->
@@ -1626,6 +1673,11 @@ class UpdatesRepository private constructor(
                 migrations = listOf(LEGACY_ROOT_MIGRATION),
                 validator = ::validatePersistedUpdatesState,
                 structureBudget = UPDATES_JSON_STRUCTURE_BUDGET,
+                protectedOptionalPaths = setOf(
+                    "$.bots[*].value.receivedUpdates",
+                    "$.bots[*].value.receivedThroughId",
+                    "$.bots[*].value.consumedAccessUnlockIds",
+                ),
                 logger = LoggerFactory.getLogger(UpdatesRepository::class.java),
             )
             return when (val read = storage.read()) {
@@ -1671,6 +1723,15 @@ private fun validateAgentTurnReply(reply: String?) {
 /** 验证一项机器人更新状态可被持久化，不允许任意读改写绕过重试检查点与偏移量的不变量。 */
 private fun validatePersistedUpdatesData(updates: UpdatesData) {
     requirePersistableTelegramUpdateId(updates.lastUpdateId, "lastUpdateId")
+    updates.receivedThroughId?.let { requirePersistableTelegramUpdateId(it, "receivedThroughId") }
+    require(updates.receivedUpdates.size <= 1024)
+    require(updates.receivedUpdates.map { it.updateId }.distinct().size == updates.receivedUpdates.size)
+    updates.receivedUpdates.forEach { update ->
+        requirePersistableTelegramUpdateId(update.updateId, "received updateId")
+        require(update.updateId > updates.lastUpdateId && update.updateId <= (updates.receivedThroughId ?: -1))
+    }
+    require(updates.consumedAccessUnlockIds.distinct().size == updates.consumedAccessUnlockIds.size)
+    updates.consumedAccessUnlockIds.forEach { requirePersistableTelegramUpdateId(it, "consumed updateId") }
     validatePendingTelegramReplies(updates.pendingTelegramReplies, updates.lastUpdateId)
     validateAgentTurnJournal(updates.agentTurnJournal)
     validateRetryCheckpoint(updates.retryCheckpoint, updates.lastUpdateId)

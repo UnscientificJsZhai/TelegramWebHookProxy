@@ -24,6 +24,7 @@ data class AppSettings(
     val chatId: String = "",
     val proxy: ProxySettings? = null,
     val ai: AISettings? = null,
+    val accessControl: AccessControlSettings = AccessControlSettings(false, emptyList()),
 )
 
 /**

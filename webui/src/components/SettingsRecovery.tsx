@@ -6,6 +6,9 @@ import {useSettings} from '../settingsContext';
 import {buildSettingsRecoveryPatch, isValidRecoveryProxy} from '../settingsRecovery';
 import {proxyAuthenticationHint, type ProxySettings, withProxyType} from '../pages/proxySettings';
 import {ConfirmDialog} from './Feedback';
+import AccessControlEditor from './AccessControlEditor';
+import {cleanAccessControl} from '../accessControl';
+import api from '../api';
 import SecretField from './SecretField';
 
 const EMPTY_PROXY: ProxySettings = {host: '', port: 8080, type: 'HTTP', username: null, password: null};
@@ -15,6 +18,7 @@ export default function SettingsRecovery({snapshot}: { snapshot: VersionedSettin
     const fields = snapshot.recoveryFields ?? [];
     const [proxy, setProxy] = useState(snapshot.settings.proxy ?? EMPTY_PROXY);
     const [baseUrl, setBaseUrl] = useState(snapshot.settings.ai?.openAiBaseUrl ?? '');
+    const [accessControl, setAccessControl] = useState(snapshot.settings.accessControl ?? {enabled: true, rules: []});
     const [confirm, setConfirm] = useState(false);
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -23,6 +27,7 @@ export default function SettingsRecovery({snapshot}: { snapshot: VersionedSettin
     const invalid = (fields.includes('proxy') && !isValidRecoveryProxy(proxy)) ||
         (fields.includes('openAiBaseUrl') && utf8Length(baseUrl) > 2048);
     const actions = [
+        ...(fields.includes('accessControl') ? ['将访问限制替换为下方完整设置。标记文件会保留，删除后使用这些规则。'] : []),
         ...(fields.includes('httpToolSettings') ? ['禁用 HTTP 工具并清空原有目标，超时与并发恢复默认值。'] : []),
         ...(fields.includes('mcpServers') ? ['清空原有 MCP 服务器列表，修复后可重新添加。'] : []),
         ...(fields.includes('proxy') ? ['将代理替换为下方填写的配置。'] : []),
@@ -35,7 +40,8 @@ export default function SettingsRecovery({snapshot}: { snapshot: VersionedSettin
         setSaving(true);
         setError(null);
         try {
-            await update(buildSettingsRecoveryPatch(fields, proxy, baseUrl), snapshot.etag);
+            if (fields.includes('accessControl')) await api.post('/access-control/check', cleanAccessControl(accessControl));
+            await update(buildSettingsRecoveryPatch(fields, proxy, baseUrl, cleanAccessControl(accessControl)), snapshot.etag);
         } catch (failure) {
             setError(isSettingsConflict(failure)
                 ? '配置已更新，本次修复未生效。请重新读取配置后再次确认修复。'
@@ -52,6 +58,7 @@ export default function SettingsRecovery({snapshot}: { snapshot: VersionedSettin
         setSaving(true);
         try {
             const next = await reload();
+            setAccessControl(next.settings.accessControl ?? {enabled: true, rules: []});
             setProxy(next.settings.proxy ?? EMPTY_PROXY);
             setBaseUrl(next.settings.ai?.openAiBaseUrl ?? '');
             setError(null);
@@ -67,6 +74,8 @@ export default function SettingsRecovery({snapshot}: { snapshot: VersionedSettin
         <Alert severity="warning">旧版配置中有无效内容，需要修复后才能继续保存设置。</Alert>
         <Typography variant="h6">修复旧版配置</Typography>
         <Box component="ul" sx={{pl: 3, my: 0}}>{actions.map(action => <li key={action}>{action}</li>)}</Box>
+        {fields.includes('accessControl') &&
+            <AccessControlEditor value={accessControl} onChange={setAccessControl} disabled={busy}/>}
         {fields.includes('proxy') && <Stack spacing={2}>
             <Typography>原代理配置无法使用，请填写有效代理。</Typography>
             <TextField label="代理地址" value={proxy.host} disabled={busy} required

@@ -120,6 +120,7 @@ internal class UpdateAdmissionPolicy(
             return UpdateAdmission.Confirmed
         }
         val message = update.message ?: return UpdateAdmission.Confirmed
+        if (message.text?.trim() == "/access_unlock") return UpdateAdmission.Confirmed
         if (message.text == null && message.voice == null) {
             return UpdateAdmission.Confirmed
         }

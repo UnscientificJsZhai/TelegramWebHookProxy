@@ -1,6 +1,6 @@
 import api from './api';
 
-const SETTINGS_RECOVERY_FIELDS = ['proxy', 'mcpServers', 'openAiBaseUrl', 'httpToolSettings'] as const;
+const SETTINGS_RECOVERY_FIELDS = ['proxy', 'mcpServers', 'openAiBaseUrl', 'httpToolSettings', 'accessControl'] as const;
 export type SettingsRecoveryField = typeof SETTINGS_RECOVERY_FIELDS[number];
 
 export interface SettingsServerVersion {
@@ -62,13 +62,14 @@ export const saveVersionedSettings = async <T>(
 
 export const patchVersionedSettings = async <T, P = Partial<T>>(
     patch: P,
-    etag: string | null
+    etag: string | null,
+    confirmAccessLoss = false
 ): Promise<VersionedSettings<T>> => {
     if (!etag) {
         throw new Error('Missing settings ETag');
     }
     const response = await api.patch<T>('/settings', patch, {
-        headers: {'If-Match': etag}
+        headers: {'If-Match': etag, ...(confirmAccessLoss ? {'X-Confirm-Access-Loss': 'true'} : {})}
     });
     const serverVersion = responseServerVersion(response.headers);
     return {

@@ -117,6 +117,10 @@ internal class PollingSessionSupervisor(
     private val processor: AgentTurnProcessor,
     private val logger: Logger,
 ) {
+    private companion object {
+        const val UPDATE_QUEUE_CAPACITY = 10
+    }
+
     private val lifecycleLock = Any()
     private var settingsJob: Job? = null
     private var pendingAgentReset: PendingAgentReset? = null
@@ -140,7 +144,8 @@ internal class PollingSessionSupervisor(
                 false
             } else {
                 settingsJob = runtime.scope.launch {
-                    modelSwitchBarrier.awaitReady()
+                    // 已配置控制私聊时 Telegram 接收不等待 AI 初始化；AI 准入仍由共享屏障保护。
+                    if (settingsChangeCoordinator.settingsFlow.value.ai?.agentChatId.isNullOrBlank()) modelSwitchBarrier.awaitReady()
                     currentCoroutineContext().ensureActive()
                     if (runtime.closed) {
                         return@launch
@@ -264,7 +269,7 @@ internal class PollingSessionSupervisor(
             botId = botId,
             generation = generation,
             scope = sessionScope,
-            updateChannel = Channel(capacity = 10),
+            updateChannel = Channel(capacity = UPDATE_QUEUE_CAPACITY),
             outboxSignal = Channel(capacity = Channel.CONFLATED),
         )
         val barrierGenerationToRelease = settingsChangeCoordinator.withTelegramTokenLifecycleLock {
@@ -315,7 +320,7 @@ internal class PollingSessionSupervisor(
                 if (resumeConsumerAfterRetry) {
                     // 先等旧批次结算或排空，再完成当前 Retry 专属的握手；纯网络故障不会留下跨批次信号。
                     processor.drainQueuedUpdatesAsRetry(session)
-                    for (completion in session.pendingUpdateCompletions) completion.await()
+                    for (completion in session.pendingUpdateCompletions) awaitWithControlPolling(session) { completion.await() }
                     runtime.withSessionLock { session.consumerResumeWaiter?.complete(Unit) }
                     resumeConsumerAfterRetry = false
                 }
@@ -391,7 +396,9 @@ internal class PollingSessionSupervisor(
     ): Boolean {
         var sequence = observedSequence
         while (runtime.isCurrent(session)) {
-            val snapshot = agentService.availability.first { state -> state.sequence != sequence }
+            val snapshot = awaitWithControlPolling(session) {
+                agentService.availability.first { state -> state.sequence != sequence }
+            }
             if (!runtime.isCurrent(session)) return false
             if (settingsChangeCoordinator.currentSettingsSnapshot().generation != observedSettingsVersion) return true
             when (snapshot.state) {
@@ -407,6 +414,55 @@ internal class PollingSessionSupervisor(
             }
         }
         return false
+    }
+
+    /** 在同一上游消费者内交替等待 AI 和接收控制消息，AI 工作耐久保留于原更新仓储。 */
+    private suspend fun <T> awaitWithControlPolling(session: PollingSession, action: suspend () -> T): T =
+        coroutineScope {
+            val waiter = async { action() }
+            try {
+                while (!waiter.isCompleted) {
+                    val completed = withTimeoutOrNull(1.seconds) { waiter.join(); true } == true
+                    if (completed) break
+                    try {
+                        receiveWhileWaiting(session)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // 容量或持久化失败只暂停接收，不取消正在等待的 AI 工作，不推进上游游标。
+                        logger.warn("Telegram control intake deferred; category=storage-or-network")
+                    }
+                }
+                waiter.await()
+            } finally {
+                waiter.cancel()
+            }
+        }
+
+    private fun consumeControlMessage(session: PollingSession, update: Update) {
+        val message = update.message ?: return
+        if (message.text?.trim() != "/access_unlock") return
+        val consumed = runtime.writeForCurrent(session) {
+            updatesRepository.consumeAccessUnlock(session.botId, update.updateId)
+        } ?: return
+        if (consumed && runtime.isCurrent(session)) AccessControlService(settingsChangeCoordinator).handleUnlock(message)
+    }
+
+    private suspend fun receiveWhileWaiting(session: PollingSession) {
+        runtime.ensureCurrent(session)
+        val received = runtime.writeForCurrent(session) {
+            updatesRepository.receiveUpdates(session.botId, session.lastReceivedBatch)
+        } ?: return
+        val cursor = maxOf(received.lastUpdateId, received.receivedThroughId ?: received.lastUpdateId)
+        val response = telegramService.getUpdatesForToken(session.token, offset = Math.addExact(cursor, 1), timeout = 0)
+        runtime.ensureCurrent(session)
+        if (!response.ok) {
+            if (!handleApiFailure(session, response)) throw CancellationException("Polling session stopped.")
+            return
+        }
+        if (response.result.any { !isPersistableTelegramUpdateId(it.updateId) }) return
+        runtime.writeForCurrent(session) { updatesRepository.receiveUpdates(session.botId, response.result) } ?: return
+        response.result.forEach { consumeControlMessage(session, it) }
     }
 
     /**
@@ -445,7 +501,10 @@ internal class PollingSessionSupervisor(
         }
         val resolvingInitialOffset =
             lastStoredId == 0L && initialRetryCheckpoint == null && !session.initialOffsetResolved
-        val (targetUpdateId, response) = if (resolvingInitialOffset) {
+        val (targetUpdateId, response) = if (snapshot.receivedUpdates.isNotEmpty()) {
+            (initialRetryCheckpoint?.targetUpdateId ?: snapshot.receivedUpdates.first().updateId) to
+                    GetUpdatesResponse(ok = true, result = snapshot.receivedUpdates)
+        } else if (resolvingInitialOffset) {
             val initialResponse = telegramService.getUpdatesForToken(session.token, offset = -1, timeout = 0)
             if (!runtime.isCurrent(session)) return PollingAttempt.Stopped
             if (!initialResponse.ok) return PollingAttempt.ApiFailure(initialResponse)
@@ -480,6 +539,11 @@ internal class PollingSessionSupervisor(
                 session.botId,
             )
             return PollingAttempt.LocalRetry
+        }
+        session.lastReceivedBatch = response.result
+        // 控制消息优先扫描整个响应；前面的 Agent 消息等待恢复时也能解锁。
+        response.result.filter { it.updateId > lastStoredId }.forEach { update ->
+            consumeControlMessage(session, update)
         }
         // 本轮长轮询期间，消费者或公开入口可能已写入一个检查点或推进 offset。必须以响应后的持久化
         // 快照重新决定是否可处理本批响应，不能让较早的请求快照覆盖新事实。
@@ -567,10 +631,23 @@ internal class PollingSessionSupervisor(
         var mustRetry = false
         var retryUpdateId: Long? = null
         var waitingForAgent: UpdateAdmission.WaitingForAgent? = null
-        for (update in response.result.asSequence().filter { it.updateId > lastStoredId }) {
+        val pendingUpdates = response.result.asSequence().filter { it.updateId > lastStoredId }
+        // 控制消息已扫描整份积压；仅限制 AI 准入批次，每批完成后再读取剩余耐久消息。
+        val admissionBatch = if (snapshot.receivedUpdates.isNotEmpty()) {
+            pendingUpdates.take(UPDATE_QUEUE_CAPACITY)
+        } else {
+            pendingUpdates
+        }
+        for (update in admissionBatch) {
             try {
                 val expectedRetryTarget = retryCheckpoint?.targetUpdateId?.takeIf { it == update.updateId }
-                when (val admission = admissionPolicy.enqueueUpdate(session, update, expectedRetryTarget)) {
+                when (val admission = awaitWithControlPolling(session) {
+                    admissionPolicy.enqueueUpdate(
+                        session,
+                        update,
+                        expectedRetryTarget
+                    )
+                }) {
                     UpdateAdmission.Confirmed -> {
                         update.chatInfo()?.let { chat ->
                             // LinkedHashMap assignment keeps an existing key at its old position. Remove first so a
@@ -641,7 +718,7 @@ internal class PollingSessionSupervisor(
             }
         }
         for ((updateId, completion) in completions.sortedBy { it.first }) {
-            when (completion.await()) {
+            when (awaitWithControlPolling(session) { completion.await() }) {
                 UpdateCompletion.Persisted -> {
                     // Agent 回合及其可能的 outbox 已在同一次提交中确认偏移量。
                     lastStoredId = maxOf(lastStoredId, updateId)
