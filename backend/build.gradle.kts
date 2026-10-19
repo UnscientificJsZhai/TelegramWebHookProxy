@@ -4,7 +4,7 @@ import com.github.jk1.license.render.TextReportRenderer
 
 plugins {
     kotlin("jvm")
-    kotlin("plugin.serialization") version "2.4.20"
+    kotlin("plugin.serialization") version "2.4.21"
     kotlin("kapt")
     id("com.gradleup.shadow") version "9.6.1"
     id("com.github.jk1.dependency-license-report") version "3.1.4"
@@ -44,15 +44,15 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Gemini SDK
-    implementation("com.google.genai:google-genai:1.75.0") {
+    implementation("com.google.genai:google-genai:1.78.0") {
         exclude(group = "com.fasterxml.jackson.core", module = "jackson-core")
         exclude(group = "commons-codec", module = "commons-codec")
     }
     implementation("com.fasterxml.jackson.core:jackson-core:2.22.3")
-    implementation("commons-codec:commons-codec:1.22.1")
+    implementation("commons-codec:commons-codec:1.23.0")
 
     // OpenAI SDK
-    implementation("com.openai:openai-java:4.73.0")
+    implementation("com.openai:openai-java:4.82.0")
 
     // AI provider transport.  Requests must retain their native OkHttp Call so coroutine cancellation can abort it.
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
@@ -62,14 +62,14 @@ dependencies {
 
     implementation("com.google.dagger:dagger:$daggerVersion")
     kapt("com.google.dagger:dagger-compiler:$daggerVersion")
-    kapt("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.20")
+    kapt("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.21")
 
     // 通过原文位置识别 Markdown 结构，所有扩展使用同一固定版本。
-    implementation("org.commonmark:commonmark:0.30.0")
-    implementation("org.commonmark:commonmark-ext-gfm-tables:0.30.0")
-    implementation("org.commonmark:commonmark-ext-footnotes:0.30.0")
-    implementation("org.commonmark:commonmark-ext-task-list-items:0.30.0")
-    implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.30.0")
+    implementation("org.commonmark:commonmark:0.30.1")
+    implementation("org.commonmark:commonmark-ext-gfm-tables:0.30.1")
+    implementation("org.commonmark:commonmark-ext-footnotes:0.30.1")
+    implementation("org.commonmark:commonmark-ext-task-list-items:0.30.1")
+    implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.30.1")
 
     // Testing
     testImplementation("org.jetbrains.kotlin:kotlin-test")
