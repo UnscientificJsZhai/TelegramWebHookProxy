@@ -44,18 +44,18 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:$ktorVersion")
 
     // Gemini SDK
-    implementation("com.google.genai:google-genai:1.78.0") {
+    implementation("com.google.genai:google-genai:1.79.0") {
         exclude(group = "com.fasterxml.jackson.core", module = "jackson-core")
         exclude(group = "commons-codec", module = "commons-codec")
     }
-    implementation("com.fasterxml.jackson.core:jackson-core:2.22.3")
+    implementation("com.fasterxml.jackson.core:jackson-core:2.22.4")
     implementation("commons-codec:commons-codec:1.23.0")
 
     // OpenAI SDK
-    implementation("com.openai:openai-java:4.82.0")
+    implementation("com.openai:openai-java:4.90.0")
 
     // AI provider transport.  Requests must retain their native OkHttp Call so coroutine cancellation can abort it.
-    implementation("com.squareup.okhttp3:okhttp:5.5.0")
+    implementation("com.squareup.okhttp3:okhttp:5.5.1")
 
     // MCP SDK
     implementation("io.modelcontextprotocol:kotlin-sdk:0.15.0")
@@ -65,17 +65,17 @@ dependencies {
     kapt("org.jetbrains.kotlin:kotlin-metadata-jvm:2.4.21")
 
     // 通过原文位置识别 Markdown 结构，所有扩展使用同一固定版本。
-    implementation("org.commonmark:commonmark:0.30.1")
-    implementation("org.commonmark:commonmark-ext-gfm-tables:0.30.1")
-    implementation("org.commonmark:commonmark-ext-footnotes:0.30.1")
-    implementation("org.commonmark:commonmark-ext-task-list-items:0.30.1")
-    implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.30.1")
+    implementation("org.commonmark:commonmark:0.31.0")
+    implementation("org.commonmark:commonmark-ext-gfm-tables:0.31.0")
+    implementation("org.commonmark:commonmark-ext-footnotes:0.31.0")
+    implementation("org.commonmark:commonmark-ext-task-list-items:0.31.0")
+    implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.31.0")
 
     // Testing
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-mock:$ktorVersion")
-    testImplementation("com.squareup.okhttp3:mockwebserver3:5.5.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver3:5.5.1")
     testImplementation("io.mockk:mockk:1.14.11")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
 }
